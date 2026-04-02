@@ -1,160 +1,158 @@
-# Zig 0.16-dev HTTP Server 实现
+# Zig HTTP Framework
 
-基于 Zig 0.16-dev 最新 HTTP 标准库的完整服务器实现。
+基于 Zig 0.16-dev 构建的高性能、轻量级 HTTP 服务器框架。提供现代化的路由系统、请求/响应封装以及 WebSocket 支持，旨在为 Zig 开发者提供简洁而强大的 Web 开发体验。
 
- 
+## ✨ 核心特性
 
-## 核心功能
+- 🚀 **高性能**: 基于 Zig 语言特性与 `std.Io` 异步/同步 IO 模型构建。
+- 🛣️ **灵活路由**: 支持静态路由、动态路径参数 (`/users/:id`) 以及 HTTP 方法匹配。
+- 📦 **请求/响应封装**: 简化的 API 处理 Query 参数、JSON 序列化/反序列化、表单数据及文件流。
+- 🔌 **WebSocket 支持**: 内置 WebSocket 升级与消息处理机制。
+- 📁 **静态文件服务**: 开箱即用的静态资源托管支持。
+- 🧩 **模块化设计**: 核心组件解耦，易于扩展和定制中间件。
 
-### 1. 参数解析
+## 📦 安装与构建
 
-```zig
-// Query 参数解析
-const query_start = mem.indexOfScalar(u8, target, '?');
-const path = if (query_start) |idx| target[0..idx] else target;
-const query = if (query_start) |idx| target[idx + 1 ..] else "";
+### 环境要求
 
-// 解析 query 参数
-var pairs = mem.splitScalar(u8, query, '&');
-while (pairs.next()) |pair| {
-    // name=value 解析
-}
-```
+- **Zig 版本**: `0.16.0-dev` (最新 master 分支)
+  > ⚠️ 注意：本项目依赖 Zig 0.16-dev 中引入的最新 `std.Io` 和 HTTP 标准库 API，请确保使用正确的编译器版本。
 
-### 2. Chunk 解析
-
-Zig 0.16-dev 的 HTTP 库已经内置了 chunked 传输编码支持：
-
-```zig
-// 自动处理 chunked 或 content-length
-const body_reader = request.readerExpectNone(&buffer);
-
-// 读取 body 数据
-while (true) {
-    const n = body_reader.read(&temp_buf) catch |err| switch (err) {
-        error.EndOfStream => break,
-        else => return err,
-    };
-    // 处理数据...
-}
-```
-
-### 3. 路由解析
-
-```zig
-fn matchRoute(method: http.Method, path: []const u8) !RouteResult {
-    if (mem.eql(u8, path, "/")) {
-        return .home;
-    } else if (mem.eql(u8, path, "/hello")) {
-        return .hello;
-    }
-    return .not_found;
-}
-```
-
-### 4. 请求体读取
-
-```zig
-// 读取请求体（支持 content-length 和 chunked）
-fn readRequestBody(request: *http.Server.Request, allocator: std.mem.Allocator) !?[]const u8 {
-    var buffer: [8192]u8 = undefined;
-    const body_reader = request.readerExpectNone(&buffer);
-    
-    var result = std.ArrayList(u8).init(allocator);
-    var temp_buf: [4096]u8 = undefined;
-    
-    while (true) {
-        const n = body_reader.read(&temp_buf) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        try result.appendSlice(temp_buf[0..n]);
-    }
-    
-    return try result.toOwnedSlice();
-}
-```
-
-### 5. 发送响应
-
-```zig
-// 简单响应
-try request.respond("Hello, World!", .{
-    .status = .ok,
-    .extra_headers = &.{
-        .{ .name = "Content-Type", .value = "text/plain" },
-    },
-});
-
-// JSON 响应
-try request.respond(json_str, .{
-    .status = .ok,
-    .extra_headers = &.{
-        .{ .name = "Content-Type", .value = "application/json" },
-    },
-});
-
-// 流式响应
-var body_writer = try request.respondStreaming(&buffer, .{
-    .respond_options = .{
-        .status = .ok,
-        .transfer_encoding = .chunked,
-    },
-});
-try body_writer.writer.writeAll("data");
-try body_writer.end();
-```
-
-### 6. WebSocket 支持
-
-```zig
-const upgrade = request.upgradeRequested();
-switch (upgrade) {
-    .websocket => |key| {
-        if (key) |k| {
-            var ws = try request.respondWebSocket(.{ .key = k });
-            
-            // 读取消息
-            const msg = try ws.readSmallMessage();
-            
-            // 发送消息
-            try ws.writeMessage("Hello", .text);
-        }
-    },
-    else => {},
-}
-```
-
-## 运行示例
+### 构建项目
 
 ```bash
 # 编译并运行
-zig run simple_http_handler.zig
+zig build run
 
-# 测试
-zig test simple_http_handler.zig
+# 仅编译
+zig build
+
+# 运行测试
+zig build test
 ```
 
-## API 端点
+## 🚀 快速开始
 
-启动服务器后，可以访问：
+### 1. 创建服务器与路由
 
-- `http://127.0.0.1:8080/` - 首页
-- `http://127.0.0.1:8080/hello` - Hello 接口
-- `http://127.0.0.1:8080/hello?name=Zig` - 带参数的 Hello 接口
-- `http://127.0.0.1:8080/api/test` - API 接口
+```zig
+const std = @import("std");
+const http_framework = @import("http_framework");
+const Server = http_framework.Server;
+const Router = http_framework.Router;
+const RequestContext = http_framework.RequestContext;
+const Response = http_framework.Response;
 
-## Zig 0.16-dev HTTP API 变化
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
 
-相比 0.13/0.14 版本，0.16-dev 的主要变化：
+    // 初始化路由
+    var router = Router.init(arena);
+    defer router.deinit();
 
-1. **新的 IO API**: 使用 `std.Io.Reader` 和 `std.Io.Writer` 替代旧的流 API
-2. **Server 初始化**: `http.Server.init(&reader, &writer)`
-3. **Body 读取**: `request.readerExpectNone(&buffer)` 返回 `*std.Io.Reader`
-4. **Chunked 处理**: 内置支持，无需手动解析
-5. **WebSocket**: `request.respondWebSocket(.{ .key = key })`
+    // 注册路由
+    try router.route(.GET, "/", homeHandler);
+    try router.route(.GET, "/users/:id", userHandler);
+    try router.route(.POST, "/users", createUserHandler);
 
-## 依赖
+    // 启动服务器
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
+    var server = try Server.init(arena, io, address, router);
+    try server.start();
+    defer server.deinit();
+}
+```
 
-- Zig 0.16.0-dev (最新 master 分支)
+### 2. 处理请求与响应
+
+框架提供了便捷的 `RequestContext` 和 `Response` 对象，简化了常见 Web 操作：
+
+```zig
+/// 处理带路径参数的请求
+fn userHandler(ctx: *RequestContext, res: *Response) !void {
+    const user_id = ctx.getParam("id") orelse "unknown";
+
+    try res.json(.{
+        .user_id = user_id,
+        .name = "John Doe",
+        .email = "john@example.com",
+    });
+}
+
+/// 处理 POST 请求体
+fn createUserHandler(ctx: *RequestContext, res: *Response) !void {
+    const body = try ctx.readBody();
+    
+    // 返回 201 Created 状态码
+    try res.statusCode(.created).json(.{
+        .success = true,
+        .body_length = body.len,
+    });
+}
+
+/// 返回 HTML 页面
+fn homeHandler(ctx: *RequestContext, res: *Response) !void {
+    _ = ctx;
+    try res.html(
+        \\<!DOCTYPE html>
+        \\<html><body><h1>Welcome to Zig HTTP Server!</h1></body></html>
+    );
+}
+```
+
+### 3. 静态文件服务 (可选)
+
+```zig
+const StaticFileServer = http_framework.StaticFileServer;
+
+// 将 /static/* 映射到 ./public 目录
+const static_server = StaticFileServer.init(arena, io, "./public", "/static");
+try router.route(.GET, "/static/*", struct {
+    fn handler(ctx: *RequestContext, res: *Response) !void {
+        try static_server.handle(ctx, res);
+    }
+}.handler);
+```
+
+## 📂 项目结构
+
+```text
+http-framework/
+├── build.zig              # Zig 构建脚本
+├── build.zig.zon          # 包依赖清单
+├── src/
+│   ├── main.zig           # 入口文件与示例路由
+│   ├── root.zig           # 库模块根文件
+│   └── core/
+│       ├── server.zig             # HTTP 服务器核心实现
+│       ├── router.zig             # 路由匹配与参数解析
+│       ├── request_context.zig    # 请求上下文封装
+│       ├── response.zig           # 响应构建器
+│       └── static_file_server.zig # 静态文件处理器
+└── README.md
+```
+
+## 🛠️ API 参考
+
+### 路由定义
+- `router.route(method, path, handler)`: 注册路由。
+- `router.notFound(handler)`: 设置 404 未找到处理器。
+- 路径参数使用 `:` 前缀，例如 `/api/users/:id`。
+
+### 请求上下文 (`RequestContext`)
+- `ctx.getParam("name")`: 获取路径参数。
+- `ctx.query`: 获取查询参数字符串。
+- `ctx.readBody()`: 读取请求体数据。
+- `ctx.content_type`: 获取请求 Content-Type。
+
+### 响应构建 (`Response`)
+- `res.json(data)`: 发送 JSON 响应。
+- `res.html(str)`: 发送 HTML 响应。
+- `res.text(str)`: 发送纯文本响应。
+- `res.statusCode(status)`: 设置 HTTP 状态码。
+- `res.header(name, value)`: 添加响应头。
+
+## 📜 许可证
+
+本项目采用 MIT 许可证开源。详见 [LICENSE](LICENSE) 文件。

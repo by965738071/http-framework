@@ -39,7 +39,7 @@ pub fn start(self: *Self) !void {
 
         var httpServer = std.http.Server.init(&in.interface, &out.interface);
 
-        _ = group.async(self.io, struct {
+        group.async(self.io, struct {
             fn handle(httpStream: *http.Server, allocator: std.mem.Allocator, router: Router) !void {
                 handleRequest(httpStream, allocator, router) catch |err| {
                     std.log.err("handle request error {s}", .{@errorName(err)});
