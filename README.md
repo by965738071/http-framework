@@ -1,11 +1,11 @@
-# Zig HTTP Framework
+# Zig HTTP 框架
 
-基于 Zig 0.16-dev 构建的高性能、轻量级 HTTP 服务器框架。提供现代化的路由系统、请求/响应封装以及 WebSocket 支持，旨在为 Zig 开发者提供简洁而强大的 Web 开发体验。
+基于 Zig 0.16-dev 构建的高性能、轻量级 HTTP 服务器框架。提供现代化的路由系统、完整的请求/响应封装、WebSocket 支持以及静态文件服务，旨在为 Zig 开发者提供简洁而强大的 Web 开发体验。
 
-## ✨ 核心特性
+## 🔧 核心功能
 
 - 🚀 **高性能**: 基于 Zig 语言特性与 `std.Io` 异步/同步 IO 模型构建。
-- 🛣️ **灵活路由**: 支持静态路由、动态路径参数 (`/users/:id`) 以及 HTTP 方法匹配。
+- 🛣️ **灵活路由**: 支持静态路由、动态路径参数（如 `/users/:id`）以及 HTTP 方法匹配。
 - 📦 **请求/响应封装**: 简化的 API 处理 Query 参数、JSON 序列化/反序列化、表单数据及文件流。
 - 🔌 **WebSocket 支持**: 内置 WebSocket 升级与消息处理机制。
 - 📁 **静态文件服务**: 开箱即用的静态资源托管支持。
@@ -15,7 +15,7 @@
 
 ### 环境要求
 
-- **Zig 版本**: `0.16.0-dev` (最新 master 分支)
+- **Zig 版本**: `0.16.0-dev` (推荐使用最新开发版)
   > ⚠️ 注意：本项目依赖 Zig 0.16-dev 中引入的最新 `std.Io` 和 HTTP 标准库 API，请确保使用正确的编译器版本。
 
 ### 构建项目
@@ -94,10 +94,16 @@ fn createUserHandler(ctx: *RequestContext, res: *Response) !void {
 /// 返回 HTML 页面
 fn homeHandler(ctx: *RequestContext, res: *Response) !void {
     _ = ctx;
-    try res.html(
-        \\<!DOCTYPE html>
-        \\<html><body><h1>Welcome to Zig HTTP Server!</h1></body></html>
-    );
+    try res.html(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Zig HTTP Server</title></head>
+        <body>
+            <h1>Welcome to Zig HTTP Server!</h1>
+            <p>Server is running on Zig 0.16-dev</p>
+        </body>
+        </html>
+    `);
 }
 ```
 
@@ -119,18 +125,18 @@ try router.route(.GET, "/static/*", struct {
 
 ```text
 http-framework/
-├── build.zig              # Zig 构建脚本
-├── build.zig.zon          # 包依赖清单
-├── src/
-│   ├── main.zig           # 入口文件与示例路由
-│   ├── root.zig           # 库模块根文件
-│   └── core/
-│       ├── server.zig             # HTTP 服务器核心实现
-│       ├── router.zig             # 路由匹配与参数解析
-│       ├── request_context.zig    # 请求上下文封装
-│       ├── response.zig           # 响应构建器
-│       └── static_file_server.zig # 静态文件处理器
-└── README.md
+├── core/                     # 核心模块
+│   ├── server.zig            # HTTP 服务器实现
+│   ├── router.zig            # 路由匹配与参数解析
+│   ├── request_context.zig   # 请求上下文封装
+│   ├── response.zig          # 响应构建器
+│   ├── middleware.zig        # 中间件系统
+│   ├── logger.zig            # 日志中间件
+│   └── static_file_server.zig# 静态文件服务
+├── main.zig                  # 程序入口与示例路由
+├── build.zig                 # Zig 构建脚本
+├── build.zig.zon             # 包依赖声明
+└── README.md                 # 项目说明文档
 ```
 
 ## 🛠️ API 参考
