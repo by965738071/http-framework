@@ -2,13 +2,18 @@ const std = @import("std");
 const Io = std.Io;
 
 const http_framework = @import("http_framework");
-const Server = @import("core/server.zig");
-const Router = @import("core/router.zig");
-const StaticFileServer = @import("core/static_file_server.zig");
-const RequestContext = @import("core/request.zig");
-const Response = @import("core/response.zig");
-const Middle = @import("core/middleware.zig");
-const logger = @import("core/logger.zig");
+const core = @import("core");
+const Server = core.Server;
+const Router = core.Router;
+const Static = core.Static;
+const RequestContext = core.RequestContext;
+const Response = core.Response;
+const Middle = core.Middle;
+const logger = core.Logger;
+const Handler = core.Handler;
+
+const HomeHandler = @import("api/home.zig");
+const UserHandler = @import("api/user.zig");
 
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
@@ -44,35 +49,38 @@ pub fn main(init: std.process.Init) !void {
     const loggerMiddle = try logger.LogMiddleware.create(arena, io);
     const authMiddle = try logger.AuthMiddleware.create(arena, io);
     // 注册路由
-    try router.routeWithMiddleware(
-        .GET,
-        "/",
-        homeHandler,
-        &.{ loggerMiddle.middle, authMiddle.middle },
-    );
-    try router.route(
-        .GET,
-        "/api",
-        apiHandler,
-    );
-    try router.routeWithMiddleware(.GET, "/users/:id", userHandler, &.{ loggerMiddle.middle, authMiddle.middle });
-    try router.routeWithMiddleware(.POST, "/users", createUserHandler, &.{ loggerMiddle.middle, authMiddle.middle });
-    // try router.route(.GET, "/ws", wsHandler);
     //
     //
 
-    //const middles = [_]Middle{ logger.LogMiddleware{ .prefix = "hello" }, logger.AuthMiddleware{ .token = "world" } };
+    // 1. 初始化首页处理器 (堆分配)
+    var home = try HomeHandler.create(arena, "My Awesome Zig 0.16 Server");
+    defer home.destroy(); // 👈 千万别忘了销毁
+
+    // 注册时，取出它内部的 .handler 字段
+    try router.routeWithMiddleware(.GET, "/", home.handler, &.{ loggerMiddle.middle, authMiddle.middle });
+
+    // 2. 初始化用户处理器 (堆分配)
+    var user = try UserHandler.create(arena, "John Doe");
+    defer user.destroy(); // 👈 千万别忘了销毁
+
+    // 注册时，取出它内部的 .handler 字段
+    try router.routeWithMiddleware(.GET, "/users/:id", user.handler, &.{ loggerMiddle.middle, authMiddle.middle });
+
+    //try router.routeWithMiddleware(.GET, "/", try HomeHandler.create(arena, "HOME"), &.{ loggerMiddle.middle, authMiddle.middle });
+
+    //try router.routeWithMiddleware(.POST, "/users", try UserHandler.create(arena, "USER"), &.{ loggerMiddle.middle, authMiddle.middle });
+    //try router.route(.GET, "/ws", wsHandler);
 
     // 静态文件服务
-    // const static_server = StaticFileServer.init(arena, io, "./public", "/static");
-    // try router.route(.GET, "/static/*", struct {
-    //     fn handler(ctx: *RequestContext, res: *Response) !void {
-    //         try static_server.handle(ctx, res);
-    //     }
-    // }.handler);
+    var static_server = Static.init(arena, io, "./public", "/static");
+
+    try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
+
+    // 你甚至可以复用同一个 static_server 注册不同的前缀
+    // try router.route(.GET, "/assets/*", Handler.init(StaticFileServer, &static_server));
 
     // 设置 404 处理器
-    router.notFound(struct {
+    router.notFound(Handler.fromFn(struct {
         fn handler(ctx: *RequestContext, res: *Response) !void {
             _ = ctx;
             try res.statusCode(.not_found).html(
@@ -80,60 +88,13 @@ pub fn main(init: std.process.Init) !void {
                 \\<html><body><h1>404 - Page Not Found</h1></body></html>
             );
         }
-    }.handler);
+    }.handler));
 
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
     var server = try Server.init(arena, io, address, router);
 
     try server.start();
     defer server.deinit();
-}
-
-/// 首页处理器
-fn homeHandler(ctx: *RequestContext, res: *Response) !void {
-    _ = ctx;
-    try res.html(
-        \\<!DOCTYPE html>
-        \\<html>
-        \\<head><title>Zig HTTP Server</title></head>
-        \\<body>
-        \\  <h1>Welcome to Zig 0.16 HTTP Server!</h1>
-        \\  <p>Server is running on Zig 0.16-dev</p>
-        \\</body>
-        \\</html>
-    );
-}
-
-/// API 处理器
-fn apiHandler(ctx: *RequestContext, res: *Response) !void {
-    try res.json(.{
-        .version = "0.16-dev",
-        .method = @tagName(ctx.method),
-        .path = ctx.path,
-        .query_params = ctx.query_params.count(),
-    });
-}
-
-/// 用户处理器（带路径参数）
-fn userHandler(ctx: *RequestContext, res: *Response) !void {
-    const user_id = ctx.getParam("id") orelse "unknown";
-
-    try res.json(.{
-        .user_id = user_id,
-        .name = "John Doe",
-        .email = "john@example.com",
-    });
-}
-
-/// POST 数据处理
-fn createUserHandler(ctx: *RequestContext, res: *Response) !void {
-    const body = try ctx.readBody();
-
-    try res.statusCode(.created).json(.{
-        .success = true,
-        .body_length = body.len,
-        .content_type = ctx.content_type,
-    });
 }
 
 // /// WebSocket 处理器
@@ -154,42 +115,3 @@ fn createUserHandler(ctx: *RequestContext, res: *Response) !void {
 //     try ws.writeMessage(msg.data, msg.opcode);
 // }
 // }
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
-}
