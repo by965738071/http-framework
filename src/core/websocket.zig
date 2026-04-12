@@ -1,6 +1,6 @@
 const std = @import("std");
 const http = std.http;
-const RequestContext = @import("request_context.zig").RequestContext;
+const RequestContext = @import("request_context.zig");
 
 /// WebSocket 处理器
 /// 处理 WebSocket 连接

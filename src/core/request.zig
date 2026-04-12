@@ -3,7 +3,7 @@ const http = std.http;
 const mem = std.mem;
 
 allocator: std.mem.Allocator,
-
+io: std.Io,
 // 基本信息
 method: http.Method,
 path: []const u8,
@@ -34,7 +34,7 @@ user_data: ?*anyopaque,
 
 const Self = @This();
 
-pub fn init(allocator: std.mem.Allocator, request: *http.Server.Request) !Self {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, request: *http.Server.Request) !Self {
     const head = request.head;
 
     // 解析 target
@@ -45,6 +45,7 @@ pub fn init(allocator: std.mem.Allocator, request: *http.Server.Request) !Self {
 
     var ctx = Self{
         .allocator = allocator,
+        .io = io,
         .method = head.method,
         .path = path,
         .query = query,

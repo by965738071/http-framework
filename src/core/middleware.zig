@@ -1,46 +1,55 @@
 const std = @import("std");
-const RequestContext = @import("request_context.zig");
+// 假设这些存在
+const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 
 /// 中间件接口
-///
 const Self = @This();
-before: ?*const fn (*RequestContext) anyerror!void = null,
-after: ?*const fn (*RequestContext, *Response) anyerror!void = null,
 
-/// 日志中间件
-pub const LoggingMiddleware = struct {
-    pub fn before(ctx: *RequestContext) !void {
-        const time = std.time.timestamp();
-        std.log.info("[{d}] {s} {s}", .{
-            time,
-            @tagName(ctx.method),
-            ctx.path,
-        });
-    }
+name: []const u8,
+ptr: *anyopaque, // <--- 新增：必须要有这个字段来保存具体对象的指针
+vtable: *const VTable,
 
-    pub fn after(ctx: *RequestContext, res: *Response) !void {
-        _ = ctx;
-        _ = res;
-        std.log.info("Request completed", .{});
-    }
+const VTable = struct {
+    process: *const fn (*anyopaque, *RequestContext) anyerror!NextAction,
+    destroy: *const fn (*anyopaque) void,
 };
 
-/// CORS 中间件
-pub const CorsMiddleware = struct {
-    allow_origin: []const u8 = "*",
-    allow_methods: []const u8 = "GET, POST, PUT, DELETE, OPTIONS",
-    allow_headers: []const u8 = "Content-Type, Authorization",
-
-    pub fn before(self: @This(), ctx: *RequestContext) !void {
-        _ = self;
-        _ = ctx;
-    }
-
-    pub fn after(self: @This(), ctx: *RequestContext, res: *Response) !void {
-        _ = ctx;
-        try res.header("Access-Control-Allow-Origin", self.allow_origin);
-        try res.header("Access-Control-Allow-Methods", self.allow_methods);
-        try res.header("Access-Control-Allow-Headers", self.allow_headers);
-    }
+pub const NextAction = enum {
+    next,
+    respond,
+    err,
 };
+
+/// 修改 init，传入具体实例的指针
+pub fn init(comptime T: type, ptr: *T) Self {
+    return .{
+        .ptr = ptr,
+        .name = @typeName(T),
+        .vtable = &.{
+            .process = struct {
+                fn process(ctx: *anyopaque, req_ctx: *RequestContext) anyerror!NextAction {
+                    const t: *T = @ptrCast(@alignCast(ctx));
+                    return t.process(req_ctx);
+                }
+            }.process,
+            .destroy = struct {
+                fn destroy(ctx: *anyopaque) void {
+                    const t: *T = @ptrCast(@alignCast(ctx));
+                    if (@hasDecl(T, "deinit")) {
+                        t.deinit();
+                    }
+                }
+            }.destroy,
+        },
+    };
+}
+
+// --- 为了方便调用，通常还会提供包装方法 ---
+pub fn process(self: Self, ctx: *RequestContext) anyerror!NextAction {
+    return self.vtable.process(self.ptr, ctx);
+}
+
+pub fn destroy(self: Self) void {
+    self.vtable.destroy(self.ptr);
+}

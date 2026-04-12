@@ -5,8 +5,10 @@ const http_framework = @import("http_framework");
 const Server = @import("core/server.zig");
 const Router = @import("core/router.zig");
 const StaticFileServer = @import("core/static_file_server.zig");
-const RequestContext = @import("core/request_context.zig");
+const RequestContext = @import("core/request.zig");
 const Response = @import("core/response.zig");
+const Middle = @import("core/middleware.zig");
+const logger = @import("core/logger.zig");
 
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
@@ -39,12 +41,27 @@ pub fn main(init: std.process.Init) !void {
     var router = Router.init(arena);
     defer router.deinit();
 
+    const loggerMiddle = try logger.LogMiddleware.create(arena, io);
+    const authMiddle = try logger.AuthMiddleware.create(arena, io);
     // 注册路由
-    try router.route(.GET, "/", homeHandler);
-    try router.route(.GET, "/api", apiHandler);
-    try router.route(.GET, "/users/:id", userHandler);
-    try router.route(.POST, "/users", createUserHandler);
+    try router.routeWithMiddleware(
+        .GET,
+        "/",
+        homeHandler,
+        &.{ loggerMiddle.middle, authMiddle.middle },
+    );
+    try router.route(
+        .GET,
+        "/api",
+        apiHandler,
+    );
+    try router.routeWithMiddleware(.GET, "/users/:id", userHandler, &.{ loggerMiddle.middle, authMiddle.middle });
+    try router.routeWithMiddleware(.POST, "/users", createUserHandler, &.{ loggerMiddle.middle, authMiddle.middle });
     // try router.route(.GET, "/ws", wsHandler);
+    //
+    //
+
+    //const middles = [_]Middle{ logger.LogMiddleware{ .prefix = "hello" }, logger.AuthMiddleware{ .token = "world" } };
 
     // 静态文件服务
     // const static_server = StaticFileServer.init(arena, io, "./public", "/static");
@@ -67,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
 
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000");
     var server = try Server.init(arena, io, address, router);
+
     try server.start();
     defer server.deinit();
 }
