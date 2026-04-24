@@ -3,20 +3,18 @@
 //! 演示 **请求级生命周期** 处理器。
 //! 通过 `Handler.initPerRequest` 注册，框架自动管理每次请求的创建和销毁。
 //!
-//! # 设计说明
+//! # 性能说明
 //!
-//! - `title` 使用 comptime 常量，**零堆分配**（不需要 dupe）
-//! - `init` 只做一次 `allocator.create(Self)`，不额外分配
-//! - `deinit` **只释放内部资源**，不调 `allocator.destroy(self)`
-//!   （框架的 VTable destroy 会统一调用 allocator.destroy）
+//! - HTML 模板在编译期完全展开为 `[]const u8` 常量，**零运行时分配**
+//! - `init` 只做一次 `allocator.create(Self)`，不 dupe 任何数据
+//! - `deinit` 为空（没有堆分配的内部字段需要释放）
+//! - 框架的 VTable destroy 会自动调用 `allocator.destroy(self)`
 //!
-//! # deinit 规则
+//! # 使用示例
 //!
-//! 当前使用的是 `Handler.initPerRequest`，其 VTable destroy 会自动：
-//!   1. 调用 `instance.deinit()`
-//!   2. 调用 `allocator.destroy(instance)`
-//!
-//! 所以 `deinit` 中**不要**调 `allocator.destroy(self)`，否则 double free。
+//! ```zig
+//! try router.route(.GET, "/", Handler.initPerRequest(HomeHandler, allocator));
+//! ```
 
 const std = @import("std");
 const core = @import("core");
@@ -26,13 +24,10 @@ const Response = core.Response;
 /// Home 页面处理器
 ///
 /// 每次请求创建一个新实例，处理完毕后自动销毁。
-/// 不持有任何堆分配的数据。
+/// 所有数据均为 comptime 常量，零堆分配。
 title: []const u8,
 
 const Self = @This();
-
-/// 页面标题（comptime 常量，零运行时开销）
-const TITLE = "My Awesome Zig Server";
 
 // =========================================================================
 // 生命周期（Handler.initPerRequest 要求的方法签名）
@@ -40,13 +35,17 @@ const TITLE = "My Awesome Zig Server";
 
 /// 工厂方法 — 每次请求时由框架自动调用。
 ///
-/// 只分配结构体本身，不 dupe 数据。
-/// title 直接引用 comptime 常量。
+/// 只分配结构体本身，title 直接引用 comptime 常量。
 pub fn init(allocator: std.mem.Allocator) !*Self {
     const ptr = try allocator.create(Self);
-    ptr.* = .{
-        .title = TITLE,
-    };
+    ptr.* = .{ .title = TITLE };
+    return ptr;
+}
+
+/// 请求级工厂方法（带参数版本用）— 允许外部传入标题。
+pub fn initWithTitle(allocator: std.mem.Allocator, title: []const u8) !*Self {
+    const ptr = try allocator.create(Self);
+    ptr.* = .{ .title = title };
     return ptr;
 }
 
@@ -54,29 +53,13 @@ pub fn init(allocator: std.mem.Allocator) !*Self {
 // 请求处理
 // =========================================================================
 
-/// 处理请求，返回动态生成的 HTML 页面。
+/// 处理请求，返回静态 HTML 页面。
 ///
-/// 注意：`allocPrint` 使用了 `page_allocator`，因为这是要传给
-/// `res.html()` 的临时数据，生命周期只需到响应发送完毕。
+/// HTML 完全嵌入在全局 comptime 常量中，零运行时格式化开销。
 pub fn handle(self: *Self, ctx: *RequestContext, res: *Response) !void {
     _ = ctx;
-
-    const html_content = try std.fmt.allocPrint(
-        std.heap.page_allocator,
-        \\<!DOCTYPE html>
-        \\<html>
-        \\<head><title>{s}</title></head>
-        \\<body>
-        \\  <h1>Welcome to {s}!</h1>
-        \\  <p>Welcome to the Zig HTTP Framework!</p>
-        \\</body>
-        \\<html>
-    ,
-        .{ self.title, self.title },
-    );
-    defer std.heap.page_allocator.free(html_content);
-
-    try res.html(html_content);
+    _ = self;
+    try res.html(HTML);
 }
 
 // =========================================================================
@@ -85,10 +68,26 @@ pub fn handle(self: *Self, ctx: *RequestContext, res: *Response) !void {
 
 /// 释放内部资源。
 ///
-/// 因为 title 指向 comptime 常量，没有堆分配的内部字段需要释放。
-/// 方法体为空，框架的 VTable destroy 会自动调用 allocator.destroy(self)。
+/// title 指向 comptime 常量，无需释放。
+/// VTable destroy 会自动调用 allocator.destroy(self)。
 pub fn deinit(self: *Self) void {
     _ = self;
-    // 没有堆分配的内部字段，不需要 free
-    // allocator.destroy(self) 由 VTable destroy 统一处理
 }
+
+// ===========================================================================
+// 编译期常量
+// ===========================================================================
+
+/// 页面标题
+const TITLE = "My Awesome Zig Server";
+
+/// 完整的 HTML 页面（编译期确定，零运行时开销）
+const HTML = "<!DOCTYPE html>\n" ++
+    "<html>\n" ++
+    "<head><title>" ++ TITLE ++ "</title></head>\n" ++
+    "<body>\n" ++
+    "  <h1>Welcome to " ++ TITLE ++ "!</h1>\n" ++
+    "  <p>Welcome to the Zig HTTP Framework!</p>\n" ++
+    "  <p><em>Served by initPerRequest</em></p>\n" ++
+    "</body>\n" ++
+    "<html>";

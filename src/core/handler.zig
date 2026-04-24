@@ -123,7 +123,7 @@ pub fn init(comptime T: type, ptr: *T) Handler {
 /// 每次请求流程：
 /// 1. `create` → 调 `T.init(allocator)` 分配新实例
 /// 2. `handle` → 调 `instance.handle(ctx, res)`
-/// 3. `destroy` → 调 `instance.deinit()` + `allocator.destroy(instance)`
+/// 3. `destroy` → 从 `ctx` 中取出 `allocator`，调 `deinit()` + `alloc.destroy(instance)`
 ///
 /// # 要求类型 T
 ///
@@ -131,12 +131,24 @@ pub fn init(comptime T: type, ptr: *T) Handler {
 /// - `pub fn handle(self: *T, ctx: *RequestContext, res: *Response) !void`
 /// - `pub fn deinit(self: *T) void`（释放内部资源，**不需要**调 destroy）
 ///
+/// # 内存分配
+///
+/// | 阶段 | 分配次数 |
+/// |------|---------|
+/// | 路由注册时 | 1 次 `alloc.create(Context)` |
+/// | 每次请求 create | 1 次 `T.init(alloc)` |
+/// | 每次请求 destroy | 1 次 `alloc.destroy(T)` |
+///
+/// 路由注册时的 Context 分配是**一次性的**，后续请求只涉及 `T` 的 create/destroy。
+///
 /// # 使用示例
 ///
 /// ```zig
 /// try router.route(.GET, "/", Handler.initPerRequest(MyHandler, allocator));
 /// ```
 pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) Handler {
+    // Context 在路由注册时分配一次，后续所有请求共享。
+    // 它持有 allocator，供 destroy 阶段释放 T 实例。
     const Context = struct {
         alloc: std.mem.Allocator,
     };
@@ -174,6 +186,11 @@ pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) Handler {
 /// **请求级处理器（带配置参数）** — 框架自动管理创建和销毁。
 ///
 /// 与 `initPerRequest` 相同，但 `T.init` 可以接收额外的配置参数。
+///
+/// # 内存分配
+///
+/// Context 中除了 allocator 还存储了 `args`（按值拷贝），
+/// 在路由注册时一次性分配，后续请求不再产生额外分配。
 ///
 /// # 要求类型 T
 ///

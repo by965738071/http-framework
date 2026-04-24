@@ -1,17 +1,19 @@
 //! 用户 API 处理器
 //!
-//! 支持两种生命周期模式（可同时使用）：
+//! 演示 **请求级生命周期** 处理器（带配置参数）。
+//! 使用 `Handler.initPerRequestWith` 注册，框架自动管理每次请求的创建和销毁。
 //!
-//! ## 单例模式（推荐 — 零分配）
-//! ```zig
-//! var user = try UserHandler.initSingleton(allocator, "John Doe");
-//! defer user.deinit();
-//! router.route(.GET, "/users/:id", Handler.init(UserHandler, user));
-//! ```
+//! # 性能说明
 //!
-//! ## 请求级模式（每次请求独立状态）
+//! - `default_name` 直接引用注册时传入的 `args` 中的 slice，**不做 dupe**
+//! - `init` 只做一次 `allocator.create(Self)`，不额外分配
+//! - `deinit` 为空（没有堆分配的内部字段需要释放）
+//! - 框架的 VTable destroy 会自动调用 `allocator.destroy(self)`
+//!
+//! # 使用示例
+//!
 //! ```zig
-//! router.route(.GET, "/users/:id", Handler.initPerRequestWith(
+//! try router.route(.GET, "/users/:id", Handler.initPerRequestWith(
 //!     UserHandler, allocator, .{ .default_name = "John Doe" },
 //! ));
 //! ```
@@ -23,43 +25,27 @@ const Response = core.Response;
 
 /// 用户信息处理器
 ///
-/// 根据初始化方式不同，可以工作于单例或请求级模式。
+/// 每次请求创建一个新实例，处理完毕后自动销毁。
+/// `default_name` 指向注册时传入的配置数据，不持有所有权。
 default_name: []const u8,
-allocator: std.mem.Allocator,
 
 const Self = @This();
 
 // =========================================================================
-// 单例模式工厂
+// 生命周期（Handler.initPerRequestWith 要求的方法签名）
 // =========================================================================
 
-/// 创建单例实例（main 启动时调用一次，程序退出时 deinit）。
-pub fn initSingleton(allocator: std.mem.Allocator, default_name: []const u8) !*Self {
-    const ptr = try allocator.create(Self);
-    const name_dup = try allocator.dupe(u8, default_name);
-    ptr.* = .{
-        .allocator = allocator,
-        .default_name = name_dup,
-    };
-    return ptr;
-}
-
-// =========================================================================
-// 请求级模式工厂（Handler.initPerRequestWith 要求的方法签名）
-// =========================================================================
-
-/// 请求级工厂方法 — 每次请求由框架自动调用。
+/// 工厂方法 — 每次请求时由框架自动调用。
 ///
-/// `args` 结构体包含注册时传入的配置参数：
-/// ```zig
-/// .{ .default_name = "John Doe" }
-/// ```
+/// `args` 结构体包含注册时传入的配置参数。
+/// `default_name` 直接引用 `args` 中的数据，**不做 dupe**。
+///
+/// 注意：由于不 dupe，args 中的数据必须在路由器生命周期内保持有效。
+/// 在 main.zig 中传入字符串字面量或 `allocator.dupe` 的持久数据即可。
 pub fn init(allocator: std.mem.Allocator, args: anytype) !*Self {
     const ptr = try allocator.create(Self);
-    const name_dup = try allocator.dupe(u8, args.default_name);
     ptr.* = .{
-        .allocator = allocator,
-        .default_name = name_dup,
+        .default_name = args.default_name,
     };
     return ptr;
 }
@@ -80,13 +66,13 @@ pub fn handle(self: *Self, ctx: *RequestContext, res: *Response) !void {
 }
 
 // =========================================================================
-// 清理（单例模式和请求级模式共用）
+// 清理
 // =========================================================================
 
 /// 释放内部资源。
 ///
-/// 框架的 VTable destroy 会自动调用 allocator.destroy(self)，
-/// 所以这里只释放内部字段即可。
+/// default_name 不持有所有权，无需释放。
+/// VTable destroy 会自动调用 allocator.destroy(self)。
 pub fn deinit(self: *Self) void {
-    self.allocator.free(self.default_name);
+    _ = self;
 }

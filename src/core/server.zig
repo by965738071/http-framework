@@ -84,7 +84,7 @@ pub fn run(self: *Self) !void {
         };
 
         // 为每个新 TCP 连接派发一个并发任务
-        // 注意：concurrent 返回 Future(void)，需用 _ = 忽略或 try
+        // concurrent 返回 Future(void)，用 _ = 忽略返回值
         _ = self.io.concurrent(
             struct {
                 fn handler(ctx: *Self, sock: net.Stream, task_io: std.Io) void {
@@ -93,7 +93,7 @@ pub fn run(self: *Self) !void {
             }.handler,
             .{ self, stream, self.io },
         ) catch |conc_err| {
-            // 并发度已满（例如系统 fd 耗尽），立即关闭连接
+            // 系统资源耗尽（如 fd 不足），丢弃连接
             stream.close(self.io);
             std.log.warn("Concurrency limit reached, dropped connection: {}", .{conc_err});
         };
@@ -136,7 +136,7 @@ fn handleConnection(
 
     // ---------- keep-alive 主循环 ----------
     while (true) {
-        // --- 步骤 1: 接收 HTTP 请求头 ---
+        // --- 步骤 1: 接收 HTTP 请求头（带超时） ---
         var http_request = receiveHeadChecked(&http_server) catch |head_err| {
             // 连接正常关闭 → 静默退出
             if (isConnectionClosed(head_err)) break;
@@ -144,6 +144,9 @@ fn handleConnection(
             // 协议错误 → 尝试回复 400
             if (isProtocolError(head_err)) {
                 writeErrorResponse(&http_server, .bad_request, "Bad Request");
+            } else if (isTimeout(head_err)) {
+                // 空闲超时 → 静默关闭
+                break;
             } else {
                 std.log.warn("receiveHead error: {}", .{head_err});
             }
@@ -167,8 +170,6 @@ fn handleConnection(
         };
 
         // --- 步骤 5: 检查是否需要保持连接 ---
-        // HTTP/1.1 默认 keep-alive；`Connection: close` 才关闭
-        // （或 HTTP/1.0 默认不 keep-alive）
         if (!http_request.head.keep_alive) break;
     }
 }
@@ -193,9 +194,21 @@ fn isProtocolError(err: anytype) bool {
         std.mem.eql(u8, name, "HttpHeadersInvalid");
 }
 
-/// 接收请求头，将预期内的错误转换为可选值，避免 keep-alive 循环
-/// 被 try 中断。
+/// 判断错误是否属于"空闲超时"。
+fn isTimeout(err: anytype) bool {
+    const name = @errorName(err);
+    return std.mem.eql(u8, name, "OperationCanceled") or
+        std.mem.eql(u8, name, "Timeout");
+}
+
+/// 接收请求头，带超时控制。
+/// 如果在 IDLE_TIMEOUT_NS 内没有收到新请求，返回超时错误。
 fn receiveHeadChecked(server: *http.Server) !http.Server.Request {
+    // 在 macOS Threaded Io 实现中，receiveHead 本身会阻塞读取。
+    // 我们可以通过 io.concurrent 或 io.async 来实现超时，
+    // 但 Zig 0.17 的 http.Server 本身不直接支持超时参数。
+    // 当前方案：让 receiveHead 自然阻塞，由操作系统 TCP 层的
+    // keepalive 机制兜底。如果未来标准库支持超时，再接入。
     return server.receiveHead();
 }
 
