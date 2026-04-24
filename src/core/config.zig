@@ -1,13 +1,19 @@
-const std = @import("std");
-allocator: std.mem.Allocator,
+//! 服务器配置
+//!
+//! 定义 HTTP 服务器所需的运行时参数。
 
-address: std.Io.net.IpAddress,
+const std = @import("std");
+
+/// HTTP 服务器配置
+text: []const u8,
+port: u16,
 
 const Self = @This();
 
-pub fn parse(text: []const u8) !Self {
-    const colon_pos = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidConfig;
-    const ip = text[0..colon_pos];
-    const port = try std.fmt.parseInt(u16, text[colon_pos + 1 ..], 10);
-    return .{ .address = .{ .ip4 = .parse(ip, port) } };
+/// 返回默认配置（监听 `127.0.0.1:9000`）
+pub fn defaults() Self {
+    return .{
+        .text = "127.0.0.1",
+        .port = 9000,
+    };
 }

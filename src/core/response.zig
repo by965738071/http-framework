@@ -1,4 +1,15 @@
-/// 响应构建器
+//! 响应构建器
+//!
+//! 提供链式调用的 API 来构建 HTTP 响应，支持设置状态码、响应头、
+//! Cookie，以及发送 JSON / HTML / 文本 / 文件 / 重定向等多种响应格式。
+//!
+//! # 使用示例
+//! ```zig
+//! var res = Response.init(allocator, &request);
+//! defer res.deinit();
+//! try res.statusCode(.ok).json(.{ .message = "Hello" });
+//! ```
+
 const std = @import("std");
 const http = std.http;
 
@@ -10,6 +21,7 @@ cookies: std.ArrayList(Cookie),
 
 const Self = @This();
 
+/// Cookie 结构
 const Cookie = struct {
     name: []const u8,
     value: []const u8,
@@ -20,6 +32,10 @@ const Cookie = struct {
     http_only: bool = false,
     same_site: ?[]const u8 = null,
 };
+
+// =========================================================================
+// 初始化与清理
+// =========================================================================
 
 pub fn init(allocator: std.mem.Allocator, request: *http.Server.Request) Self {
     return .{
@@ -36,13 +52,17 @@ pub fn deinit(self: *Self) void {
     self.cookies.deinit(self.allocator);
 }
 
-/// 设置状态码
+// =========================================================================
+// 响应构建（链式 API）
+// =========================================================================
+
+/// 设置 HTTP 状态码
 pub fn statusCode(self: *Self, code: http.Status) *Self {
     self.status = code;
     return self;
 }
 
-/// 添加 Header
+/// 添加响应头
 pub fn header(self: *Self, name: []const u8, value: []const u8) !*Self {
     try self.headers.append(self.allocator, .{ .name = name, .value = value });
     return self;
@@ -57,39 +77,14 @@ pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !*Self {
     return self;
 }
 
-/// 构建 Set-Cookie header
-fn buildCookieHeader(self: *Self, cookie: Cookie) ![]const u8 {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(self.allocator);
+// =========================================================================
+// 响应发送
+// =========================================================================
 
-    try buf.print(self.allocator, "{s}={s}", .{ cookie.name, cookie.value });
-
-    if (cookie.max_age) |age| {
-        try buf.print(self.allocator, "; Max-Age={d}", .{age});
-    }
-    if (cookie.path) |p| {
-        try buf.print(self.allocator, "; Path={s}", .{p});
-    }
-    if (cookie.domain) |d| {
-        try buf.print(self.allocator, "; Domain={s}", .{d});
-    }
-    if (cookie.secure) {
-        try buf.print(self.allocator, "; Secure", .{});
-    }
-    if (cookie.http_only) {
-        try buf.print(self.allocator,"; HttpOnly",.{});
-    }
-    if (cookie.same_site) |ss| {
-        try buf.print(self.allocator, "; SameSite={s}", .{ss});
-    }
-
-    return buf.toOwnedSlice(self.allocator);
-}
-
-/// 发送文本
+/// 发送纯文本响应（`Content-Type: text/plain`）
 pub fn text(self: *Self, content: []const u8) !void {
     try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator,.{
+    try self.headers.append(self.allocator, .{
         .name = "Content-Type",
         .value = "text/plain; charset=utf-8",
     });
@@ -100,10 +95,10 @@ pub fn text(self: *Self, content: []const u8) !void {
     });
 }
 
-/// 发送 HTML
+/// 发送 HTML 响应（`Content-Type: text/html`）
 pub fn html(self: *Self, content: []const u8) !void {
     try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator,.{
+    try self.headers.append(self.allocator, .{
         .name = "Content-Type",
         .value = "text/html; charset=utf-8",
     });
@@ -114,13 +109,13 @@ pub fn html(self: *Self, content: []const u8) !void {
     });
 }
 
-/// 发送 JSON
+/// 发送 JSON 响应（`Content-Type: application/json`）
 pub fn json(self: *Self, value: anytype) !void {
     const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
     defer self.allocator.free(json_str);
 
     try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator,.{
+    try self.headers.append(self.allocator, .{
         .name = "Content-Type",
         .value = "application/json",
     });
@@ -131,10 +126,10 @@ pub fn json(self: *Self, value: anytype) !void {
     });
 }
 
-/// 发送文件
+/// 发送文件内容（指定 `Content-Type`）
 pub fn file(self: *Self, content: []const u8, content_type: []const u8) !void {
     try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator,.{
+    try self.headers.append(self.allocator, .{
         .name = "Content-Type",
         .value = content_type,
     });
@@ -145,10 +140,10 @@ pub fn file(self: *Self, content: []const u8, content_type: []const u8) !void {
     });
 }
 
-/// 重定向
+/// 发送重定向响应
 pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
     try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator,.{
+    try self.headers.append(self.allocator, .{
         .name = "Location",
         .value = location,
     });
@@ -161,14 +156,55 @@ pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
     });
 }
 
-/// 添加 cookies 到 headers
+// =========================================================================
+// 内部辅助
+// =========================================================================
+
+/// 将所有 Cookie 转换为 `Set-Cookie` 响应头并追加到 headers 中
 fn addCookiesToHeaders(self: *Self) !void {
     for (self.cookies.items) |cookie| {
-        const cookie_str = try self.buildCookieHeader(cookie);
+        const cookie_str = try self.buildCookieString(cookie);
         defer self.allocator.free(cookie_str);
-        try self.headers.append(self.allocator,.{
+        try self.headers.append(self.allocator, .{
             .name = "Set-Cookie",
             .value = cookie_str,
         });
     }
+}
+
+/// 将 `Cookie` 结构序列化为 `Set-Cookie` 头值字符串
+fn buildCookieString(self: *Self, cookie: Cookie) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(self.allocator);
+
+    // name=value
+    try buf.appendSlice(self.allocator, cookie.name);
+    try buf.append(self.allocator, '=');
+    try buf.appendSlice(self.allocator, cookie.value);
+
+    // 可选属性
+    if (cookie.max_age) |age| {
+        try buf.appendSlice(self.allocator, "; Max-Age=");
+        try buf.print(self.allocator, "{d}", .{age});
+    }
+    if (cookie.path) |p| {
+        try buf.appendSlice(self.allocator, "; Path=");
+        try buf.appendSlice(self.allocator, p);
+    }
+    if (cookie.domain) |d| {
+        try buf.appendSlice(self.allocator, "; Domain=");
+        try buf.appendSlice(self.allocator, d);
+    }
+    if (cookie.secure) {
+        try buf.appendSlice(self.allocator, "; Secure");
+    }
+    if (cookie.http_only) {
+        try buf.appendSlice(self.allocator, "; HttpOnly");
+    }
+    if (cookie.same_site) |ss| {
+        try buf.appendSlice(self.allocator, "; SameSite=");
+        try buf.appendSlice(self.allocator, ss);
+    }
+
+    return buf.toOwnedSlice(self.allocator);
 }

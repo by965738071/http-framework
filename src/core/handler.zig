@@ -1,31 +1,79 @@
-// src/core/handler.zig
+//! 处理器（Handler）接口
+//!
+//! 使用 VTable 多态模式，支持三种处理器生命周期模式：
+//!
+//! | 模式 | 工厂函数 | create | destroy | 适用场景 |
+//! |------|----------|--------|---------|----------|
+//! | **纯函数** | `fromFn` | 空操作 | 空操作 | 无状态的普通函数 |
+//! | **单例** | `init(T, ptr)` | 返回自身 | **空操作** | 全局共享的处理器 |
+//! | **请求级** | `initPerRequest(T, alloc)` | 分配新实例 | deinit + destroy | 每次请求独立状态 |
+//!
+//! # 生命周期
+//!
+//! 请求级模式（`initPerRequest`）：
+//! ```text
+//! router.dispatch:
+//!   create(ctx_ptr) → T.init(alloc) → 返回 *T
+//!   handle(instance, ctx, res)
+//!   destroy(ctx_ptr, instance):
+//!     T.deinit(instance)
+//!     alloc.destroy(instance)
+//! ```
+//!
+//! # ⚠️ deinit 不需要调 allocator.destroy(self)
+//!
+//! VTable destroy 会统一处理 `allocator.destroy(instance)`。
+//! `deinit` 只负责释放实例内部持有的资源即可：
+//!
+//! ```zig
+//! pub fn deinit(self: *Self) void {
+//!     self.allocator.free(self.some_field); // ✅ 释放内部资源
+//!     // ❌ 不需要 allocator.destroy(self) — 框架自动调用
+//! }
+//! ```
+
 const std = @import("std");
 const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 
 const Handler = @This();
 
+/// Handler 持有的不透明指针（指向 Context 或实例本身）
 ptr: *anyopaque,
+
+/// 虚函数表
 vtable: *const VTable,
 
 const VTable = struct {
-    // 🚨 新增：工厂函数，用于按需创建实例
-    create: *const fn (std.mem.Allocator, *anyopaque) anyerror!*anyopaque,
-    // 原有：处理请求
-    handle: *const fn (*anyopaque, *RequestContext, *Response) anyerror!void,
-    // 🚨 新增：销毁函数
-    destroy: *const fn (std.mem.Allocator, *anyopaque) void,
+    /// 创建处理器实例。
+    /// `ctx` = `Handler.ptr`，返回的指针会传给 `handle` 和 `destroy`。
+    create: *const fn (ctx: *anyopaque) anyerror!*anyopaque,
+
+    /// 处理请求。
+    /// `instance` = `create` 的返回值。
+    handle: *const fn (instance: *anyopaque, *RequestContext, *Response) anyerror!void,
+
+    /// 销毁处理器实例。
+    /// `ctx` = `Handler.ptr`（可从中获取分配器）。
+    /// `instance` = `create` 的返回值。
+    destroy: *const fn (ctx: *anyopaque, instance: *anyopaque) void,
 };
 
-/// 1. 用于“无状态纯函数” (零开销适配)
+// ===========================================================================
+// 工厂函数
+// ===========================================================================
+
+/// **纯函数处理器** — create/destroy 均为空操作，零开销。
 pub fn fromFn(comptime func: *const fn (*RequestContext, *Response) anyerror!void) Handler {
-    const Dummy = struct { data: [0]u8 = .{} };
+    const Placeholder = struct {
+        pub const instance: u8 = 0;
+    };
+
     return .{
-        .ptr = @ptrCast(@constCast(&Dummy{})),
+        .ptr = @ptrCast(@constCast(&Placeholder.instance)),
         .vtable = &.{
             .create = struct {
-                // 纯函数不需要创建，直接返回虚拟指针
-                fn create(_: std.mem.Allocator, ctx: *anyopaque) anyerror!*anyopaque {
+                fn create(ctx: *anyopaque) anyerror!*anyopaque {
                     return ctx;
                 }
             }.create,
@@ -35,36 +83,147 @@ pub fn fromFn(comptime func: *const fn (*RequestContext, *Response) anyerror!voi
                 }
             }.call,
             .destroy = struct {
-                // 纯函数不需要销毁
-                fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+                fn destroy(_: *anyopaque, _: *anyopaque) void {}
             }.destroy,
         },
     };
 }
 
-/// 2. 用于“全局单例结构体” (如你之前的 StaticFileServer)
+/// **单例处理器** — destroy 为空操作，由调用者管理生命周期。
+///
+/// `ptr` 指向一个全局稳定的实例。每次请求 `create` 返回同一个指针。
 pub fn init(comptime T: type, ptr: *T) Handler {
     return .{
         .ptr = @ptrCast(ptr),
         .vtable = &.{
             .create = struct {
-                // 单例不创建新对象，直接把传入的指针原路返回
-                fn create(_: std.mem.Allocator, ctx: *anyopaque) anyerror!*anyopaque {
-                    return ctx;
+                fn create(any: *anyopaque) anyerror!*anyopaque {
+                    return any;
                 }
             }.create,
             .handle = struct {
-                fn call(ctx: *anyopaque, req: *RequestContext, res: *Response) anyerror!void {
-                    const self: *T = @ptrCast(@alignCast(ctx));
+                fn call(any: *anyopaque, req: *RequestContext, res: *Response) anyerror!void {
+                    const self: *T = @ptrCast(@alignCast(any));
                     return self.handle(req, res);
                 }
             }.call,
             .destroy = struct {
-                // 单例绝对不允许在这里销毁！
-                fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+                fn destroy(_: *anyopaque, _: *anyopaque) void {}
             }.destroy,
         },
     };
 }
 
-// (未来你可以在这里加一个 initPerRequest，让 create 真正去 allocator.create)
+// ===========================================================================
+// 请求级生命周期
+// ===========================================================================
+
+/// **请求级处理器** — 框架自动管理创建和销毁。
+///
+/// 每次请求流程：
+/// 1. `create` → 调 `T.init(allocator)` 分配新实例
+/// 2. `handle` → 调 `instance.handle(ctx, res)`
+/// 3. `destroy` → 调 `instance.deinit()` + `allocator.destroy(instance)`
+///
+/// # 要求类型 T
+///
+/// - `pub fn init(allocator: std.mem.Allocator) !*T`
+/// - `pub fn handle(self: *T, ctx: *RequestContext, res: *Response) !void`
+/// - `pub fn deinit(self: *T) void`（释放内部资源，**不需要**调 destroy）
+///
+/// # 使用示例
+///
+/// ```zig
+/// try router.route(.GET, "/", Handler.initPerRequest(MyHandler, allocator));
+/// ```
+pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) Handler {
+    const Context = struct {
+        alloc: std.mem.Allocator,
+    };
+
+    const ctx = allocator.create(Context) catch @panic("OOM in Handler.initPerRequest");
+    ctx.* = .{ .alloc = allocator };
+
+    return .{
+        .ptr = @ptrCast(ctx),
+        .vtable = &.{
+            .create = struct {
+                fn create(any: *anyopaque) anyerror!*anyopaque {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    return @ptrCast(try T.init(c.alloc));
+                }
+            }.create,
+            .handle = struct {
+                fn call(any: *anyopaque, req: *RequestContext, res: *Response) anyerror!void {
+                    const self: *T = @ptrCast(@alignCast(any));
+                    return self.handle(req, res);
+                }
+            }.call,
+            .destroy = struct {
+                fn destroy(any: *anyopaque, instance: *anyopaque) void {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    const self: *T = @ptrCast(@alignCast(instance));
+                    self.deinit();
+                    c.alloc.destroy(self);
+                }
+            }.destroy,
+        },
+    };
+}
+
+/// **请求级处理器（带配置参数）** — 框架自动管理创建和销毁。
+///
+/// 与 `initPerRequest` 相同，但 `T.init` 可以接收额外的配置参数。
+///
+/// # 要求类型 T
+///
+/// - `pub fn init(allocator: std.mem.Allocator, args: anytype) !*T`
+/// - args 是注册时传入的结构体，见示例
+///
+/// # 使用示例
+///
+/// ```zig
+/// try router.route(.GET, "/users/:id", Handler.initPerRequestWith(
+///     UserHandler, allocator, .{ .default_name = "John Doe" },
+/// ));
+/// ```
+pub fn initPerRequestWith(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    args: anytype,
+) Handler {
+    const Args = @TypeOf(args);
+    const Context = struct {
+        alloc: std.mem.Allocator,
+        args: Args,
+    };
+
+    const ctx = allocator.create(Context) catch @panic("OOM in Handler.initPerRequestWith");
+    ctx.* = .{ .alloc = allocator, .args = args };
+
+    return .{
+        .ptr = @ptrCast(ctx),
+        .vtable = &.{
+            .create = struct {
+                fn create(any: *anyopaque) anyerror!*anyopaque {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    return @ptrCast(try T.init(c.alloc, c.args));
+                }
+            }.create,
+            .handle = struct {
+                fn call(any: *anyopaque, req: *RequestContext, res: *Response) anyerror!void {
+                    const self: *T = @ptrCast(@alignCast(any));
+                    return self.handle(req, res);
+                }
+            }.call,
+            .destroy = struct {
+                fn destroy(any: *anyopaque, instance: *anyopaque) void {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    const self: *T = @ptrCast(@alignCast(instance));
+                    self.deinit();
+                    c.alloc.destroy(self);
+                }
+            }.destroy,
+        },
+    };
+}
