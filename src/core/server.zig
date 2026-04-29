@@ -310,3 +310,32 @@ pub fn shutdown(self: *Self) void {
 pub fn isRunning(self: *const Self) bool {
     return self.running;
 }
+
+// =========================================================================
+// 自定义错误页面
+// =========================================================================
+
+/// 发送自定义错误页面
+fn sendErrorPage(
+    response: *Response,
+    status: http.Status,
+    message: ?[]const u8,
+) void {
+    const status_text = http.Status.text(status) orelse "Unknown Error";
+    const msg = message orelse status_text;
+    
+    // 构建简单的 HTML 错误页面
+    var buf: [1024]u8 = undefined;
+    const html = std.fmt.bufPrint(&buf, 
+        \\<!DOCTYPE html>
+        \\<html>
+        \\<head><title>{s}</title></head>
+        \\<body>
+        \\  <h1>{s}</h1>
+        \\  <p>{s}</p>
+        \\</body>
+        \\</html>
+    , .{ status_text, msg }) catch "Error";
+    
+    response.statusCode(status).html(html) catch {};
+}

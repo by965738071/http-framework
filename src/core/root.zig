@@ -8,3 +8,6 @@ pub const Router = @import("router.zig");
 pub const Server = @import("server.zig");
 pub const Static = @import("static.zig");
 pub const WebSocket = @import("websocket.zig");
+pub const Cors = @import("cors.zig");
+pub const Multipart = @import("multipart.zig");
+pub const RateLimiter = @import("rate_limiter.zig");
