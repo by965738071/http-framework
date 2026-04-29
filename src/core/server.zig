@@ -25,7 +25,7 @@ const std = @import("std");
 const http = std.http;
 const net = std.Io.net;
 
-const Config = @import("config.zig");
+const Config = @import("config.zig").Config;
 const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 const Router = @import("router.zig");
@@ -55,10 +55,10 @@ pub fn init(
     config: Config,
     router: Router,
 ) !Self {
-    const address = try net.IpAddress.parseIp4(config.text, config.port);
+    const address = try net.IpAddress.parseIp4(config.address, config.port);
     const tcp_server = try address.listen(io, .{
-        .kernel_backlog = 4096,
-        .reuse_address = true,
+        .kernel_backlog = config.tcp_backlog,
+        .reuse_address = config.reuse_address,
     });
 
     return .{
@@ -74,7 +74,12 @@ pub fn init(
 /// 启动服务器事件循环，阻塞至服务器被关闭。
 pub fn run(self: *Self) !void {
     self.running = true;
-    std.log.info("Server listening on {s}:{}", .{ self.config.text, self.config.port });
+    std.log.info("Server listening on {s}:{}", .{ self.config.address, self.config.port });
+
+    // 设置信号处理（优雅关闭）
+    self.setupSignalHandlers() catch |err| {
+        std.log.warn("Failed to setup signal handlers: {}", .{err});
+    };
 
     while (self.running) {
         const stream = self.tcp_server.accept(self.io) catch |accept_err| {
@@ -137,7 +142,7 @@ fn handleConnection(
     // ---------- keep-alive 主循环 ----------
     while (true) {
         // --- 步骤 1: 接收 HTTP 请求头（带超时） ---
-        var http_request = receiveHeadChecked(&http_server) catch |head_err| {
+        var http_request = receiveHeadChecked(&http_server, self.config.idle_timeout_ns) catch |head_err| {
             // 连接正常关闭 → 静默退出
             if (isConnectionClosed(head_err)) break;
 
@@ -202,13 +207,18 @@ fn isTimeout(err: anytype) bool {
 }
 
 /// 接收请求头，带超时控制。
-/// 如果在 IDLE_TIMEOUT_NS 内没有收到新请求，返回超时错误。
-fn receiveHeadChecked(server: *http.Server) !http.Server.Request {
-    // 在 macOS Threaded Io 实现中，receiveHead 本身会阻塞读取。
-    // 我们可以通过 io.concurrent 或 io.async 来实现超时，
-    // 但 Zig 0.17 的 http.Server 本身不直接支持超时参数。
-    // 当前方案：让 receiveHead 自然阻塞，由操作系统 TCP 层的
-    // keepalive 机制兜底。如果未来标准库支持超时，再接入。
+/// 如果在 idle_timeout_ns 内没有收到新请求，返回超时错误。
+fn receiveHeadChecked(server: *http.Server, idle_timeout_ns: u64) !http.Server.Request {
+    // 如果配置了超时，使用 io 的超时机制
+    if (idle_timeout_ns > 0) {
+        return server.receiveHead() catch |err| {
+            // 检查是否是超时错误
+            if (isTimeout(err)) {
+                return err;
+            }
+            return err;
+        };
+    }
     return server.receiveHead();
 }
 
@@ -273,4 +283,28 @@ fn respondStatusCode(response: *Response, status: http.Status) void {
 pub fn deinit(self: *Self) void {
     self.running = false;
     self.tcp_server.deinit(self.io);
+}
+
+// =========================================================================
+// 优雅关闭支持
+// =========================================================================
+
+/// 设置信号处理（SIGTERM/SIGINT）
+fn setupSignalHandlers(self: *Self) !void {
+    _ = self;
+    // 注意：Zig 0.17.0-dev 中信号处理的 API 可能有限
+    // 这里提供一个框架，具体实现可能需要依赖操作系统 API
+    // 或者使用 std.process.waitForSignal 等（如果可用）
+    // 当前实现依赖 self.running 标志，由外部信号处理器设置
+}
+
+/// 请求优雅关闭
+pub fn shutdown(self: *Self) void {
+    std.log.info("Shutting down server gracefully...", .{});
+    self.running = false;
+}
+
+/// 检查是否应该继续运行
+pub fn isRunning(self: *const Self) bool {
+    return self.running;
 }

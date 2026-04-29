@@ -18,6 +18,7 @@ request: *http.Server.Request,
 status: http.Status,
 headers: std.ArrayList(http.Header),
 cookies: std.ArrayList(Cookie),
+enable_compression: bool = false,
 
 const Self = @This();
 
@@ -44,12 +45,47 @@ pub fn init(allocator: std.mem.Allocator, request: *http.Server.Request) Self {
         .status = .ok,
         .headers = std.ArrayList(http.Header).empty,
         .cookies = std.ArrayList(Cookie).empty,
+        .enable_compression = false,
     };
 }
 
 pub fn deinit(self: *Self) void {
     self.headers.deinit(self.allocator);
     self.cookies.deinit(self.allocator);
+}
+
+/// 启用或禁用压缩
+pub fn compression(self: *Self, enabled: bool) *Self {
+    self.enable_compression = enabled;
+    return self;
+}
+
+// =========================================================================
+// 压缩支持
+// =========================================================================
+
+/// 压缩数据（gzip格式）
+/// 使用 std.Io.Writer.Allocating 捕获压缩后的数据
+fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    // 使用 Allocating writer 来捕获压缩输出
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    // 初始化 gzip 压缩器，输出到 out.writer
+    var gzip_compressor = std.compress.gzip.Compress.init(allocator, .gzip);
+    defer gzip_compressor.deinit();
+
+    // 获取压缩器的写入接口
+    const writer = gzip_compressor.writer();
+
+    // 写入数据
+    try writer.writeAll(data);
+
+    // 关闭压缩器，确保所有数据被刷新
+    try gzip_compressor.close();
+
+    // 返回压缩后的数据
+    return out.toOwnedSlice();
 }
 
 // =========================================================================
@@ -111,8 +147,15 @@ pub fn html(self: *Self, content: []const u8) !void {
 
 /// 发送 JSON 响应（`Content-Type: application/json`）
 pub fn json(self: *Self, value: anytype) !void {
-    const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-    defer self.allocator.free(json_str);
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+
+    var stringify: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try stringify.write(value);
+    const json_output = out.written();
 
     try self.addCookiesToHeaders();
     try self.headers.append(self.allocator, .{
@@ -120,7 +163,7 @@ pub fn json(self: *Self, value: anytype) !void {
         .value = "application/json",
     });
 
-    try self.request.respond(json_str, .{
+    try self.request.respond(json_output, .{
         .status = self.status,
         .extra_headers = self.headers.items,
     });

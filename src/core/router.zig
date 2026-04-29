@@ -18,6 +18,9 @@ pub const Route = struct {
     pattern: []const u8,
     handler: Handler,
     middlewares: []const Middleware = &.{},
+    /// 可选的路由参数验证函数，在路径参数解析后调用。
+    /// 如果返回 false，则跳过此路由（视为不匹配）。
+    param_validator: ?*const fn (ctx: *RequestContext) bool = null,
 };
 
 /// 路由分发结果
@@ -96,6 +99,16 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
         const clean_path = trimSlash(ctx.path);
 
         if (matchPattern(clean_pattern, clean_path, self.allocator, ctx)) {
+            // 参数验证（如果设置了验证器）
+            if (r.param_validator) |validator| {
+                if (!validator(ctx)) {
+                    // 验证失败，清除已解析的路径参数，继续下一个路由
+                    ctx.path_params.deinit(self.allocator);
+                    ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
+                    continue;
+                }
+            }
+
             // 方法必须匹配
             if (r.method != ctx.method) {
                 continue;
@@ -180,7 +193,7 @@ fn matchPattern(
             allocator.free(key_dup);
             return false;
         };
-        ctx.path_params.put(key_dup, val_dup) catch {
+        ctx.path_params.put(allocator, key_dup, val_dup) catch {
             allocator.free(key_dup);
             allocator.free(val_dup);
             return false;

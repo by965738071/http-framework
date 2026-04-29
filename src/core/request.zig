@@ -42,7 +42,7 @@ query: []const u8,
 version: http.Version,
 
 // ---- 路径参数 — 必须用 HashMap（路由批量写入） ----
-path_params: std.StringHashMap([]const u8),
+path_params: std.StringHashMapUnmanaged([]const u8),
 
 // ---- 请求体 ----
 content_type: ?[]const u8,
@@ -88,7 +88,7 @@ pub fn init(
         .path = path,
         .query = query,
         .version = head.version,
-        .path_params = std.StringHashMap([]const u8).init(allocator),
+        .path_params = std.StringHashMapUnmanaged([]const u8).empty,
         .content_type = head.content_type,
         .content_length = head.content_length,
         .transfer_encoding = head.transfer_encoding,
@@ -263,6 +263,58 @@ pub fn getUserData(self: *const Self, comptime T: type) ?*T {
 }
 
 // =========================================================================
+// 实用方法
+// =========================================================================
+
+/// 检查是否为 AJAX 请求（通过 X-Requested-With 头）
+pub fn isAjax(self: *const Self) bool {
+    const header = self.getHeader("X-Requested-With") orelse return false;
+    return std.ascii.eqlIgnoreCase(header, "XMLHttpRequest");
+}
+
+/// 获取客户端 IP 地址（从请求头或连接信息）
+pub fn getClientIp(self: *const Self) ?[]const u8 {
+    // 尝试从常见代理头获取
+    if (self.getHeader("X-Forwarded-For")) |header| {
+        // X-Forwarded-For: client, proxy1, proxy2
+        var it = mem.splitScalar(u8, header, ',');
+        if (it.first()) |first| {
+            return mem.trim(u8, first, " ");
+        }
+    }
+    if (self.getHeader("X-Real-IP")) |ip| {
+        return ip;
+    }
+    // 注意：从 std.http.Server.Request 获取直接连接 IP 需要更低层 API
+    // 当前返回 null，由上层处理
+    return null;
+}
+
+/// 检查请求是否包含特定 Content-Type
+pub fn hasContentType(self: *const Self, expected: []const u8) bool {
+    const ct = self.content_type orelse return false;
+    return std.ascii.eqlIgnoreCase(ct, expected);
+}
+
+/// 检查是否为 JSON 请求
+pub fn isJson(self: *const Self) bool {
+    const ct = self.content_type orelse return false;
+    return mem.indexOfIgnoreCase(u8, ct, "application/json") != null;
+}
+
+/// 检查是否为表单请求
+pub fn isForm(self: *const Self) bool {
+    const ct = self.content_type orelse return false;
+    return mem.indexOfIgnoreCase(u8, ct, "application/x-www-form-urlencoded") != null;
+}
+
+/// 检查是否为 multipart 表单请求
+pub fn isMultipartForm(self: *const Self) bool {
+    const ct = self.content_type orelse return false;
+    return mem.indexOfIgnoreCase(u8, ct, "multipart/form-data") != null;
+}
+
+// =========================================================================
 // Form 参数（延迟解析，不缓存）
 // =========================================================================
 
@@ -296,14 +348,14 @@ pub fn getForm(self: *Self, key: []const u8) ?[]const u8 {
 // 内部工具函数
 // =========================================================================
 
-/// 释放 `StringHashMap` 中所有堆分配的 key 和 value
-fn freeHashMap(map: *std.StringHashMap([]const u8), allocator: std.mem.Allocator) void {
+/// 释放 `StringHashMapUnmanaged` 中所有堆分配的 key 和 value
+fn freeHashMap(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.mem.Allocator) void {
     var it = map.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
         allocator.free(entry.value_ptr.*);
     }
-    map.deinit();
+    map.deinit(allocator);
 }
 
 /// 对 URL 编码的字符串进行百分比解码。

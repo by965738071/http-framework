@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     // ================================================================
     // 服务器配置与启动
     // ================================================================
-    const config = Config.defaults();
+    const config: core.Config.Config = .{};
 
     var server = try Server.init(allocator, io, config, router);
     defer server.deinit();

@@ -66,8 +66,8 @@ pub fn init(comptime T: type, ptr: *T) Self {
         .name = @typeName(T),
         .vtable = &.{
             .process = struct {
-                fn process(ctx: *anyopaque, req_ctx: *RequestContext) anyerror!NextAction {
-                    const t: *T = @ptrCast(@alignCast(ctx));
+                fn process(any: *anyopaque, req_ctx: *RequestContext) anyerror!NextAction {
+                    const t: *T = @ptrCast(@alignCast(any));
                     return t.process(req_ctx);
                 }
             }.process,
