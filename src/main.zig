@@ -84,6 +84,13 @@ pub fn main(init: std.process.Init) !void {
     }.handler));
 
     // ================================================================
+    // 静态文件服务
+    // ================================================================
+    const Static = core.Static;
+    var static_server = Static.init(allocator, io, "./public", "/static");
+    try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
+
+    // ================================================================
     // 服务器配置与启动
     // ================================================================
     const config: core.Config.Config = .{};

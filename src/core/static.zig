@@ -128,7 +128,7 @@ pub fn handle(self: *const Self, ctx: *RequestContext, res: *Response) !void {
     const content_type = getContentType(real_full);
 
     // 添加缓存头（默认缓存 1 小时）
-    try res.header("Cache-Control", "public, max-age=3600");
+    _ = try res.header("Cache-Control", "public, max-age=3600");
 
     try res.file(file_content, content_type);
 }
