@@ -149,7 +149,7 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
 // 路径模式匹配
 // ---------------------------------------------------------------------------
 
-/// 将路径模式与真实路径进行匹配，支持 `:param` 动态参数。
+/// 将路径模式与真实路径进行匹配，支持 `:param` 动态参数和 `*` 通配符。
 ///
 /// 匹配成功时，参数会被写入 `ctx.path_params`。
 fn matchPattern(
@@ -159,6 +159,31 @@ fn matchPattern(
     ctx: *RequestContext,
 ) bool {
     if (pattern.len == 0 and path.len == 0) return true;
+
+    // 检查通配符模式（以 * 结尾）
+    if (mem.endsWith(u8, pattern, "*")) {
+        const prefix = pattern[0 .. pattern.len - 1];
+        const clean_prefix = trimSlash(prefix);
+        const clean_path = trimSlash(path);
+
+        // 检查路径是否以前缀开头
+        if (mem.startsWith(u8, clean_path, clean_prefix)) {
+            // 剩余路径部分赋值给 path_params 的 * 键
+            const remaining = clean_path[clean_prefix.len..];
+            const key_dup = allocator.dupe(u8, "*") catch return false;
+            const val_dup = allocator.dupe(u8, remaining) catch {
+                allocator.free(key_dup);
+                return false;
+            };
+            ctx.path_params.put(allocator, key_dup, val_dup) catch {
+                allocator.free(key_dup);
+                allocator.free(val_dup);
+                return false;
+            };
+            return true;
+        }
+        return false;
+    }
 
     var p_parts = mem.splitScalar(u8, pattern, '/');
     var path_parts = mem.splitScalar(u8, path, '/');

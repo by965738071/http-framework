@@ -136,7 +136,7 @@ pub const MetricsCollector = struct {
 
     /// 生成指标报告（文本格式）
     pub fn generateReport(self: *const Self, buffer: []u8) ![]u8 {
-        var fbuf: std.io.FixedBufferStream([]u8) = .{ .buf = buffer };
+        var fbuf: std.Io.FixedBufferStream([]u8) = .{ .buf = buffer };
         const writer = fbuf.writer();
 
         try writer.print("Total Requests: {d}\n", .{self.total_requests});

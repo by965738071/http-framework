@@ -15,7 +15,7 @@ pub const Template = struct {
 
     /// 从文件加载模板
     pub fn fromFile(allocator: Allocator, io: std.Io, path: []const u8) !Self {
-        const content = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, allocator, .unlimited);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
         return Self{
             .allocator = allocator,
             .content = content,

@@ -14,3 +14,4 @@ pub const RateLimiter = @import("rate_limiter.zig");
 pub const Session = @import("session.zig");
 pub const Metrics = @import("metrics.zig");
 pub const Template = @import("template.zig");
+pub const WsEchoHandler = @import("websocket.zig").WsEchoHandler;

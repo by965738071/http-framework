@@ -307,8 +307,8 @@ pub fn getClientIp(self: *const Self) ?[]const u8 {
     if (self.getHeader("X-Forwarded-For")) |header| {
         // X-Forwarded-For: client, proxy1, proxy2
         var it = mem.splitScalar(u8, header, ',');
-        if (it.first()) |first| {
-            return mem.trim(u8, first, " ");
+        if (it.buffer.len > 0) {
+            return mem.trim(u8, it.first(), " ");
         }
     }
     if (self.getHeader("X-Real-IP")) |ip| {
