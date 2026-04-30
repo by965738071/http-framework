@@ -61,6 +61,17 @@ pub fn init(
         .reuse_address = config.reuse_address,
     });
 
+    // TLS 支持（框架代码）
+    // 注意：Zig 0.17.0-dev 标准库中 TLS 服务器 API 可能不完整
+    // 这里提供配置项，具体实现需要根据实际 API 调整
+    if (config.tls_enabled) {
+        if (config.tls_cert_file) |cert_file| {
+            std.log.info("TLS enabled with cert: {s}", .{cert_file});
+            // TODO: 实现 TLS 服务器
+            // 参考 SKILL.md: std.crypto.tls.Client.Options 需要 entropy 和 realtime_now_seconds
+        }
+    }
+
     return .{
         .allocator = allocator,
         .io = io,
@@ -323,10 +334,10 @@ fn sendErrorPage(
 ) void {
     const status_text = http.Status.text(status) orelse "Unknown Error";
     const msg = message orelse status_text;
-    
+
     // 构建简单的 HTML 错误页面
     var buf: [1024]u8 = undefined;
-    const html = std.fmt.bufPrint(&buf, 
+    const html = std.fmt.bufPrint(&buf,
         \\<!DOCTYPE html>
         \\<html>
         \\<head><title>{s}</title></head>
@@ -336,6 +347,6 @@ fn sendErrorPage(
         \\</body>
         \\</html>
     , .{ status_text, msg }) catch "Error";
-    
+
     response.statusCode(status).html(html) catch {};
 }

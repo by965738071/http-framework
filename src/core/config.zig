@@ -36,6 +36,19 @@ pub const Config = struct {
     /// 是否启用访问日志
     access_log_enabled: bool = true,
 
+    // =========================================================================
+    // TLS/HTTPS 配置
+    // =========================================================================
+
+    /// 是否启用 HTTPS/TLS
+    tls_enabled: bool = false,
+
+    /// TLS 证书文件路径（PEM 格式）
+    tls_cert_file: ?[]const u8 = null,
+
+    /// TLS 私钥文件路径（PEM 格式）
+    tls_key_file: ?[]const u8 = null,
+
     /// 返回默认配置
     pub fn defaults() Config {
         return .{};

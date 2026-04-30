@@ -32,6 +32,8 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
+const Multipart = @import("multipart.zig");
+
 allocator: std.mem.Allocator,
 io: std.Io,
 
@@ -48,6 +50,9 @@ path_params: std.StringHashMapUnmanaged([]const u8),
 content_type: ?[]const u8,
 content_length: ?u64,
 transfer_encoding: http.TransferEncoding,
+
+// ---- Multipart 解析器（延迟初始化） ----
+multipart_parser: ?*Multipart.Parser = null,
 
 // ---- 原始请求引用 ----
 request: *http.Server.Request,
@@ -245,6 +250,30 @@ pub fn json(self: *Self, comptime T: type) !T {
     const parsed = try std.json.parseFromSlice(T, self.allocator, body, .{});
     defer parsed.deinit();
     return parsed.value;
+}
+
+/// 获取 Multipart 表单解析器（延迟初始化）
+pub fn getMultipart(self: *Self) !*Multipart.Parser {
+    if (self.multipart_parser) |parser| {
+        return parser;
+    }
+
+    // 检查是否为 multipart/form-data
+    const ct = self.content_type orelse return error.NotMultipart;
+    if (std.mem.indexOfIgnoreCase(u8, ct, "multipart/form-data") == null) {
+        return error.NotMultipart;
+    }
+
+    // 创建解析器
+    const parser = try self.allocator.create(Multipart.Parser);
+    parser.* = try Multipart.Parser.init(self.allocator, ct);
+    self.multipart_parser = parser;
+
+    // 解析请求体
+    const body = try self.readBody();
+    try parser.parse(body);
+
+    return parser;
 }
 
 // =========================================================================
