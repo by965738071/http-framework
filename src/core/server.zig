@@ -163,18 +163,20 @@ fn handleConnection(
             std.log.warn("RequestContext init error: {}", .{ctx_err});
             break;
         };
-        defer ctx.deinit();
 
         // --- 步骤 3: 初始化响应构建器（纯栈分配，零开销） ---
         var response = Response.init(self.allocator, &http_request);
-        defer response.deinit();
 
         // --- 步骤 4: 路由分发 ---
         _ = self.router.dispatch(&ctx, &response) catch |dispatch_err| {
             handleDispatchError(self, &ctx, &response, dispatch_err);
         };
 
-        // --- 步骤 5: 检查是否需要保持连接 ---
+        // --- 步骤 5: 清理请求上下文和响应（每次请求迭代后必须清理，防止 keep-alive 场景内存泄漏） ---
+        ctx.deinit();
+        response.deinit();
+
+        // --- 步骤 6: 检查是否需要保持连接 ---
         if (!http_request.head.keep_alive) break;
     }
 }
