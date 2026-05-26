@@ -146,14 +146,14 @@ pub fn init(comptime T: type, ptr: *T) Handler {
 /// ```zig
 /// try router.route(.GET, "/", Handler.initPerRequest(MyHandler, allocator));
 /// ```
-pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) Handler {
+pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) !Handler {
     // Context 在路由注册时分配一次，后续所有请求共享。
     // 它持有 allocator，供 destroy 阶段释放 T 实例。
     const Context = struct {
         alloc: std.mem.Allocator,
     };
 
-    const ctx = allocator.create(Context) catch @panic("OOM in Handler.initPerRequest");
+    const ctx = try allocator.create(Context);
     ctx.* = .{ .alloc = allocator };
 
     return .{
@@ -208,14 +208,14 @@ pub fn initPerRequestWith(
     comptime T: type,
     allocator: std.mem.Allocator,
     args: anytype,
-) Handler {
+) !Handler {
     const Args = @TypeOf(args);
     const Context = struct {
         alloc: std.mem.Allocator,
         args: Args,
     };
 
-    const ctx = allocator.create(Context) catch @panic("OOM in Handler.initPerRequestWith");
+    const ctx = try allocator.create(Context);
     ctx.* = .{ .alloc = allocator, .args = args };
 
     return .{

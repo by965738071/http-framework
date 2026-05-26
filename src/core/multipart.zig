@@ -96,13 +96,13 @@ pub const Parser = struct {
             var file_name: ?[]const u8 = null;
 
             if (mem.indexOf(u8, headers, "Content-Disposition:")) |idx| {
-                const disp_header = headers[idx + "Content-Disposition:".len..];
+                const disp_header = headers[idx + "Content-Disposition:".len ..];
                 if (mem.indexOf(u8, disp_header, "name=")) |name_idx| {
                     var start = name_idx + "name=".len;
                     if (disp_header[start] == '"') {
                         start += 1;
                         if (mem.indexOf(u8, disp_header[start..], "\"")) |end_idx| {
-                            field_name = disp_header[start..start + end_idx];
+                            field_name = disp_header[start .. start + end_idx];
                         }
                     }
                 }
@@ -111,7 +111,7 @@ pub const Parser = struct {
                     if (disp_header[start] == '"') {
                         start += 1;
                         if (mem.indexOf(u8, disp_header[start..], "\"")) |end_idx| {
-                            file_name = disp_header[start..start + end_idx];
+                            file_name = disp_header[start .. start + end_idx];
                         }
                     }
                 }
@@ -139,7 +139,7 @@ pub const Parser = struct {
             };
 
             const data = rest[0..data_end];
-            rest = rest[data_end + end_boundary.len..];
+            rest = rest[data_end + end_boundary.len ..];
 
             // 处理字段
             try self.processField(field_name.?, file_name, null, data);
@@ -183,7 +183,8 @@ pub const Parser = struct {
         for (self.fields.items) |field| {
             switch (field) {
                 .text => |text| {
-                    // 注意：这里简化了，实际需要检查 field_name
+                    // 文本字段需要根据 name 匹配，但当前实现简化
+                    // 实际应该解析 Content-Disposition 中的 name
                     _ = name;
                     return text;
                 },
@@ -199,9 +200,9 @@ pub const Parser = struct {
             switch (field) {
                 .text => continue,
                 .file => |file| {
-                    // 注意：这里简化了，实际需要检查 field_name
-                    _ = name;
-                    return file;
+                    if (std.mem.eql(u8, file.field_name, name)) {
+                        return file;
+                    }
                 },
             }
         }

@@ -111,15 +111,23 @@ pub const MetricsCollector = struct {
 
     /// 计算百分位延迟
     fn getPercentile(self: *const Self, percentile: u8) u64 {
-        _ = percentile;
         if (self.latencies.items.len == 0) return 0;
 
-        // 简化：返回平均值（实际应该排序后计算）
-        var total: u64 = 0;
-        for (self.latencies.items) |lat| {
-            total += lat;
-        }
-        return total / self.latencies.items.len;
+        // 复制并排序延迟数据
+        var sorted = std.ArrayList(u64).empty;
+        defer sorted.deinit(self.allocator);
+        sorted.appendSlice(self.allocator, self.latencies.items) catch return 0;
+
+        std.sort.insertion(u64, sorted.items, {}, struct {
+            fn lessThan(_: void, a: u64, b: u64) bool {
+                return a < b;
+            }
+        }.lessThan);
+
+        const idx = @as(usize, @intCast((@as(u64, percentile) * sorted.items.len + 99) / 100));
+        const clamped_idx = if (idx > 0) idx - 1 else 0;
+        if (clamped_idx >= sorted.items.len) return sorted.getLast();
+        return sorted.items[clamped_idx];
     }
 
     /// 增加活跃连接数

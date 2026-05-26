@@ -183,7 +183,10 @@ fn handleConnection(
             handleDispatchError(self, &ctx, &response, dispatch_err);
         };
 
-        // --- 步骤 5: 清理请求上下文和响应（每次请求迭代后必须清理，防止 keep-alive 场景内存泄漏） ---
+        // WebSocket 升级后跳出 keep-alive，让 handler 独占连接
+        if (ctx.is_websocket) break;
+
+        // --- 步骤 5: 清理请求上下文和响应 ---
         ctx.deinit();
         response.deinit();
 

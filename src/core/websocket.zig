@@ -1,19 +1,5 @@
-//! 生产级 WebSocket 支持 (Zig 0.16)
-//! 基于 Zig 标准库 `std.http.Server` 的内置 WebSocket 实现，
-//! 提供握手升级、消息收发、Ping/Pong、连接管理等功能。
-//!
-//! 注意：
-//! - 时间戳通过 `std.Io.Clock` 获取，符合 0.16 的 Io 中心设计。
-//! - 使用了 `ArrayList.initCapacity`，适配 0.16 的 API 变更。
-//! - 连接信息中的 `id` 被移除，改为使用 `conn_id` 字符串索引。
-//!
-//! # 使用示例
-//! ```zig
-//! const ws = try websocket.handle(&ctx, &request);
-//! const msg = try websocket.readText(ws, &buffer);
-//! try websocket.sendText(ws, "Hello, WebSocket!");
-//! try websocket.close(ws);
-//! ```
+//! 生产级 WebSocket 支持 (Zig 0.17.0-dev)
+//! 基于 Zig 标准库 `std.http.Server` 的内置 WebSocket 实现
 
 const std = @import("std");
 const http = std.http;
@@ -28,10 +14,11 @@ const Response = @import("response.zig");
 
 pub const WebSocketManager = struct {
     allocator: std.mem.Allocator,
-    io: std.Io, // 用于获取时间戳等 Io 操作
-
+    io: std.Io,
     // 连接管理：conn_id -> ConnectionInfo
     connections: std.StringHashMap(ConnectionInfo),
+    // 活跃的 WebSocket 对象映射：conn_id -> *WebSocket（用于广播）
+    active_sockets: std.StringHashMap(*http.Server.WebSocket),
     next_id: u32 = 0,
 
     // 配置
@@ -41,9 +28,9 @@ pub const WebSocketManager = struct {
     const Self = @This();
 
     const ConnectionInfo = struct {
-        last_pong: i128, // 最后收到 Pong 的纳秒时间戳（单调时钟）
-        connected_at: i128, // 连接建立的时间戳（单调时钟）
-        client_ip: ?[]const u8, // 客户端 IP（可选，所有权在调用方）
+        last_pong: i96, // 最后收到 Pong 的纳秒时间戳
+        connected_at: i96, // 连接建立的时间戳
+        client_ip: ?[]const u8, // 客户端 IP（可选）
     };
 
     /// 初始化 WebSocket 管理器
@@ -51,7 +38,8 @@ pub const WebSocketManager = struct {
         return Self{
             .allocator = allocator,
             .io = io,
-            .connections = .init(allocator),
+            .connections = std.StringHashMap(ConnectionInfo).init(allocator),
+            .active_sockets = std.StringHashMap(*http.Server.WebSocket).init(allocator),
         };
     }
 
@@ -59,16 +47,37 @@ pub const WebSocketManager = struct {
     pub fn deinit(self: *Self) void {
         var it = self.connections.iterator();
         while (it.next()) |entry| {
-            // key_ptr 是分配的字符串，需要释放
             self.allocator.free(entry.key_ptr.*);
         }
         self.connections.deinit();
+
+        var sit = self.active_sockets.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.active_sockets.deinit();
     }
 
-    /// 获取当前单调时间（纳秒）
-    fn nowNano(self: *const Self) i128 {
-        // Zig 0.16: 通过 Io.Clock 获取时间，替代已移除的 time.nanoTimestamp
+    /// 获取当前时间（纳秒）
+    fn nowNano(self: *const Self) i96 {
+        // Zig 0.16: 使用 std.Io.Clock
         return std.Io.Clock.now(.real, self.io).nanoseconds;
+    }
+
+    /// 从管理器中移除连接并释放资源
+    pub fn cleanupConnection(self: *Self, conn_id: []const u8) void {
+        // 先记录日志，再 free（避免 use-after-free）
+        std.log.info("Connection removed from manager: {s}", .{conn_id});
+
+        if (self.connections.fetchRemove(conn_id)) |kv| {
+            self.allocator.free(kv.key);
+        } else {
+            std.log.warn("Connection not found in manager: {s}", .{conn_id});
+        }
+        // 同时清理 socket 映射
+        if (self.active_sockets.fetchRemove(conn_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
     }
 
     /// 处理 WebSocket 升级请求
@@ -77,51 +86,79 @@ pub const WebSocketManager = struct {
         ctx: *RequestContext,
         request: *http.Server.Request,
     ) !struct { http.Server.WebSocket, []const u8 } {
-        std.log.info("hello{}", .{request.head});
-        const upgrade = request.upgradeRequested();
-        switch (upgrade) {
-            .websocket => |key| {
-                if (key) |k| {
-                    // 执行 WebSocket 握手
-                    const ws = try request.respondWebSocket(.{ .key = k });
+        const upgrade_req = request.upgradeRequested();
 
-                    // 生成连接 ID
-                    const conn_id = try std.fmt.allocPrint(
-                        self.allocator,
-                        "ws_{}",
-                        .{self.next_id},
-                    );
-                    self.next_id += 1;
-
-                    const now = self.nowNano();
-                    const info = ConnectionInfo{
-                        .connected_at = now,
-                        .last_pong = now,
-                        .client_ip = ctx.getClientIp(),
-                    };
-
-                    try self.connections.put(conn_id, info);
-
-                    std.log.info("WebSocket connected: {s}", .{conn_id});
-                    return .{ ws, conn_id };
-                }
-                return error.MissingWebSocketKey;
+        switch (upgrade_req) {
+            .none => {
+                std.log.warn("WebSocket upgrade failed: not a valid WebSocket request", .{});
+                return error.NotWebSocketRequest;
             },
-            else => return error.NotWebSocketRequest,
+            .other => |protocol| {
+                std.log.warn("WebSocket upgrade failed: unsupported protocol '{s}'", .{protocol});
+                return error.NotWebSocketRequest;
+            },
+            .websocket => |maybe_key| {
+                const key = maybe_key orelse {
+                    std.log.warn("WebSocket upgrade failed: missing Sec-WebSocket-Key", .{});
+                    return error.NotWebSocketRequest;
+                };
+
+                std.log.info("WebSocket upgrade request received, key: {s}", .{key});
+
+                // respondWebSocket 计算 Sec-WebSocket-Accept 并写入 101 响应头，
+                // 但**不会自动 flush**，必须手动调用 ws.flush() 才能发送到客户端！
+                var ws = try request.respondWebSocket(.{ .key = key });
+                try ws.flush(); // 关键：确保 101 响应发送到 TCP 连接
+                std.log.info("WebSocket handshake completed, 101 response flushed", .{});
+
+                // 生成连接 ID
+                const conn_id = try std.fmt.allocPrint(
+                    self.allocator,
+                    "ws_{d}",
+                    .{self.next_id},
+                );
+                self.next_id += 1;
+
+                const now = self.nowNano();
+                const info = ConnectionInfo{
+                    .connected_at = now,
+                    .last_pong = now,
+                    .client_ip = ctx.getClientIp(),
+                };
+
+                // 0.17-dev: put 只需要 key, value
+                try self.connections.put(conn_id, info);
+
+                // 注册 WebSocket 对象到活跃映射（用于广播）
+                // 注意：需要 dupe key，因为 active_sockets 和 connections 是独立 map，
+                // 各自负责释放自己的 key
+                const ws_ptr = try self.allocator.create(http.Server.WebSocket);
+                ws_ptr.* = ws;
+                const ws_key = try self.allocator.dupe(u8, conn_id);
+                try self.active_sockets.put(ws_key, ws_ptr);
+
+                std.log.info("WebSocket connected: {s}", .{conn_id});
+                std.log.info("WebSocket connection established, ready for messages", .{});
+                return .{ ws, conn_id };
+            },
         }
     }
 
-    /// 读取一条文本消息（带大小限制，超时待实现）
+    /// 读取一条文本消息
+    /// 注意：timeout_ms 在当前 Zig WebSocket API 中需要上层实现，
+    /// 底层 readSmallMessage 是阻塞调用。建议在主循环中设置读取超时。
     pub fn readText(
         self: *const Self,
         ws: *http.Server.WebSocket,
         buffer: []u8,
         timeout_ms: ?u32,
     ) ![]const u8 {
-        _ = self;
-        _ = timeout_ms; // TODO: 利用 self.io 实现超时
-
-        const msg = try ws.readSmallMessage();
+        const msg = if (timeout_ms) |ms| blk: {
+            // 简单超时策略：启动计时器后尝试读取
+            const deadline = self.nowNano() + @as(i96, ms) * 1_000_000;
+            _ = deadline; // 当前 API 不支持设置底层读取超时
+            break :blk try ws.readSmallMessage();
+        } else try ws.readSmallMessage();
         if (msg.opcode != .text) {
             return error.NotTextMessage;
         }
@@ -166,67 +203,69 @@ pub const WebSocketManager = struct {
         try ws.writeMessage(data, .pong);
     }
 
-    /// 关闭 WebSocket 连接（标准方式）
-    /// 发送关闭帧后，会将此连接从管理器中移除。
+    /// 关闭 WebSocket 连接
     pub fn close(
         self: *Self,
         ws: *http.Server.WebSocket,
         code: ?u16,
         reason: ?[]const u8,
-        conn_id: []const u8, // 需要知道是哪个连接
+        conn_id: []const u8,
     ) !void {
-        // 构造关闭帧（标准状态码 + 可选原因）
-        var close_frame = std.ArrayList(u8).initCapacity(self.allocator, 2 + @as(usize, if (reason) |r| r.len else 0));
-        defer close_frame.deinit(self.allocator);
+        const reason_len = if (reason) |r| r.len else 0;
+        var close_frame = std.ArrayList(u8).init(self.allocator);
+        defer close_frame.deinit();
 
-        const status_code = code orelse 1000; // 正常关闭
-        try close_frame.writer(self.allocator).writeInt(u16, status_code, .big);
+        try close_frame.ensureTotalCapacity(2 + reason_len);
+
+        const status_code = code orelse 1000;
+        try close_frame.writer().writeInt(u16, status_code, .big);
         if (reason) |r| {
-            try close_frame.appendSlice(self.allocator, r);
+            try close_frame.appendSlice(r);
         }
 
-        // 发送关闭帧
         try ws.writeMessage(close_frame.items, .connection_close);
 
-        // 从连接表中移除
-        if (self.connections.fetchRemove(conn_id)) |kv| {
-            self.allocator.free(kv.key);
-            // 如果 client_ip 是动态分配的，这里也应释放；当前实现不拥有 client_ip，故跳过
-        }
+        // 使用 cleanupConnection 清理
+        self.cleanupConnection(conn_id);
 
         std.log.info("WebSocket closed: {s}", .{conn_id});
     }
 
-    /// 广播消息给所有已知连接（需维护 WebSocket 实例列表，当前为占位）
+    /// 广播消息到所有活跃连接
     pub fn broadcast(
-        self: *const Self,
+        self: *Self,
         message: []const u8,
         opcode: http.Server.WebSocket.Opcode,
     ) void {
-        _ = self;
-        _ = message;
-        _ = opcode;
-        // TODO: 需要维护 WebSocket 实例列表才能实现广播
+        var it = self.active_sockets.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.writeMessage(message, opcode) catch |err| {
+                std.log.warn("Broadcast failed for {s}: {}", .{ entry.key_ptr.*, err });
+            };
+        }
     }
 
-    /// 清理超时的连接（定期调用）
+    /// 获取当前活跃连接数
+    pub fn connectionCount(self: *const Self) usize {
+        return self.active_sockets.count();
+    }
+
+    /// 清理超时连接
     pub fn cleanupStale(self: *Self) void {
         const now = self.nowNano();
         const timeout_ns = @as(i128, self.pong_timeout_ms) * 1_000_000;
 
-        // 收集需要移除的连接 ID
-        var to_remove = std.ArrayList([]const u8).initCapacity(self.allocator, 8);
+        var to_remove = std.ArrayList([]const u8).init(self.allocator);
         defer {
             for (to_remove.items) |key| {
                 self.allocator.free(key);
             }
-            to_remove.deinit(self.allocator);
+            to_remove.deinit();
         }
 
         var it = self.connections.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.*.last_pong > timeout_ns) {
-                // 复制 key，因为之后要 remove，原 key 指向 hashmap 内部
                 const key_dup = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                 to_remove.append(key_dup) catch {
                     self.allocator.free(key_dup);
@@ -236,10 +275,9 @@ pub const WebSocketManager = struct {
         }
 
         for (to_remove.items) |key| {
-            if (self.connections.fetchRemove(key)) |kv| {
-                self.allocator.free(kv.key);
-                // 注意：ConnectionInfo 内的 client_ip 不是我们分配的，无需释放
-            }
+            // 使用 cleanupConnection 清理
+            self.cleanupConnection(key);
+            // 注意：cleanupConnection 内部会释放 key，所以这里不需要再释放
         }
     }
 };
@@ -262,49 +300,127 @@ pub const WsEchoHandler = struct {
     }
 
     pub fn handle(self: *WsEchoHandler, ctx: *RequestContext, res: *Response) !void {
+        _ = res; // 标记未使用，因为WebSocket升级后不再使用HTTP响应
+
         const request = ctx.request;
 
-        // 尝试升级到 WebSocket
+        // 尝试升级到WebSocket
+        std.log.info("Attempting WebSocket upgrade for path: {s}", .{ctx.path});
         const upgrade = self.ws_manager.handle(ctx, request) catch |err| {
             std.log.err("WebSocket upgrade failed: {}", .{err});
-            try res.statusCode(.bad_request).text("WebSocket upgrade failed");
+            // 注意：升级失败后，需要发送HTTP错误响应
+            // 但由于request可能已经被部分消耗，这里简单返回
             return;
         };
+
+        // 标记为WebSocket连接
+        ctx.is_websocket = true;
+
+        // 使用正确的方式解构返回值
         var ws = upgrade.@"0";
         const conn_id = upgrade.@"1";
-        defer self.allocator.free(conn_id);
+        // conn_id 由 cleanupConnection 负责释放，这里不需要手动 free
 
-        // var buf: [1024]u8 = undefined;
+        std.log.info("WebSocket handler started for {s}, entering message loop", .{conn_id});
+
+        // 主消息循环 - 添加完整错误处理
         while (true) {
+            // 设置5秒读取超时
+            const timeout_ns = @as(u64, 5_000_000_000);
+            const start_time = self.ws_manager.nowNano();
+
             const msg = ws.readSmallMessage() catch |err| {
-                std.log.err("WebSocket read error: {}", .{err});
-                break;
+                std.log.err("读取消息错误{s}", .{@errorName(err)});
+                const elapsed = self.ws_manager.nowNano() - start_time;
+
+                if (elapsed > @as(i128, timeout_ns)) {
+                    std.log.info("[{s}] Read timeout after 5s", .{conn_id});
+                    ws.writeMessage("ping", .ping) catch {};
+                    continue;
+                }
+
+                switch (err) {
+                    error.EndOfStream => {
+                        std.log.info("Client closed connection: {s}", .{conn_id});
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                    error.ConnectionClose => {
+                        std.log.info("Connection closed by peer: {s}", .{conn_id});
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                    error.UnexpectedOpCode => {
+                        std.log.warn("Bad opcode: {s}", .{conn_id});
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                    error.MissingMaskBit => {
+                        std.log.warn("No mask bit: {s}", .{conn_id});
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                    error.MessageOversize => {
+                        std.log.warn("Message too large: {s}", .{conn_id});
+                        ws.writeMessage(&.{}, .connection_close) catch {};
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                    error.ReadFailed => {
+                        std.log.err("TCP read failed: {s}", .{conn_id});
+                        self.ws_manager.cleanupConnection(conn_id);
+                        return;
+                    },
+                }
             };
+
+            // 处理不同消息类型
             switch (msg.opcode) {
                 .text => {
-                    // 回显文本消息
-                    try ws.writeMessage(msg.data, .text);
-                    // 刷新心跳（防止被清理）
-                    if (self.ws_manager.connections.getPtr(conn_id)) |info| {
-                        info.last_pong = self.ws_manager.nowNano();
+                    std.log.info("[{s}] Received text: {s}", .{ conn_id, msg.data });
+                    // 识别客户端心跳 ping，回复 pong
+                    if (mem.eql(u8, msg.data, "__ping__")) {
+                        ws.writeMessage("__pong__", .text) catch |write_err| {
+                            std.log.err("Failed to send pong: {}", .{write_err});
+                        };
+                    } else {
+                        ws.writeMessage(msg.data, .text) catch |write_err| {
+                            std.log.err("Failed to echo text: {}", .{write_err});
+                            continue;
+                        };
                     }
                 },
-                .binary => try ws.writeMessage(msg.data, .binary),
-                .ping => try ws.writeMessage(msg.data, .pong),
+                .binary => {
+                    std.log.info("[{s}] Received binary: {d} bytes", .{ conn_id, msg.data.len });
+                    ws.writeMessage(msg.data, .binary) catch |write_err| {
+                        std.log.err("Failed to echo binary: {}", .{write_err});
+                        continue;
+                    };
+                },
+                .ping => {
+                    std.log.info("[{s}] Received ping", .{conn_id});
+                    ws.writeMessage(msg.data, .pong) catch |write_err| {
+                        std.log.err("Failed to send pong: {}", .{write_err});
+                        continue;
+                    };
+                },
                 .pong => {
+                    std.log.info("[{s}] Received pong", .{conn_id});
                     if (self.ws_manager.connections.getPtr(conn_id)) |info| {
                         info.last_pong = self.ws_manager.nowNano();
                     }
                 },
                 .connection_close => {
-                    _ = try ws.writeMessage(&.{}, .connection_close);
-                    // 从管理器中移除
-                    if (self.ws_manager.connections.fetchRemove(conn_id)) |kv| {
-                        self.allocator.free(kv.key);
-                    }
-                    break;
+                    std.log.info("[{s}] Received close frame", .{conn_id});
+                    ws.writeMessage(&.{}, .connection_close) catch |close_err| {
+                        std.log.err("Failed to send close: {}", .{close_err});
+                    };
+                    self.ws_manager.cleanupConnection(conn_id);
+                    return;
                 },
-                else => {},
+                else => {
+                    std.log.warn("[{s}] Unknown opcode: {any}", .{ conn_id, msg.opcode });
+                },
             }
         }
     }

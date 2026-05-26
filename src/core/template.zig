@@ -24,7 +24,7 @@ pub const Template = struct {
     }
 
     /// 从字符串加载模板
-    pub fn fromString(allocator: Allocator, content: []const u8) Self {
+    pub fn fromString(allocator: Allocator, content: []const u8) !Self {
         return Self{
             .allocator = allocator,
             .content = try allocator.dupe(u8, content),

@@ -67,6 +67,9 @@ headers_parsed: bool,
 // ---- 用户数据（中间件传递） ----
 user_data: ?*anyopaque,
 
+// ---- websocket ----
+is_websocket: bool = false, // 新增
+
 const Self = @This();
 
 // =========================================================================
@@ -225,13 +228,13 @@ pub fn readBody(self: *Self) ![]const u8 {
         return self.body_data orelse error.BodyAlreadyRead;
     }
 
-    var temp_buf: [4096]u8 = undefined;
+    var temp_buf: [65536]u8 = undefined;
     const body_reader = self.request.readerExpectNone(&temp_buf);
 
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(self.allocator);
 
-    var chunk_buf: [4096]u8 = undefined;
+    var chunk_buf: [65536]u8 = undefined;
     while (true) {
         const n = try body_reader.readSliceShort(&chunk_buf);
         if (n == 0) break;
