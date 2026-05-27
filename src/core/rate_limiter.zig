@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const mem = std.mem;
-const time = std.time;
 
 const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
@@ -33,6 +32,7 @@ pub const RateLimiter = struct {
     config: RateLimitConfig,
     middleware: Middleware,
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// 存储客户端请求记录：key -> {count, window_start}
     records: std.StringHashMapUnmanaged(Record) = .empty,
 
@@ -45,12 +45,13 @@ pub const RateLimiter = struct {
     };
 
     /// 创建速率限制器
-    pub fn init(allocator: std.mem.Allocator, config: RateLimitConfig) !*Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: RateLimitConfig) !*Self {
         const ptr = try allocator.create(Self);
         ptr.* = .{
             .config = config,
             .middleware = undefined,
             .allocator = allocator,
+            .io = io,
         };
         ptr.middleware = Middleware.init(Self, ptr);
         return ptr;
@@ -61,11 +62,11 @@ pub const RateLimiter = struct {
         // 获取客户端标识符
         const identifier = self.getIdentifier(ctx) orelse {
             // 无法识别客户端，放行
-            return .next;
+            return .err;
         };
 
         // 获取当前时间（纳秒）
-        const now = time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds; // time.nanoTimestamp();
 
         // 检查速率限制
         if (self.isRateLimited(identifier, now)) {
@@ -111,8 +112,8 @@ pub const RateLimiter = struct {
     }
 
     /// 检查是否超出速率限制
-    fn isRateLimited(self: *Self, identifier: []const u8, now: i128) bool {
-        const window_ns = @as(i128, self.config.window_seconds) * 1_000_000_000;
+    fn isRateLimited(self: *Self, identifier: []const u8, now: i96) bool {
+        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
 
         if (self.records.get(identifier)) |record| {
             // 检查是否在当前窗口内
@@ -125,8 +126,8 @@ pub const RateLimiter = struct {
     }
 
     /// 更新请求记录
-    fn updateRecord(self: *Self, identifier: []const u8, now: i128) !void {
-        const window_ns = @as(i128, self.config.window_seconds) * 1_000_000_000;
+    fn updateRecord(self: *Self, identifier: []const u8, now: i96) !void {
+        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
 
         if (self.records.get(identifier)) |*record| {
             // 检查是否需要重置窗口
@@ -150,12 +151,12 @@ pub const RateLimiter = struct {
     }
 
     /// 添加 X-RateLimit-* 响应头（需要在路由处理器中手动调用）
-    pub fn addRateLimitHeaders(self: *const Self, res: *Response, identifier: []const u8, now: i128) !void {
+    pub fn addRateLimitHeaders(self: *const Self, res: *Response, identifier: []const u8, now: i96) !void {
         // 获取记录
         if (self.records.get(identifier)) |record| {
             const limit = self.config.max_requests;
             const remaining = @as(u32, @intCast(if (limit > record.count) limit - record.count else 0));
-            const reset_time = now + @as(i128, self.config.window_seconds) * 1_000_000_000;
+            const reset_time = now + @as(i96, self.config.window_seconds) * 1_000_000_000;
 
             // 通过 Response API 设置响应头
             var limit_buf: [32]u8 = undefined;

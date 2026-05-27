@@ -14,10 +14,10 @@ pub const CorsConfig = struct {
     allowed_origins: []const []const u8 = &.{},
 
     /// 允许的 HTTP 方法
-    allowed_methods: []const []const u8 = &.{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+    allowed_methods: std.http.Method,
 
     /// 允许的请求头
-    allowed_headers: []const []const u8 = &.{"Content-Type", "Authorization"},
+    allowed_headers: []const []const u8 = &.{ "Content-Type", "Authorization" },
 
     /// 暴露的响应头
     exposed_headers: []const []const u8 = &.{},
