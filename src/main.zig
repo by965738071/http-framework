@@ -28,7 +28,8 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // ── 解析命令行参数（获取静态文件目录）───────────────
-    var args = init.minimal.args.iterate();
+    
+    var args = try init.minimal.args.iterateAllocator(allocator);
     var static_dir: []const u8 = "public"; // 默认值
 
     while (args.next()) |arg| {
@@ -78,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     // ── 静态文件服务（动态路径）─────────────────────────
 
     var static_server = Static.init(allocator, io, static_dir, "/static");
-    try router.route(.GET, "/static*", Handler.init(Static, &static_server));
+    try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
     // ── 服务器配置 ─────────────────────────────────────
     const config: core.Config.Config = .{};

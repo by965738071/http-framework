@@ -1,18 +1,39 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
-const Io = std.Io;
+const core = @import("core");
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
+/// By convention, `root.zig` is the root source file when making a package.
 ///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+/// This file re‑exports the public API of the HTTP framework so that
+/// external projects can simply `@import("http-framework")` and access all
+/// the core types and functions.
+///
+/// ## Usage example
+///
+/// ```zig
+/// const http_framework = @import("http-framework");
+/// const Server   = http_framework.Server;
+/// const Router   = http_framework.Router;
+/// const Handler  = http_framework.Handler;
+/// const RequestContext = http_framework.RequestContext;
+/// const Response = http_framework.Response;
+/// const Config   = http_framework.Config;
+/// ```
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+// Re‑export core types and helpers
+pub const Server = core.Server;
+pub const Router = core.Router;
+pub const RequestContext = core.RequestContext;
+pub const Response = core.Response;
+pub const Handler = core.Handler;
+pub const Config = core.Config;
+pub const Middleware = core.Middleware;
+pub const NextAction = core.Middleware.NextAction;
+pub const WebSocket = core.WebSocket;
+pub const Static = core.Static;
+pub const WsEchoHandler = core.WsEchoHandler;
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
-}
+// Optional: expose the entire core module for advanced use
+pub const Core = core;
+
+// No additional test or helper functions are required in this file.
