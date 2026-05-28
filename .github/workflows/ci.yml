@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: https://codeberg.org/mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
 
       - name: Build
         run: zig build
