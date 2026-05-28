@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: nightly
+
+      - name: Build
+        run: zig build
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Check formatting
+        run: zig fmt --check src/ examples/src/
+
+  build-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: nightly
+
+      - name: Build examples
+        run: cd examples && zig build
+
+      - name: Run example tests
+        run: cd examples && zig build test
