@@ -1,8 +1,15 @@
 ---
+name: zig
+description: Zig 0.16.0 API guidance and porting notes. Use this when writing or upgrading Zig code to the 0.16.0 stable release (std.Io era, @Type removal, @cImport deprecation).
+disable-model-invocation: false
+---
+
+---
 name: zig-0.16
 description: Zig 0.16.0 API guidance and porting notes. Use this when writing or upgrading Zig code to the 0.16.0 stable release (std.Io era, @Type removal, @cImport deprecation).
 license: MIT
 compatibility:
+  - zed
   - opencode
   - claude-code
 metadata:
