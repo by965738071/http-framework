@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // ── 解析命令行参数（获取静态文件目录）───────────────
-    
+
     var args = try init.minimal.args.iterateAllocator(allocator);
     var static_dir: []const u8 = "public"; // 默认值
 
@@ -82,7 +82,10 @@ pub fn main(init: std.process.Init) !void {
     try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
     // ── 服务器配置 ─────────────────────────────────────
-    const config: core.Config.Config = .{};
+    const config: core.Config.Config = .{
+        .log_file_path = "./log/zighttp.log",
+        .log_async_enabled = true,
+    };
     var server = try Server.init(allocator, io, config, router);
     defer server.deinit();
     try server.run();

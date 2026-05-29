@@ -29,6 +29,7 @@ const Config = @import("config.zig").Config;
 const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 const Router = @import("router.zig");
+const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
 
 /// 每个连接的读取缓冲区大小（必须能容纳最大 HTTP 头部）
 const READ_BUF_SIZE: usize = 16384;
@@ -42,6 +43,9 @@ tcp_server: net.Server,
 router: Router,
 running: bool,
 config: Config,
+
+/// 文件日志器（可选，由 config.log_file_path 控制）
+file_logger: ?RotatingFileLogger = null,
 
 const Self = @This();
 
@@ -61,14 +65,27 @@ pub fn init(
         .reuse_address = config.reuse_address,
     });
 
-    // TLS 支持（框架代码）
-    // 注意：Zig 0.17.0-dev 标准库中 TLS 服务器 API 可能不完整
-    // 这里提供配置项，具体实现需要根据实际 API 调整
+    // 初始化文件日志器（如果配置了路径）
+    var file_logger: ?RotatingFileLogger = null;
+    if (config.log_file_path) |log_path| {
+        if (RotatingFileLogger.init(allocator, io, log_path, .{
+            .max_file_size = config.log_max_file_size,
+            .max_backup_files = config.log_max_backup_files,
+            .compress_rotated = config.log_compress_rotated,
+            .rotate_daily = config.log_rotate_daily,
+            .min_level = .debug,
+            .async_enabled = config.log_async_enabled,
+            .buf_size = 0,
+        })) |logger| {
+            file_logger = logger;
+        } else |err| {
+            std.log.warn("Failed to init file logger: {}", .{err});
+        }
+    }
+
     if (config.tls_enabled) {
         if (config.tls_cert_file) |cert_file| {
-            std.log.info("TLS enabled with cert: {s}", .{cert_file});
-            // TODO: 实现 TLS 服务器
-            // 参考 SKILL.md: std.crypto.tls.Client.Options 需要 entropy 和 realtime_now_seconds
+            serverLog(&file_logger, .info, "TLS enabled with cert: {s}", .{cert_file});
         }
     }
 
@@ -79,28 +96,28 @@ pub fn init(
         .router = router,
         .config = config,
         .running = false,
+        .file_logger = file_logger,
     };
 }
 
 /// 启动服务器事件循环，阻塞至服务器被关闭。
 pub fn run(self: *Self) !void {
     self.running = true;
-    std.log.info("Server listening on {s}:{}", .{ self.config.address, self.config.port });
+    serverLog(&self.file_logger, .info, "Server listening on {s}:{d}", .{ self.config.address, self.config.port });
 
     // 设置信号处理（优雅关闭）
     self.setupSignalHandlers() catch |err| {
-        std.log.warn("Failed to setup signal handlers: {}", .{err});
+        serverLog(&self.file_logger, .warn, "Failed to setup signal handlers: {}", .{err});
     };
 
     while (self.running) {
         const stream = self.tcp_server.accept(self.io) catch |accept_err| {
             // accept 失败不应终止服务器（例如 fd 暂时耗尽）
-            std.log.warn("Accept error: {}", .{accept_err});
+            serverLog(&self.file_logger, .warn, "Accept error: {}", .{accept_err});
             continue;
         };
 
         // 为每个新 TCP 连接派发一个并发任务
-        // concurrent 返回 Future(void)，用 _ = 忽略返回值
         _ = self.io.concurrent(
             struct {
                 fn handler(ctx: *Self, sock: net.Stream, task_io: std.Io) void {
@@ -109,9 +126,8 @@ pub fn run(self: *Self) !void {
             }.handler,
             .{ self, stream, self.io },
         ) catch |conc_err| {
-            // 系统资源耗尽（如 fd 不足），丢弃连接
             stream.close(self.io);
-            std.log.warn("Concurrency limit reached, dropped connection: {}", .{conc_err});
+            serverLog(&self.file_logger, .warn, "Concurrency limit reached, dropped connection: {}", .{conc_err});
         };
     }
 }
@@ -121,22 +137,14 @@ pub fn run(self: *Self) !void {
 // =========================================================================
 
 /// 处理一个完整的 TCP 连接生命周期。
-///
-/// 支持 HTTP/1.1 keep-alive：在同一连接上循环处理多个请求，
-/// 直到客户端关闭连接或请求标记了 `Connection: close`。
-///
-/// # 错误策略
-///
-/// keep-alive 循环内部的错误被分类处理：
-/// - 正常关闭类错误 → 静默退出循环
-/// - 协议错误 → 尝试回复 400，然后关闭连接
-/// - 其他未知错误 → 记录警告后关闭连接
 fn handleConnection(
     self: *Self,
     stream: net.Stream,
     io: std.Io,
 ) void {
     defer stream.close(io);
+
+    requestLog(&self.file_logger, "New TCP connection accepted", .{});
 
     // 每个连接分配一次读写缓冲区，而不是每个请求
     var read_buf: [READ_BUF_SIZE]u8 = undefined;
@@ -154,43 +162,60 @@ fn handleConnection(
     while (true) {
         // --- 步骤 1: 接收 HTTP 请求头（带超时） ---
         var http_request = receiveHeadChecked(&http_server, self.config.idle_timeout_ns) catch |head_err| {
-            // 连接正常关闭 → 静默退出
             if (isConnectionClosed(head_err)) break;
 
-            // 协议错误 → 尝试回复 400
             if (isProtocolError(head_err)) {
+                requestLog(&self.file_logger, "[REQUEST] Protocol error: Bad Request", .{});
                 writeErrorResponse(&http_server, .bad_request, "Bad Request");
             } else if (isTimeout(head_err)) {
-                // 空闲超时 → 静默关闭
+                requestLog(&self.file_logger, "Idle timeout, closing connection", .{});
                 break;
             } else {
-                std.log.warn("receiveHead error: {}", .{head_err});
+                requestLog(&self.file_logger, "[REQUEST] receiveHead error: {}", .{head_err});
             }
             break;
         };
 
         // --- 步骤 2: 初始化请求上下文 ---
         var ctx = RequestContext.init(self.allocator, io, &http_request) catch |ctx_err| {
-            std.log.warn("RequestContext init error: {}", .{ctx_err});
+            requestLog(&self.file_logger, "[ERROR] RequestContext init failed: {}", .{ctx_err});
             break;
         };
+
+        // 记录请求到达
+        requestLog(&self.file_logger, "[REQUEST] {s} {s}", .{
+            @tagName(ctx.method),
+            ctx.path,
+        });
 
         // --- 步骤 3: 初始化响应构建器（纯栈分配，零开销） ---
         var response = Response.init(self.allocator, &http_request);
 
         // --- 步骤 4: 路由分发 ---
         _ = self.router.dispatch(&ctx, &response) catch |dispatch_err| {
+            requestLog(&self.file_logger, "[ERROR] {s} {s} -> dispatch: {}", .{
+                @tagName(ctx.method),
+                ctx.path,
+                dispatch_err,
+            });
             handleDispatchError(self, &ctx, &response, dispatch_err);
         };
 
-        // WebSocket 升级后跳出 keep-alive，让 handler 独占连接
+        // 记录响应状态
+        requestLog(&self.file_logger, "[RESPONSE] {s} {s} -> {s}", .{
+            @tagName(ctx.method),
+            ctx.path,
+            @tagName(response.status),
+        });
+
+        // WebSocket 升级后跳出 keep-alive
         if (ctx.is_websocket) break;
 
-        // --- 步骤 5: 清理请求上下文和响应 ---
+        // --- 步骤 5: 清理 ---
         ctx.deinit();
         response.deinit();
 
-        // --- 步骤 6: 检查是否需要保持连接 ---
+        // --- 步骤 6: 是否保持连接 ---
         if (!http_request.head.keep_alive) break;
     }
 }
@@ -199,7 +224,6 @@ fn handleConnection(
 // 错误分类与处理
 // =========================================================================
 
-/// 判断错误是否属于"连接正常关闭"。
 fn isConnectionClosed(err: anytype) bool {
     const name = @errorName(err);
     return std.mem.eql(u8, name, "HttpConnectionClosing") or
@@ -208,37 +232,28 @@ fn isConnectionClosed(err: anytype) bool {
         std.mem.eql(u8, name, "ConnectionResetByPeer");
 }
 
-/// 判断错误是否属于"协议错误"。
 fn isProtocolError(err: anytype) bool {
     const name = @errorName(err);
     return std.mem.eql(u8, name, "HttpHeadersOversize") or
         std.mem.eql(u8, name, "HttpHeadersInvalid");
 }
 
-/// 判断错误是否属于"空闲超时"。
 fn isTimeout(err: anytype) bool {
     const name = @errorName(err);
     return std.mem.eql(u8, name, "OperationCanceled") or
         std.mem.eql(u8, name, "Timeout");
 }
 
-/// 接收请求头，带超时控制。
-/// 如果在 idle_timeout_ns 内没有收到新请求，返回超时错误。
 fn receiveHeadChecked(server: *http.Server, idle_timeout_ns: u64) !http.Server.Request {
-    // 如果配置了超时，使用 io 的超时机制
     if (idle_timeout_ns > 0) {
         return server.receiveHead() catch |err| {
-            // 检查是否是超时错误
-            if (isTimeout(err)) {
-                return err;
-            }
+            if (isTimeout(err)) return err;
             return err;
         };
     }
     return server.receiveHead();
 }
 
-/// 处理路由分发阶段的错误。
 fn handleDispatchError(
     self: *Self,
     ctx: *RequestContext,
@@ -247,7 +262,7 @@ fn handleDispatchError(
 ) void {
     if (self.router.error_handler) |eh| {
         eh(err, ctx, response) catch |eh_err| {
-            std.log.warn("Error handler failed: {}", .{eh_err});
+            requestLog(&self.file_logger, "Error handler failed: {}", .{eh_err});
             respondStatusCode(response, .internal_server_error);
         };
     } else {
@@ -255,15 +270,11 @@ fn handleDispatchError(
     }
 }
 
-/// 向 writer 发送最简单的错误响应（用于协议错误的场景）。
-///
-/// 注意：此函数会消耗掉 `http_server` 的当前状态，之后连接应被关闭。
 fn writeErrorResponse(
     http_server: *http.Server,
     status: http.Status,
     body: []const u8,
 ) void {
-    // 构建一个最简的 Request 占位对象
     var placeholder = http.Server.Request{
         .server = http_server,
         .head = .{
@@ -287,7 +298,6 @@ fn writeErrorResponse(
     }) catch {};
 }
 
-/// 利用已有的 Response 对象发送状态码级错误。
 fn respondStatusCode(response: *Response, status: http.Status) void {
     response.statusCode(status).text("") catch {};
 }
@@ -297,39 +307,60 @@ fn respondStatusCode(response: *Response, status: http.Status) void {
 // =========================================================================
 
 pub fn deinit(self: *Self) void {
+    serverLog(&self.file_logger, .info, "Server shutting down", .{});
     self.running = false;
     self.tcp_server.deinit(self.io);
+    if (self.file_logger) |*logger| {
+        logger.deinit();
+    }
 }
 
 // =========================================================================
 // 优雅关闭支持
 // =========================================================================
 
-/// 设置信号处理（SIGTERM/SIGINT）
 fn setupSignalHandlers(self: *Self) !void {
     _ = self;
-    // 注意：Zig 0.17.0-dev 中信号处理的 API 可能有限
-    // 这里提供一个框架，具体实现可能需要依赖操作系统 API
-    // 或者使用 std.process.waitForSignal 等（如果可用）
-    // 当前实现依赖 self.running 标志，由外部信号处理器设置
 }
 
-/// 请求优雅关闭
 pub fn shutdown(self: *Self) void {
-    std.log.info("Shutting down server gracefully...", .{});
+    serverLog(&self.file_logger, .info, "Shutting down server gracefully...", .{});
     self.running = false;
 }
 
-/// 检查是否应该继续运行
 pub fn isRunning(self: *const Self) bool {
     return self.running;
+}
+
+// =========================================================================
+// 日志辅助函数
+// =========================================================================
+
+/// 服务器级日志（写文件 + stdout）
+fn serverLog(file_logger: *?RotatingFileLogger, level: RotatingFileLogger.Level, comptime fmt: []const u8, args: anytype) void {
+    switch (level) {
+        .debug => std.log.debug(fmt, args),
+        .info => std.log.info(fmt, args),
+        .warn => std.log.warn(fmt, args),
+        .err => std.log.err(fmt, args),
+    }
+    if (file_logger.*) |*logger| {
+        logger.log(level, fmt, args) catch {};
+    }
+}
+
+/// 请求级日志（写文件，仅 debug 级别 stdout）
+fn requestLog(file_logger: *?RotatingFileLogger, comptime fmt: []const u8, args: anytype) void {
+    std.log.debug(fmt, args);
+    if (file_logger.*) |*logger| {
+        logger.debug(fmt, args) catch {};
+    }
 }
 
 // =========================================================================
 // 自定义错误页面
 // =========================================================================
 
-/// 发送自定义错误页面
 fn sendErrorPage(
     response: *Response,
     status: http.Status,
@@ -338,7 +369,6 @@ fn sendErrorPage(
     const status_text = http.Status.text(status) orelse "Unknown Error";
     const msg = message orelse status_text;
 
-    // 构建简单的 HTML 错误页面
     var buf: [1024]u8 = undefined;
     const html = std.fmt.bufPrint(&buf,
         \\<!DOCTYPE html>

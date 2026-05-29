@@ -11,6 +11,7 @@ const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 const Middleware = @import("middleware.zig");
 const Handler = @import("handler.zig");
+const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
 
 /// 单条路由记录
 pub const Route = struct {
@@ -18,8 +19,6 @@ pub const Route = struct {
     pattern: []const u8,
     handler: Handler,
     middlewares: []const Middleware = &.{},
-    /// 可选的路由参数验证函数，在路径参数解析后调用。
-    /// 如果返回 false，则跳过此路由（视为不匹配）。
     param_validator: ?*const fn (ctx: *RequestContext) bool = null,
 };
 
@@ -33,13 +32,15 @@ pub const DispatchResult = enum {
 
 const Self = @This();
 
-/// 路径参数最大数量（防止恶意超大路径）
 const MAX_PATH_PARAMS = 32;
 
 allocator: std.mem.Allocator,
 routes: std.ArrayList(Route),
 not_found_handler: ?Handler = null,
 error_handler: ?*const fn (anyerror, *RequestContext, *Response) anyerror!void = null,
+
+/// 文件日志器（由 Server 注入）
+file_logger: ?*RotatingFileLogger = null,
 
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{
@@ -50,6 +51,11 @@ pub fn init(allocator: std.mem.Allocator) Self {
 
 pub fn deinit(self: *Self) void {
     self.routes.deinit(self.allocator);
+}
+
+/// 设置文件日志器（由 Server.init 调用）
+pub fn setLogger(self: *Self, logger: *RotatingFileLogger) void {
+    self.file_logger = logger;
 }
 
 /// 注册一条路由
@@ -77,12 +83,10 @@ pub fn routeWithMiddleware(
     });
 }
 
-/// 设置 404 处理器
 pub fn notFound(self: *Self, handler: Handler) void {
     self.not_found_handler = handler;
 }
 
-/// 设置错误处理器（路由分发过程中出现异常时调用）
 pub fn onError(
     self: *Self,
     handler: *const fn (anyerror, *RequestContext, *Response) anyerror!void,
@@ -90,8 +94,7 @@ pub fn onError(
     self.error_handler = handler;
 }
 
-/// 分发请求到匹配的路由
-///
+/// 分发请求到匹配的路由。
 /// 返回 `true` 表示已处理，`false` 表示无匹配。
 pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
     for (self.routes.items) |r| {
@@ -99,34 +102,50 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
         const clean_path = trimSlash(ctx.path);
 
         if (matchPattern(clean_pattern, clean_path, self.allocator, ctx)) {
-            // 参数验证（如果设置了验证器）
+            // 记录路由匹配
+            routeLog(self.file_logger, "[ROUTE] matched: {s} {s} -> {s}", .{
+                @tagName(ctx.method),
+                ctx.path,
+                r.pattern,
+            });
+
             if (r.param_validator) |validator| {
                 if (!validator(ctx)) {
-                    // 验证失败，清除已解析的路径参数，继续下一个路由
                     ctx.path_params.deinit(self.allocator);
                     ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
                     continue;
                 }
             }
 
-            // 方法必须匹配
             if (r.method != ctx.method) {
                 continue;
             }
 
             // 执行中间件链
             if (r.middlewares.len > 0) {
+                routeLog(self.file_logger, "[MIDDLEWARE] {d} middlewares for {s} {s}", .{
+                    r.middlewares.len,
+                    @tagName(ctx.method),
+                    ctx.path,
+                });
                 for (r.middlewares) |middle| {
                     const action = try middle.vtable.process(middle.ptr, ctx);
                     switch (action) {
                         .next => continue,
-                        .respond => return true,
+                        .respond => {
+                            routeLog(self.file_logger, "[MIDDLEWARE] blocked at '{s}'", .{middle.name});
+                            return true;
+                        },
                         .err => return true,
                     }
                 }
             }
 
-            // 创建处理器实例并执行
+            // 执行 Handler
+            routeLog(self.file_logger, "[HANDLER] {s} {s}", .{
+                @tagName(ctx.method),
+                ctx.path,
+            });
             const handler_instance = try r.handler.vtable.create(r.handler.ptr);
             defer r.handler.vtable.destroy(r.handler.ptr, handler_instance);
             try r.handler.vtable.handle(handler_instance, ctx, res);
@@ -134,7 +153,11 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
         }
     }
 
-    // 无匹配 → 调用 404 处理器（如果已设置）
+    // 404
+    routeLog(self.file_logger, "[404] {s} {s}", .{
+        @tagName(ctx.method),
+        ctx.path,
+    });
     if (self.not_found_handler) |nf| {
         const instance = try nf.vtable.create(nf.ptr);
         defer nf.vtable.destroy(nf.ptr, instance);
@@ -149,9 +172,6 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
 // 路径模式匹配
 // ---------------------------------------------------------------------------
 
-/// 将路径模式与真实路径进行匹配，支持 `:param` 动态参数和 `*` 通配符。
-///
-/// 匹配成功时，参数会被写入 `ctx.path_params`。
 fn matchPattern(
     pattern: []const u8,
     path: []const u8,
@@ -160,15 +180,12 @@ fn matchPattern(
 ) bool {
     if (pattern.len == 0 and path.len == 0) return true;
 
-    // 检查通配符模式（以 * 结尾）
     if (mem.endsWith(u8, pattern, "*")) {
         const prefix = pattern[0 .. pattern.len - 1];
         const clean_prefix = trimSlash(prefix);
         const clean_path = trimSlash(path);
 
-        // 检查路径是否以前缀开头
         if (mem.startsWith(u8, clean_path, clean_prefix)) {
-            // 剩余路径部分赋值给 path_params 的 * 键
             const remaining = clean_path[clean_prefix.len..];
             const key_dup = allocator.dupe(u8, "*") catch return false;
             const val_dup = allocator.dupe(u8, remaining) catch {
@@ -196,7 +213,7 @@ fn matchPattern(
         if (p_part.len == 0 and path_part.len == 0) continue;
 
         if (p_part.len > 0 and p_part[0] == ':') {
-            if (params_len >= MAX_PATH_PARAMS) return false; // 防御性限制
+            if (params_len >= MAX_PATH_PARAMS) return false;
             params_buf[params_len] = .{
                 .key = p_part[1..],
                 .value = path_part,
@@ -207,11 +224,8 @@ fn matchPattern(
         }
     }
 
-    // 路径段数量必须一致
     if (path_parts.next() != null) return false;
 
-    // ---------- 所有匹配检查通过，一次性写入 context ----------
-    // 注意：这里仅在完全匹配后才分配内存，避免中途失败留下脏数据
     for (params_buf[0..params_len]) |param| {
         const key_dup = allocator.dupe(u8, param.key) catch return false;
         const val_dup = allocator.dupe(u8, param.value) catch {
@@ -228,7 +242,6 @@ fn matchPattern(
     return true;
 }
 
-/// 去除首尾的 `/` 字符
 fn trimSlash(path: []const u8) []const u8 {
     var start: usize = 0;
     var end: usize = path.len;
@@ -237,4 +250,15 @@ fn trimSlash(path: []const u8) []const u8 {
     if (end > start and path[end - 1] == '/') end -= 1;
 
     return path[start..end];
+}
+
+// ---------------------------------------------------------------------------
+// 日志辅助
+// ---------------------------------------------------------------------------
+
+fn routeLog(file_logger: ?*RotatingFileLogger, comptime fmt: []const u8, args: anytype) void {
+    std.log.debug(fmt, args);
+    if (file_logger) |logger| {
+        logger.debug(fmt, args) catch {};
+    }
 }

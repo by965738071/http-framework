@@ -4,3 +4,4 @@ zig-out
 .DS_Store
 /examples/.zig-cache
 /example/zig-out
+/log
