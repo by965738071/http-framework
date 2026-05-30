@@ -103,7 +103,8 @@ pub fn parseForm(
     var result: T = undefined;
     const fields = info.@"struct".fields;
 
-    var set_fields: [fields.len]bool = ([_]bool{false})**fields.len;
+    var set_fields: [fields.len]bool = undefined;
+    for (&set_fields) |*s| s.* = false;
 
     while (pairs.next()) |pair| {
         inline for (fields, 0..) |field, i| {
