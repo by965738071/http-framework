@@ -124,8 +124,8 @@ pub fn parseForm(
             const field_info = @typeInfo(field.type);
             if (field_info == .optional) {
                 @field(result, field.name) = null;
-            } else if (field.default_value) |default| {
-                @field(result, field.name) = @as(*const field.type, @ptrCast(@alignCast(default))).*;
+            } else if (field.defaultValue()) |default| {
+                @field(result, field.name) = default;
             } else {
                 return error.MissingField;
             }
