@@ -33,6 +33,9 @@ pub const Config = struct {
     /// 连接空闲超时（纳秒），0 表示无超时
     idle_timeout_ns: u64 = 30_000_000_000, // 30 秒
 
+    /// 请求体最大字节数（0 表示不限制）
+    body_size_limit: u64 = 10 * 1024 * 1024, // 10MB 默认限制
+
     /// 是否启用访问日志
     access_log_enabled: bool = true,
 

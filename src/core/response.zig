@@ -65,27 +65,18 @@ pub fn compression(self: *Self, enabled: bool) *Self {
 // =========================================================================
 
 /// 压缩数据（gzip格式）
-/// 使用 std.Io.Writer.Allocating 捕获压缩后的数据
+/// 使用 Allocating writer 捕获压缩后的数据。
+/// 压缩器输出通过 flate 管道写入 Allocating writer，数据完整性由 finish() 保证。
 fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    // 使用 Allocating writer 来捕获压缩输出
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
 
-    // 初始化 gzip 压缩器，输出到 out.writer
-    var gzip_compressor = std.compress.gzip.Compress.init(allocator, .gzip);
-    defer gzip_compressor.deinit();
+    var compress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&alloc_writer.writer, &compress_buf, .gzip, .default);
+    try compressor.writer.writeAll(data);
+    try compressor.finish();
 
-    // 获取压缩器的写入接口
-    const writer = gzip_compressor.writer();
-
-    // 写入数据
-    try writer.writeAll(data);
-
-    // 关闭压缩器，确保所有数据被刷新
-    try gzip_compressor.close();
-
-    // 返回压缩后的数据
-    return out.toOwnedSlice();
+    return alloc_writer.toOwnedSlice();
 }
 
 // =========================================================================
@@ -203,11 +194,12 @@ pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
 // 内部辅助
 // =========================================================================
 
-/// 将所有 Cookie 转换为 `Set-Cookie` 响应头并追加到 headers 中
+/// 将所有 Cookie 转换为 `Set-Cookie` 响应头并追加到 headers 中。
+/// cookie_str 的所有权转移给 headers，由 deinit 统一释放。
 fn addCookiesToHeaders(self: *Self) !void {
     for (self.cookies.items) |cookie| {
         const cookie_str = try self.buildCookieString(cookie);
-        defer self.allocator.free(cookie_str);
+        errdefer self.allocator.free(cookie_str);
         try self.headers.append(self.allocator, .{
             .name = "Set-Cookie",
             .value = cookie_str,

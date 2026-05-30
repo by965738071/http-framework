@@ -82,7 +82,32 @@ pub fn handle(self: *const Self, ctx: *RequestContext, res: *Response) !void {
         return;
     }
 
-    // 4. 读取文件内容，限制最大大小
+    // 4. 获取文件元数据（用于缓存头）
+    const stat = std.Io.Dir.cwd().statFile(self.io, full_path, .{}) catch |stat_err| {
+        switch (stat_err) {
+            error.FileNotFound => try res.statusCode(.not_found).text("File not found"),
+            error.AccessDenied => try res.statusCode(.forbidden).text("Access denied"),
+            else => {
+                std.log.err("Failed to stat file '{s}': {}", .{ full_path, stat_err });
+                try res.statusCode(.internal_server_error).text(@errorName(stat_err));
+            },
+        }
+        return;
+    };
+
+    // 5. 生成 ETag 和 Last-Modified 缓存头
+    var etag_buf: [64]u8 = undefined;
+    const etag = std.fmt.bufPrint(&etag_buf, "\"{d}-{d}\"", .{ stat.size, stat.mtime.nanoseconds }) catch "\"0\"";
+
+    // 检查 If-None-Match（ETag 缓存验证）
+    if (ctx.getHeader("If-None-Match")) |if_none_match| {
+        if (std.mem.eql(u8, if_none_match, etag)) {
+            try res.statusCode(.not_modified).text("");
+            return;
+        }
+    }
+
+    // 6. 读取文件内容，限制最大大小
     const file_content = std.Io.Dir.cwd().readFileAlloc(
         self.io,
         full_path,
@@ -103,8 +128,10 @@ pub fn handle(self: *const Self, ctx: *RequestContext, res: *Response) !void {
     };
     defer self.allocator.free(file_content);
 
-    // 5. 根据扩展名确定 Content-Type 并响应
+    // 7. 添加缓存头并响应
     const content_type = getContentType(full_path);
+    _ = try res.header("ETag", etag);
+    _ = try res.header("Cache-Control", "public, max-age=3600");
     try res.file(file_content, content_type);
 }
 

@@ -33,6 +33,7 @@ const http = std.http;
 const mem = std.mem;
 
 const Multipart = @import("multipart.zig");
+const deserialize = @import("deserialize.zig");
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -60,6 +61,9 @@ request: *http.Server.Request,
 // ---- 内部状态 ----
 body_read: bool,
 body_data: ?[]const u8,
+
+/// 请求体大小限制（字节），0 表示不限制
+body_size_limit: u64 = 0,
 
 // ---- 延迟解析标志 ----
 headers_parsed: bool,
@@ -231,16 +235,32 @@ pub fn readBody(self: *Self) ![]const u8 {
         return self.body_data orelse error.BodyAlreadyRead;
     }
 
+    // 检查 Content-Length 是否超过限制
+    if (self.body_size_limit > 0) {
+        if (self.content_length) |cl| {
+            if (cl > self.body_size_limit) {
+                return error.BodyTooLarge;
+            }
+        }
+    }
+
     var temp_buf: [65536]u8 = undefined;
     const body_reader = self.request.readerExpectNone(&temp_buf);
 
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(self.allocator);
 
+    var total_read: u64 = 0;
     var chunk_buf: [65536]u8 = undefined;
     while (true) {
         const n = try body_reader.readSliceShort(&chunk_buf);
         if (n == 0) break;
+
+        total_read += n;
+        if (self.body_size_limit > 0 and total_read > self.body_size_limit) {
+            return error.BodyTooLarge;
+        }
+
         try result.appendSlice(self.allocator, chunk_buf[0..n]);
     }
 
@@ -251,11 +271,90 @@ pub fn readBody(self: *Self) ![]const u8 {
 }
 
 /// 将请求体解析为指定类型的 JSON 值
+///
+/// ⚠️ 已废弃：请使用 `bodyAs(T)` 替代，它提供更好的内存管理。
+/// 此函数保留向后兼容，但返回的值可能包含悬挂指针（对于含 slice 字段的类型）。
 pub fn json(self: *Self, comptime T: type) !T {
     const body = try self.readBody();
     const parsed = try std.json.parseFromSlice(T, self.allocator, body, .{});
     defer parsed.deinit();
     return parsed.value;
+}
+
+/// 根据 Content-Type 自动反序列化请求体为类型 T
+///
+/// 支持的 Content-Type：
+/// - `application/json` → JSON 解析
+/// - `application/x-www-form-urlencoded` → form 解析（comptime 反射）
+///
+/// 返回 `Parsed(T)`，调用方需在使用完毕后调用 `parsed.deinit()` 释放内存。
+///
+/// # 使用示例
+///
+/// ```zig
+/// const CreateUser = struct {
+///     name: []const u8,
+///     age: u32,
+///     email: []const u8,
+/// };
+///
+/// fn handler(ctx: *RequestContext, res: *Response) !void {
+///     var parsed = try ctx.bodyAs(CreateUser);
+///     defer parsed.deinit();
+///
+///     const user = parsed.value;
+///     std.log.info("name={s}, age={d}", .{ user.name, user.age });
+/// }
+/// ```
+pub fn bodyAs(self: *Self, comptime T: type) !deserialize.Parsed(T) {
+    const body = try self.readBody();
+
+    if (body.len == 0) {
+        return error.EmptyBody;
+    }
+
+    const ct = self.content_type orelse return error.NoContentType;
+
+    if (std.ascii.indexOfIgnoreCase(ct, "application/json") != null) {
+        return deserialize.parseJson(T, self.allocator, body);
+    }
+
+    if (std.ascii.indexOfIgnoreCase(ct, "application/x-www-form-urlencoded") != null) {
+        return deserialize.parseForm(T, self.allocator, body);
+    }
+
+    return error.UnsupportedContentType;
+}
+
+/// 将 URL 查询参数反序列化为结构体 T
+///
+/// 查询字符串格式与 form-urlencoded 相同（`key=value&key=value`），
+/// 直接复用 `parseForm` 的 comptime 反射逻辑。
+///
+/// 返回 `Parsed(T)`，调用方需在使用完毕后调用 `parsed.deinit()` 释放内存。
+///
+/// # 使用示例
+///
+/// ```zig
+/// const ListQuery = struct {
+///     page: u32 = 1,
+///     limit: u32 = 20,
+///     sort: ?[]const u8,
+/// };
+///
+/// fn handler(ctx: *RequestContext, res: *Response) !void {
+///     var parsed = try ctx.queryAs(ListQuery);
+///     defer parsed.deinit();
+///
+///     const q = parsed.value;
+///     std.log.info("page={d}, limit={d}", .{ q.page, q.limit });
+/// }
+/// ```
+pub fn queryAs(self: *Self, comptime T: type) !deserialize.Parsed(T) {
+    if (self.query.len == 0) {
+        return error.EmptyBody;
+    }
+    return deserialize.parseForm(T, self.allocator, self.query);
 }
 
 /// 获取 Multipart 表单解析器（延迟初始化）
@@ -384,7 +483,7 @@ pub fn getForm(self: *Self, key: []const u8) ?[]const u8 {
 // =========================================================================
 
 /// 释放 `StringHashMapUnmanaged` 中所有堆分配的 key 和 value
-fn freeHashMap(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.mem.Allocator) void {
+pub fn freeHashMap(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.mem.Allocator) void {
     var it = map.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
@@ -426,4 +525,36 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "urlDecode - basic" {
+    const allocator = std.testing.allocator;
+    const result = try urlDecode(allocator, "hello+world");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "urlDecode - percent encoding" {
+    const allocator = std.testing.allocator;
+    const result = try urlDecode(allocator, "foo%2Fbar%3Dbaz");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("foo/bar=baz", result);
+}
+
+test "urlDecode - mixed" {
+    const allocator = std.testing.allocator;
+    const result = try urlDecode(allocator, "hello%20world+foo%26bar");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello world foo&bar", result);
+}
+
+test "urlDecode - no encoding" {
+    const allocator = std.testing.allocator;
+    const result = try urlDecode(allocator, "plain");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("plain", result);
 }

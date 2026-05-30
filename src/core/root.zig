@@ -10,6 +10,7 @@ pub const Static = @import("static.zig");
 pub const WebSocket = @import("websocket.zig");
 pub const Cors = @import("cors.zig");
 pub const Multipart = @import("multipart.zig");
+pub const Deserialize = @import("deserialize.zig");
 pub const RateLimiter = @import("rate_limiter.zig");
 pub const Session = @import("session.zig");
 pub const Metrics = @import("metrics.zig");

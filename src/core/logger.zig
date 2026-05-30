@@ -7,7 +7,7 @@
 //!
 //! - 日志级别：debug / info / warn / err，可按级别过滤
 //! - 写入缓冲：减少磁盘 I/O，默认 8KB 缓冲区
-//! - 异步写入：后台线程写盘，`log()` 调用立即返回不阻塞请求
+//! - 异步写入：后台任务写盘，`log()` 调用立即返回不阻塞请求
 //! - 自动创建目录：日志路径的父目录不存在时自动创建
 //! - 每日轮转：日期变更时自动创建新日志文件
 //! - 大小滚动：文件超过阈值时轮转并保留编号备份
@@ -119,7 +119,7 @@ pub const RotatingFileLogger = struct {
 
     // ---- 异步模式状态 ----
     async_queue: ?AsyncQueue,
-    async_running: std.atomic.Value(bool),
+    async_future: ?std.Io.Future(std.Io.Cancelable!void) = .{ .any_future = null, .result = {} },
 
     const Date = struct { year: u16, month: u8, day: u8 };
 
@@ -243,7 +243,6 @@ pub const RotatingFileLogger = struct {
             .write_buf_end = 0,
             .mutex = .init,
             .async_queue = async_queue,
-            .async_running = std.atomic.Value(bool).init(false),
         };
 
         if (config.async_enabled) {
@@ -262,9 +261,10 @@ pub const RotatingFileLogger = struct {
 
     pub fn deinit(self: *RotatingFileLogger) void {
         if (self.async_enabled) {
-            self.async_running.store(false, .release);
-            // 等待后台线程完成当前批次后退出
-            std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(@intCast(100 * std.time.ns_per_ms)), .awake) catch {};
+            // 请求取消后台任务并等待完成
+            if (self.async_future) |*f| {
+                _ = f.cancel(self.io) catch unreachable;
+            }
             if (self.async_queue) |*q| q.deinit(self.allocator);
         } else {
             if (self.current_file) |file| {
@@ -300,14 +300,11 @@ pub const RotatingFileLogger = struct {
         if (!Level.atLeast(level, self.min_level)) return;
 
         if (self.async_enabled) {
-            // 懒启动后台线程（首次调用 log 时），此时 self 地址稳定
-            if (!self.async_running.load(.acquire)) {
-                // CAS 防止多线程重复启动
-                if (self.async_running.cmpxchgStrong(false, true, .release, .monotonic) == null) {
-                    self.rotateExistingFile();
-                    self.openLogFile() catch return;
-                    _ = std.Thread.spawn(.{}, asyncWriterThread, .{self}) catch return;
-                }
+            // 懒启动后台任务（首次调用 log 时）
+            if (self.async_future == null) {
+                self.rotateExistingFile();
+                self.openLogFile() catch return;
+                self.async_future = self.io.async(asyncWriterThread, .{self});
             }
             // 格式化 + 推入队列
             const now = std.Io.Timestamp.now(self.io, .real);
@@ -355,7 +352,7 @@ pub const RotatingFileLogger = struct {
     // 异步后台线程
     // =================================================================
 
-    fn asyncWriterThread(self: *RotatingFileLogger) void {
+    fn asyncWriterThread(self: *RotatingFileLogger) std.Io.Cancelable!void {
         // 初始化文件
         self.rotateExistingFile();
         self.openLogFile() catch return;
@@ -374,7 +371,8 @@ pub const RotatingFileLogger = struct {
             if (self.write_buf) |buf| self.allocator.free(buf);
         }
 
-        while (self.async_running.load(.acquire)) {
+        while (true) {
+            try self.io.checkCancel();
             // 排空队列中的所有消息
             var did_work = false;
             while (self.async_queue) |*q| {
@@ -408,7 +406,7 @@ pub const RotatingFileLogger = struct {
         return .{ .year = year_day.year, .month = month_day.month.numeric(), .day = @as(u8, month_day.day_index) + 1 };
     }
 
-    fn checkRotation(self: *RotatingFileLogger) !void {
+    fn checkRotation(self: *RotatingFileLogger) !void { // error set includes error.Canceled
         if (self.rotate_daily) {
             const today = self.getCurrentDate();
             if (self.current_year != 0 and
@@ -518,7 +516,7 @@ pub const RotatingFileLogger = struct {
     // 内部 — 文件 I/O & 缓冲（同步和异步共用）
     // =================================================================
 
-    fn openLogFile(self: *RotatingFileLogger) !void {
+    fn openLogFile(self: *RotatingFileLogger) !void { // error set includes error.Canceled
         self.current_file = try std.Io.Dir.cwd().createFile(self.io, self.base_path, .{});
         self.current_size = 0;
     }

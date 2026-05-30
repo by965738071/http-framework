@@ -8,6 +8,7 @@ const mem = std.mem;
 const http = std.http;
 
 const RequestContext = @import("request.zig");
+const freeHashMap = RequestContext.freeHashMap;
 const Response = @import("response.zig");
 const Middleware = @import("middleware.zig");
 const Handler = @import("handler.zig");
@@ -97,63 +98,81 @@ pub fn onError(
 /// 分发请求到匹配的路由。
 /// 返回 `true` 表示已处理，`false` 表示无匹配。
 pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
+    var method_matched = false;
+
     for (self.routes.items) |r| {
         const clean_pattern = trimSlash(r.pattern);
         const clean_path = trimSlash(ctx.path);
 
-        if (matchPattern(clean_pattern, clean_path, self.allocator, ctx)) {
-            // 记录路由匹配
-            routeLog(self.file_logger, "[ROUTE] matched: {s} {s} -> {s}", .{
-                @tagName(ctx.method),
-                ctx.path,
-                r.pattern,
-            });
+        if (!matchPattern(clean_pattern, clean_path, self.allocator, ctx)) continue;
 
-            if (r.param_validator) |validator| {
-                if (!validator(ctx)) {
-                    ctx.path_params.deinit(self.allocator);
-                    ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
-                    continue;
-                }
-            }
+        // 记录路由匹配
+        routeLog(self.file_logger, "[ROUTE] matched: {s} {s} -> {s}", .{
+            @tagName(ctx.method),
+            ctx.path,
+            r.pattern,
+        });
 
-            if (r.method != ctx.method) {
+        if (r.param_validator) |validator| {
+            if (!validator(ctx)) {
+                ctx.path_params.deinit(self.allocator);
+                ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
                 continue;
             }
+        }
 
-            // 执行中间件链
-            if (r.middlewares.len > 0) {
-                routeLog(self.file_logger, "[MIDDLEWARE] {d} middlewares for {s} {s}", .{
-                    r.middlewares.len,
-                    @tagName(ctx.method),
-                    ctx.path,
-                });
-                for (r.middlewares) |middle| {
-                    const action = try middle.vtable.process(middle.ptr, ctx);
-                    switch (action) {
-                        .next => continue,
-                        .respond => {
-                            routeLog(self.file_logger, "[MIDDLEWARE] blocked at '{s}'", .{middle.name});
-                            if (ctx.blocked_status) |status| {
-                                _ = res.statusCode(status);
-                            }
-                            return true;
-                        },
-                        .err => return true,
-                    }
-                }
-            }
+        if (r.method != ctx.method) {
+            method_matched = true;
+            ctx.path_params.deinit(self.allocator);
+            ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
+            continue;
+        }
 
-            // 执行 Handler
-            routeLog(self.file_logger, "[HANDLER] {s} {s}", .{
+        // 执行中间件链
+        if (r.middlewares.len > 0) {
+            routeLog(self.file_logger, "[MIDDLEWARE] {d} middlewares for {s} {s}", .{
+                r.middlewares.len,
                 @tagName(ctx.method),
                 ctx.path,
             });
-            const handler_instance = try r.handler.vtable.create(r.handler.ptr);
-            defer r.handler.vtable.destroy(r.handler.ptr, handler_instance);
-            try r.handler.vtable.handle(handler_instance, ctx, res);
-            return true;
+            var blocked = false;
+            for (r.middlewares) |middle| {
+                const action = try middle.vtable.process(middle.ptr, ctx);
+                switch (action) {
+                    .next => {},
+                    .respond => {
+                        routeLog(self.file_logger, "[MIDDLEWARE] blocked at '{s}'", .{middle.name});
+                        if (ctx.blocked_status) |status| {
+                            _ = res.statusCode(status);
+                        }
+                        blocked = true;
+                        break;
+                    },
+                    .err => return true,
+                }
+            }
+            if (blocked) return true;
         }
+
+        // 执行 Handler
+        routeLog(self.file_logger, "[HANDLER] {s} {s}", .{
+            @tagName(ctx.method),
+            ctx.path,
+        });
+        const handler_instance = try r.handler.vtable.create(r.handler.ptr);
+        defer r.handler.vtable.destroy(r.handler.ptr, handler_instance);
+        try r.handler.vtable.handle(handler_instance, ctx, res);
+        return true;
+    }
+
+    // 方法不匹配但模式匹配
+    if (method_matched) {
+        routeLog(self.file_logger, "[405] {s} {s}", .{
+            @tagName(ctx.method),
+            ctx.path,
+        });
+        _ = res.statusCode(.method_not_allowed);
+        return true;
     }
 
     // 404
@@ -264,4 +283,125 @@ fn routeLog(file_logger: ?*RotatingFileLogger, comptime fmt: []const u8, args: a
     if (file_logger) |logger| {
         logger.debug(fmt, args) catch {};
     }
+}
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "trimSlash" {
+    try std.testing.expectEqualStrings("", trimSlash(""));
+    try std.testing.expectEqualStrings("", trimSlash("/"));
+    try std.testing.expectEqualStrings("foo", trimSlash("/foo/"));
+    try std.testing.expectEqualStrings("foo/bar", trimSlash("/foo/bar"));
+    try std.testing.expectEqualStrings("foo/bar", trimSlash("foo/bar/"));
+}
+
+test "matchPattern - static path" {
+    const allocator = std.testing.allocator;
+    var ctx = RequestContext{
+        .allocator = undefined,
+        .io = undefined,
+        .method = .GET,
+        .path = "/users",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .path_params = std.StringHashMapUnmanaged([]const u8).empty,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .request = undefined,
+        .body_read = false,
+        .body_data = null,
+        .headers_parsed = false,
+        .user_data = null,
+    };
+    defer {
+        freeHashMap(&ctx.path_params, allocator);
+    }
+
+    try std.testing.expect(matchPattern("users", "/users", allocator, &ctx));
+    try std.testing.expect(!matchPattern("users", "/posts", allocator, &ctx));
+    try std.testing.expect(!matchPattern("users/123", "/users", allocator, &ctx));
+}
+
+test "matchPattern - path params" {
+    const allocator = std.testing.allocator;
+    var ctx = RequestContext{
+        .allocator = undefined,
+        .io = undefined,
+        .method = .GET,
+        .path = "/users/42",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .path_params = std.StringHashMapUnmanaged([]const u8).empty,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .request = undefined,
+        .body_read = false,
+        .body_data = null,
+        .headers_parsed = false,
+        .user_data = null,
+    };
+    defer {
+        freeHashMap(&ctx.path_params, allocator);
+    }
+
+    try std.testing.expect(matchPattern("users/:id", "/users/42", allocator, &ctx));
+    try std.testing.expectEqualStrings("42", ctx.path_params.get("id").?);
+}
+
+test "matchPattern - wildcard" {
+    const allocator = std.testing.allocator;
+    var ctx = RequestContext{
+        .allocator = undefined,
+        .io = undefined,
+        .method = .GET,
+        .path = "/static/js/app.js",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .path_params = std.StringHashMapUnmanaged([]const u8).empty,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .request = undefined,
+        .body_read = false,
+        .body_data = null,
+        .headers_parsed = false,
+        .user_data = null,
+    };
+    defer {
+        freeHashMap(&ctx.path_params, allocator);
+    }
+
+    try std.testing.expect(matchPattern("static/*", "/static/js/app.js", allocator, &ctx));
+    try std.testing.expectEqualStrings("js/app.js", ctx.path_params.get("").?);
+}
+
+test "matchPattern - trailing slash" {
+    const allocator = std.testing.allocator;
+    var ctx = RequestContext{
+        .allocator = undefined,
+        .io = undefined,
+        .method = .GET,
+        .path = "/users/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .path_params = std.StringHashMapUnmanaged([]const u8).empty,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .request = undefined,
+        .body_read = false,
+        .body_data = null,
+        .headers_parsed = false,
+        .user_data = null,
+    };
+    defer {
+        freeHashMap(&ctx.path_params, allocator);
+    }
+
+    try std.testing.expect(matchPattern("users", "/users/", allocator, &ctx));
+    try std.testing.expect(!matchPattern("users/posts", "/users/", allocator, &ctx));
 }

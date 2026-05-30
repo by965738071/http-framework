@@ -21,9 +21,17 @@
 //! - 连接断开（EndOfStream、BrokenPipe 等）静默处理
 //! - `io.concurrent` 失败时关闭连接但不崩溃
 
+const builtin = @import("builtin");
 const std = @import("std");
 const http = std.http;
 const net = std.Io.net;
+
+// Windows: SetConsoleCtrlHandler 已从 std.os.windows 中移除，
+// 需要从 kernel32 直接声明
+const SetConsoleCtrlHandler = if (builtin.os.tag == .windows)
+    @extern(*const fn (handler: *const fn (u32) callconv(.c) i32, add: i32) callconv(.c) i32, .{ .library_name = "kernel32", .name = "SetConsoleCtrlHandler" })
+else
+    @compileError("SetConsoleCtrlHandler is Windows-only");
 
 const Config = @import("config.zig").Config;
 const RequestContext = @import("request.zig");
@@ -197,6 +205,7 @@ fn handleConnection(
             requestLog(&self.file_logger, "[ERROR] RequestContext init failed: {}", .{ctx_err});
             break;
         };
+        ctx.body_size_limit = self.config.body_size_limit;
 
         // 记录请求到达
         requestLog(&self.file_logger, "[REQUEST] {s} {s}", .{
@@ -354,7 +363,19 @@ pub fn deinit(self: *Self) void {
 // =========================================================================
 
 fn setupSignalHandlers(self: *Self) !void {
-    _ = self;
+    const S = struct {
+        var server_ptr: ?*Self = null;
+
+        fn handler(ctrl_type: u32) callconv(.c) i32 {
+            _ = ctrl_type;
+            if (server_ptr) |s| {
+                s.shutdown();
+            }
+            return 1;
+        }
+    };
+    S.server_ptr = self;
+    _ = SetConsoleCtrlHandler(S.handler, 1);
 }
 
 pub fn shutdown(self: *Self) void {
