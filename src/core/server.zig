@@ -375,7 +375,9 @@ fn setupSignalHandlers(self: *Self) !void {
         }
     };
     S.server_ptr = self;
-    _ = SetConsoleCtrlHandler(S.handler, 1);
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(S.handler, 1);
+    }
 }
 
 pub fn shutdown(self: *Self) void {

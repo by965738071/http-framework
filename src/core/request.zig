@@ -247,8 +247,7 @@ pub fn readBody(self: *Self) ![]const u8 {
     var temp_buf: [65536]u8 = undefined;
     const body_reader = self.request.readerExpectNone(&temp_buf);
 
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(self.allocator);
+    var result = try std.ArrayList(u8).initCapacity(self.allocator, 256);
 
     var total_read: u64 = 0;
     var chunk_buf: [65536]u8 = undefined;
@@ -496,8 +495,7 @@ pub fn freeHashMap(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.
 ///
 /// 将 `%XX` 序列解码为对应字节，将 `+` 解码为空格。
 fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
+    var result = try std.ArrayList(u8).initCapacity(allocator, 64);
 
     var i: usize = 0;
     while (i < input.len) : (i += 1) {

@@ -1,40 +1,25 @@
-//! 通用反序列化模块
+//! Deserialization module
 //!
-//! 利用 Zig comptime 反射，将 HTTP 请求体（JSON / form-urlencoded�?
-//! 自动映射到用户定义的结构体类�?T�?
+//! Auto-map HTTP request body (JSON / form-urlencoded) to user structs
+//! using Zig comptime reflection.
 //!
-//! # 设计原则
-//!
-//! 1. **类型安全** �?编译期检�?T 是否为合法的结构体类�?
-//! 2. **内存安全** �?使用 Arena 分配器，调用方通过 `Parsed(T).deinit()` 统一释放
-//! 3. **零拷�?* �?JSON 解析直接映射�?T，form 解析使用 arena 分配字符�?
-//! 4. **扩展�?* �?Content-Type 分发机制，易于添加新格式
-//!
-//! # 使用示例
-//!
+//! Usage:
 //! ```zig
-//! const CreateUser = struct {
-//!     name: []const u8,
-//!     age: u32,
-//!     email: []const u8,
-//! };
-//!
+//! const CreateUser = struct { name: []const u8, age: u32, email: []const u8 };
 //! fn handler(ctx: *RequestContext, res: *Response) !void {
 //!     var parsed = try ctx.bodyAs(CreateUser);
 //!     defer parsed.deinit();
-//!
 //!     const user = parsed.value;
-//!     std.log.info("name={s}, age={d}", .{ user.name, user.age });
 //! }
 //! ```
 
 const std = @import("std");
 const mem = std.mem;
 
-/// 反序列化结果包装�?
+
 ///
 /// 持有反序列化后的值和 Arena 分配器，
-/// 调用 `deinit()` 一次性释放所有相关内存�?
+
 pub fn Parsed(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -42,7 +27,7 @@ pub fn Parsed(comptime T: type) type {
         value: T,
         arena: *std.heap.ArenaAllocator,
 
-        /// 释放所有反序列化过程中分配的内�?
+
         pub fn deinit(self: *Self) void {
             const allocator = self.arena.child_allocator;
             self.arena.deinit();
@@ -51,13 +36,13 @@ pub fn Parsed(comptime T: type) type {
     };
 }
 
-/// 反序列化错误�?
+
 pub const DeserializeError = error{
-    /// 请求体为�?
+
     EmptyBody,
     /// 不支持的 Content-Type
     UnsupportedContentType,
-    /// 缺少 Content-Type �?
+
     NoContentType,
     /// JSON 解析失败
     InvalidJson,
@@ -65,7 +50,7 @@ pub const DeserializeError = error{
     InvalidForm,
     /// 缺少必填字段
     MissingField,
-    /// 字段类型不匹�?
+
     TypeMismatch,
 };
 
@@ -73,16 +58,16 @@ pub const DeserializeError = error{
 // JSON 反序列化
 // ===========================================================================
 
-/// �?JSON 请求体反序列化为类型 T
+
 ///
-/// 使用 `std.json.parseFromSlice` 进行解析�?
-/// 通过 Arena 分配器管理所有堆内存�?
+
+
 pub fn parseJson(
     comptime T: type,
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-    // 创建 arena 分配�?
+
     const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
     arena.* = std.heap.ArenaAllocator.init(allocator);
 
@@ -94,8 +79,8 @@ pub fn parseJson(
         allocator.destroy(arena);
         return error.InvalidJson;
     };
-    // 注意：不�?deinit parsed，arena 会统一管理内存
-    // parsed.value 中的 slice 指向 arena 分配的内�?
+
+
 
     return Parsed(T){
         .value = parsed.value,
@@ -104,26 +89,26 @@ pub fn parseJson(
 }
 
 // ===========================================================================
-// form-urlencoded 反序列化（comptime 反射�?
+
 // ===========================================================================
 
-/// �?form-urlencoded 请求体反序列化为类型 T
+
 ///
-/// 使用 comptime 反射遍历 T 的字段，�?key=value 对中提取值并转换类型�?
+
 ///
 /// 支持的字段类型：
-/// - `[]const u8` �?原样赋值（URL 解码后）
-/// - `[]u8` �?同上
-/// - 整数类型（i8/i16/i32/i64/u8/u16/u32/u64）�?解析为对应整�?
-/// - 浮点类型（f32/f64）�?解析为对应浮点数
-/// - `bool` �?"true"/"1" �?true，其余为 false
-/// - `?T` �?可选类型，字段缺失时为 null
+
+
+
+
+
+
 pub fn parseForm(
     comptime T: type,
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-    // 创建 arena 分配�?
+
     const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
@@ -136,7 +121,7 @@ pub fn parseForm(
     // 解析 form-urlencoded 键值对
     var pairs = FormPairs.init(body);
 
-    // comptime 反射：遍�?T 的所有字�?
+
     const info = @typeInfo(T);
     if (info != .@"struct") {
         @compileError("bodyAs only supports struct types, got: " ++ @typeName(T));
@@ -145,7 +130,7 @@ pub fn parseForm(
     var result: T = undefined;
     const fields = info.@"struct".fields;
 
-    // 记录哪些字段已被设置（用于检测缺失的必填字段�?
+
     var set_fields: [fields.len]bool = [_]bool{false}**fields.len;
 
     // 遍历 form 键值对，匹配结构体字段
@@ -162,7 +147,7 @@ pub fn parseForm(
         }
     }
 
-    // 检查缺失的必填字段（非可选类型必须被设置�?
+
     inline for (fields, 0..) |field, i| {
         if (!set_fields[i]) {
             const field_info = @typeInfo(field.type);
@@ -193,14 +178,14 @@ fn parseFormField(
 ) DeserializeError!T {
     const info = @typeInfo(T);
 
-    // 处理可选类�?
+
     if (info == .optional) {
         const inner = info.optional.child;
         if (value.len == 0) return null;
         return try parseFormField(inner, allocator, value);
     }
 
-    // 处理字符串类�?�?使用 arena 分配一份副�?
+
     if (T == []const u8 or T == [:0]const u8) {
         const decoded = urlDecode(allocator, value) catch return error.TypeMismatch;
         return decoded;
@@ -238,18 +223,18 @@ fn parseFormField(
 // URL 解码
 // ===========================================================================
 
-/// �?URL 编码的字符串进行百分比解�?
+
 ///
-/// �?`%XX` 序列解码为对应字节，�?`+` 解码为空格�?
-/// 返回的内存由 arena 分配器管理�?
+
+
 fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     // 快速路径：没有需要解码的字符
     if (mem.indexOfAny(u8, input, "%+") == null) {
-        // 直接复制一�?
+
         return allocator.dupe(u8, input);
     }
 
-    var result = std.ArrayList(u8).empty;
+    var result = try std.ArrayList(u8).initCapacity(allocator, 64);
     errdefer result.deinit(allocator);
 
     var i: usize = 0;
@@ -276,10 +261,10 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 }
 
 // ===========================================================================
-// Form 键值对解析�?
+
 // ===========================================================================
 
-/// 简单的 form-urlencoded 解析�?
+
 const FormPairs = struct {
     input: []const u8,
     pos: usize,
@@ -299,7 +284,7 @@ const FormPairs = struct {
     fn next(self: *FormPairs) ?Pair {
         if (self.pos >= self.input.len) return null;
 
-        // 找到下一�?'&' �?';'
+
         const end = mem.indexOfAny(u8, self.input[self.pos..], "&;") orelse self.input.len - self.pos;
         const segment = self.input[self.pos .. self.pos + end];
 
@@ -314,7 +299,7 @@ const FormPairs = struct {
             };
         }
 
-        // 没有 '='，视�?key=true
+
         return .{
             .key = segment,
             .value = "true",
