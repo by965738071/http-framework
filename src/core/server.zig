@@ -21,17 +21,10 @@
 //! - 连接断开（EndOfStream、BrokenPipe 等）静默处理
 //! - `io.concurrent` 失败时关闭连接但不崩溃
 
-const builtin = @import("builtin");
 const std = @import("std");
+const builtin = @import("builtin");
 const http = std.http;
 const net = std.Io.net;
-
-// Windows: SetConsoleCtrlHandler 已从 std.os.windows 中移除，
-// 需要从 kernel32 直接声明
-const SetConsoleCtrlHandler = if (builtin.os.tag == .windows)
-    @extern(*const fn (handler: *const fn (u32) callconv(.c) i32, add: i32) callconv(.c) i32, .{ .library_name = "kernel32", .name = "SetConsoleCtrlHandler" })
-else
-    @compileError("SetConsoleCtrlHandler is Windows-only");
 
 const Config = @import("config.zig").Config;
 const RequestContext = @import("request.zig");
@@ -376,7 +369,8 @@ fn setupSignalHandlers(self: *Self) !void {
     };
     S.server_ptr = self;
     if (builtin.os.tag == .windows) {
-        _ = SetConsoleCtrlHandler(S.handler, 1);
+        const handler_fn = @extern(*const fn (handler: *const fn (u32) callconv(.c) i32, add: i32) callconv(.c) i32, .{ .library_name = "kernel32", .name = "SetConsoleCtrlHandler" });
+        _ = handler_fn(S.handler, 1);
     }
 }
 
