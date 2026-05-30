@@ -52,7 +52,7 @@ pub fn parseJson(
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.EmptyBody;
     arena.* = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
 
@@ -85,7 +85,7 @@ pub fn parseForm(
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.EmptyBody;
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
         arena.deinit();
@@ -109,7 +109,9 @@ pub fn parseForm(
         inline for (fields, 0..) |field, i| {
             if (mem.eql(u8, pair.key, field.name)) {
                 @field(result, field.name) = try parseFormField(
-                    field.type, arena_alloc, pair.value,
+                    field.type,
+                    arena_alloc,
+                    pair.value,
                 );
                 set_fields[i] = true;
             }
