@@ -70,9 +70,8 @@ pub const RateLimiter = struct {
 
         // 检查速率限制
         if (self.isRateLimited(identifier, now)) {
-            // 超出限制，返回 .respond 阻止请求
-            // 注意：此处无法设置响应头，需要在外层处理
-            return .respond; // 阻止请求
+            ctx.blocked_status = .too_many_requests;
+            return .respond;
         }
 
         // 更新记录
@@ -129,8 +128,8 @@ pub const RateLimiter = struct {
     fn updateRecord(self: *Self, identifier: []const u8, now: i96) !void {
         const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
 
-        if (self.records.get(identifier)) |*record| {
-            // 检查是否需要重置窗口
+        if (self.records.getPtr(identifier)) |record| {
+            // check if window needs reset
             if (now - record.window_start >= window_ns) {
                 record.* = .{
                     .count = 1,

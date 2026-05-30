@@ -30,6 +30,8 @@ const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 const Router = @import("router.zig");
 const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
+const MetricsCollector = @import("metrics.zig").MetricsCollector;
+const CorsMiddleware = @import("cors.zig").CorsMiddleware;
 
 /// 每个连接的读取缓冲区大小（必须能容纳最大 HTTP 头部）
 const READ_BUF_SIZE: usize = 16384;
@@ -46,6 +48,12 @@ config: Config,
 
 /// 文件日志器（可选，由 config.log_file_path 控制）
 file_logger: ?RotatingFileLogger = null,
+
+/// CORS 中间件（可选）
+cors: ?*CorsMiddleware = null,
+
+/// 性能指标（可选）
+metrics: ?MetricsCollector = null,
 
 const Self = @This();
 
@@ -101,6 +109,14 @@ pub fn init(
 }
 
 /// 启动服务器事件循环，阻塞至服务器被关闭。
+pub fn setMetrics(self: *Self, m: MetricsCollector) void {
+    self.metrics = m;
+}
+
+pub fn setCors(self: *Self, c: *CorsMiddleware) void {
+    self.cors = c;
+}
+
 pub fn run(self: *Self) !void {
     self.running = true;
     serverLog(&self.file_logger, .info, "Server listening on {s}:{d}", .{ self.config.address, self.config.port });
@@ -188,10 +204,16 @@ fn handleConnection(
             ctx.path,
         });
 
-        // --- 步骤 3: 初始化响应构建器（纯栈分配，零开销） ---
+        // --- 步骤 3: 初始化响应构建器 ---
         var response = Response.init(self.allocator, &http_request);
 
+        // CORS 自动注入
+        if (self.cors) |c| {
+            c.addCorsHeaders(&ctx, &response) catch {};
+        }
+
         // --- 步骤 4: 路由分发 ---
+        const dispatch_start = std.Io.Timestamp.now(io, .awake).nanoseconds;
         _ = self.router.dispatch(&ctx, &response) catch |dispatch_err| {
             requestLog(&self.file_logger, "[ERROR] {s} {s} -> dispatch: {}", .{
                 @tagName(ctx.method),
@@ -207,6 +229,18 @@ fn handleConnection(
             ctx.path,
             @tagName(response.status),
         });
+
+        // 记录性能指标
+        if (self.metrics) |*m| {
+            const latency = std.Io.Timestamp.now(io, .awake).nanoseconds - dispatch_start;
+            m.recordRequest(.{
+                .method = @tagName(ctx.method),
+                .path = ctx.path,
+                .status = @intFromEnum(response.status),
+                .latency_ns = @as(u64, @intCast(latency)),
+                .timestamp = @intCast(dispatch_start),
+            }) catch {};
+        }
 
         // WebSocket 升级后跳出 keep-alive
         if (ctx.is_websocket) break;

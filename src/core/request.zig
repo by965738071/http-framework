@@ -67,6 +67,9 @@ headers_parsed: bool,
 // ---- 用户数据（中间件传递） ----
 user_data: ?*anyopaque,
 
+// ---- 中间件拦截状态码 ----
+blocked_status: ?http.Status = null,
+
 // ---- websocket ----
 is_websocket: bool = false, // 新增
 

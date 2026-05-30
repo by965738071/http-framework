@@ -14,7 +14,7 @@ pub const CorsConfig = struct {
     allowed_origins: []const []const u8 = &.{},
 
     /// 允许的 HTTP 方法
-    allowed_methods: std.http.Method,
+    allowed_methods: []const std.http.Method = &.{},
 
     /// 允许的请求头
     allowed_headers: []const []const u8 = &.{ "Content-Type", "Authorization" },
@@ -107,46 +107,40 @@ pub const CorsMiddleware = struct {
 
         // Access-Control-Allow-Origin
         if (self.config.allowed_origins.len == 0) {
-            try res.header("Access-Control-Allow-Origin", "*");
+            _ = try res.header("Access-Control-Allow-Origin", "*");
         } else {
-            try res.header("Access-Control-Allow-Origin", origin);
+            _ = try res.header("Access-Control-Allow-Origin", origin);
         }
 
         // Access-Control-Allow-Methods
         if (self.config.allowed_methods.len > 0) {
-            var methods_list = std.ArrayList(u8).empty;
+            var methods_list = try std.ArrayList(u8).initCapacity(self.allocator, 64);
             defer methods_list.deinit(self.allocator);
-
             for (self.config.allowed_methods, 0..) |method, i| {
-                if (i > 0) {
-                    try methods_list.appendSlice(self.allocator, ", ");
-                }
-                try methods_list.appendSlice(self.allocator, method);
+                if (i > 0) try methods_list.appendSlice(self.allocator, ", ");
+                try methods_list.appendSlice(self.allocator, @tagName(method));
             }
             const methods_str = try methods_list.toOwnedSlice(self.allocator);
             defer self.allocator.free(methods_str);
-            try res.header("Access-Control-Allow-Methods", methods_str);
+            _ = try res.header("Access-Control-Allow-Methods", methods_str);
         }
 
         // Access-Control-Allow-Headers
         if (self.config.allowed_headers.len > 0) {
-            var headers_list = std.ArrayList(u8).empty;
+            var headers_list = try std.ArrayList(u8).initCapacity(self.allocator, 64);
             defer headers_list.deinit(self.allocator);
-
             for (self.config.allowed_headers, 0..) |header, i| {
-                if (i > 0) {
-                    try headers_list.appendSlice(self.allocator, ", ");
-                }
+                if (i > 0) try headers_list.appendSlice(self.allocator, ", ");
                 try headers_list.appendSlice(self.allocator, header);
             }
             const headers_str = try headers_list.toOwnedSlice(self.allocator);
             defer self.allocator.free(headers_str);
-            try res.header("Access-Control-Allow-Headers", headers_str);
+            _ = try res.header("Access-Control-Allow-Headers", headers_str);
         }
 
         // Access-Control-Expose-Headers
         if (self.config.exposed_headers.len > 0) {
-            var exposed_list = std.ArrayList(u8).empty;
+            var exposed_list = try std.ArrayList(u8).initCapacity(self.allocator, 64);
             defer exposed_list.deinit(self.allocator);
 
             for (self.config.exposed_headers, 0..) |header, i| {
@@ -157,19 +151,19 @@ pub const CorsMiddleware = struct {
             }
             const exposed_str = try exposed_list.toOwnedSlice(self.allocator);
             defer self.allocator.free(exposed_str);
-            try res.header("Access-Control-Expose-Headers", exposed_str);
+            _ = try res.header("Access-Control-Expose-Headers", exposed_str);
         }
 
         // Access-Control-Allow-Credentials
         if (self.config.allow_credentials) {
-            try res.header("Access-Control-Allow-Credentials", "true");
+            _ = try res.header("Access-Control-Allow-Credentials", "true");
         }
 
         // Access-Control-Max-Age (for preflight)
         if (ctx.method == .OPTIONS) {
             var max_age_buf: [32]u8 = undefined;
             const max_age_str = try std.fmt.bufPrint(&max_age_buf, "{d}", .{self.config.max_age});
-            try res.header("Access-Control-Max-Age", max_age_str);
+            _ = try res.header("Access-Control-Max-Age", max_age_str);
         }
     }
 };

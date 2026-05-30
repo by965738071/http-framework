@@ -134,6 +134,9 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
                         .next => continue,
                         .respond => {
                             routeLog(self.file_logger, "[MIDDLEWARE] blocked at '{s}'", .{middle.name});
+                            if (ctx.blocked_status) |status| {
+                                _ = res.statusCode(status);
+                            }
                             return true;
                         },
                         .err => return true,

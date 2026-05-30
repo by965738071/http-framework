@@ -14,6 +14,9 @@ const Config = core.Config;
 const WebSocket = core.WebSocket;
 const Static = core.Static;
 const WsEchoHandler = core.WsEchoHandler;
+const CorsMiddleware = core.Cors;
+const RateLimiter = core.RateLimiter;
+const MetricsCollector = core.Metrics;
 const HomeHandler = @import("api/home.zig");
 const UserHandler = @import("api/user.zig");
 
@@ -47,6 +50,22 @@ pub fn main(init: std.process.Init) !void {
     var router = Router.init(allocator);
     defer router.deinit();
 
+    // ── CORS / RateLimiter / Metrics ───────────────
+    var cors = try CorsMiddleware.CorsMiddleware.init(allocator, .{
+        .allowed_origins = &.{"*"},
+        .allowed_methods = &.{.GET},
+    });
+    defer cors.deinit();
+
+    var rate_limiter = try RateLimiter.RateLimiter.init(allocator, io, .{
+        .window_seconds = 60, .max_requests = 100,
+    });
+    defer rate_limiter.deinit();
+
+    var metrics = MetricsCollector.MetricsCollector.init(allocator);
+    defer metrics.deinit();
+
+
     // ── WebSocket 管理器 & 处理器 ─────────────────────
     var ws_manager = WebSocket.WebSocketManager.init(allocator, io);
     defer ws_manager.deinit();
@@ -61,6 +80,22 @@ pub fn main(init: std.process.Init) !void {
         allocator,
         .{ .default_name = "John Doe" },
     ));
+
+    // Rate-limited endpoint
+    try router.routeWithMiddleware(.GET, "/api/limited", Handler.fromFn(struct {
+        fn handler(ctx: *RequestContext, res: *Response) !void {
+            _ = ctx;
+            try res.statusCode(.ok).json(.{ .message = "rate-limited endpoint" });
+        }
+    }.handler), &.{rate_limiter.middleware});
+
+    // Metrics endpoint (uses server.metrics)
+    try router.route(.GET, "/metrics", Handler.fromFn(struct {
+        fn handler(ctx: *RequestContext, res: *Response) !void {
+            _ = ctx;
+            try res.statusCode(.ok).text("Metrics: see server logs for report");
+        }
+    }.handler));
 
     // 404 处理
     router.notFound(Handler.fromFn(struct {
@@ -88,5 +123,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var server = try Server.init(allocator, io, config, router);
     defer server.deinit();
+    server.setCors(cors);
+    server.setMetrics(metrics);
     try server.run();
 }
