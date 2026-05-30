@@ -16,17 +16,12 @@
 const std = @import("std");
 const mem = std.mem;
 
-
-///
-/// 持有反序列化后的值和 Arena 分配器，
-
+/// Wraps a deserialized value with an ArenaAllocator for unified cleanup.
 pub fn Parsed(comptime T: type) type {
     return struct {
         const Self = @This();
-
         value: T,
         arena: *std.heap.ArenaAllocator,
-
 
         pub fn deinit(self: *Self) void {
             const allocator = self.arena.child_allocator;
@@ -36,42 +31,29 @@ pub fn Parsed(comptime T: type) type {
     };
 }
 
-
 pub const DeserializeError = error{
-
     EmptyBody,
-    /// 不支持的 Content-Type
     UnsupportedContentType,
-
     NoContentType,
-    /// JSON 解析失败
     InvalidJson,
-    /// form-urlencoded 解析失败
     InvalidForm,
-    /// 缺少必填字段
     MissingField,
-
     TypeMismatch,
 };
 
 // ===========================================================================
-// JSON 反序列化
+// JSON Deserialization
 // ===========================================================================
 
-
-///
-
-
+/// Parse a JSON request body into type T.
+/// Uses an ArenaAllocator to manage all heap memory.
 pub fn parseJson(
     comptime T: type,
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-
     const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
     arena.* = std.heap.ArenaAllocator.init(allocator);
-
-    // 使用 arena 的分配器进行 JSON 解析
     const arena_alloc = arena.allocator();
 
     const parsed = std.json.parseFromSlice(T, arena_alloc, body, .{}) catch {
@@ -80,8 +62,6 @@ pub fn parseJson(
         return error.InvalidJson;
     };
 
-
-
     return Parsed(T){
         .value = parsed.value,
         .arena = arena,
@@ -89,38 +69,31 @@ pub fn parseJson(
 }
 
 // ===========================================================================
-
+// Form Deserialization (comptime reflection)
 // ===========================================================================
 
-
+/// Parse a form-urlencoded body into type T using comptime reflection.
 ///
-
-///
-/// 支持的字段类型：
-
-
-
-
-
-
+/// Supported field types:
+/// - []const u8, [:0]const u8, []u8 � URL-decoded copy
+/// - Integers (i8..i64, u8..u64) � parsed from string
+/// - Floats (f32, f64) � parsed from string
+/// - bool � "true"/"1" = true, else false
+/// - ?T � optional, null if missing
 pub fn parseForm(
     comptime T: type,
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-
     const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
         arena.deinit();
         allocator.destroy(arena);
     }
-
     const arena_alloc = arena.allocator();
 
-    // 解析 form-urlencoded 键值对
     var pairs = FormPairs.init(body);
-
 
     const info = @typeInfo(T);
     if (info != .@"struct") {
@@ -130,47 +103,36 @@ pub fn parseForm(
     var result: T = undefined;
     const fields = info.@"struct".fields;
 
+    var set_fields: [fields.len]bool = ([_]bool{false})**fields.len;
 
-    var set_fields: [fields.len]bool = [_]bool{false}**fields.len;
-
-    // 遍历 form 键值对，匹配结构体字段
     while (pairs.next()) |pair| {
         inline for (fields, 0..) |field, i| {
             if (mem.eql(u8, pair.key, field.name)) {
                 @field(result, field.name) = try parseFormField(
-                    field.type,
-                    arena_alloc,
-                    pair.value,
+                    field.type, arena_alloc, pair.value,
                 );
                 set_fields[i] = true;
             }
         }
     }
 
-
     inline for (fields, 0..) |field, i| {
         if (!set_fields[i]) {
             const field_info = @typeInfo(field.type);
             if (field_info == .optional) {
-                // 可选字段默认为 null
                 @field(result, field.name) = null;
             } else if (field.default_value) |default| {
-                // 有默认值的字段
                 @field(result, field.name) = @as(*const field.type, @ptrCast(@alignCast(default))).*;
             } else {
-                // 必填字段缺失
                 return error.MissingField;
             }
         }
     }
 
-    return Parsed(T){
-        .value = result,
-        .arena = arena,
-    };
+    return Parsed(T){ .value = result, .arena = arena };
 }
 
-/// 解析单个 form 字段值为指定类型
+/// Parse a single form field value to the given type.
 fn parseFormField(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -178,59 +140,44 @@ fn parseFormField(
 ) DeserializeError!T {
     const info = @typeInfo(T);
 
-
     if (info == .optional) {
         const inner = info.optional.child;
         if (value.len == 0) return null;
         return try parseFormField(inner, allocator, value);
     }
 
-
     if (T == []const u8 or T == [:0]const u8) {
-        const decoded = urlDecode(allocator, value) catch return error.TypeMismatch;
-        return decoded;
+        return urlDecode(allocator, value) catch return error.TypeMismatch;
     }
     if (T == []u8) {
-        const decoded = urlDecode(allocator, value) catch return error.TypeMismatch;
-        return decoded;
+        return urlDecode(allocator, value) catch return error.TypeMismatch;
     }
 
-    // 处理布尔类型
     if (T == bool) {
-        if (mem.eql(u8, value, "true") or mem.eql(u8, value, "1")) {
-            return true;
-        }
+        if (mem.eql(u8, value, "true") or mem.eql(u8, value, "1")) return true;
         return false;
     }
 
-    // 处理整数类型
     if (info == .int) {
         const trimmed = mem.trim(u8, value, " ");
         return std.fmt.parseInt(T, trimmed, 10) catch return error.TypeMismatch;
     }
 
-    // 处理浮点类型
     if (info == .float) {
         const trimmed = mem.trim(u8, value, " ");
         return std.fmt.parseFloat(T, trimmed) catch return error.TypeMismatch;
     }
 
-    // 不支持的类型
     @compileError("Unsupported field type for form deserialization: " ++ @typeName(T));
 }
 
 // ===========================================================================
-// URL 解码
+// URL Decode
 // ===========================================================================
 
-
-///
-
-
+/// Percent-decode a URL-encoded string. Caller owns the returned memory.
 fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    // 快速路径：没有需要解码的字符
     if (mem.indexOfAny(u8, input, "%+") == null) {
-
         return allocator.dupe(u8, input);
     }
 
@@ -261,9 +208,8 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 }
 
 // ===========================================================================
-
+// Form Key-Value Pair Iterator
 // ===========================================================================
-
 
 const FormPairs = struct {
     input: []const u8,
@@ -275,23 +221,16 @@ const FormPairs = struct {
     };
 
     fn init(input: []const u8) FormPairs {
-        return .{
-            .input = input,
-            .pos = 0,
-        };
+        return .{ .input = input, .pos = 0 };
     }
 
     fn next(self: *FormPairs) ?Pair {
         if (self.pos >= self.input.len) return null;
 
-
         const end = mem.indexOfAny(u8, self.input[self.pos..], "&;") orelse self.input.len - self.pos;
         const segment = self.input[self.pos .. self.pos + end];
-
-        // 推进位置
         self.pos += end + 1;
 
-        // 分割 key=value
         if (mem.indexOfScalar(u8, segment, '=')) |eq_idx| {
             return .{
                 .key = segment[0..eq_idx],
@@ -299,25 +238,17 @@ const FormPairs = struct {
             };
         }
 
-
-        return .{
-            .key = segment,
-            .value = "true",
-        };
+        return .{ .key = segment, .value = "true" };
     }
 };
 
 // ===========================================================================
-// 测试
+// Tests
 // ===========================================================================
 
 test "Parsed lifecycle" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-        age: u32,
-    };
+    const T = struct { name: []const u8, age: u32 };
 
     var parsed = try parseJson(T, allocator, "{\"name\":\"Alice\",\"age\":30}");
     defer parsed.deinit();
@@ -328,11 +259,7 @@ test "Parsed lifecycle" {
 
 test "parseForm basic" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-        age: u32,
-    };
+    const T = struct { name: []const u8, age: u32 };
 
     var parsed = try parseForm(T, allocator, "name=Alice&age=30");
     defer parsed.deinit();
@@ -343,11 +270,7 @@ test "parseForm basic" {
 
 test "parseForm optional field" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-        nickname: ?[]const u8,
-    };
+    const T = struct { name: []const u8, nickname: ?[]const u8 };
 
     var parsed = try parseForm(T, allocator, "name=Alice");
     defer parsed.deinit();
@@ -358,11 +281,7 @@ test "parseForm optional field" {
 
 test "parseForm with default value" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-        role: []const u8 = "user",
-    };
+    const T = struct { name: []const u8, role: []const u8 = "user" };
 
     var parsed = try parseForm(T, allocator, "name=Alice");
     defer parsed.deinit();
@@ -373,10 +292,7 @@ test "parseForm with default value" {
 
 test "parseForm with URL encoding" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-    };
+    const T = struct { name: []const u8 };
 
     var parsed = try parseForm(T, allocator, "name=Hello+World%21");
     defer parsed.deinit();
@@ -386,11 +302,7 @@ test "parseForm with URL encoding" {
 
 test "parseForm bool field" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        active: bool,
-        deleted: bool,
-    };
+    const T = struct { active: bool, deleted: bool };
 
     var parsed = try parseForm(T, allocator, "active=true&deleted=false");
     defer parsed.deinit();
@@ -401,11 +313,7 @@ test "parseForm bool field" {
 
 test "parseForm missing required field" {
     const allocator = std.testing.allocator;
-
-    const T = struct {
-        name: []const u8,
-        age: u32,
-    };
+    const T = struct { name: []const u8, age: u32 };
 
     const result = parseForm(T, allocator, "name=Alice");
     try std.testing.expectError(error.MissingField, result);
