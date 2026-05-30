@@ -49,50 +49,6 @@ pub const LogMiddleware = struct {
 };
 
 // =========================================================================
-// AuthMiddleware — Bearer Token 鉴权
-// =========================================================================
-
-pub const AuthMiddleware = struct {
-    token: []const u8,
-    middle: Middle,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-
-    pub fn create(allocator: std.mem.Allocator, io: std.Io, expected_token: []const u8) !*AuthMiddleware {
-        const ptr = try allocator.create(AuthMiddleware);
-        errdefer allocator.destroy(ptr);
-        const token_dup = try allocator.dupe(u8, expected_token);
-        ptr.* = .{ .allocator = allocator, .io = io, .middle = undefined, .token = token_dup };
-        ptr.middle = Middle.init(AuthMiddleware, ptr);
-        return ptr;
-    }
-
-    pub fn process(self: *AuthMiddleware, ctx: *RequestContext) anyerror!NextAction {
-        const auth_header = ctx.getHeader("Authorization") orelse {
-            std.log.debug("[Auth] Missing Authorization header", .{});
-            return .err;
-        };
-        const bearer_prefix = "Bearer ";
-        if (!std.mem.startsWith(u8, auth_header, bearer_prefix)) {
-            std.log.debug("[Auth] Invalid Authorization scheme", .{});
-            return .err;
-        }
-        const provided_token = auth_header[bearer_prefix.len..];
-        if (std.mem.eql(u8, provided_token, self.token)) return .next;
-        std.log.debug("[Auth] Token mismatch", .{});
-        return .err;
-    }
-
-    pub fn deinit(self: *AuthMiddleware) void {
-        self.allocator.free(self.token);
-        self.allocator.destroy(self);
-    }
-};
-
-// =========================================================================
-// RotatingFileLogger — 滚动文件日志器
-// =========================================================================
-
 pub const RotatingFileLogger = struct {
     // ---- 配置 ----
     base_path: []const u8,

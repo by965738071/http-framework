@@ -1,4 +1,5 @@
 pub const Config = @import("config.zig");
+pub const Auth = @import("auth.zig");
 pub const Handler = @import("handler.zig");
 pub const Logger = @import("logger.zig");
 pub const Middleware = @import("middleware.zig");
