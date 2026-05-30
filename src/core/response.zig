@@ -243,3 +243,23 @@ fn buildCookieString(self: *Self, cookie: Cookie) ![]const u8 {
 
     return buf.toOwnedSlice(self.allocator);
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "Cookie struct" {
+    const c = Cookie{
+        .name = "session",
+        .value = "abc123",
+        .max_age = 3600,
+        .path = "/",
+        .secure = true,
+        .http_only = true,
+    };
+    try std.testing.expectEqualStrings("session", c.name);
+    try std.testing.expectEqualStrings("abc123", c.value);
+    try std.testing.expectEqual(@as(?i64, 3600), c.max_age);
+    try std.testing.expect(c.secure);
+    try std.testing.expect(c.http_only);
+}

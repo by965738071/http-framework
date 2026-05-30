@@ -188,3 +188,25 @@ fn getContentType(path: []const u8) []const u8 {
 
     return "application/octet-stream";
 }
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "getContentType - common extensions" {
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", getContentType("index.html"));
+    try std.testing.expectEqualStrings("text/css; charset=utf-8", getContentType("style.css"));
+    try std.testing.expectEqualStrings("application/javascript", getContentType("app.js"));
+    try std.testing.expectEqualStrings("image/png", getContentType("logo.png"));
+    try std.testing.expectEqualStrings("image/jpeg", getContentType("photo.jpg"));
+    try std.testing.expectEqualStrings("image/jpeg", getContentType("photo.jpeg"));
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", getContentType("readme.txt"));
+    try std.testing.expectEqualStrings("application/json", getContentType("data.json"));
+    try std.testing.expectEqualStrings("image/gif", getContentType("anim.gif"));
+    try std.testing.expectEqualStrings("image/svg+xml", getContentType("icon.svg"));
+}
+
+test "getContentType - unknown extension falls back to octet-stream" {
+    try std.testing.expectEqualStrings("application/octet-stream", getContentType("file.xyz"));
+    try std.testing.expectEqualStrings("application/octet-stream", getContentType("noextension"));
+}

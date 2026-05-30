@@ -73,3 +73,132 @@ pub const MetricsCollector = struct {
         return fbs.getWritten();
     }
 };
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "MetricsCollector.init initializes with zero counters" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var collector = MetricsCollector.init(allocator);
+    defer collector.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), collector.total_requests);
+    try std.testing.expectEqual(@as(u32, 0), collector.active_connections);
+    try std.testing.expectEqual(@as(usize, 0), collector.latencies.items.len);
+}
+
+test "MetricsCollector.recordRequest increments counter and stores latency" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var collector = MetricsCollector.init(allocator);
+    defer collector.deinit();
+
+    try collector.recordRequest(.{
+        .method = "GET",
+        .path = "/api/test",
+        .status = 200,
+        .latency_ns = 1_500_000,
+        .timestamp = 1000,
+    });
+    try std.testing.expectEqual(@as(u64, 1), collector.total_requests);
+    try std.testing.expectEqual(@as(usize, 1), collector.latencies.items.len);
+    try std.testing.expectEqual(@as(u64, 1_500_000), collector.latencies.items[0]);
+}
+
+test "MetricsCollector.recordRequest with multiple requests" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var collector = MetricsCollector.init(allocator);
+    defer collector.deinit();
+
+    try collector.recordRequest(.{ .method = "GET", .path = "/a", .status = 200, .latency_ns = 100, .timestamp = 1 });
+    try collector.recordRequest(.{ .method = "POST", .path = "/b", .status = 201, .latency_ns = 200, .timestamp = 2 });
+    try collector.recordRequest(.{ .method = "GET", .path = "/c", .status = 404, .latency_ns = 300, .timestamp = 3 });
+
+    try std.testing.expectEqual(@as(u64, 3), collector.total_requests);
+    try std.testing.expectEqual(@as(usize, 3), collector.latencies.items.len);
+}
+
+test "MetricsCollector getP50/P95/P99 with empty data returns zero" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var collector = MetricsCollector.init(allocator);
+    defer collector.deinit();
+
+    // Empty latency list → early return 0 from getPercentile
+    try std.testing.expectEqual(@as(u64, 0), collector.getP50());
+    try std.testing.expectEqual(@as(u64, 0), collector.getP95());
+    try std.testing.expectEqual(@as(u64, 0), collector.getP99());
+}
+
+test "MetricsCollector.generateReport with empty data" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var collector = MetricsCollector.init(allocator);
+    defer collector.deinit();
+
+    var buf: [512]u8 = undefined;
+    const report = try collector.generateReport(&buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, report, "requests: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "active_conn: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "p50_ns: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "p95_ns: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "p99_ns: 0") != null);
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "MetricsCollector - record and report" {
+    var m = MetricsCollector.init(std.testing.allocator);
+    defer m.deinit();
+
+    try m.recordRequest(.{ .method = "GET", .path = "/", .status = 200, .latency_ns = 1000, .timestamp = 0 });
+    try m.recordRequest(.{ .method = "POST", .path = "/users", .status = 201, .latency_ns = 2000, .timestamp = 0 });
+    try std.testing.expectEqual(@as(u64, 2), m.total_requests);
+
+    var buf: [256]u8 = undefined;
+    const report = try m.generateReport(&buf);
+    try std.testing.expect(report.len > 0);
+}
+
+test "MetricsCollector - connection tracking" {
+    var m = MetricsCollector.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.connectionOpened();
+    m.connectionOpened();
+    try std.testing.expectEqual(@as(u32, 2), m.active_connections);
+    m.connectionClosed();
+    try std.testing.expectEqual(@as(u32, 1), m.active_connections);
+    m.connectionClosed();
+    try std.testing.expectEqual(@as(u32, 0), m.active_connections);
+    m.connectionClosed(); // should not underflow
+    try std.testing.expectEqual(@as(u32, 0), m.active_connections);
+}
+
+test "MetricsCollector - percentiles" {
+    var m = MetricsCollector.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), m.getP50());
+    for (0..100) |i| {
+        try m.recordRequest(.{ .method = "GET", .path = "/", .status = 200, .latency_ns = @as(u64, i) * 10, .timestamp = 0 });
+    }
+    const p50 = m.getP50();
+    try std.testing.expect(p50 > 0);
+}

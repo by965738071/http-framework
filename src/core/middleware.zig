@@ -92,3 +92,68 @@ pub fn process(self: Self, ctx: *RequestContext) anyerror!NextAction {
 pub fn destroy(self: Self) void {
     self.vtable.destroy(self.ptr);
 }
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "Middleware.init - creates middleware" {
+    const T = struct {
+        call_count: u32 = 0,
+
+        pub fn process(self: *@This(), req_ctx: *RequestContext) anyerror!NextAction {
+            _ = req_ctx;
+            self.call_count += 1;
+            return .next;
+        }
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+
+    try std.testing.expectEqualStrings(@typeName(T), mw.name);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&t)), mw.ptr);
+}
+
+test "Middleware.process - executes and returns next" {
+    const T = struct {
+        call_count: u32 = 0,
+
+        pub fn process(self: *@This(), req_ctx: *RequestContext) anyerror!NextAction {
+            _ = req_ctx;
+            self.call_count += 1;
+            return .next;
+        }
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+
+    const req: *RequestContext = @ptrFromInt(0x1000);
+    const action = try mw.process(req);
+
+    try std.testing.expectEqual(NextAction.next, action);
+    try std.testing.expectEqual(@as(u32, 1), t.call_count);
+}
+
+test "Middleware.destroy - calls deinit" {
+    const T = struct {
+        deinit_called: bool = false,
+
+        pub fn process(self: *@This(), req_ctx: *RequestContext) anyerror!NextAction {
+            _ = self;
+            _ = req_ctx;
+            return .next;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.deinit_called = true;
+        }
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+    mw.destroy();
+
+    try std.testing.expect(t.deinit_called);
+}

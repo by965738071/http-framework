@@ -172,3 +172,138 @@ pub const RateLimiter = struct {
         }
     }
 };
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "RateLimiter.init creates instance with given config" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 30,
+        .max_requests = 50,
+        .per_ip = false,
+    };
+
+    const rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    try std.testing.expectEqual(@as(u32, 30), rl.config.window_seconds);
+    try std.testing.expectEqual(@as(u32, 50), rl.config.max_requests);
+    try std.testing.expectEqual(false, rl.config.per_ip);
+    try std.testing.expectEqual(@as(u64, 0), rl.records.count());
+}
+
+test "RateLimiter sliding window: within limit not rate-limited" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 10,
+    };
+
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // Directly insert a record: 5 requests at window_start=0
+    const key = try allocator.dupe(u8, "client-a");
+    try rl.records.put(allocator, key, .{ .count = 5, .window_start = 0 });
+
+    // At 30s (within 60s window), 5 < 10 max → not limited
+    try std.testing.expect(!rl.isRateLimited("client-a", 30_000_000_000));
+}
+
+test "RateLimiter sliding window: exceeding limit is rate-limited" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 10,
+    };
+
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // Record with count at exactly the limit, within the window
+    const key = try allocator.dupe(u8, "client-b");
+    try rl.records.put(allocator, key, .{ .count = 10, .window_start = 0 });
+
+    // At 10s (within 60s window), 10 >= 10 → rate-limited (triggers .respond in process)
+    try std.testing.expect(rl.isRateLimited("client-b", 10_000_000_000));
+}
+
+test "RateLimiter sliding window: window expiry resets limit" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 5,
+    };
+
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // Record at window_start=0 with count=5 (at limit)
+    const key = try allocator.dupe(u8, "client-c");
+    try rl.records.put(allocator, key, .{ .count = 5, .window_start = 0 });
+
+    // At 10s (within 60s window) → rate-limited
+    try std.testing.expect(rl.isRateLimited("client-c", 10_000_000_000));
+
+    // At 60s (exactly window boundary, now - window_start = 60s, NOT < 60s) → not limited
+    // Actually: now - window_start >= window_ns → returns false (window expired)
+    try std.testing.expect(!rl.isRateLimited("client-c", 60_000_000_000));
+
+    // At 61s (past window) → definitely not limited
+    try std.testing.expect(!rl.isRateLimited("client-c", 61_000_000_000));
+}
+
+test "RateLimiter: unknown identifier not rate-limited" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 1,
+    };
+
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // No record exists for "unknown-client" → not rate-limited
+    try std.testing.expect(!rl.isRateLimited("unknown-client", 0));
+}
+
+test "RateLimiter: over-limit returns respond-equivalent" {
+    // When isRateLimited returns true, process() would return .respond
+    // and set ctx.blocked_status = .too_many_requests.
+    // This test verifies the core logic that triggers .respond.
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = RateLimitConfig{
+        .window_seconds = 1,
+        .max_requests = 3,
+    };
+
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const key = try allocator.dupe(u8, "over-limit-client");
+    try rl.records.put(allocator, key, .{ .count = 4, .window_start = 0 });
+
+    // 4 > 3 max, still within 1s window → rate-limited → would trigger .respond
+    try std.testing.expect(rl.isRateLimited("over-limit-client", 500_000_000));
+}

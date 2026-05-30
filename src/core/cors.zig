@@ -167,3 +167,15 @@ pub const CorsMiddleware = struct {
         }
     }
 };
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "CorsConfig defaults" {
+    const cfg = CorsConfig{};
+    try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.allowed_methods.len);
+    try std.testing.expectEqual(@as(u32, 86400), cfg.max_age);
+    try std.testing.expectEqual(false, cfg.allow_credentials);
+}

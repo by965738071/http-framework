@@ -79,3 +79,32 @@ pub const Config = struct {
         return .{};
     }
 };
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "Config.defaults - returns default values" {
+    const config = Config.defaults();
+
+    try std.testing.expectEqualStrings("127.0.0.1", config.address);
+    try std.testing.expectEqual(@as(u16, 9000), config.port);
+    try std.testing.expectEqualStrings("ZigHTTP", config.server_name);
+    try std.testing.expectEqual(@as(u31, 4096), config.tcp_backlog);
+    try std.testing.expectEqual(true, config.reuse_address);
+    try std.testing.expectEqual(@as(usize, 16384), config.read_buffer_size);
+    try std.testing.expectEqual(@as(usize, 8192), config.write_buffer_size);
+    try std.testing.expectEqual(true, config.keep_alive_enabled);
+    try std.testing.expectEqual(@as(u64, 30_000_000_000), config.idle_timeout_ns);
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), config.body_size_limit);
+    try std.testing.expectEqual(true, config.access_log_enabled);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.log_file_path);
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), config.log_max_file_size);
+    try std.testing.expectEqual(@as(u32, 10), config.log_max_backup_files);
+    try std.testing.expectEqual(true, config.log_compress_rotated);
+    try std.testing.expectEqual(false, config.log_async_enabled);
+    try std.testing.expectEqual(true, config.log_rotate_daily);
+    try std.testing.expectEqual(false, config.tls_enabled);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.tls_cert_file);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.tls_key_file);
+}

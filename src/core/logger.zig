@@ -612,6 +612,65 @@ pub const RotatingFileLogger = struct {
 };
 
 // =========================================================================
+// 测试
+// =========================================================================
+
+test "Level.label returns correct labels" {
+    const t = std.testing;
+    try t.expectEqualStrings("ERROR", RotatingFileLogger.Level.label(.err));
+    try t.expectEqualStrings("WARN ", RotatingFileLogger.Level.label(.warn));
+    try t.expectEqualStrings("INFO ", RotatingFileLogger.Level.label(.info));
+    try t.expectEqualStrings("DEBUG", RotatingFileLogger.Level.label(.debug));
+}
+
+test "Level.atLeast filters by minimum level" {
+    const t = std.testing;
+    // Level encoding: err=0, warn=1, info=2, debug=3
+    // atLeast(l, min) = @intFromEnum(l) <= @intFromEnum(min)
+    // Lower numeric value = higher severity; allowed when severity >= min
+
+    // err (0) passes every filter
+    try t.expect(RotatingFileLogger.Level.atLeast(.err, .err));
+    try t.expect(RotatingFileLogger.Level.atLeast(.err, .warn));
+    try t.expect(RotatingFileLogger.Level.atLeast(.err, .info));
+    try t.expect(RotatingFileLogger.Level.atLeast(.err, .debug));
+
+    // warn (1) blocked by err filter, passes warn+
+    try t.expect(!RotatingFileLogger.Level.atLeast(.warn, .err));
+    try t.expect(RotatingFileLogger.Level.atLeast(.warn, .warn));
+    try t.expect(RotatingFileLogger.Level.atLeast(.warn, .info));
+    try t.expect(RotatingFileLogger.Level.atLeast(.warn, .debug));
+
+    // info (2) blocked by err/warn filters
+    try t.expect(!RotatingFileLogger.Level.atLeast(.info, .err));
+    try t.expect(!RotatingFileLogger.Level.atLeast(.info, .warn));
+    try t.expect(RotatingFileLogger.Level.atLeast(.info, .info));
+    try t.expect(RotatingFileLogger.Level.atLeast(.info, .debug));
+
+    // debug (3) only passes debug filter
+    try t.expect(!RotatingFileLogger.Level.atLeast(.debug, .err));
+    try t.expect(!RotatingFileLogger.Level.atLeast(.debug, .warn));
+    try t.expect(!RotatingFileLogger.Level.atLeast(.debug, .info));
+    try t.expect(RotatingFileLogger.Level.atLeast(.debug, .debug));
+}
+
+test "Date struct construction and field access" {
+    const t = std.testing;
+    const date = RotatingFileLogger.Date{ .year = 2026, .month = 5, .day = 30 };
+    try t.expectEqual(@as(u16, 2026), date.year);
+    try t.expectEqual(@as(u8, 5), date.month);
+    try t.expectEqual(@as(u8, 30), date.day);
+}
+
+test "Date struct zero values" {
+    const t = std.testing;
+    const d = RotatingFileLogger.Date{ .year = 0, .month = 0, .day = 0 };
+    try t.expectEqual(@as(u16, 0), d.year);
+    try t.expectEqual(@as(u8, 0), d.month);
+    try t.expectEqual(@as(u8, 0), d.day);
+}
+
+// =========================================================================
 // FileLogMiddleware — 文件日志中间件
 // =========================================================================
 
@@ -640,3 +699,39 @@ pub const FileLogMiddleware = struct {
         self.allocator.destroy(self);
     }
 };
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "Level.atLeast - debug allows all" {
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.debug, .debug));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.info, .debug));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.warn, .debug));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.err, .debug));
+}
+
+test "Level.atLeast - info filters debug" {
+    try std.testing.expect(!RotatingFileLogger.Level.atLeast(.debug, .info));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.info, .info));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.warn, .info));
+    try std.testing.expect(RotatingFileLogger.Level.atLeast(.err, .info));
+}
+
+test "Level.label - correct strings" {
+    try std.testing.expectEqualStrings("DEBUG", RotatingFileLogger.Level.label(.debug));
+    try std.testing.expectEqualStrings("INFO ", RotatingFileLogger.Level.label(.info));
+    try std.testing.expectEqualStrings("WARN ", RotatingFileLogger.Level.label(.warn));
+    try std.testing.expectEqualStrings("ERROR", RotatingFileLogger.Level.label(.err));
+}
+
+test "Config defaults" {
+    const cfg: RotatingFileLogger.Config = .{};
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), cfg.max_file_size);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_backup_files);
+    try std.testing.expectEqual(true, cfg.compress_rotated);
+    try std.testing.expectEqual(true, cfg.rotate_daily);
+    try std.testing.expectEqual(RotatingFileLogger.Level.info, cfg.min_level);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.buf_size);
+    try std.testing.expectEqual(false, cfg.async_enabled);
+}

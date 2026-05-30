@@ -92,3 +92,55 @@ pub const Template = struct {
         return result.toOwnedSlice(self.allocator);
     }
 };
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "fromString" {
+    const allocator = std.testing.allocator;
+    var tmpl = try Template.fromString(allocator, "Hello");
+    defer tmpl.deinit();
+    try std.testing.expectEqualStrings("Hello", tmpl.content);
+}
+
+test "set and render - single variable" {
+    const allocator = std.testing.allocator;
+    var tmpl = try Template.fromString(allocator, "Hello, {name}!");
+    defer tmpl.deinit();
+    try tmpl.set("name", "World");
+    const result = try tmpl.render();
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello, World!", result);
+}
+
+test "render - multiple variables" {
+    const allocator = std.testing.allocator;
+    var tmpl = try Template.fromString(allocator, "{greeting}, {name}! Score: {score}.");
+    defer tmpl.deinit();
+    try tmpl.set("greeting", "Hi");
+    try tmpl.set("name", "Alice");
+    try tmpl.set("score", "100");
+    const result = try tmpl.render();
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hi, Alice! Score: 100.", result);
+}
+
+test "render - unset variable preserved as-is" {
+    const allocator = std.testing.allocator;
+    var tmpl = try Template.fromString(allocator, "Hello, {name}!");
+    defer tmpl.deinit();
+    // 不设置 name，占位符应保持原样
+    const result = try tmpl.render();
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello, {name}!", result);
+}
+
+test "render - no variables in template" {
+    const allocator = std.testing.allocator;
+    var tmpl = try Template.fromString(allocator, "Plain text without variables.");
+    defer tmpl.deinit();
+    const result = try tmpl.render();
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Plain text without variables.", result);
+}
