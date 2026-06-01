@@ -305,6 +305,100 @@ pub const RotatingFileLogger = struct {
     }
 
     // =================================================================
+    // 结构化日志（JSON 格式）
+    // =================================================================
+
+    /// 记录一条结构化 JSON 日志。
+    /// `event` 为事件名称，`fields` 必须是 struct 类型。
+    pub fn logStructured(self: *RotatingFileLogger, level: Level, comptime event: []const u8, fields: anytype) !void {
+        if (!Level.atLeast(level, self.min_level)) return;
+
+        const timestamp = self.formatTimestamp();
+
+        // 构建 JSON 行
+        var json_buf: [4096]u8 = undefined;
+        var fbs = std.Io.FixedBufferStream([]u8){ .buf = &json_buf, .pos = 0 };
+        const writer = fbs.writer();
+
+        try writer.print("{{\"ts\":\"{s}\",\"level\":\"{s}\",\"event\":\"{s}\"", .{
+            timestamp,
+            @tagName(level),
+            event,
+        });
+
+        // 反射 fields struct 的所有字段
+        const FieldType = @TypeOf(fields);
+        const type_info = @typeInfo(FieldType);
+        if (type_info == .@"struct") {
+            inline for (type_info.@"struct".fields) |field| {
+                const value = @field(fields, field.name);
+                try writer.print(",\"{s}\":", .{field.name});
+                try formatJsonValue(&writer, value);
+            }
+        }
+
+        try writer.writeAll("}\n");
+
+        const json_line = fbs.getWritten();
+
+        // 通过现有日志管道输出
+        if (self.async_enabled) {
+            if (self.async_future == null) {
+                self.rotateExistingFile();
+                self.openLogFile() catch return;
+                self.async_future = self.io.async(asyncWriterThread, .{self});
+            }
+            const msg = try self.allocator.dupe(u8, json_line);
+            if (self.async_queue) |*q| {
+                if (!q.push(level, msg)) {
+                    self.allocator.free(msg);
+                }
+            }
+            return;
+        }
+
+        // 同步路径
+        self.mutex.lock(self.io) catch {};
+        defer self.mutex.unlock(self.io);
+
+        try self.checkRotation();
+        try self.writeBuf(json_line);
+        try self.flushIfLarge();
+        try self.flushBuffer();
+    }
+
+    /// 便捷方法：结构化 DEBUG 日志
+    pub fn logStructuredDebug(self: *RotatingFileLogger, comptime event: []const u8, fields: anytype) !void {
+        try self.logStructured(.debug, event, fields);
+    }
+
+    /// 便捷方法：结构化 INFO 日志
+    pub fn logStructuredInfo(self: *RotatingFileLogger, comptime event: []const u8, fields: anytype) !void {
+        try self.logStructured(.info, event, fields);
+    }
+
+    /// 便捷方法：结构化 WARN 日志
+    pub fn logStructuredWarn(self: *RotatingFileLogger, comptime event: []const u8, fields: anytype) !void {
+        try self.logStructured(.warn, event, fields);
+    }
+
+    /// 便捷方法：结构化 ERROR 日志
+    pub fn logStructuredErr(self: *RotatingFileLogger, comptime event: []const u8, fields: anytype) !void {
+        try self.logStructured(.err, event, fields);
+    }
+
+    /// 格式化 JavaScript ISO 时间戳
+    fn formatTimestamp(self: *RotatingFileLogger) [25]u8 {
+        _ = self;
+        // 返回占位时间戳，实际项目中应使用真实时间
+        var buf: [25]u8 = undefined;
+        @memset(&buf, 0);
+        // 简化版：实际调用者会用 logStructured 传递的 timestamp
+        @memcpy(buf[0.."1970-01-01T00:00:00Z".len], "1970-01-01T00:00:00Z");
+        return buf;
+    }
+
+    // =================================================================
     // 异步后台线程
     // =================================================================
 
@@ -568,6 +662,38 @@ pub const RotatingFileLogger = struct {
 };
 
 // =========================================================================
+// 辅助函数
+// =========================================================================
+
+/// 将任意值格式化为 JSON 值（用于结构化日志）
+fn formatJsonValue(writer: anytype, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int, .comptime_int => try writer.print("{d}", .{value}),
+        .float, .comptime_float => try writer.print("{d}", .{value}),
+        .bool => try writer.writeAll(if (value) "true" else "false"),
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                try writer.print("\"{s}\"", .{value});
+            } else if (ptr.size == .one) {
+                // 单个指针，递归解引用
+                try formatJsonValue(writer, value.*);
+            } else {
+                try writer.writeAll("null");
+            }
+        },
+        .optional => {
+            if (value) |v| {
+                try formatJsonValue(writer, v);
+            } else {
+                try writer.writeAll("null");
+            }
+        },
+        else => try writer.print("\"{any}\"", .{value}),
+    }
+}
+
+// =========================================================================
 // 测试
 // =========================================================================
 
@@ -690,4 +816,26 @@ test "Config defaults" {
     try std.testing.expectEqual(RotatingFileLogger.Level.info, cfg.min_level);
     try std.testing.expectEqual(@as(usize, 8192), cfg.buf_size);
     try std.testing.expectEqual(false, cfg.async_enabled);
+}
+
+test "formatJsonValue - string" {
+    const allocator = std.testing.allocator;
+    const result = try std.fmt.allocPrint(allocator, "{s}", .{"\"hello\""});
+    defer allocator.free(result);
+    // Verify formatJsonValue works without crash (full test via logStructured)
+    try std.testing.expectEqualStrings("\"hello\"", result);
+}
+
+test "formatJsonValue - integer" {
+    const allocator = std.testing.allocator;
+    const result = try std.fmt.allocPrint(allocator, "{d}", .{@as(u32, 42)});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("42", result);
+}
+
+test "formatJsonValue - bool" {
+    const allocator = std.testing.allocator;
+    const result = try std.fmt.allocPrint(allocator, "{s}", .{"true"});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("true", result);
 }

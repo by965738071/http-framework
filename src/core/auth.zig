@@ -170,12 +170,16 @@ pub const AuthMiddleware = struct {
     // ── Result helpers ────────────────────────────────
 
     fn authOk(self: *AuthMiddleware, ctx: *RequestContext, strategy: AuthStrategy) !NextAction {
-        var info = AuthInfo{ .strategy = strategy };
+        // Heap-allocate AuthInfo (freed in ctx.deinit)
+        const info_ptr = try self.allocator.create(AuthInfo);
+        errdefer self.allocator.destroy(info_ptr);
+
+        info_ptr.* = .{ .strategy = strategy };
 
         switch (strategy) {
             .bearer => {
                 const header = ctx.getHeader("Authorization").?;
-                info.token = header["Bearer ".len..];
+                info_ptr.token = try self.allocator.dupe(u8, header["Bearer ".len..]);
             },
             .basic => {
                 const header = ctx.getHeader("Authorization").?;
@@ -184,15 +188,22 @@ pub const AuthMiddleware = struct {
                 const decoder = std.base64.standard.Decoder.init(encoded);
                 const len = decoder.decode(&dec_buf) catch return .next;
                 const colon = std.mem.indexOfScalar(u8, dec_buf[0..len], ':') orelse 0;
-                info.username = dec_buf[0..colon];
+                info_ptr.username = try self.allocator.dupe(u8, dec_buf[0..colon]);
             },
             .api_key => {
-                info.api_key = ctx.getHeader(self.config.api_key_header) orelse ctx.getQuery("api_key");
+                if (ctx.getHeader(self.config.api_key_header)) |key| {
+                    info_ptr.api_key = try self.allocator.dupe(u8, key);
+                } else if (self.config.api_key_query) {
+                    if (ctx.getQuery("api_key")) |key| {
+                        info_ptr.api_key = try self.allocator.dupe(u8, key);
+                    }
+                }
             },
             .custom => {},
         }
 
         // Store in context for downstream handlers
+        ctx.setUserData(@ptrCast(info_ptr));
 
         return .next;
     }

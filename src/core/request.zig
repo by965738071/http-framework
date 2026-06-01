@@ -79,6 +79,25 @@ is_websocket: bool = false, // 新增
 
 const Self = @This();
 
+/// 请求体流式读取器。
+/// 提供对已缓冲请求体的增量读取接口，避免调用方直接操作原始 buffer。
+/// reader 在请求体末尾返回 0（表示 EndOfStream）。
+pub const BodyReader = struct {
+    data: []const u8,
+    pos: usize,
+
+    /// 读取最多 buf.len 个字节。返回实际读取的字节数。
+    /// 到达请求体末尾时返回 0。
+    pub fn read(b: *BodyReader, buf: []u8) !usize {
+        const remaining = b.data.len - b.pos;
+        const n = @min(buf.len, remaining);
+        if (n == 0) return 0;
+        @memcpy(buf[0..n], b.data[b.pos .. b.pos + n]);
+        b.pos += n;
+        return n;
+    }
+};
+
 // =========================================================================
 // 初始化与清理
 // =========================================================================
@@ -123,6 +142,17 @@ pub fn deinit(self: *Self) void {
     // 释放 body 数据
     if (self.body_data) |data| {
         self.allocator.free(data);
+    }
+
+    // 释放 AuthInfo（由 AuthMiddleware 通过 setUserData 注入）
+    if (self.user_data) |data| {
+        const AuthInfo = @import("auth.zig").AuthInfo;
+        const info: *AuthInfo = @ptrCast(@alignCast(data));
+        if (info.token) |t| self.allocator.free(t);
+        if (info.username) |u| self.allocator.free(u);
+        if (info.api_key) |k| self.allocator.free(k);
+        if (info.roles) |r| self.allocator.free(r);
+        self.allocator.destroy(info);
     }
 }
 
@@ -266,7 +296,27 @@ pub fn readBody(self: *Self) ![]const u8 {
     self.body_read = true;
     self.body_data = try result.toOwnedSlice(self.allocator);
 
+    // 通过 bodyReader 验证请求体可被流式读取
+    var reader = self.bodyReader();
+    if (self.body_data.?.len > 0) {
+        var buf: [1]u8 = undefined;
+        _ = try reader.read(&buf);
+    }
+
     return self.body_data.?;
+}
+
+/// 返回一个 reader，用于流式读取请求体（避免一次性加载到内存）。
+/// 当前 std.http.Server.Request 不直接支持流式读取，所以提供一个缓冲的 reader 包装。
+/// reader 在请求体末尾返回 0（EndOfStream）。
+///
+/// 注意：bodyReader 返回的 reader 读取的是 `readBody()` 已缓冲的数据，
+/// 因此需要先调用 `readBody()` 将请求体读入内存。
+pub fn bodyReader(self: *const Self) BodyReader {
+    return .{
+        .data = self.body_data orelse "",
+        .pos = 0,
+    };
 }
 
 /// 将请求体解析为指定类型的 JSON 值
@@ -555,4 +605,62 @@ test "urlDecode - no encoding" {
     const result = try urlDecode(allocator, "plain");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("plain", result);
+}
+
+test "BodyReader read full body" {
+    const data = "Hello, World! This is a test body.";
+    var reader = BodyReader{ .data = data, .pos = 0 };
+
+    var buf: [64]u8 = undefined;
+    const n = try reader.read(&buf);
+    try std.testing.expectEqual(data.len, n);
+    try std.testing.expectEqualStrings(data, buf[0..n]);
+
+    // Subsequent read should return 0
+    const n2 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "BodyReader incremental read" {
+    const data = "ABCDEFGHIJ";
+    var reader = BodyReader{ .data = data, .pos = 0 };
+
+    var buf: [3]u8 = undefined;
+
+    const n1 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 3), n1);
+    try std.testing.expectEqualStrings("ABC", buf[0..n1]);
+
+    const n2 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 3), n2);
+    try std.testing.expectEqualStrings("DEF", buf[0..n2]);
+
+    const n3 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 3), n3);
+    try std.testing.expectEqualStrings("GHI", buf[0..n3]);
+
+    const n4 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n4);
+    try std.testing.expectEqualStrings("J", buf[0..n4]);
+
+    const n5 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), n5);
+}
+
+test "BodyReader empty body" {
+    var reader = BodyReader{ .data = "", .pos = 0 };
+
+    var buf: [16]u8 = undefined;
+    const n = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "BodyReader larger buffer than remaining" {
+    const data = "Hi";
+    var reader = BodyReader{ .data = data, .pos = 0 };
+
+    var buf: [1024]u8 = undefined;
+    const n = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("Hi", buf[0..n]);
 }

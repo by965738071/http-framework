@@ -5,3 +5,4 @@ zig-out
 /examples/.zig-cache
 /example/zig-out
 /log
+.test_data/

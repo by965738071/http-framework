@@ -9,8 +9,14 @@ const Allocator = std.mem.Allocator;
 
 /// Multipart 表单字段
 pub const FormField = union(enum) {
-    text: []const u8,
+    text: TextField,
     file: FileUpload,
+};
+
+/// 文本表单字段
+pub const TextField = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 /// 文件上传信息
@@ -45,7 +51,10 @@ pub const Parser = struct {
     pub fn deinit(self: *Self) void {
         for (self.fields.items) |field| {
             switch (field) {
-                .text => |text| self.allocator.free(text),
+                .text => |t| {
+                    self.allocator.free(t.name);
+                    self.allocator.free(t.value);
+                },
                 .file => |file| {
                     self.allocator.free(file.field_name);
                     if (file.file_name) |name| self.allocator.free(name);
@@ -170,10 +179,11 @@ pub const Parser = struct {
             });
         } else {
             // 普通文本字段
+            const name_dup = try self.allocator.dupe(u8, field_name);
             const data_dup = try self.allocator.dupe(u8, data);
 
             try self.fields.append(self.allocator, .{
-                .text = data_dup,
+                .text = .{ .name = name_dup, .value = data_dup },
             });
         }
     }
@@ -182,11 +192,10 @@ pub const Parser = struct {
     pub fn getText(self: *const Self, name: []const u8) ?[]const u8 {
         for (self.fields.items) |field| {
             switch (field) {
-                .text => |text| {
-                    // 文本字段需要根据 name 匹配，但当前实现简化
-                    // 实际应该解析 Content-Disposition 中的 name
-                    _ = name;
-                    return text;
+                .text => |t| {
+                    if (std.mem.eql(u8, t.name, name)) {
+                        return t.value;
+                    }
                 },
                 .file => continue,
             }

@@ -124,6 +124,6 @@ pub fn main(init: std.process.Init) !void {
     var server = try Server.init(allocator, io, config, router);
     defer server.deinit();
     server.setCors(cors);
-    server.setMetrics(metrics);
+    server.setMetrics(&metrics);
     try server.run();
 }

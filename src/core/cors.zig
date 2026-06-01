@@ -49,29 +49,24 @@ pub const CorsMiddleware = struct {
         return ptr;
     }
 
-    /// 处理请求 - 检查 CORS 并添加响应头
+    /// 处理请求 - 检查 CORS 来源是否允许。
+    /// 注意：响应头的添加通过 `addCorsHeaders()` 单独调用，
+    /// 因为中间件 VTable 不传递 Response 参数。
     pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
         const origin = ctx.getHeader("Origin");
 
-        // 如果没有 Origin 头，不是跨域请求，直接放行
         if (origin == null) {
             return .next;
         }
 
-        // 检查是否为预检请求（OPTIONS 方法 + Access-Control-Request-Method）
-        const is_preflight = ctx.method == .OPTIONS and ctx.getHeader("Access-Control-Request-Method") != null;
-
-        // 检查源是否被允许
-        if (self.isOriginAllowed(origin.?)) {
-            // 如果是预检请求，需要特殊处理
-            if (is_preflight) {
-                // 预检请求：设置 CORS 头并返回 204
-                // 注意：中间件接口限制，这里需要访问 Response
-                // 实际实现需要在路由分发时处理
-                return .next;
-            }
-        } else {
+        if (!self.isOriginAllowed(origin.?)) {
             std.log.warn("CORS: Origin not allowed: {s}", .{origin.?});
+            return .next;
+        }
+
+        // 预检请求：标记为 respond（框架在分发前处理）
+        if (ctx.method == .OPTIONS and ctx.getHeader("Access-Control-Request-Method") != null) {
+            return .respond;
         }
 
         return .next;

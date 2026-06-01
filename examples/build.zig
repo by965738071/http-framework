@@ -23,11 +23,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    const run_step = b.step("run", "Run the app");
+    const run_step = b.step("run", "Run the basic server example");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+
+    // ── User Management Example ──
+    const user_mgmt_exe = b.addExecutable(.{
+        .name = "user_management",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/user_management.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "http_framework", .module = http_framework.module("http_framework") },
+            },
+        }),
+    });
+    b.installArtifact(user_mgmt_exe);
+
+    const run_user_mgmt_step = b.step("run-user-mgmt", "Run the user management system");
+    const run_user_mgmt_cmd = b.addRunArtifact(user_mgmt_exe);
+    run_user_mgmt_step.dependOn(&run_user_mgmt_cmd.step);
+    run_user_mgmt_cmd.step.dependOn(b.getInstallStep());
 
     // ── HTTP Integration Tests ──
     const test_mod = b.createModule(.{

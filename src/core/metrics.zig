@@ -54,7 +54,7 @@ pub const MetricsCollector = struct {
     fn getPercentile(self: *const Self, percentile: u8) u64 {
         const items = self.latencies.items;
         if (items.len == 0) return 0;
-        const sorted = try self.allocator.alloc(u64, items.len);
+        const sorted = self.allocator.alloc(u64, items.len) catch return 0;
         defer self.allocator.free(sorted);
         @memcpy(sorted, items);
         std.mem.sort(u64, sorted, {}, comptime std.sort.asc(u64));
@@ -63,14 +63,14 @@ pub const MetricsCollector = struct {
     }
 
     pub fn generateReport(self: *const Self, buffer: []u8) ![]u8 {
-        var fbs = std.Io.FixedBufferStream([]u8){ .buf = buffer, .pos = 0 };
-        const w = fbs.writer();
-        try w.print("requests: {d}\n", .{self.total_requests});
-        try w.print("active_conn: {d}\n", .{self.active_connections});
-        try w.print("p50_ns: {d}\n", .{self.getP50()});
-        try w.print("p95_ns: {d}\n", .{self.getP95()});
-        try w.print("p99_ns: {d}\n", .{self.getP99()});
-        return fbs.getWritten();
+        const report = try std.fmt.bufPrint(buffer, "requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
+            self.total_requests,
+            self.active_connections,
+            self.getP50(),
+            self.getP95(),
+            self.getP99(),
+        });
+        return report;
     }
 };
 
@@ -79,9 +79,7 @@ pub const MetricsCollector = struct {
 // =========================================================================
 
 test "MetricsCollector.init initializes with zero counters" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var collector = MetricsCollector.init(allocator);
     defer collector.deinit();
@@ -92,9 +90,7 @@ test "MetricsCollector.init initializes with zero counters" {
 }
 
 test "MetricsCollector.recordRequest increments counter and stores latency" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var collector = MetricsCollector.init(allocator);
     defer collector.deinit();
@@ -112,9 +108,7 @@ test "MetricsCollector.recordRequest increments counter and stores latency" {
 }
 
 test "MetricsCollector.recordRequest with multiple requests" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var collector = MetricsCollector.init(allocator);
     defer collector.deinit();
@@ -128,9 +122,7 @@ test "MetricsCollector.recordRequest with multiple requests" {
 }
 
 test "MetricsCollector getP50/P95/P99 with empty data returns zero" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var collector = MetricsCollector.init(allocator);
     defer collector.deinit();
@@ -142,9 +134,7 @@ test "MetricsCollector getP50/P95/P99 with empty data returns zero" {
 }
 
 test "MetricsCollector.generateReport with empty data" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var collector = MetricsCollector.init(allocator);
     defer collector.deinit();

@@ -178,9 +178,7 @@ pub const RateLimiter = struct {
 // =========================================================================
 
 test "RateLimiter.init creates instance with given config" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 30,
@@ -198,9 +196,7 @@ test "RateLimiter.init creates instance with given config" {
 }
 
 test "RateLimiter sliding window: within limit not rate-limited" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 60,
@@ -219,9 +215,7 @@ test "RateLimiter sliding window: within limit not rate-limited" {
 }
 
 test "RateLimiter sliding window: exceeding limit is rate-limited" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 60,
@@ -240,9 +234,7 @@ test "RateLimiter sliding window: exceeding limit is rate-limited" {
 }
 
 test "RateLimiter sliding window: window expiry resets limit" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 60,
@@ -268,9 +260,7 @@ test "RateLimiter sliding window: window expiry resets limit" {
 }
 
 test "RateLimiter: unknown identifier not rate-limited" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 60,
@@ -289,9 +279,7 @@ test "RateLimiter: over-limit returns respond-equivalent" {
     // and set ctx.blocked_status = .too_many_requests.
     // This test verifies the core logic that triggers .respond.
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const config = RateLimitConfig{
         .window_seconds = 1,

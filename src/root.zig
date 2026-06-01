@@ -32,6 +32,13 @@ pub const NextAction = core.Middleware.NextAction;
 pub const WebSocket = core.WebSocket;
 pub const Static = core.Static;
 pub const WsEchoHandler = core.WsEchoHandler;
+pub const SecurityHeaders = core.SecurityHeaders;
+pub const Csrf = core.Csrf;
+pub const Validation = core.Validation;
+pub const Background = core.Background;
+pub const RouteGroup = core.Router.RouteGroup;
+pub const Http2 = core.Http2;
+pub const Orm = core.Orm;
 
 // Optional: expose the entire core module for advanced use
 pub const Core = core;

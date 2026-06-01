@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const mem = std.mem;
-const time = std.time;
 const io = std.Io;
 
 const Allocator = std.mem.Allocator;
@@ -60,7 +59,7 @@ pub const SessionManager = struct {
         // 1. 尝试从 Cookie 获取 session_id
         if (ctx.getCookie(self.cookie_name)) |session_id| {
             if (self.sessions.get(session_id)) |*record| {
-                const now = time.nanoTimestamp();
+                const now = self.io_ctx.now(.real).nanoseconds;
 
                 // 检查是否过期
                 if (now < record.expires) {
@@ -93,11 +92,12 @@ pub const SessionManager = struct {
         );
 
         // 创建 Session 记录
+        const now_ns = self.io_ctx.now(.real).nanoseconds;
         const record = SessionRecord{
             .id = try self.allocator.dupe(u8, session_id),
             .data = SessionData.init(self.allocator),
-            .expires = time.nanoTimestamp() + @as(i128, self.session_timeout_sec) * 1_000_000_000,
-            .created = time.nanoTimestamp(),
+            .expires = now_ns + @as(i128, self.session_timeout_sec) * 1_000_000_000,
+            .created = now_ns,
         };
 
         try self.sessions.put(self.allocator, session_id, record);
@@ -138,7 +138,7 @@ pub const SessionManager = struct {
 
     /// 定期清理过期 Session
     fn maybeCleanup(self: *Self) void {
-        const now = time.nanoTimestamp();
+        const now = self.io_ctx.now(.real).nanoseconds;
         const cleanup_interval_ns = @as(i128, self.cleanup_interval_sec) * 1_000_000_000;
 
         if (now - self.last_cleanup < cleanup_interval_ns) {
@@ -151,7 +151,7 @@ pub const SessionManager = struct {
 
     /// 清理所有过期的 Session
     fn cleanupExpired(self: *Self) void {
-        const now = time.nanoTimestamp();
+        const now = self.io_ctx.now(.real).nanoseconds;
         var to_remove = std.ArrayList([]const u8).init(self.allocator);
         defer to_remove.deinit(self.allocator);
 
@@ -177,7 +177,7 @@ pub const SessionManager = struct {
         active: u32, // 未过期
         expired: u32, // 已过期
     } {
-        const now = time.nanoTimestamp();
+        const now = self.io_ctx.now(.real).nanoseconds;
         var stats = .{ .total = 0, .active = 0, .expired = 0 };
 
         var it = self.sessions.iterator();

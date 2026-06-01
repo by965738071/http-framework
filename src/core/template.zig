@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 pub const Template = struct {
     allocator: Allocator,
     content: []const u8,
-    variables: std.StringHashMap([]const u8) = .empty,
+    variables: std.StringHashMapUnmanaged([]const u8) = .{},
 
     const Self = @This();
 
@@ -19,7 +19,7 @@ pub const Template = struct {
         return Self{
             .allocator = allocator,
             .content = content,
-            .variables = std.StringHashMap([]const u8).empty,
+            .variables = .{},
         };
     }
 
@@ -28,7 +28,7 @@ pub const Template = struct {
         return Self{
             .allocator = allocator,
             .content = try allocator.dupe(u8, content),
-            .variables = std.StringHashMap([]const u8).empty,
+            .variables = .{},
         };
     }
 

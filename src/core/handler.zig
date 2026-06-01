@@ -311,9 +311,7 @@ test "Handler.init - singleton returns itself" {
 }
 
 test "Handler.initPerRequest - new instance per request and deinit called" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const PerRequest = struct {
         id: u32,

@@ -32,6 +32,7 @@ pub const DispatchResult = enum {
 };
 
 const Self = @This();
+pub const Router = Self;
 
 const MAX_PATH_PARAMS = 32;
 
@@ -93,6 +94,88 @@ pub fn onError(
     handler: *const fn (anyerror, *RequestContext, *Response) anyerror!void,
 ) void {
     self.error_handler = handler;
+}
+
+// =========================================================================
+// 路由分组
+// =========================================================================
+
+/// 路由组 — 共享前缀和中间件的一组路由。
+///
+/// 使用方式：
+/// ```zig
+/// var api = router.group("/api/v1", &.{auth_middleware});
+/// try api.route(.GET, "/users", users_handler);
+/// try api.route(.POST, "/users", create_user_handler);
+/// ```
+pub const RouteGroup = struct {
+    prefix: []const u8,
+    shared_middlewares: []const Middleware,
+    router: *Self,
+
+    /// 注册路由（自动拼接 prefix + pattern，合并共享中间件）
+    pub fn route(self: *const RouteGroup, method: http.Method, pattern: []const u8, handler: Handler) !void {
+        const full_pattern = try concatPath(self.router.allocator, self.prefix, pattern);
+        defer self.router.allocator.free(full_pattern);
+
+        if (self.shared_middlewares.len > 0) {
+            try self.router.routeWithMiddleware(method, full_pattern, handler, self.shared_middlewares);
+        } else {
+            try self.router.route(method, full_pattern, handler);
+        }
+    }
+
+    /// 注册带额外中间件的路由（合并组的共享中间件 + 路由自己的中间件）
+    pub fn routeWithMiddleware(
+        self: *const RouteGroup,
+        method: http.Method,
+        pattern: []const u8,
+        handler: Handler,
+        extra_middlewares: []const Middleware,
+    ) !void {
+        const full_pattern = try concatPath(self.router.allocator, self.prefix, pattern);
+        defer self.router.allocator.free(full_pattern);
+
+        // 合并共享中间件和额外中间件
+        const total_len = self.shared_middlewares.len + extra_middlewares.len;
+        const merged = try self.router.allocator.alloc(Middleware, total_len);
+        defer self.router.allocator.free(merged);
+
+        @memcpy(merged[0..self.shared_middlewares.len], self.shared_middlewares);
+        @memcpy(merged[self.shared_middlewares.len..], extra_middlewares);
+
+        try self.router.routeWithMiddleware(method, full_pattern, handler, merged);
+    }
+
+    /// 设置组的 404 处理器（注意：这会覆盖 Router 级别的 404）
+    pub fn notFound(self: *const RouteGroup, handler: Handler) void {
+        self.router.notFound(handler);
+    }
+};
+
+/// 创建一个路由组。
+///
+/// `prefix` — 该组所有路由的公共前缀（如 "/api/v1"）
+/// `shared_middlewares` — 该组所有路由共享的中间件
+///
+/// 返回的 `RouteGroup` 生命周期由调用者管理（栈分配即可）。
+pub fn group(self: *Self, prefix: []const u8, shared_middlewares: []const Middleware) RouteGroup {
+    return .{
+        .prefix = prefix,
+        .shared_middlewares = shared_middlewares,
+        .router = self,
+    };
+}
+
+/// 拼接路径前缀和路由模式（处理前后斜杠）
+fn concatPath(allocator: std.mem.Allocator, prefix: []const u8, pattern: []const u8) ![]const u8 {
+    const p = trimSlash(prefix);
+    const r = if (pattern.len > 0 and pattern[0] == '/') pattern[1..] else pattern;
+
+    if (p.len == 0) return allocator.dupe(u8, r);
+    if (r.len == 0) return allocator.dupe(u8, p);
+
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ p, r });
 }
 
 /// 分发请求到匹配的路由。
@@ -377,6 +460,74 @@ test "matchPattern - wildcard" {
 
     try std.testing.expect(matchPattern("static/*", "/static/js/app.js", allocator, &ctx));
     try std.testing.expectEqualStrings("js/app.js", ctx.path_params.get("").?);
+}
+
+test "RouteGroup - basic routing with prefix" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const fn_handler = Handler.fromFn(struct {
+        fn handler(ctx: *RequestContext, res: *Response) !void {
+            _ = ctx;
+            _ = res;
+        }
+    }.handler);
+
+    var api = router.group("api/v1", &.{});
+    try api.route(.GET, "/users", fn_handler);
+
+    // 验证路由已注册且 pattern 正确拼接
+    try std.testing.expectEqual(@as(usize, 1), router.routes.items.len);
+    try std.testing.expectEqualStrings("api/v1/users", router.routes.items[0].pattern);
+}
+
+test "RouteGroup - prefix trimming handles slashes" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const fn_handler = Handler.fromFn(struct {
+        fn handler(ctx: *RequestContext, res: *Response) !void {
+            _ = ctx;
+            _ = res;
+        }
+    }.handler);
+
+    // 前缀有尾部斜杠，pattern 有前导斜杠 → 应该正确拼接
+    var api = router.group("/api/v1/", &.{});
+    try api.route(.GET, "/users", fn_handler);
+
+    try std.testing.expectEqualStrings("api/v1/users", router.routes.items[0].pattern);
+}
+
+test "RouteGroup - shared middlewares are attached" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const fn_handler = Handler.fromFn(struct {
+        fn handler(ctx: *RequestContext, res: *Response) !void {
+            _ = ctx;
+            _ = res;
+        }
+    }.handler);
+
+    // 创建一个简单的中间件
+    const MwType = struct {
+        pub fn process(self: *@This(), req_ctx: *RequestContext) !Middleware.NextAction {
+            _ = self;
+            _ = req_ctx;
+            return .next;
+        }
+    };
+    var mw_instance = MwType{};
+    const mw = Middleware.init(MwType, &mw_instance);
+
+    var api = router.group("/admin", &.{mw});
+    try api.route(.GET, "/dashboard", fn_handler);
+
+    try std.testing.expectEqual(@as(usize, 1), router.routes.items[0].middlewares.len);
 }
 
 test "matchPattern - trailing slash" {

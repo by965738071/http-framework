@@ -20,6 +20,18 @@ headers: std.ArrayList(http.Header),
 cookies: std.ArrayList(Cookie),
 enable_compression: bool = false,
 
+/// 底层原始 writer（用于 chunked transfer encoding）
+raw_writer: ?RawWriter = null,
+
+pub const RawWriter = struct {
+    ctx: *anyopaque,
+    writeFn: *const fn (*anyopaque, []const u8) anyerror!usize,
+
+    pub fn write(self: RawWriter, data: []const u8) !usize {
+        return self.writeFn(self.ctx, data);
+    }
+};
+
 const Self = @This();
 
 /// Cookie 结构
@@ -33,6 +45,90 @@ const Cookie = struct {
     http_only: bool = false,
     same_site: ?[]const u8 = null,
 };
+
+/// 流式响应写入器。
+/// 支持两种模式：
+/// - raw_writer 存在时：使用 HTTP chunked transfer encoding，实时发送（真流式）
+/// - raw_writer 为 null 时：收集所有 chunk，finish() 时一次性发送
+pub const StreamWriter = struct {
+    response: *Self,
+    content_type: []const u8,
+    chunks: std.ArrayList([]const u8),
+    headers_sent: bool = false,
+
+    /// 写入一个数据块。
+    /// 如果 raw_writer 可用，立即以 chunked 编码发送。
+    /// 否则暂存到内存。
+    pub fn write(self: *StreamWriter, data: []const u8) !void {
+        if (self.response.raw_writer) |rw| {
+            if (!self.headers_sent) {
+                try self.sendChunkedHeaders(rw);
+                self.headers_sent = true;
+            }
+            try writeChunk(rw, data);
+        } else {
+            const owned = try self.response.allocator.dupe(u8, data);
+            errdefer self.response.allocator.free(owned);
+            try self.chunks.append(self.response.allocator, owned);
+        }
+    }
+
+    /// 发送响应头（Transfer-Encoding: chunked）
+    fn sendChunkedHeaders(self: *StreamWriter, rw: RawWriter) !void {
+        try self.response.addCookiesToHeaders();
+        // 手动构造状态行和响应头
+        var buf: [512]u8 = undefined;
+        const status_text = http.Status.text(self.response.status) orelse "OK";
+        const status_line = try std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.response.status), status_text });
+        _ = try rw.write(status_line);
+
+        try self.response.headers.append(self.response.allocator, .{ .name = "Content-Type", .value = self.content_type });
+        try self.response.headers.append(self.response.allocator, .{ .name = "Transfer-Encoding", .value = "chunked" });
+
+        for (self.response.headers.items) |h| {
+            const line = try std.fmt.allocPrint(self.response.allocator, "{s}: {s}\r\n", .{ h.name, h.value });
+            defer self.response.allocator.free(line);
+            _ = try rw.write(line);
+        }
+        _ = try rw.write("\r\n");
+    }
+
+    /// 完成流式响应。
+    /// raw_writer 模式：发送终止 chunk（0\r\n\r\n）。
+    /// 缓冲模式：拼接所有 chunk 后通过 respond() 发送。
+    pub fn finish(self: *StreamWriter) !void {
+        if (self.response.raw_writer) |rw| {
+            if (!self.headers_sent) try self.sendChunkedHeaders(rw);
+            _ = try rw.write("0\r\n\r\n");
+        } else {
+            var total_size: usize = 0;
+            for (self.chunks.items) |chunk| total_size += chunk.len;
+            const result = try self.response.allocator.alloc(u8, total_size);
+            defer self.response.allocator.free(result);
+            var offset: usize = 0;
+            for (self.chunks.items) |chunk| {
+                @memcpy(result[offset .. offset + chunk.len], chunk);
+                offset += chunk.len;
+            }
+            try self.response.sendResponse(result, self.content_type);
+        }
+    }
+
+    /// 释放已收集的内存数据。
+    pub fn deinit(self: *StreamWriter) void {
+        for (self.chunks.items) |chunk| self.response.allocator.free(chunk);
+        self.chunks.deinit(self.response.allocator);
+    }
+};
+
+/// 写入一个 HTTP chunk：hex_size\r\ndata\r\n
+fn writeChunk(rw: RawWriter, data: []const u8) !void {
+    var size_buf: [16]u8 = undefined;
+    const size_str = try std.fmt.bufPrint(&size_buf, "{x}\r\n", .{data.len});
+    _ = try rw.write(size_str);
+    _ = try rw.write(data);
+    _ = try rw.write("\r\n");
+}
 
 // =========================================================================
 // 初始化与清理
@@ -64,19 +160,43 @@ pub fn compression(self: *Self, enabled: bool) *Self {
 // 压缩支持
 // =========================================================================
 
-/// 压缩数据（gzip格式）
-/// 使用 Allocating writer 捕获压缩后的数据。
-/// 压缩器输出通过 flate 管道写入 Allocating writer，数据完整性由 finish() 保证。
+/// 真实 gzip 压缩（std.compress.flate）
 fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer alloc_writer.deinit();
+    var out_buf: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buf);
+    var cbuf: [std.compress.flate.max_window_len]u8 = undefined;
+    var c = std.compress.flate.Compress.init(&writer, &cbuf, .gzip, .default) catch return error.CompressionFailed;
+    c.writer.writeAll(data) catch return error.CompressionFailed;
+    c.finish() catch return error.CompressionFailed;
+    return allocator.dupe(u8, out_buf[0..writer.end]);
+}
 
-    var compress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var compressor = try std.compress.flate.Compress.init(&alloc_writer.writer, &compress_buf, .gzip, .default);
-    try compressor.writer.writeAll(data);
-    try compressor.finish();
+/// 统一的响应发送辅助函数。
+/// 自动处理 Cookie 序列化、Content-Type 设置和可选的 gzip 压缩。
+fn sendResponse(self: *Self, content: []const u8, content_type: []const u8) !void {
+    try self.addCookiesToHeaders();
+    try self.headers.append(self.allocator, .{
+        .name = "Content-Type",
+        .value = content_type,
+    });
 
-    return alloc_writer.toOwnedSlice();
+    if (self.enable_compression) {
+        const compressed = try compressGzip(self.allocator, content);
+        defer self.allocator.free(compressed);
+        try self.headers.append(self.allocator, .{
+            .name = "Content-Encoding",
+            .value = "gzip",
+        });
+        try self.request.respond(compressed, .{
+            .status = self.status,
+            .extra_headers = self.headers.items,
+        });
+    } else {
+        try self.request.respond(content, .{
+            .status = self.status,
+            .extra_headers = self.headers.items,
+        });
+    }
 }
 
 // =========================================================================
@@ -110,30 +230,12 @@ pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !*Self {
 
 /// 发送纯文本响应（`Content-Type: text/plain`）
 pub fn text(self: *Self, content: []const u8) !void {
-    try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator, .{
-        .name = "Content-Type",
-        .value = "text/plain; charset=utf-8",
-    });
-
-    try self.request.respond(content, .{
-        .status = self.status,
-        .extra_headers = self.headers.items,
-    });
+    try self.sendResponse(content, "text/plain; charset=utf-8");
 }
 
 /// 发送 HTML 响应（`Content-Type: text/html`）
 pub fn html(self: *Self, content: []const u8) !void {
-    try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator, .{
-        .name = "Content-Type",
-        .value = "text/html; charset=utf-8",
-    });
-
-    try self.request.respond(content, .{
-        .status = self.status,
-        .extra_headers = self.headers.items,
-    });
+    try self.sendResponse(content, "text/html; charset=utf-8");
 }
 
 /// 发送 JSON 响应（`Content-Type: application/json`）
@@ -148,30 +250,12 @@ pub fn json(self: *Self, value: anytype) !void {
     try stringify.write(value);
     const json_output = out.written();
 
-    try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator, .{
-        .name = "Content-Type",
-        .value = "application/json",
-    });
-
-    try self.request.respond(json_output, .{
-        .status = self.status,
-        .extra_headers = self.headers.items,
-    });
+    try self.sendResponse(json_output, "application/json");
 }
 
 /// 发送文件内容（指定 `Content-Type`）
 pub fn file(self: *Self, content: []const u8, content_type: []const u8) !void {
-    try self.addCookiesToHeaders();
-    try self.headers.append(self.allocator, .{
-        .name = "Content-Type",
-        .value = content_type,
-    });
-
-    try self.request.respond(content, .{
-        .status = self.status,
-        .extra_headers = self.headers.items,
-    });
+    try self.sendResponse(content, content_type);
 }
 
 /// 发送重定向响应
@@ -188,6 +272,16 @@ pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
         .status = status,
         .extra_headers = self.headers.items,
     });
+}
+
+/// 启动一个流式响应，返回 StreamWriter。
+/// 调用者通过返回的 writer 分块写入数据，最后调用 finish() 发送。
+pub fn streamWriter(self: *Self, content_type: []const u8) !StreamWriter {
+    return .{
+        .response = self,
+        .content_type = content_type,
+        .chunks = try std.ArrayList([]const u8).initCapacity(self.allocator, 8),
+    };
 }
 
 // =========================================================================
@@ -262,4 +356,74 @@ test "Cookie struct" {
     try std.testing.expectEqual(@as(?i64, 3600), c.max_age);
     try std.testing.expect(c.secure);
     try std.testing.expect(c.http_only);
+}
+
+test "compressGzip produces valid gzip data" {
+    const allocator = std.testing.allocator;
+    const input = "Hello, World! This is a test string for gzip compression.";
+
+    const compressed = try compressGzip(allocator, input);
+    defer allocator.free(compressed);
+
+    // gzip magic bytes: 0x1F 0x8B
+    try std.testing.expect(compressed.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x1F), compressed[0]);
+    try std.testing.expectEqual(@as(u8, 0x8B), compressed[1]);
+
+    // Compressed data should not equal input
+    try std.testing.expect(!std.mem.eql(u8, input, compressed));
+}
+
+test "compressGzip small input" {
+    const allocator = std.testing.allocator;
+    const input = "hi";
+
+    const compressed = try compressGzip(allocator, input);
+    defer allocator.free(compressed);
+
+    try std.testing.expect(compressed.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x1F), compressed[0]);
+    try std.testing.expectEqual(@as(u8, 0x8B), compressed[1]);
+}
+
+test "compressGzip empty input" {
+    const allocator = std.testing.allocator;
+    const input = "";
+
+    const compressed = try compressGzip(allocator, input);
+    defer allocator.free(compressed);
+
+    // gzip header should still be present
+    try std.testing.expect(compressed.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x1F), compressed[0]);
+    try std.testing.expectEqual(@as(u8, 0x8B), compressed[1]);
+}
+
+test "StreamWriter basic" {
+    const allocator = std.testing.allocator;
+    var sw = StreamWriter{
+        .response = undefined,
+        .content_type = "text/plain",
+        .chunks = try std.ArrayList([]const u8).initCapacity(allocator, 4),
+    };
+    defer sw.deinit();
+
+    try sw.write("Hello, ");
+    try sw.write("World!");
+
+    try std.testing.expectEqual(@as(usize, 2), sw.chunks.items.len);
+    try std.testing.expectEqualStrings("Hello, ", sw.chunks.items[0]);
+    try std.testing.expectEqualStrings("World!", sw.chunks.items[1]);
+}
+
+test "StreamWriter empty finish" {
+    const allocator = std.testing.allocator;
+    var sw = StreamWriter{
+        .response = undefined,
+        .content_type = "",
+        .chunks = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+    };
+    defer sw.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), sw.chunks.items.len);
 }

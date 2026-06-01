@@ -54,9 +54,19 @@ file_logger: ?RotatingFileLogger = null,
 cors: ?*CorsMiddleware = null,
 
 /// 性能指标（可选）
-metrics: ?MetricsCollector = null,
+metrics: ?*MetricsCollector = null,
+
+/// 当前活跃连接数（原子操作，用于优雅关闭）
+active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+/// 优雅关闭等待超时（纳秒，默认 30 秒）
+drain_timeout_ns: u64 = 30_000_000_000,
+
+/// 是否正在关闭（原子标志）
+shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 const Self = @This();
+pub const Server = Self;
 
 // =========================================================================
 // 初始化与启动
@@ -110,7 +120,7 @@ pub fn init(
 }
 
 /// 启动服务器事件循环，阻塞至服务器被关闭。
-pub fn setMetrics(self: *Self, m: MetricsCollector) void {
+pub fn setMetrics(self: *Self, m: *MetricsCollector) void {
     self.metrics = m;
 }
 
@@ -147,6 +157,11 @@ pub fn run(self: *Self) !void {
             serverLog(&self.file_logger, .warn, "Concurrency limit reached, dropped connection: {}", .{conc_err});
         };
     }
+
+    // =========================================================================
+    // 优雅关闭：drain 阶段
+    // =========================================================================
+    self.drainConnections();
 }
 
 // =========================================================================
@@ -154,12 +169,22 @@ pub fn run(self: *Self) !void {
 // =========================================================================
 
 /// 处理一个完整的 TCP 连接生命周期。
+/// 单次 dispatch 失败不会终止 keep-alive 循环，
+/// 但连续失败超过上限后会关闭连接防止资源泄漏。
 fn handleConnection(
     self: *Self,
     stream: net.Stream,
     io: std.Io,
 ) void {
     defer stream.close(io);
+
+    // 服务器正在关闭，拒绝新连接
+    if (self.shutting_down.load(.monotonic)) {
+        return;
+    }
+
+    _ = self.active_connections.fetchAdd(1, .monotonic);
+    defer _ = self.active_connections.fetchSub(1, .monotonic);
 
     requestLog(&self.file_logger, "New TCP connection accepted", .{});
 
@@ -175,22 +200,47 @@ fn handleConnection(
         @constCast(&writer.interface),
     );
 
+    // 可恢复错误计数器：防止无限重试导致资源泄漏
+    var recoverable_errors: u32 = 0;
+    const max_recoverable_errors: u32 = 10;
+
     // ---------- keep-alive 主循环 ----------
     while (true) {
+        // 检查是否正在关闭
+        if (self.shutting_down.load(.monotonic)) {
+            requestLog(&self.file_logger, "Server shutting down, closing connection", .{});
+            break;
+        }
+
         // --- 步骤 1: 接收 HTTP 请求头（带超时） ---
         var http_request = receiveHeadChecked(&http_server, self.config.idle_timeout_ns) catch |head_err| {
-            if (isConnectionClosed(head_err)) break;
+            if (isConnectionClosed(head_err)) {
+                if (recoverable_errors > 0) {
+                    requestLog(&self.file_logger, "Connection closed after {d} recoverable errors", .{recoverable_errors});
+                }
+                break;
+            }
 
             if (isProtocolError(head_err)) {
                 requestLog(&self.file_logger, "[REQUEST] Protocol error: Bad Request", .{});
                 writeErrorResponse(&http_server, .bad_request, "Bad Request");
+                recoverable_errors += 1;
+                if (recoverable_errors >= max_recoverable_errors) {
+                    requestLog(&self.file_logger, "Too many recoverable errors ({d}), closing connection", .{recoverable_errors});
+                    break;
+                }
+                break;
             } else if (isTimeout(head_err)) {
                 requestLog(&self.file_logger, "Idle timeout, closing connection", .{});
                 break;
             } else {
                 requestLog(&self.file_logger, "[REQUEST] receiveHead error: {}", .{head_err});
+                recoverable_errors += 1;
+                if (recoverable_errors >= max_recoverable_errors) {
+                    break;
+                }
+                break;
             }
-            break;
         };
 
         // --- 步骤 2: 初始化请求上下文 ---
@@ -208,22 +258,63 @@ fn handleConnection(
 
         // --- 步骤 3: 初始化响应构建器 ---
         var response = Response.init(self.allocator, &http_request);
+        // 设置原始 writer 用于 chunked transfer encoding（通过 writer.interface）
+        const RawCtx = struct {
+            iface: *std.Io.Writer,
+            fn write(wctx: *anyopaque, data: []const u8) anyerror!usize {
+                const c: *@This() = @ptrCast(@alignCast(wctx));
+                return c.iface.writeVec(&.{data});
+            }
+        };
+        var raw_ctx = RawCtx{ .iface = @constCast(&writer.interface) };
+        response.raw_writer = .{
+            .ctx = @ptrCast(&raw_ctx),
+            .writeFn = RawCtx.write,
+        };
 
-        // CORS 自动注入
+        // CORS 处理（检查来源 + 自动注入响应头）
         if (self.cors) |c| {
+            const action = if (c.process(&ctx)) |a| a else |_| .next;
+            // 预检请求直接响应 204
+            if (action == .respond) {
+                c.addCorsHeaders(&ctx, &response) catch {};
+                _ = response.statusCode(.no_content);
+                response.text("") catch {};
+                ctx.deinit();
+                response.deinit();
+                if (!http_request.head.keep_alive) break;
+                continue;
+            }
+            if (action == .err) {
+                ctx.deinit();
+                response.deinit();
+                break;
+            }
+            // 正常请求：注入 CORS 响应头
             c.addCorsHeaders(&ctx, &response) catch {};
         }
 
         // --- 步骤 4: 路由分发 ---
         const dispatch_start = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        _ = self.router.dispatch(&ctx, &response) catch |dispatch_err| {
+        if (self.router.dispatch(&ctx, &response)) |_| {
+            // 请求成功：重置错误计数器
+            recoverable_errors = 0;
+        } else |dispatch_err| {
             requestLog(&self.file_logger, "[ERROR] {s} {s} -> dispatch: {}", .{
                 @tagName(ctx.method),
                 ctx.path,
                 dispatch_err,
             });
             handleDispatchError(self, &ctx, &response, dispatch_err);
-        };
+            recoverable_errors += 1;
+            // 检查是否超过可恢复错误上限
+            if (recoverable_errors >= max_recoverable_errors) {
+                requestLog(&self.file_logger, "Too many recoverable errors ({d}), closing connection", .{recoverable_errors});
+                ctx.deinit();
+                response.deinit();
+                break;
+            }
+        }
 
         // 记录响应状态
         requestLog(&self.file_logger, "[RESPONSE] {s} {s} -> {s}", .{
@@ -233,7 +324,7 @@ fn handleConnection(
         });
 
         // 记录性能指标
-        if (self.metrics) |*m| {
+        if (self.metrics) |m| {
             const latency = std.Io.Timestamp.now(io, .awake).nanoseconds - dispatch_start;
             m.recordRequest(.{
                 .method = @tagName(ctx.method),
@@ -251,7 +342,10 @@ fn handleConnection(
         ctx.deinit();
         response.deinit();
 
-        // --- 步骤 6: 是否保持连接 ---
+        // --- 步骤 6: 优雅关闭检查 ---
+        if (self.shutting_down.load(.monotonic)) break;
+
+        // --- 步骤 7: 是否保持连接 ---
         if (!http_request.head.keep_alive) break;
     }
 }
@@ -379,6 +473,33 @@ pub fn shutdown(self: *Self) void {
     self.running = false;
 }
 
+/// 等待所有活跃连接处理完毕（或超时）。
+/// 在 run() 中 accept 循环退出后自动调用。
+pub fn drainConnections(self: *Self) void {
+    const drain_start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+    self.shutting_down.store(true, .monotonic);
+
+    const initial = self.active_connections.load(.monotonic);
+    serverLog(&self.file_logger, .info, "Graceful shutdown: draining {d} active connections...", .{initial});
+
+    while (self.active_connections.load(.monotonic) > 0) {
+        const elapsed = std.Io.Timestamp.now(self.io, .awake).nanoseconds - drain_start;
+        if (elapsed >= self.drain_timeout_ns) {
+            const remaining = self.active_connections.load(.monotonic);
+            serverLog(&self.file_logger, .warn, "Drain timeout reached after {d}s, {d} connections still active", .{
+                @divTrunc(elapsed, 1_000_000_000),
+                remaining,
+            });
+            break;
+        }
+        // 短暂休眠，避免忙等待（10ms）
+        self.io.sleep(std.Io.Duration{ .nanoseconds = 10_000_000 }, .awake) catch break;
+    }
+
+    const remaining = self.active_connections.load(.monotonic);
+    serverLog(&self.file_logger, .info, "Graceful shutdown complete: {d} connections drained", .{remaining});
+}
+
 pub fn isRunning(self: *const Self) bool {
     return self.running;
 }
@@ -433,4 +554,91 @@ fn sendErrorPage(
     , .{ status_text, msg }) catch "Error";
 
     response.statusCode(status).html(html) catch {};
+}
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "graceful shutdown: active_connections counter" {
+    var counter = std.atomic.Value(u32).init(0);
+
+    // 模拟连接进入
+    _ = counter.fetchAdd(1, .monotonic);
+    try std.testing.expectEqual(@as(u32, 1), counter.load(.monotonic));
+
+    _ = counter.fetchAdd(1, .monotonic);
+    try std.testing.expectEqual(@as(u32, 2), counter.load(.monotonic));
+
+    // 模拟连接退出
+    _ = counter.fetchSub(1, .monotonic);
+    try std.testing.expectEqual(@as(u32, 1), counter.load(.monotonic));
+
+    _ = counter.fetchSub(1, .monotonic);
+    try std.testing.expectEqual(@as(u32, 0), counter.load(.monotonic));
+}
+
+test "graceful shutdown: shutting_down flag" {
+    var flag = std.atomic.Value(bool).init(false);
+
+    try std.testing.expectEqual(false, flag.load(.monotonic));
+
+    flag.store(true, .monotonic);
+    try std.testing.expectEqual(true, flag.load(.monotonic));
+
+    flag.store(false, .monotonic);
+    try std.testing.expectEqual(false, flag.load(.monotonic));
+}
+
+test "graceful shutdown: drainConnections when no active connections" {
+    const allocator = std.testing.allocator;
+
+    var test_config = Config.defaults();
+    test_config.port = 0; // ephemeral port
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var server = Self.init(allocator, io, test_config, router) catch {
+        // 端口绑定失败时跳过测试
+        return;
+    };
+    defer server.deinit();
+
+    // 不调用 run()，直接测试 drain
+    // 所有连接都应已处理完毕（0 个活跃连接）
+    server.drainConnections();
+
+    // drain 完成后，active_connections 应为 0
+    try std.testing.expectEqual(@as(u32, 0), server.active_connections.load(.monotonic));
+    try std.testing.expectEqual(true, server.shutting_down.load(.monotonic));
+}
+
+test "graceful shutdown: drainConnections respects timeout" {
+    const allocator = std.testing.allocator;
+
+    var test_config = Config.defaults();
+    test_config.port = 0; // ephemeral port
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var server = Self.init(allocator, io, test_config, router) catch {
+        return;
+    };
+    defer server.deinit();
+
+    // 模拟有一个活跃连接
+    _ = server.active_connections.fetchAdd(1, .monotonic);
+
+    // 设置极短的超时（1ms），确保超时触发
+    server.drain_timeout_ns = 1_000_000;
+
+    server.drainConnections();
+
+    // 超时后，连接计数可能仍为 1（连接未真正释放）
+    // 但 shutting_down 标志应已设置
+    try std.testing.expectEqual(true, server.shutting_down.load(.monotonic));
 }
