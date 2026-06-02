@@ -139,7 +139,14 @@ pub fn run(self: *Self) !void {
 
     while (self.running) {
         const stream = self.tcp_server.accept(self.io) catch |accept_err| {
-            // accept 失败不应终止服务器（例如 fd 暂时耗尽）
+            // 1. 正常的错误（如 fd 暂时耗尽） → 记录并继续
+            // 2. shutdown 期间产生的 Cancelled → 直接退出循环
+            if (accept_err == error.Cancelled) {
+                // 被取消的 accept 是我们期望的退出信号
+                self.drainConnections();
+                break;
+            }
+            // 其它错误（如网络异常） → 记录并继续
             serverLog(&self.file_logger, .warn, "Accept error: {}", .{accept_err});
             continue;
         };
@@ -161,7 +168,7 @@ pub fn run(self: *Self) !void {
     // =========================================================================
     // 优雅关闭：drain 阶段
     // =========================================================================
-    self.drainConnections();
+
 }
 
 // =========================================================================
@@ -171,11 +178,7 @@ pub fn run(self: *Self) !void {
 /// 处理一个完整的 TCP 连接生命周期。
 /// 单次 dispatch 失败不会终止 keep-alive 循环，
 /// 但连续失败超过上限后会关闭连接防止资源泄漏。
-fn handleConnection(
-    self: *Self,
-    stream: net.Stream,
-    io: std.Io,
-) void {
+fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
     defer stream.close(io);
 
     // 服务器正在关闭，拒绝新连接
@@ -192,13 +195,10 @@ fn handleConnection(
     var read_buf: [READ_BUF_SIZE]u8 = undefined;
     var write_buf: [WRITE_BUF_SIZE]u8 = undefined;
 
-    const reader = stream.reader(io, &read_buf);
-    const writer = stream.writer(io, &write_buf);
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
 
-    var http_server = http.Server.init(
-        @constCast(&reader.interface),
-        @constCast(&writer.interface),
-    );
+    var http_server = http.Server.init(&reader.interface, &writer.interface);
 
     // 可恢复错误计数器：防止无限重试导致资源泄漏
     var recoverable_errors: u32 = 0;
@@ -266,7 +266,7 @@ fn handleConnection(
                 return c.iface.writeVec(&.{data});
             }
         };
-        var raw_ctx = RawCtx{ .iface = @constCast(&writer.interface) };
+        var raw_ctx = RawCtx{ .iface = &writer.interface };
         response.raw_writer = .{
             .ctx = @ptrCast(&raw_ctx),
             .writeFn = RawCtx.write,
@@ -384,12 +384,7 @@ fn receiveHeadChecked(server: *http.Server, idle_timeout_ns: u64) !http.Server.R
     return server.receiveHead();
 }
 
-fn handleDispatchError(
-    self: *Self,
-    ctx: *RequestContext,
-    response: *Response,
-    err: anytype,
-) void {
+fn handleDispatchError(self: *Self, ctx: *RequestContext, response: *Response, err: anytype) void {
     if (self.router.error_handler) |eh| {
         eh(err, ctx, response) catch |eh_err| {
             requestLog(&self.file_logger, "Error handler failed: {}", .{eh_err});
@@ -400,11 +395,7 @@ fn handleDispatchError(
     }
 }
 
-fn writeErrorResponse(
-    http_server: *http.Server,
-    status: http.Status,
-    body: []const u8,
-) void {
+fn writeErrorResponse(http_server: *http.Server, status: http.Status, body: []const u8) void {
     var placeholder = http.Server.Request{
         .server = http_server,
         .head = .{
@@ -471,8 +462,9 @@ fn setupSignalHandlers(self: *Self) !void {
 pub fn shutdown(self: *Self) void {
     serverLog(&self.file_logger, .info, "Shutting down server gracefully...", .{});
     self.running = false;
+    // 关闭监听套接字，强制唤醒阻塞在 accept 的调用
+    self.tcp_server.deinit(self.io);
 }
-
 /// 等待所有活跃连接处理完毕（或超时）。
 /// 在 run() 中 accept 循环退出后自动调用。
 pub fn drainConnections(self: *Self) void {
@@ -533,11 +525,7 @@ fn requestLog(file_logger: *?RotatingFileLogger, comptime fmt: []const u8, args:
 // 自定义错误页面
 // =========================================================================
 
-fn sendErrorPage(
-    response: *Response,
-    status: http.Status,
-    message: ?[]const u8,
-) void {
+fn sendErrorPage(response: *Response, status: http.Status, message: ?[]const u8) void {
     const status_text = http.Status.text(status) orelse "Unknown Error";
     const msg = message orelse status_text;
 
