@@ -101,16 +101,25 @@ pub fn parseForm(
     }
 
     var result: T = undefined;
-    const fields = info.@"struct".fields;
+    const field_names = info.@"struct".field_names;
+    const field_types = info.@"struct".field_types;
+    const field_attrs = info.@"struct".field_attrs;
 
-    var set_fields: [fields.len]bool = undefined;
+    // Initialize fields with their compile-time default values (e.g. `age: u32 = 30`)
+    inline for (field_names, field_types, field_attrs) |field_name, field_type, field_attr| {
+        if (field_attr.defaultValue(field_type)) |default_val| {
+            @field(result, field_name) = default_val;
+        }
+    }
+
+    var set_fields: [field_names.len]bool = undefined;
     for (&set_fields) |*s| s.* = false;
 
     while (pairs.next()) |pair| {
-        inline for (fields, 0..) |field, i| {
-            if (mem.eql(u8, pair.key, field.name)) {
-                @field(result, field.name) = try parseFormField(
-                    field.type,
+        inline for (field_names, field_types, 0..) |field_name, field_type, i| {
+            if (mem.eql(u8, pair.key, field_name)) {
+                @field(result, field_name) = try parseFormField(
+                    field_type,
                     arena_alloc,
                     pair.value,
                 );
@@ -119,16 +128,15 @@ pub fn parseForm(
         }
     }
 
-    inline for (fields, 0..) |field, i| {
+    inline for (field_names, field_types, field_attrs, 0..) |field_name, field_type, field_attr, i| {
         if (!set_fields[i]) {
-            const field_info = @typeInfo(field.type);
+            const field_info = @typeInfo(field_type);
             if (field_info == .optional) {
-                @field(result, field.name) = null;
-            } else if (field.defaultValue()) |default| {
-                @field(result, field.name) = default;
-            } else {
+                @field(result, field_name) = null;
+            } else if (field_attr.default_value_ptr == null) {
                 return error.MissingField;
             }
+            // else: field has a default value (already set above), keep it
         }
     }
 

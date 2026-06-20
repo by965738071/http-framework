@@ -61,8 +61,9 @@ pub const RateLimiter = struct {
     pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
         // 获取客户端标识符
         const identifier = self.getIdentifier(ctx) orelse {
-            // 无法识别客户端，放行
-            return .err;
+            // 无法识别客户端（如无 IP、无标识头），放行请求
+            // 注意：之前返回 .err 会导致路由器静默吞掉请求（视为内部错误）
+            return .next;
         };
 
         // 获取当前时间（纳秒）
@@ -140,8 +141,8 @@ pub const RateLimiter = struct {
             }
         } else {
             // 新记录
+            // key_dup 的所有权转移给 HashMap，由 deinit 统一释放
             const key_dup = try self.allocator.dupe(u8, identifier);
-            defer self.allocator.free(key_dup);
             try self.records.put(self.allocator, key_dup, .{
                 .count = 1,
                 .window_start = now,

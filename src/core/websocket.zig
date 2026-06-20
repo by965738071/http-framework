@@ -145,20 +145,18 @@ pub const WebSocketManager = struct {
     }
 
     /// 读取一条文本消息
-    /// 注意：timeout_ms 在当前 Zig WebSocket API 中需要上层实现，
-    /// 底层 readSmallMessage 是阻塞调用。建议在主循环中设置读取超时。
+    ///
+    /// 注意：当前底层 http.Server.WebSocket.readSmallMessage() 是阻塞调用，
+    /// 不支持原生超时。需要使用者在主循环中自行管理超时（见 WsEchoHandler.handle 的示例实现）。
+    ///
+    /// 参数 `buffer` 用于存储读取的数据。如果消息超过 buffer 长度，返回 BufferTooSmall。
     pub fn readText(
         self: *const Self,
         ws: *http.Server.WebSocket,
         buffer: []u8,
-        timeout_ms: ?u32,
     ) ![]const u8 {
-        const msg = if (timeout_ms) |ms| blk: {
-            // 简单超时策略：启动计时器后尝试读取
-            const deadline = self.nowNano() + @as(i96, ms) * 1_000_000;
-            _ = deadline; // 当前 API 不支持设置底层读取超时
-            break :blk try ws.readSmallMessage();
-        } else try ws.readSmallMessage();
+        _ = self;
+        const msg = try ws.readSmallMessage();
         if (msg.opcode != .text) {
             return error.NotTextMessage;
         }
@@ -255,19 +253,19 @@ pub const WebSocketManager = struct {
         const now = self.nowNano();
         const timeout_ns = @as(i128, self.pong_timeout_ms) * 1_000_000;
 
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        var to_remove = std.ArrayList([]const u8).empty;
         defer {
             for (to_remove.items) |key| {
                 self.allocator.free(key);
             }
-            to_remove.deinit();
+            to_remove.deinit(self.allocator);
         }
 
         var it = self.connections.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.*.last_pong > timeout_ns) {
                 const key_dup = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
-                to_remove.append(key_dup) catch {
+                to_remove.append(self.allocator, key_dup) catch {
                     self.allocator.free(key_dup);
                     continue;
                 };
@@ -425,3 +423,161 @@ pub const WsEchoHandler = struct {
         }
     }
 };
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "WebSocketManager.init - creates empty manager" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), wsm.connectionCount());
+    try std.testing.expectEqual(@as(u32, 30000), wsm.ping_interval_ms);
+    try std.testing.expectEqual(@as(u32, 5000), wsm.pong_timeout_ms);
+}
+
+test "WebSocketManager.connectionCount - empty manager returns 0" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), wsm.connectionCount());
+}
+
+test "WebSocketManager.cleanupConnection - non-existent key does not crash" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    // Should not crash — only log a warning
+    wsm.cleanupConnection("non_existent");
+}
+
+test "WebSocketManager.cleanupStale - empty manager does not crash" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    // Should not crash with no connections
+    wsm.cleanupStale();
+}
+
+test "WebSocketManager - default config values" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    try std.testing.expectEqual(@as(u32, 30000), wsm.ping_interval_ms);
+    try std.testing.expectEqual(@as(u32, 5000), wsm.pong_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), wsm.next_id);
+    try std.testing.expectEqual(@as(usize, 0), wsm.connections.count());
+    try std.testing.expectEqual(@as(usize, 0), wsm.active_sockets.count());
+}
+
+test "WsEchoHandler.init and deinit" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    var handler = try WsEchoHandler.init(allocator, &wsm);
+    defer handler.deinit();
+
+    try std.testing.expectEqual(&wsm, handler.ws_manager);
+}
+
+test "WebSocketManager - connectionCount after manual add" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    // Add entries directly — no need for real WebSocket objects
+    const key = try allocator.dupe(u8, "test_1");
+    wsm.active_sockets.put(key, undefined) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 1), wsm.connectionCount());
+
+    // Remove entry so deinit doesn't free the key (avoid double-free)
+    if (wsm.active_sockets.fetchRemove("test_1")) |kv| {
+        allocator.free(kv.key);
+    }
+}
+
+test "WebSocketManager - cleanupConnection removes from both maps" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    // Add connections to both maps
+    const key = try allocator.dupe(u8, "ws_0");
+    const info = WebSocketManager.ConnectionInfo{
+        .last_pong = 0,
+        .connected_at = 0,
+        .client_ip = null,
+    };
+    wsm.connections.put(key, info) catch unreachable;
+
+    const ws_key = try allocator.dupe(u8, "ws_0");
+    wsm.active_sockets.put(ws_key, undefined) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 1), wsm.connections.count());
+    try std.testing.expectEqual(@as(usize, 1), wsm.active_sockets.count());
+
+    // Clean it up — cleanupConnection frees the key internally
+    wsm.cleanupConnection("ws_0");
+
+    try std.testing.expectEqual(@as(usize, 0), wsm.connections.count());
+    try std.testing.expectEqual(@as(usize, 0), wsm.active_sockets.count());
+}
+
+test "WebSocketManager - deinit after adding connections does not leak" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+
+    // Add a connection
+    const key = try allocator.dupe(u8, "ws_0");
+    const info = WebSocketManager.ConnectionInfo{
+        .last_pong = 0,
+        .connected_at = 0,
+        .client_ip = null,
+    };
+    wsm.connections.put(key, info) catch unreachable;
+
+    const ws_key = try allocator.dupe(u8, "ws_0");
+    wsm.active_sockets.put(ws_key, undefined) catch unreachable;
+
+    // deinit should clean up all allocated keys without leaking
+    // (no defer — we call deinit manually)
+    wsm.deinit();
+}
+
+test "WebSocketManager - cleanupStale removes timed out connections" {
+    const allocator = std.testing.allocator;
+    var wsm = WebSocketManager.init(allocator, std.testing.io);
+    defer wsm.deinit();
+
+    // Add a connection with a very old last_pong (1 hour ago)
+    const now = @as(i96, @intCast(std.Io.Clock.now(.real, std.testing.io).nanoseconds));
+    const one_hour_ago_ns = now - 3_600_000_000_000;
+
+    const key = try allocator.dupe(u8, "ws_stale");
+    const info = WebSocketManager.ConnectionInfo{
+        .last_pong = one_hour_ago_ns,
+        .connected_at = one_hour_ago_ns,
+        .client_ip = null,
+    };
+    wsm.connections.put(key, info) catch unreachable;
+
+    // Also add an active socket entry
+    const ws_key = try allocator.dupe(u8, "ws_stale");
+    wsm.active_sockets.put(ws_key, undefined) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 1), wsm.connections.count());
+
+    // cleanupStale should remove the stale connection and free the key
+    wsm.cleanupStale();
+
+    try std.testing.expectEqual(@as(usize, 0), wsm.connections.count());
+    try std.testing.expectEqual(@as(usize, 0), wsm.active_sockets.count());
+}

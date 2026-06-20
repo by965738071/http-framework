@@ -210,7 +210,6 @@ test "CsrfConfig defaults" {
 test "CsrfMiddleware create and deinit" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    
 
     const cfg = CsrfConfig{
         .cookie_name = "my_csrf",
@@ -290,8 +289,24 @@ test "CsrfMiddleware middleware VTable process" {
     const csrf = try CsrfMiddleware.create(allocator, io, .{});
     defer csrf.deinit();
 
-    // 验证 VTable 可用
-    const dummy_ctx: *RequestContext = @ptrFromInt(0x1000);
-    const action = try csrf.middleware.process(dummy_ctx);
+    // 验证 VTable 已正确连接
+    // 创建一个 minimal RequestContext（method=GET 属于忽略方法，process 会立即返回 .next）
+    var ctx = RequestContext{
+        .allocator = allocator,
+        .io = io,
+        .method = .GET,
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .path_params = .{},
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .request = undefined,
+        .body_read = false,
+        .body_data = null,
+        .headers_parsed = false,
+    };
+    const action = try csrf.middleware.process(&ctx);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }

@@ -78,7 +78,7 @@ pub const StreamWriter = struct {
         try self.response.addCookiesToHeaders();
         // 手动构造状态行和响应头
         var buf: [512]u8 = undefined;
-        const status_text = http.Status.text(self.response.status) orelse "OK";
+        const status_text = statusText(self.response.status);
         const status_line = try std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.response.status), status_text });
         _ = try rw.write(status_line);
 
@@ -160,15 +160,32 @@ pub fn compression(self: *Self, enabled: bool) *Self {
 // 压缩支持
 // =========================================================================
 
-/// 真实 gzip 压缩（std.compress.flate）
+/// 真实 gzip 压缩（std.compress.flate），使用动态增长缓冲区
+/// 修复：之前使用固定 16KB 缓冲区，大数据会被静默截断
+///
+/// 使用 ArrayList 预分配 data.len + 安全余量，避免二次拷贝。
+/// 安全余量 = data.len / 8 + 128 = 12.5% 额外空间 + 固定 128 字节
 fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    var out_buf: [16384]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&out_buf);
+    // gzip 输出通常小于输入，但不可压缩数据（如已压缩的图片）
+    // 可能略大于原始数据（最多约 0.1% + 20 字节开销）
+    const overhead = (data.len / 8) + 128;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    // 预分配: items.len=0, capacity ≥ data.len+overhead
+    try out.ensureTotalCapacity(allocator, data.len + overhead);
+
+    var writer = std.Io.Writer.fixed(out.unusedCapacitySlice());
     var cbuf: [std.compress.flate.max_window_len]u8 = undefined;
     var c = std.compress.flate.Compress.init(&writer, &cbuf, .gzip, .default) catch return error.CompressionFailed;
     c.writer.writeAll(data) catch return error.CompressionFailed;
     c.finish() catch return error.CompressionFailed;
-    return allocator.dupe(u8, out_buf[0..writer.end]);
+
+    // writer.end 记录了写入多少字节，更新 items.len
+    out.items.len += writer.end;
+
+    // toOwnedSlice 将 items 所有权转移给调用者，零拷贝
+    return out.toOwnedSlice(allocator);
 }
 
 /// 统一的响应发送辅助函数。
@@ -210,6 +227,16 @@ pub fn statusCode(self: *Self, code: http.Status) *Self {
 }
 
 /// 添加响应头
+///
+/// # 生命周期约定
+///
+/// `header()` 直接存储传入的指针，不执行内部复制。
+/// 调用者**必须**保证 name 和 value 在 `respond()` 调用之前保持有效。
+///
+/// 安全的使用方式：
+/// - 字符串字面量（`"Content-Type"`）— 始终安全
+/// - `allocator.dupe()` 出的堆分配数据 — 在 respond() 之前手动保持存活
+/// - **不要**传入栈缓冲区（如 `std.fmt.bufPrint` 的结果）— 会导致悬空指针
 pub fn header(self: *Self, name: []const u8, value: []const u8) !*Self {
     try self.headers.append(self.allocator, .{ .name = name, .value = value });
     return self;
@@ -287,6 +314,24 @@ pub fn streamWriter(self: *Self, content_type: []const u8) !StreamWriter {
 // =========================================================================
 // 内部辅助
 // =========================================================================
+
+/// 将 HTTP 状态码映射为文本描述
+fn statusText(status: http.Status) []const u8 {
+    return switch (status) {
+        .ok => "OK",
+        .created => "Created",
+        .no_content => "No Content",
+        .moved_permanently => "Moved Permanently",
+        .not_found => "Not Found",
+        .internal_server_error => "Internal Server Error",
+        .bad_request => "Bad Request",
+        .forbidden => "Forbidden",
+        .unauthorized => "Unauthorized",
+        .too_many_requests => "Too Many Requests",
+        .service_unavailable => "Service Unavailable",
+        else => "OK",
+    };
+}
 
 /// 将所有 Cookie 转换为 `Set-Cookie` 响应头并追加到 headers 中。
 /// cookie_str 的所有权转移给 headers，由 deinit 统一释放。
@@ -401,8 +446,17 @@ test "compressGzip empty input" {
 
 test "StreamWriter basic" {
     const allocator = std.testing.allocator;
+    var res: Self = .{
+        .allocator = allocator,
+        .request = undefined,
+        .status = .ok,
+        .headers = std.ArrayList(http.Header).empty,
+        .cookies = std.ArrayList(Cookie).empty,
+        .enable_compression = false,
+        .raw_writer = null,
+    };
     var sw = StreamWriter{
-        .response = undefined,
+        .response = &res,
         .content_type = "text/plain",
         .chunks = try std.ArrayList([]const u8).initCapacity(allocator, 4),
     };
@@ -418,12 +472,120 @@ test "StreamWriter basic" {
 
 test "StreamWriter empty finish" {
     const allocator = std.testing.allocator;
+    var res: Self = .{
+        .allocator = allocator,
+        .request = undefined,
+        .status = .ok,
+        .headers = std.ArrayList(http.Header).empty,
+        .cookies = std.ArrayList(Cookie).empty,
+        .enable_compression = false,
+        .raw_writer = null,
+    };
     var sw = StreamWriter{
-        .response = undefined,
+        .response = &res,
         .content_type = "",
         .chunks = try std.ArrayList([]const u8).initCapacity(allocator, 0),
     };
     defer sw.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), sw.chunks.items.len);
+}
+
+test "init creates Response with defaults" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+    defer res.deinit();
+
+    try std.testing.expectEqual(allocator, res.allocator);
+    try std.testing.expectEqual(@as(http.Status, .ok), res.status);
+    try std.testing.expectEqual(false, res.enable_compression);
+    try std.testing.expectEqual(@as(usize, 0), res.headers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), res.cookies.items.len);
+}
+
+test "statusCode sets status and returns self for chaining" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(http.Status, .ok), res.status);
+
+    const returned = res.statusCode(.not_found);
+    try std.testing.expectEqual(@as(http.Status, .not_found), res.status);
+    try std.testing.expectEqual(@as(http.Status, .not_found), returned.*.status);
+    // Verify it's the same object
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&res)), @intFromPtr(returned));
+}
+
+test "header appends headers and supports chaining" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+    defer res.deinit();
+
+    const returned = try res.header("Content-Type", "application/json");
+
+    try std.testing.expectEqual(@as(usize, 1), res.headers.items.len);
+    try std.testing.expectEqualStrings("Content-Type", res.headers.items[0].name);
+    try std.testing.expectEqualStrings("application/json", res.headers.items[0].value);
+
+    // Multiple headers
+    _ = try res.header("X-Custom", "value");
+    try std.testing.expectEqual(@as(usize, 2), res.headers.items.len);
+    try std.testing.expectEqualStrings("X-Custom", res.headers.items[1].name);
+    try std.testing.expectEqualStrings("value", res.headers.items[1].value);
+
+    // Chaining returns self
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&res)), @intFromPtr(returned));
+}
+
+test "setCookie appends cookies and supports chaining" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+    defer res.deinit();
+
+    const returned = try res.setCookie("session", "abc123");
+
+    try std.testing.expectEqual(@as(usize, 1), res.cookies.items.len);
+    try std.testing.expectEqualStrings("session", res.cookies.items[0].name);
+    try std.testing.expectEqualStrings("abc123", res.cookies.items[0].value);
+
+    // Multiple cookies
+    _ = try res.setCookie("theme", "dark");
+    try std.testing.expectEqual(@as(usize, 2), res.cookies.items.len);
+    try std.testing.expectEqualStrings("theme", res.cookies.items[1].name);
+    try std.testing.expectEqualStrings("dark", res.cookies.items[1].value);
+
+    // Chaining returns self
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&res)), @intFromPtr(returned));
+}
+
+test "compression enables compression flag and supports chaining" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+    defer res.deinit();
+
+    try std.testing.expectEqual(false, res.enable_compression);
+
+    const returned = res.compression(true);
+    try std.testing.expectEqual(true, res.enable_compression);
+    try std.testing.expectEqual(true, returned.*.enable_compression);
+
+    // Can disable too
+    _ = res.compression(false);
+    try std.testing.expectEqual(false, res.enable_compression);
+
+    // Chaining returns self
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&res)), @intFromPtr(returned));
+}
+
+test "deinit cleanup doesn't crash" {
+    const allocator = std.testing.allocator;
+    var res = Self.init(allocator, undefined);
+
+    // Add some data so deinit has work to do
+    _ = try res.header("X-Test", "survive");
+    _ = try res.setCookie("test", "cookie");
+
+    // Should clean up without crashing or leaking
+    res.deinit();
 }

@@ -269,8 +269,10 @@ test "Handler.fromFn - pure function can be called" {
     try std.testing.expectEqual(handler.ptr, instance);
 
     // handle 应调用纯函数
-    const req: *RequestContext = @ptrFromInt(0x1000);
-    const res: *Response = @ptrFromInt(0x2000);
+    // 安全说明：0x10 是一个从不被解引用的标记指针 — 该处理函数忽略参数
+    // 用于测试 VTable 分派逻辑，而非实际的 Request／Response 操作
+    const req: *RequestContext = @ptrFromInt(0x10);
+    const res: *Response = @ptrFromInt(0x10);
     try handler.vtable.handle(instance, req, res);
     try std.testing.expectEqual(@as(u32, 1), handler_test_call_count);
 
@@ -301,8 +303,9 @@ test "Handler.init - singleton returns itself" {
     try std.testing.expectEqual(&singleton, typed);
 
     // handle 应调用 singleton.handle
-    const req: *RequestContext = @ptrFromInt(0x1000);
-    const res: *Response = @ptrFromInt(0x2000);
+    // 安全说明：标记指针（0x10）从不被解引用 — 该处理函数忽略参数
+    const req: *RequestContext = @ptrFromInt(0x10);
+    const res: *Response = @ptrFromInt(0x10);
     try handler.vtable.handle(instance, req, res);
     try std.testing.expect(singleton.handle_called);
 
@@ -359,7 +362,7 @@ test "Handler.initPerRequest - new instance per request and deinit called" {
     const typed1: *PerRequest = @ptrCast(@alignCast(inst1));
     try std.testing.expectEqual(@as(u32, 0), typed1.id);
 
-    try handler.vtable.handle(inst1, @ptrFromInt(0x1000), @ptrFromInt(0x2000));
+    try handler.vtable.handle(inst1, @ptrFromInt(0x10), @ptrFromInt(0x10));
     try std.testing.expectEqual(@as(u32, 0), PerRequest.last_handle_id);
 
     // 第二次请求 — 应创建新实例 id=1（不同于第一次）
@@ -368,7 +371,7 @@ test "Handler.initPerRequest - new instance per request and deinit called" {
     try std.testing.expectEqual(@as(u32, 1), typed2.id);
     try std.testing.expect(typed1 != typed2);
 
-    try handler.vtable.handle(inst2, @ptrFromInt(0x1000), @ptrFromInt(0x2000));
+    try handler.vtable.handle(inst2, @ptrFromInt(0x10), @ptrFromInt(0x10));
     try std.testing.expectEqual(@as(u32, 1), PerRequest.last_handle_id);
 
     // 销毁第一个实例 — 应调用 deinit
@@ -382,4 +385,149 @@ test "Handler.initPerRequest - new instance per request and deinit called" {
     handler.vtable.destroy(handler.ptr, inst2);
     try std.testing.expect(PerRequest.deinit_called);
     try std.testing.expectEqual(@as(u32, 1), PerRequest.deinit_id);
+}
+
+test "Handler.init - creates from struct with handle method" {
+    const T = struct {
+        handled: bool = false,
+
+        pub fn handle(self: *@This(), req: *RequestContext, res: *Response) !void {
+            _ = req;
+            _ = res;
+            self.handled = true;
+        }
+    };
+
+    var t = T{};
+    const handler = Handler.init(T, &t);
+
+    const instance = try handler.vtable.create(handler.ptr);
+    try handler.vtable.handle(instance, @ptrFromInt(0x10), @ptrFromInt(0x10));
+    try std.testing.expect(t.handled);
+
+    handler.vtable.destroy(handler.ptr, instance);
+}
+
+test "Handler vtable dispatches to correct function" {
+    const T = struct {
+        pub fn handle(self: *@This(), req: *RequestContext, res: *Response) !void {
+            _ = self;
+            _ = req;
+            _ = res;
+            handler_test_call_count += 1;
+        }
+    };
+
+    handler_test_call_count = 0;
+    var t = T{};
+    const handler = Handler.init(T, &t);
+
+    const instance = try handler.vtable.create(handler.ptr);
+    try std.testing.expectEqual(handler.ptr, instance);
+
+    try handler.vtable.handle(instance, @ptrFromInt(0x10), @ptrFromInt(0x10));
+    try std.testing.expectEqual(@as(u32, 1), handler_test_call_count);
+
+    handler.vtable.destroy(handler.ptr, instance);
+}
+
+test "Handler - error propagation from handle" {
+    const T = struct {
+        pub fn handle(_: *@This(), _: *RequestContext, _: *Response) !void {
+            return error.HandlerTestError;
+        }
+    };
+
+    var t = T{};
+    const handler = Handler.init(T, &t);
+
+    const instance = try handler.vtable.create(handler.ptr);
+    errdefer handler.vtable.destroy(handler.ptr, instance);
+
+    try std.testing.expectError(error.HandlerTestError, handler.vtable.handle(instance, @ptrFromInt(0x10), @ptrFromInt(0x10)));
+
+    handler.vtable.destroy(handler.ptr, instance);
+}
+
+test "Handler.initPerRequestWith - args passed through and deinit called" {
+    const allocator = std.testing.allocator;
+
+    const TestArgs = struct {
+        name: []const u8,
+        value: u32,
+    };
+
+    const PerRequestWith = struct {
+        name: []const u8,
+        value: u32,
+
+        pub fn init(alloc: std.mem.Allocator, args: TestArgs) !*@This() {
+            const self = try alloc.create(@This());
+            self.* = .{ .name = args.name, .value = args.value };
+            return self;
+        }
+
+        pub fn handle(self: *@This(), req: *RequestContext, res: *Response) !void {
+            _ = req;
+            _ = res;
+            last_name = self.name;
+            last_value = self.value;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            deinit_called = true;
+        }
+
+        var last_name: []const u8 = "";
+        var last_value: u32 = 0;
+        var deinit_called: bool = false;
+    };
+
+    // 重置全局状态
+    PerRequestWith.last_name = "";
+    PerRequestWith.last_value = 0;
+    PerRequestWith.deinit_called = false;
+
+    const args = TestArgs{ .name = "test-handler", .value = 42 };
+    const handler = try Handler.initPerRequestWith(PerRequestWith, allocator, args);
+    defer {
+        // 释放 initPerRequestWith 分配的 Context（含 alloc + args）
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            args: TestArgs,
+        };
+        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
+        allocator.destroy(ctx);
+    }
+
+    // 第一次请求 — 应创建新实例并正确保存 args
+    const inst1 = try handler.vtable.create(handler.ptr);
+    const typed1: *PerRequestWith = @ptrCast(@alignCast(inst1));
+    try std.testing.expectEqualStrings("test-handler", typed1.name);
+    try std.testing.expectEqual(@as(u32, 42), typed1.value);
+
+    try handler.vtable.handle(inst1, @ptrFromInt(0x10), @ptrFromInt(0x10));
+    try std.testing.expectEqualStrings("test-handler", PerRequestWith.last_name);
+    try std.testing.expectEqual(@as(u32, 42), PerRequestWith.last_value);
+
+    // 第二次请求 — 应创建新实例，且 args 仍然正确
+    const inst2 = try handler.vtable.create(handler.ptr);
+    const typed2: *PerRequestWith = @ptrCast(@alignCast(inst2));
+    try std.testing.expectEqualStrings("test-handler", typed2.name);
+    try std.testing.expectEqual(@as(u32, 42), typed2.value);
+    try std.testing.expect(typed1 != typed2);
+
+    try handler.vtable.handle(inst2, @ptrFromInt(0x10), @ptrFromInt(0x10));
+    try std.testing.expectEqualStrings("test-handler", PerRequestWith.last_name);
+    try std.testing.expectEqual(@as(u32, 42), PerRequestWith.last_value);
+
+    // 销毁第一个实例 — 应调用 deinit
+    handler.vtable.destroy(handler.ptr, inst1);
+    try std.testing.expect(PerRequestWith.deinit_called);
+
+    // 销毁第二个实例
+    PerRequestWith.deinit_called = false;
+    handler.vtable.destroy(handler.ptr, inst2);
+    try std.testing.expect(PerRequestWith.deinit_called);
 }

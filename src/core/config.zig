@@ -108,3 +108,67 @@ test "Config.defaults - returns default values" {
     try std.testing.expectEqual(@as(?[]const u8, null), config.tls_cert_file);
     try std.testing.expectEqual(@as(?[]const u8, null), config.tls_key_file);
 }
+
+test "Config - custom values override defaults" {
+    const config = Config{
+        .address = "0.0.0.0",
+        .port = 8080,
+        .server_name = "MyServer",
+        .keep_alive_enabled = false,
+        .read_buffer_size = 4096,
+    };
+
+    try std.testing.expectEqualStrings("0.0.0.0", config.address);
+    try std.testing.expectEqual(@as(u16, 8080), config.port);
+    try std.testing.expectEqualStrings("MyServer", config.server_name);
+    try std.testing.expectEqual(false, config.keep_alive_enabled);
+    try std.testing.expectEqual(@as(usize, 4096), config.read_buffer_size);
+    // Unchanged fields should still be defaults
+    try std.testing.expectEqual(@as(u31, 4096), config.tcp_backlog);
+    try std.testing.expectEqual(true, config.reuse_address);
+    try std.testing.expectEqual(@as(u64, 30_000_000_000), config.idle_timeout_ns);
+}
+
+test "Config - TLS enabled configuration" {
+    const config = Config{
+        .tls_enabled = true,
+        .tls_cert_file = "/etc/certs/server.crt",
+        .tls_key_file = "/etc/certs/server.key",
+    };
+
+    try std.testing.expectEqual(true, config.tls_enabled);
+    try std.testing.expectEqualStrings("/etc/certs/server.crt", config.tls_cert_file.?);
+    try std.testing.expectEqualStrings("/etc/certs/server.key", config.tls_key_file.?);
+}
+
+test "Config - log configuration" {
+    const config = Config{
+        .log_file_path = "/var/log/server.log",
+        .log_max_file_size = 100 * 1024 * 1024,
+        .log_max_backup_files = 5,
+        .log_compress_rotated = false,
+        .log_async_enabled = true,
+        .log_rotate_daily = false,
+    };
+
+    try std.testing.expectEqualStrings("/var/log/server.log", config.log_file_path.?);
+    try std.testing.expectEqual(@as(u64, 100 * 1024 * 1024), config.log_max_file_size);
+    try std.testing.expectEqual(@as(u32, 5), config.log_max_backup_files);
+    try std.testing.expectEqual(false, config.log_compress_rotated);
+    try std.testing.expectEqual(true, config.log_async_enabled);
+    try std.testing.expectEqual(false, config.log_rotate_daily);
+}
+
+test "Config - TLS with custom port" {
+    const config = Config{
+        .tls_enabled = true,
+        .tls_cert_file = "/etc/ssl/certs/server.crt",
+        .tls_key_file = "/etc/ssl/private/server.key",
+        .port = 443,
+    };
+
+    try std.testing.expectEqual(true, config.tls_enabled);
+    try std.testing.expectEqualStrings("/etc/ssl/certs/server.crt", config.tls_cert_file.?);
+    try std.testing.expectEqualStrings("/etc/ssl/private/server.key", config.tls_key_file.?);
+    try std.testing.expectEqual(@as(u16, 443), config.port);
+}

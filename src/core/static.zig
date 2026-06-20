@@ -210,3 +210,25 @@ test "getContentType - unknown extension falls back to octet-stream" {
     try std.testing.expectEqualStrings("application/octet-stream", getContentType("file.xyz"));
     try std.testing.expectEqualStrings("application/octet-stream", getContentType("noextension"));
 }
+
+test "Static.init - normalizes url prefix" {
+    const s = Self.init(std.testing.allocator, std.testing.io, "/var/www", "/static/");
+    try std.testing.expectEqualStrings("/static", s.url_prefix);
+}
+
+test "Static.init - keeps prefix without trailing slash" {
+    const s = Self.init(std.testing.allocator, std.testing.io, "/var/www", "/static");
+    try std.testing.expectEqualStrings("/static", s.url_prefix);
+}
+
+test "stripPrefix - extracts relative path" {
+    const s = Self.init(std.testing.allocator, std.testing.io, "/var/www", "/static");
+    const result = s.stripPrefix("/static/css/style.css");
+    try std.testing.expectEqualStrings("css/style.css", result.?);
+}
+
+test "stripPrefix - returns null for non-matching path" {
+    const s = Self.init(std.testing.allocator, std.testing.io, "/var/www", "/static");
+    const result = s.stripPrefix("/api/users");
+    try std.testing.expect(result == null);
+}

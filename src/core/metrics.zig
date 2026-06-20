@@ -16,6 +16,8 @@ pub const MetricsCollector = struct {
     total_requests: u64 = 0,
     active_connections: u32 = 0,
     latencies: std.ArrayList(u64),
+    /// 标记数据是否已被修改，需要重新排序才能计算百分位数
+    sorted: bool = true,
 
     const Self = @This();
 
@@ -31,6 +33,7 @@ pub const MetricsCollector = struct {
         self.total_requests += 1;
         if (self.latencies.items.len < 10000) {
             try self.latencies.append(self.allocator, metrics.latency_ns);
+            self.sorted = false;
         }
     }
 
@@ -41,28 +44,39 @@ pub const MetricsCollector = struct {
         if (self.active_connections > 0) self.active_connections -= 1;
     }
 
-    pub fn getP50(self: *const Self) u64 {
+    pub fn getP50(self: *Self) u64 {
         return self.getPercentile(50);
     }
-    pub fn getP95(self: *const Self) u64 {
+    pub fn getP95(self: *Self) u64 {
         return self.getPercentile(95);
     }
-    pub fn getP99(self: *const Self) u64 {
+    pub fn getP99(self: *Self) u64 {
         return self.getPercentile(99);
     }
 
-    fn getPercentile(self: *const Self, percentile: u8) u64 {
+    fn getPercentile(self: *Self, percentile: u8) u64 {
         const items = self.latencies.items;
         if (items.len == 0) return 0;
-        const sorted = self.allocator.alloc(u64, items.len) catch return 0;
-        defer self.allocator.free(sorted);
-        @memcpy(sorted, items);
-        std.mem.sort(u64, sorted, {}, comptime std.sort.asc(u64));
+
+        // 仅在数据被修改时重新排序（惰性排序优化）
+        if (!self.sorted) {
+            const sorted = self.allocator.alloc(u64, items.len) catch {
+                std.log.warn("Metrics: failed to allocate memory for percentile calculation", .{});
+                return 0;
+            };
+            @memcpy(sorted, items);
+            std.mem.sort(u64, sorted, {}, comptime std.sort.asc(u64));
+            // 将排序结果写回（仅当分配成功时）
+            @memcpy(self.latencies.items.ptr[0..items.len], sorted);
+            self.allocator.free(sorted);
+            self.sorted = true;
+        }
+
         const idx = (percentile * items.len + 99) / 100;
-        return sorted[if (idx > 0) idx - 1 else 0];
+        return items[if (idx > 0) idx - 1 else 0];
     }
 
-    pub fn generateReport(self: *const Self, buffer: []u8) ![]u8 {
+    pub fn generateReport(self: *Self, buffer: []u8) ![]u8 {
         const report = try std.fmt.bufPrint(buffer, "requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
             self.total_requests,
             self.active_connections,

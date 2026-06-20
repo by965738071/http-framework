@@ -377,9 +377,12 @@ fn compareBool(op: Operator, a: bool, b: bool) bool {
 
 /// 从结构体实例中获取字段值（编译期反射）
 pub fn getFieldValue(comptime T: type, instance: T, field_name: []const u8) FieldValue {
-    inline for (std.meta.fields(T)) |f| {
-        if (std.mem.eql(u8, f.name, field_name)) {
-            const val = @field(instance, f.name);
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, 0..) |name, field_type, i| {
+        _ = field_type;
+        _ = i;
+        if (std.mem.eql(u8, name, field_name)) {
+            const val = @field(instance, name);
             return toFieldValue(val);
         }
     }
@@ -422,34 +425,36 @@ pub fn toFieldValue(value: anytype) FieldValue {
 
 /// 从 FieldValue 设置结构体字段
 pub fn setFieldFromValue(comptime T: type, instance: *T, field_name: []const u8, value: FieldValue) void {
-    inline for (std.meta.fields(T)) |f| {
-        if (std.mem.eql(u8, f.name, field_name)) {
-            switch (@typeInfo(f.type)) {
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, 0..) |name, field_type, i| {
+        _ = i;
+        if (std.mem.eql(u8, name, field_name)) {
+            switch (@typeInfo(field_type)) {
                 .int, .comptime_int => {
-                    @field(instance, f.name) = @intCast(value.integer);
+                    @field(instance, name) = @intCast(value.integer);
                 },
                 .float, .comptime_float => {
-                    @field(instance, f.name) = @floatCast(value.float);
+                    @field(instance, name) = @floatCast(value.float);
                 },
                 .bool => {
-                    @field(instance, f.name) = value.boolean;
+                    @field(instance, name) = value.boolean;
                 },
                 .pointer => |ptr| {
                     if (ptr.size == .slice and ptr.child == u8) {
-                        @field(instance, f.name) = value.string;
+                        @field(instance, name) = value.string;
                     }
                 },
                 .optional => {
-                    const Child = std.meta.Child(f.type);
+                    const Child = std.meta.Child(field_type);
                     switch (@typeInfo(Child)) {
                         .int, .comptime_int => {
-                            @field(instance, f.name) = @as(Child, @intCast(value.integer));
+                            @field(instance, name) = @intCast(value.integer);
                         },
                         .float, .comptime_float => {
-                            @field(instance, f.name) = @as(Child, @floatCast(value.float));
+                            @field(instance, name) = @as(Child, @floatCast(value.float));
                         },
                         .bool => {
-                            @field(instance, f.name) = value.boolean;
+                            @field(instance, name) = value.boolean;
                         },
                         else => {},
                     }

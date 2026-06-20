@@ -25,7 +25,7 @@ const SessionRecord = struct {
 pub const SessionManager = struct {
     allocator: Allocator,
     io_ctx: std.Io,
-    sessions: std.StringHashMap(SessionRecord) = .empty,
+    sessions: std.StringHashMap(SessionRecord),
     cookie_name: []const u8 = "session_id",
     session_timeout_sec: u32 = 3600, // 1 小时
     cleanup_interval_sec: u32 = 300, // 5 分钟清理一次
@@ -38,7 +38,7 @@ pub const SessionManager = struct {
         return Self{
             .allocator = allocator,
             .io_ctx = io_ctx,
-            .sessions = std.StringHashMap(SessionRecord).empty,
+            .sessions = std.StringHashMap(SessionRecord).init(allocator),
         };
     }
 
@@ -48,10 +48,16 @@ pub const SessionManager = struct {
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             var record = entry.value_ptr.*;
-            record.data.deinit(self.allocator);
+            // Free all keys and values in the data hashmap
+            var data_it = record.data.iterator();
+            while (data_it.next()) |data_entry| {
+                self.allocator.free(data_entry.key_ptr.*);
+                self.allocator.free(data_entry.value_ptr.*);
+            }
+            record.data.deinit();
             self.allocator.free(record.id);
         }
-        self.sessions.deinit(self.allocator);
+        self.sessions.deinit();
     }
 
     /// 获取或创建 Session（生产级）
@@ -59,7 +65,7 @@ pub const SessionManager = struct {
         // 1. 尝试从 Cookie 获取 session_id
         if (ctx.getCookie(self.cookie_name)) |session_id| {
             if (self.sessions.get(session_id)) |*record| {
-                const now = self.io_ctx.now(.real).nanoseconds;
+                const now = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
 
                 // 检查是否过期
                 if (now < record.expires) {
@@ -92,7 +98,7 @@ pub const SessionManager = struct {
         );
 
         // 创建 Session 记录
-        const now_ns = self.io_ctx.now(.real).nanoseconds;
+        const now_ns = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
         const record = SessionRecord{
             .id = try self.allocator.dupe(u8, session_id),
             .data = SessionData.init(self.allocator),
@@ -100,7 +106,7 @@ pub const SessionManager = struct {
             .created = now_ns,
         };
 
-        try self.sessions.put(self.allocator, session_id, record);
+        try self.sessions.put(session_id, record);
 
         // 设置 Cookie（遵循标准格式）
         try res.setCookie(self.cookie_name, session_id);
@@ -112,33 +118,33 @@ pub const SessionManager = struct {
     }
 
     /// 获取 Session 数据
-    pub fn getData(self: *const Self, session_id: []const u8) ?*SessionData {
-        if (self.sessions.get(session_id)) |*record| {
-            return &record.data;
-        }
-        return null;
+    pub fn getData(self: *const Self, session_id: []const u8) ?*const SessionData {
+        const entry = self.sessions.getEntry(session_id) orelse return null;
+        return &entry.value_ptr.data;
     }
 
     /// 设置 Session 数据
     pub fn setData(self: *Self, session_id: []const u8, key: []const u8, value: []const u8) !void {
-        if (self.sessions.getPtr(session_id)) |*record| {
-            const key_dup = try self.allocator.dupe(u8, key);
-            const val_dup = try self.allocator.dupe(u8, value);
-            try record.data.put(self.allocator, key_dup, val_dup);
-        }
+        const entry = self.sessions.getEntry(session_id) orelse {
+            std.log.warn("Session.setData: session_id not found (may have expired): {s}", .{session_id});
+            return;
+        };
+        const key_dup = try self.allocator.dupe(u8, key);
+        const val_dup = try self.allocator.dupe(u8, value);
+        try entry.value_ptr.data.put(key_dup, val_dup);
     }
 
     /// 删除 Session
     fn deleteSession(self: *Self, session_id: []const u8) void {
         if (self.sessions.fetchRemove(session_id)) |kv| {
             self.allocator.free(kv.value.id);
-            kv.value.data.deinit(self.allocator);
+            kv.value.data.deinit();
         }
     }
 
     /// 定期清理过期 Session
     fn maybeCleanup(self: *Self) void {
-        const now = self.io_ctx.now(.real).nanoseconds;
+        const now = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
         const cleanup_interval_ns = @as(i128, self.cleanup_interval_sec) * 1_000_000_000;
 
         if (now - self.last_cleanup < cleanup_interval_ns) {
@@ -151,8 +157,8 @@ pub const SessionManager = struct {
 
     /// 清理所有过期的 Session
     fn cleanupExpired(self: *Self) void {
-        const now = self.io_ctx.now(.real).nanoseconds;
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        const now = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
+        var to_remove = std.ArrayList([]const u8).empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.sessions.iterator();
@@ -172,13 +178,15 @@ pub const SessionManager = struct {
     }
 
     /// 获取 Session 统计信息
-    pub fn getStats(self: *const Self) struct {
+    pub const Stats = struct {
         total: u32,
-        active: u32, // 未过期
-        expired: u32, // 已过期
-    } {
-        const now = self.io_ctx.now(.real).nanoseconds;
-        var stats = .{ .total = 0, .active = 0, .expired = 0 };
+        active: u32,
+        expired: u32,
+    };
+
+    pub fn getStats(self: *const Self) Stats {
+        const now = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
+        var stats = Stats{ .total = 0, .active = 0, .expired = 0 };
 
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
@@ -193,3 +201,113 @@ pub const SessionManager = struct {
         return stats;
     }
 };
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "SessionManager.init - creates empty manager" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    try std.testing.expectEqualStrings("session_id", sm.cookie_name);
+    try std.testing.expectEqual(@as(u32, 3600), sm.session_timeout_sec);
+    try std.testing.expect(sm.sessions.count() == 0);
+}
+
+test "SessionManager.getData - returns null for non-existent session" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    const data = sm.getData("non_existent");
+    try std.testing.expect(data == null);
+}
+
+test "SessionManager.setData - warns on non-existent session (no crash)" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    // Should not crash, just log a warning
+    try sm.setData("non_existent", "key", "value");
+}
+
+test "SessionManager.setData/getData - round trip" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    // 手动创建一个 session 记录
+    const session_id = try std.fmt.allocPrint(allocator, "test_session", .{});
+    defer allocator.free(session_id);
+
+    const now = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
+    const record = SessionRecord{
+        .id = try allocator.dupe(u8, session_id),
+        .data = SessionData.init(allocator),
+        .expires = now + @as(i128, 3600) * 1_000_000_000,
+        .created = now,
+    };
+    try sm.sessions.put(try allocator.dupe(u8, session_id), record);
+
+    // setData
+    try sm.setData(session_id, "username", "alice");
+    try sm.setData(session_id, "role", "admin");
+
+    // getData
+    const data = sm.getData(session_id) orelse @panic("data should exist");
+    try std.testing.expectEqualStrings("alice", data.get("username").?);
+    try std.testing.expectEqualStrings("admin", data.get("role").?);
+}
+
+test "SessionManager.getStats - empty manager" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    const stats = sm.getStats();
+    try std.testing.expectEqual(@as(u32, 0), stats.total);
+    try std.testing.expectEqual(@as(u32, 0), stats.active);
+    try std.testing.expectEqual(@as(u32, 0), stats.expired);
+}
+
+test "SessionManager.getStats - with sessions" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io);
+    defer sm.deinit();
+
+    const now = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
+
+    // Active session
+    {
+        const id = try std.fmt.allocPrint(allocator, "active_1", .{});
+        defer allocator.free(id);
+        const record = SessionRecord{
+            .id = try allocator.dupe(u8, id),
+            .data = SessionData.init(allocator),
+            .expires = now + @as(i128, 3600) * 1_000_000_000,
+            .created = now,
+        };
+        try sm.sessions.put(try allocator.dupe(u8, id), record);
+    }
+
+    // Expired session (set timeout in the past)
+    {
+        const id = try std.fmt.allocPrint(allocator, "expired_1", .{});
+        defer allocator.free(id);
+        const record = SessionRecord{
+            .id = try allocator.dupe(u8, id),
+            .data = SessionData.init(allocator),
+            .expires = now - @as(i128, 3600) * 1_000_000_000, // 1 hour ago
+            .created = now - @as(i128, 7200) * 1_000_000_000,
+        };
+        try sm.sessions.put(try allocator.dupe(u8, id), record);
+    }
+
+    const stats = sm.getStats();
+    try std.testing.expectEqual(@as(u32, 2), stats.total);
+    try std.testing.expectEqual(@as(u32, 1), stats.active);
+    try std.testing.expectEqual(@as(u32, 1), stats.expired);
+}

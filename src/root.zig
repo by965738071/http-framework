@@ -43,4 +43,8 @@ pub const Orm = core.Orm;
 // Optional: expose the entire core module for advanced use
 pub const Core = core;
 
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
 // No additional test or helper functions are required in this file.

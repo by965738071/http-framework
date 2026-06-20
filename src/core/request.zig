@@ -23,7 +23,7 @@
 //!
 //! # 零分配路径
 //!
-//! 如果 handler 完全不需要 header/query/cookie，则 `RequestContext.init` 只做：
+//! 如果 handler 完全不需要 header/query/cookie，则 `Self.init` 只做：
 //! - 1 次 `StringHashMap.init`（path_params 用，条目为空）
 //! - 无 dupe 分配
 //! - `deinit` 只有一次 HashMap deinit
@@ -34,6 +34,13 @@ const mem = std.mem;
 
 const Multipart = @import("multipart.zig");
 const deserialize = @import("deserialize.zig");
+
+/// 用户数据容器 — 包含不透明指针和销毁函数
+/// 任何模块都可以存入自定义数据，框架会通过 destroyFn 自动释放
+pub const UserData = struct {
+    ptr: *anyopaque,
+    destroyFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+};
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -46,6 +53,9 @@ version: http.Version,
 
 // ---- 路径参数 — 必须用 HashMap（路由批量写入） ----
 path_params: std.StringHashMapUnmanaged([]const u8),
+
+// ---- 查询参数缓存（延迟初始化的 HashMap） ----
+query_params: ?std.StringHashMapUnmanaged([]const u8) = null,
 
 // ---- 请求体 ----
 content_type: ?[]const u8,
@@ -69,7 +79,7 @@ body_size_limit: u64 = 0,
 headers_parsed: bool,
 
 // ---- 用户数据（中间件传递） ----
-user_data: ?*anyopaque,
+user_data: ?UserData = null,
 
 // ---- 中间件拦截状态码 ----
 blocked_status: ?http.Status = null,
@@ -136,6 +146,11 @@ pub fn init(
 
 /// 释放所有堆分配的资源
 pub fn deinit(self: *Self) void {
+    // 释放查询参数缓存
+    if (self.query_params) |*qp| {
+        freeHashMap(qp, self.allocator);
+    }
+
     // 只有 path_params 一定需要释放
     freeHashMap(&self.path_params, self.allocator);
 
@@ -144,15 +159,15 @@ pub fn deinit(self: *Self) void {
         self.allocator.free(data);
     }
 
-    // 释放 AuthInfo（由 AuthMiddleware 通过 setUserData 注入）
-    if (self.user_data) |data| {
-        const AuthInfo = @import("auth.zig").AuthInfo;
-        const info: *AuthInfo = @ptrCast(@alignCast(data));
-        if (info.token) |t| self.allocator.free(t);
-        if (info.username) |u| self.allocator.free(u);
-        if (info.api_key) |k| self.allocator.free(k);
-        if (info.roles) |r| self.allocator.free(r);
-        self.allocator.destroy(info);
+    // 释放 multipart 解析器
+    if (self.multipart_parser) |parser| {
+        parser.deinit();
+        self.allocator.destroy(parser);
+    }
+
+    // 通过注册的销毁函数释放用户数据（通用、类型安全）
+    if (self.user_data) |ud| {
+        ud.destroyFn(ud.ptr, self.allocator);
     }
 }
 
@@ -179,31 +194,64 @@ pub fn getHeader(self: *const Self, key: []const u8) ?[]const u8 {
 
 /// 获取查询参数值。
 ///
-/// 首次调用时在线解析 query string，不缓存、不分配。
-/// 返回的 slice 指向**请求头缓冲区**中的原始数据，生命周期到下一个请求头解析。
-pub fn getQuery(self: *const Self, key: []const u8) ?[]const u8 {
+/// 首次调用时全量解析 query string 并缓存到 HashMap 中，
+/// 后续所有 `getQuery()` 调用均为 O(1) 查询。
+///
+/// 返回的 slice 在请求上下文的生命周期内有效。
+pub fn getQuery(self: *Self, key: []const u8) ?[]const u8 {
     if (self.query.len == 0) return null;
 
-    var pairs = mem.splitScalar(u8, self.query, '&');
-    while (pairs.next()) |pair| {
-        if (pair.len == 0) continue;
+    // 延迟初始化查询参数缓存
+    if (self.query_params == null) {
+        self.query_params = std.StringHashMapUnmanaged([]const u8).empty;
+        var pairs = mem.splitScalar(u8, self.query, '&');
+        while (pairs.next()) |pair| {
+            if (pair.len == 0) continue;
 
-        const eq_idx = mem.indexOfScalar(u8, pair, '=');
-        if (eq_idx) |idx| {
-            if (mem.eql(u8, pair[0..idx], key)) {
-                // URL 解码只在有 % 或 + 字符时分配
-                if (mem.indexOfAny(u8, pair[idx + 1 ..], "%+")) |_| {
-                    return urlDecode(self.allocator, pair[idx + 1 ..]) catch return null;
+            const eq_idx = mem.indexOfScalar(u8, pair, '=');
+            if (eq_idx) |idx| {
+                const k = pair[0..idx];
+                const raw_v = pair[idx + 1 ..];
+
+                // URL 解码值只在需要时分配
+                const value = if (mem.indexOfAny(u8, raw_v, "%+")) |_|
+                    (urlDecode(self.allocator, raw_v) catch raw_v)
+                else
+                    raw_v;
+
+                const key_dup = self.allocator.dupe(u8, k) catch continue;
+                if (value.ptr != raw_v.ptr) {
+                    // value 是 urlDecode 分配的新内存，所有权转移给 HashMap
+                    self.query_params.?.put(self.allocator, key_dup, value) catch {
+                        self.allocator.free(key_dup);
+                    };
+                } else {
+                    // value 指向原始 query 缓冲区，需要复制一份
+                    const val_dup = self.allocator.dupe(u8, value) catch {
+                        self.allocator.free(key_dup);
+                        continue;
+                    };
+                    self.query_params.?.put(self.allocator, key_dup, val_dup) catch {
+                        self.allocator.free(key_dup);
+                        self.allocator.free(val_dup);
+                    };
                 }
-                return pair[idx + 1 ..];
-            }
-        } else {
-            if (mem.eql(u8, pair, key)) {
-                return "";
+            } else {
+                // 没有 '=' 的参数，值为空字符串
+                const key_dup = self.allocator.dupe(u8, pair) catch continue;
+                const val_dup = self.allocator.dupe(u8, "") catch {
+                    self.allocator.free(key_dup);
+                    continue;
+                };
+                self.query_params.?.put(self.allocator, key_dup, val_dup) catch {
+                    self.allocator.free(key_dup);
+                    self.allocator.free(val_dup);
+                };
             }
         }
     }
-    return null;
+
+    return self.query_params.?.get(key);
 }
 
 // =========================================================================
@@ -347,7 +395,7 @@ pub fn json(self: *Self, comptime T: type) !T {
 ///     email: []const u8,
 /// };
 ///
-/// fn handler(ctx: *RequestContext, res: *Response) !void {
+/// fn handler(ctx: *Self, res: *Response) !void {
 ///     var parsed = try ctx.bodyAs(CreateUser);
 ///     defer parsed.deinit();
 ///
@@ -391,7 +439,7 @@ pub fn bodyAs(self: *Self, comptime T: type) !deserialize.Parsed(T) {
 ///     sort: ?[]const u8,
 /// };
 ///
-/// fn handler(ctx: *RequestContext, res: *Response) !void {
+/// fn handler(ctx: *Self, res: *Response) !void {
 ///     var parsed = try ctx.queryAs(ListQuery);
 ///     defer parsed.deinit();
 ///
@@ -434,15 +482,33 @@ pub fn getMultipart(self: *Self) !*Multipart.Parser {
 // 用户数据（中间件传递）
 // =========================================================================
 
-/// 设置用户自定义数据
-pub fn setUserData(self: *Self, data: *anyopaque) void {
-    self.user_data = data;
+/// 设置用户自定义数据（需同时提供销毁函数）
+///
+/// `destroyFn` 负责释放在 data 中持有的所有堆分配资源。
+/// 框架会在 Self.deinit() 时自动调用它。
+///
+/// # 使用示例
+/// ```zig
+/// fn destroyMyData(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+///     const data: *MyData = @ptrCast(@alignCast(ptr));
+///     allocator.free(data.name);
+///     allocator.destroy(data);
+/// }
+/// ctx.setUserData(@ptrCast(my_data), destroyMyData);
+/// ```
+pub fn setUserData(
+    self: *Self,
+    data: *anyopaque,
+    destroyFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+) void {
+    self.user_data = .{ .ptr = data, .destroyFn = destroyFn };
 }
 
 /// 获取用户自定义数据
+/// 调用方需知道具体的类型 T，通过 comptime 参数进行指针转换
 pub fn getUserData(self: *const Self, comptime T: type) ?*T {
     const data = self.user_data orelse return null;
-    return @ptrCast(@alignCast(data));
+    return @ptrCast(@alignCast(data.ptr));
 }
 
 // =========================================================================
@@ -479,22 +545,32 @@ pub fn hasContentType(self: *const Self, expected: []const u8) bool {
     return std.ascii.eqlIgnoreCase(ct, expected);
 }
 
+/// Case-insensitive contains check for ASCII strings.
+fn ciContains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
 /// 检查是否为 JSON 请求
 pub fn isJson(self: *const Self) bool {
     const ct = self.content_type orelse return false;
-    return mem.indexOfIgnoreCase(u8, ct, "application/json") != null;
+    return ciContains(ct, "application/json");
 }
 
 /// 检查是否为表单请求
 pub fn isForm(self: *const Self) bool {
     const ct = self.content_type orelse return false;
-    return mem.indexOfIgnoreCase(u8, ct, "application/x-www-form-urlencoded") != null;
+    return ciContains(ct, "application/x-www-form-urlencoded");
 }
 
 /// 检查是否为 multipart 表单请求
 pub fn isMultipartForm(self: *const Self) bool {
     const ct = self.content_type orelse return false;
-    return mem.indexOfIgnoreCase(u8, ct, "multipart/form-data") != null;
+    return ciContains(ct, "multipart/form-data");
 }
 
 // =========================================================================
@@ -578,6 +654,12 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 // =========================================================================
 // 测试
 // =========================================================================
+
+fn testDestroyMyData(ptr: *anyopaque, a: std.mem.Allocator) void {
+    const T = struct { value: u32 };
+    const data: *T = @ptrCast(@alignCast(ptr));
+    a.destroy(data);
+}
 
 test "urlDecode - basic" {
     const allocator = std.testing.allocator;
@@ -663,4 +745,463 @@ test "BodyReader larger buffer than remaining" {
     const n = try reader.read(&buf);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("Hi", buf[0..n]);
+}
+
+test "Self.init - parses path and query" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /search?q=hello&page=1 HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{
+            .in = undefined,
+            .state = .received_head,
+            .interface = undefined,
+            .max_head_len = 4096,
+        },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("/search", ctx.path);
+    try std.testing.expectEqualStrings("q=hello&page=1", ctx.query);
+    try std.testing.expectEqual(.GET, ctx.method);
+}
+
+test "Self.init - no query string" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /static/file.html HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("/static/file.html", ctx.path);
+    try std.testing.expectEqualStrings("", ctx.query);
+}
+
+test "Self.getHeader - basic lookup" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Custom: custom-value\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("example.com", ctx.getHeader("Host").?);
+    try std.testing.expectEqualStrings("custom-value", ctx.getHeader("X-Custom").?);
+    try std.testing.expect(ctx.getHeader("NonExistent") == null);
+}
+
+test "Self.getHeader - case insensitive" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "CONTENT-TYPE: application/json\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("application/json", ctx.getHeader("content-type").?);
+    try std.testing.expectEqualStrings("application/json", ctx.getHeader("Content-Type").?);
+}
+
+test "Self.getQuery - multiple params" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /api?name=John&age=30&city=NYC HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("John", ctx.getQuery("name").?);
+    try std.testing.expectEqualStrings("30", ctx.getQuery("age").?);
+    try std.testing.expectEqualStrings("NYC", ctx.getQuery("city").?);
+    try std.testing.expect(ctx.getQuery("missing") == null);
+}
+
+test "Self.getQuery - url encoded" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /api?q=hello+world&lang=zh%2Fcn HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // Query params are URL-decoded by getQuery
+    try std.testing.expectEqualStrings("hello world", ctx.getQuery("q").?);
+    try std.testing.expectEqualStrings("zh/cn", ctx.getQuery("lang").?);
+}
+
+test "Self.getCookie - single cookie" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Cookie: session=abc123\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("abc123", ctx.getCookie("session").?);
+    try std.testing.expect(ctx.getCookie("nonexistent") == null);
+}
+
+test "Self.getCookie - multiple cookies" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Cookie: session=abc123; theme=dark; lang=en-US\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("abc123", ctx.getCookie("session").?);
+    try std.testing.expectEqualStrings("dark", ctx.getCookie("theme").?);
+    try std.testing.expectEqualStrings("en-US", ctx.getCookie("lang").?);
+}
+
+test "Self.isAjax - X-Requested-With" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /api HTTP/1.1\r\n" ++
+        "X-Requested-With: XMLHttpRequest\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.isAjax());
+}
+
+test "Self.isAjax - not ajax" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /page HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expect(!ctx.isAjax());
+}
+
+test "Self.getClientIp - X-Forwarded-For" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "X-Forwarded-For: 192.168.1.1, 10.0.0.1\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // Should return the first IP in the list
+    try std.testing.expectEqualStrings("192.168.1.1", ctx.getClientIp().?);
+}
+
+test "Self.getClientIp - X-Real-IP" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "X-Real-IP: 10.0.0.5\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("10.0.0.5", ctx.getClientIp().?);
+}
+
+test "Self.getClientIp - no IP headers" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.getClientIp() == null);
+}
+
+test "Self.readBody - GET request returns empty" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // GET requests have no body, readBody should return empty slice
+    const body = try ctx.readBody();
+    try std.testing.expectEqual(@as(usize, 0), body.len);
+}
+
+test "Self.userData - set and get" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const MyData = struct { value: u32 };
+    const my_data = try allocator.create(MyData);
+    my_data.* = .{ .value = 42 };
+
+    ctx.setUserData(@ptrCast(my_data), testDestroyMyData);
+
+    const retrieved = ctx.getUserData(MyData);
+    try std.testing.expect(retrieved != null);
+    try std.testing.expectEqual(@as(u32, 42), retrieved.?.value);
+}
+
+test "Self.blocked_status - set and get" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.blocked_status == null);
+
+    ctx.blocked_status = .too_many_requests;
+    try std.testing.expectEqual(.too_many_requests, ctx.blocked_status.?);
+
+    ctx.blocked_status = null;
+    try std.testing.expect(ctx.blocked_status == null);
+}
+
+test "Self.getParam - path parameters" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /users/42 HTTP/1.1\r\n\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // No params set yet
+    try std.testing.expect(ctx.getParam("id") == null);
+
+    // Set path params manually
+    const key = try allocator.dupe(u8, "id");
+    const val = try allocator.dupe(u8, "42");
+    ctx.path_params.put(allocator, key, val) catch unreachable;
+
+    try std.testing.expectEqualStrings("42", ctx.getParam("id").?);
+    try std.testing.expect(ctx.getParam("missing") == null);
+}
+
+test "Self - content type checks" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "POST /api HTTP/1.1\r\n" ++
+        "Content-Type: application/json; charset=utf-8\r\n" ++
+        "Content-Length: 4\r\n" ++
+        "\r\n" ++
+        "test";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.isJson());
+    try std.testing.expect(!ctx.isForm());
+    try std.testing.expect(!ctx.isMultipartForm());
+    try std.testing.expect(ctx.hasContentType("application/json; charset=utf-8"));
 }

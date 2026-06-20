@@ -157,3 +157,59 @@ test "Middleware.destroy - calls deinit" {
 
     try std.testing.expect(t.deinit_called);
 }
+
+test "Middleware.process - returns respond" {
+    const T = struct {
+        pub fn process(_: *@This(), _: *RequestContext) anyerror!NextAction {
+            return .respond;
+        }
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+
+    const req: *RequestContext = @ptrFromInt(0x1000);
+    const action = try mw.process(req);
+
+    try std.testing.expectEqual(NextAction.respond, action);
+}
+
+test "Middleware.process - returns err" {
+    const T = struct {
+        pub fn process(_: *@This(), _: *RequestContext) anyerror!NextAction {
+            return .err;
+        }
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+
+    const req: *RequestContext = @ptrFromInt(0x1000);
+    const action = try mw.process(req);
+
+    try std.testing.expectEqual(NextAction.err, action);
+}
+
+test "Middleware.process - middleware without deinit" {
+    const T = struct {
+        call_count: u32 = 0,
+
+        pub fn process(self: *@This(), _: *RequestContext) anyerror!NextAction {
+            self.call_count += 1;
+            return .next;
+        }
+        // Intentionally no deinit method
+    };
+
+    var t = T{};
+    const mw = Self.init(T, &t);
+
+    const req: *RequestContext = @ptrFromInt(0x1000);
+    const action = try mw.process(req);
+
+    try std.testing.expectEqual(NextAction.next, action);
+    try std.testing.expectEqual(@as(u32, 1), t.call_count);
+
+    // destroy should not call deinit (T has no deinit), should not crash
+    mw.destroy();
+}

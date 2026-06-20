@@ -27,6 +27,10 @@ pub const CorsConfig = struct {
 
     /// 预检请求缓存时间（秒），默认 24 小时
     max_age: u32 = 86400,
+
+    /// 是否阻止未授权来源的请求（true=返回 403，false=仅不添加 CORS 头但仍放行）
+    /// 生产环境建议设为 true
+    block_unauthorized: bool = false,
 };
 
 /// CORS 中间件
@@ -61,6 +65,12 @@ pub const CorsMiddleware = struct {
 
         if (!self.isOriginAllowed(origin.?)) {
             std.log.warn("CORS: Origin not allowed: {s}", .{origin.?});
+            if (self.config.block_unauthorized) {
+                ctx.blocked_status = .forbidden;
+                return .respond;
+            }
+            // 非阻塞模式：仅不添加 CORS 头，但仍放行请求
+            // 浏览器会因缺少 Access-Control-Allow-Origin 头而阻止前端读取响应
             return .next;
         }
 
@@ -156,8 +166,8 @@ pub const CorsMiddleware = struct {
 
         // Access-Control-Max-Age (for preflight)
         if (ctx.method == .OPTIONS) {
-            var max_age_buf: [32]u8 = undefined;
-            const max_age_str = try std.fmt.bufPrint(&max_age_buf, "{d}", .{self.config.max_age});
+            const max_age_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.config.max_age});
+            defer self.allocator.free(max_age_str);
             _ = try res.header("Access-Control-Max-Age", max_age_str);
         }
     }
@@ -170,7 +180,41 @@ pub const CorsMiddleware = struct {
 test "CorsConfig defaults" {
     const cfg = CorsConfig{};
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
-    try std.testing.expectEqual(@as(usize, 0), cfg.allowed_methods.len);
     try std.testing.expectEqual(@as(u32, 86400), cfg.max_age);
     try std.testing.expectEqual(false, cfg.allow_credentials);
+    try std.testing.expectEqual(false, cfg.block_unauthorized);
+}
+
+test "CorsMiddleware - create and deinit" {
+    const allocator = std.testing.allocator;
+
+    var cors = try CorsMiddleware.init(allocator, .{});
+    defer cors.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cors.config.allowed_origins.len);
+    try std.testing.expectEqual(@as(u32, 86400), cors.config.max_age);
+    try std.testing.expectEqual(false, cors.config.allow_credentials);
+    try std.testing.expectEqual(false, cors.config.block_unauthorized);
+}
+
+test "CorsMiddleware - create with custom config" {
+    const allocator = std.testing.allocator;
+
+    const cfg = CorsConfig{
+        .allowed_origins = &.{"https://app.example.com"},
+        .allowed_methods = &.{ .GET, .POST },
+        .allow_credentials = true,
+        .max_age = 3600,
+        .block_unauthorized = true,
+        .exposed_headers = &.{"X-Custom"},
+    };
+    var cors = try CorsMiddleware.init(allocator, cfg);
+    defer cors.deinit();
+
+    try std.testing.expectEqualStrings("https://app.example.com", cors.config.allowed_origins[0]);
+    try std.testing.expectEqual(@as(u32, 3600), cors.config.max_age);
+    try std.testing.expectEqual(true, cors.config.allow_credentials);
+    try std.testing.expectEqual(true, cors.config.block_unauthorized);
+    try std.testing.expectEqual(@as(usize, 2), cors.config.allowed_methods.len);
+    try std.testing.expectEqualStrings("X-Custom", cors.config.exposed_headers[0]);
 }

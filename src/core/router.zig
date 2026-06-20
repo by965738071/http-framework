@@ -52,6 +52,9 @@ pub fn init(allocator: std.mem.Allocator) Self {
 }
 
 pub fn deinit(self: *Self) void {
+    for (self.routes.items) |r| {
+        self.allocator.free(r.pattern);
+    }
     self.routes.deinit(self.allocator);
 }
 
@@ -62,9 +65,10 @@ pub fn setLogger(self: *Self, logger: *RotatingFileLogger) void {
 
 /// 注册一条路由
 pub fn route(self: *Self, method: http.Method, pattern: []const u8, handler: Handler) !void {
+    const owned_pattern = try self.allocator.dupe(u8, pattern);
     try self.routes.append(self.allocator, .{
         .method = method,
-        .pattern = pattern,
+        .pattern = owned_pattern,
         .handler = handler,
     });
 }
@@ -77,9 +81,10 @@ pub fn routeWithMiddleware(
     handle: Handler,
     middle: []const Middleware,
 ) !void {
+    const owned_pattern = try self.allocator.dupe(u8, pattern);
     try self.routes.append(self.allocator, .{
         .method = method,
-        .pattern = pattern,
+        .pattern = owned_pattern,
         .handler = handle,
         .middlewares = middle,
     });
@@ -198,7 +203,7 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
 
         if (r.param_validator) |validator| {
             if (!validator(ctx)) {
-                ctx.path_params.deinit(self.allocator);
+                freeHashMap(&ctx.path_params, self.allocator);
                 ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
                 continue;
             }
@@ -206,7 +211,7 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
 
         if (r.method != ctx.method) {
             method_matched = true;
-            ctx.path_params.deinit(self.allocator);
+            freeHashMap(&ctx.path_params, self.allocator);
             ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
             continue;
         }
@@ -285,13 +290,20 @@ fn matchPattern(
 ) bool {
     if (pattern.len == 0 and path.len == 0) return true;
 
-    if (mem.endsWith(u8, pattern, "*")) {
-        const prefix = pattern[0 .. pattern.len - 1];
+    // Strip leading/trailing slashes for consistent matching
+    const clean_pattern = trimSlash(pattern);
+    const clean_path = trimSlash(path);
+
+    if (mem.endsWith(u8, clean_pattern, "*")) {
+        const prefix = clean_pattern[0 .. clean_pattern.len - 1];
         const clean_prefix = trimSlash(prefix);
-        const clean_path = trimSlash(path);
 
         if (mem.startsWith(u8, clean_path, clean_prefix)) {
-            const remaining = clean_path[clean_prefix.len..];
+            var remaining = clean_path[clean_prefix.len..];
+            // Strip leading slash from remaining path for consistency
+            if (remaining.len > 0 and remaining[0] == '/') {
+                remaining = remaining[1..];
+            }
             const key_dup = allocator.dupe(u8, "*") catch return false;
             const val_dup = allocator.dupe(u8, remaining) catch {
                 allocator.free(key_dup);
@@ -307,8 +319,8 @@ fn matchPattern(
         return false;
     }
 
-    var p_parts = mem.splitScalar(u8, pattern, '/');
-    var path_parts = mem.splitScalar(u8, path, '/');
+    var p_parts = mem.splitScalar(u8, clean_pattern, '/');
+    var path_parts = mem.splitScalar(u8, clean_path, '/');
 
     var params_buf: [MAX_PATH_PARAMS]struct { key: []const u8, value: []const u8 } = undefined;
     var params_len: usize = 0;
@@ -459,7 +471,7 @@ test "matchPattern - wildcard" {
     }
 
     try std.testing.expect(matchPattern("static/*", "/static/js/app.js", allocator, &ctx));
-    try std.testing.expectEqualStrings("js/app.js", ctx.path_params.get("").?);
+    try std.testing.expectEqualStrings("js/app.js", ctx.path_params.get("*").?);
 }
 
 test "RouteGroup - basic routing with prefix" {

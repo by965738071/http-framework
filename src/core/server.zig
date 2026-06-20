@@ -33,6 +33,7 @@ const Router = @import("router.zig");
 const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
 const MetricsCollector = @import("metrics.zig").MetricsCollector;
 const CorsMiddleware = @import("cors.zig").CorsMiddleware;
+const BackgroundQueue = @import("background.zig").BackgroundQueue;
 
 /// 每个连接的读取缓冲区大小（必须能容纳最大 HTTP 头部）
 const READ_BUF_SIZE: usize = 16384;
@@ -53,6 +54,9 @@ file_logger: ?RotatingFileLogger = null,
 /// CORS 中间件（可选）
 cors: ?*CorsMiddleware = null,
 
+/// 后台任务队列（可选）
+background_queue: ?*BackgroundQueue = null,
+
 /// 性能指标（可选）
 metrics: ?*MetricsCollector = null,
 
@@ -64,6 +68,9 @@ drain_timeout_ns: u64 = 30_000_000_000,
 
 /// 是否正在关闭（原子标志）
 shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// tcp_server 是否已被关闭（防止 shutdown + deinit 双重释放）
+server_closed: bool = false,
 
 const Self = @This();
 pub const Server = Self;
@@ -128,6 +135,10 @@ pub fn setCors(self: *Self, c: *CorsMiddleware) void {
     self.cors = c;
 }
 
+pub fn setBackgroundQueue(self: *Self, bg: *BackgroundQueue) void {
+    self.background_queue = bg;
+}
+
 pub fn run(self: *Self) !void {
     self.running = true;
     serverLog(&self.file_logger, .info, "Server listening on {s}:{d}", .{ self.config.address, self.config.port });
@@ -139,14 +150,13 @@ pub fn run(self: *Self) !void {
 
     while (self.running) {
         const stream = self.tcp_server.accept(self.io) catch |accept_err| {
-            // 1. 正常的错误（如 fd 暂时耗尽） → 记录并继续
+            // 1. 正常的错误（如 fd 暂时耗尽）→ 记录并继续
             // 2. shutdown 期间产生的 Cancelled → 直接退出循环
+            // 3. 处理完毕（tcp_server 已被 deinit），直接退出
             if (accept_err == error.Cancelled) {
-                // 被取消的 accept 是我们期望的退出信号
-                self.drainConnections();
                 break;
             }
-            // 其它错误（如网络异常） → 记录并继续
+            // 其它错误（如网络异常）→ 记录并继续
             serverLog(&self.file_logger, .warn, "Accept error: {}", .{accept_err});
             continue;
         };
@@ -167,8 +177,11 @@ pub fn run(self: *Self) !void {
 
     // =========================================================================
     // 优雅关闭：drain 阶段
+    // 等待所有活跃连接处理完毕（或超时），然后执行清理
     // =========================================================================
 
+    self.shutting_down.store(true, .monotonic);
+    self.drainConnections();
 }
 
 // =========================================================================
@@ -275,10 +288,12 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
         // CORS 处理（检查来源 + 自动注入响应头）
         if (self.cors) |c| {
             const action = if (c.process(&ctx)) |a| a else |_| .next;
-            // 预检请求直接响应 204
+            // 预检请求直接响应 204（除非被 CORS 策略阻止，如 block_unauthorized）
             if (action == .respond) {
                 c.addCorsHeaders(&ctx, &response) catch {};
-                _ = response.statusCode(.no_content);
+                // 使用 blocked_status（如 403 Forbidden）或默认 204 No Content
+                const status = if (ctx.blocked_status) |s| s else std.http.Status.no_content;
+                _ = response.statusCode(status);
                 response.text("") catch {};
                 ctx.deinit();
                 response.deinit();
@@ -342,6 +357,13 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
         ctx.deinit();
         response.deinit();
 
+        // 处理后台任务队列（fire-and-forget 任务在此执行）
+        if (self.background_queue) |bg| {
+            bg.drain() catch |bg_err| {
+                requestLog(&self.file_logger, "[BACKGROUND] Queue drain error: {}", .{bg_err});
+            };
+        }
+
         // --- 步骤 6: 优雅关闭检查 ---
         if (self.shutting_down.load(.monotonic)) break;
 
@@ -354,7 +376,7 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
 // 错误分类与处理
 // =========================================================================
 
-fn isConnectionClosed(err: anytype) bool {
+fn isConnectionClosed(err: std.http.Server.ReceiveHeadError) bool {
     const name = @errorName(err);
     return std.mem.eql(u8, name, "HttpConnectionClosing") or
         std.mem.eql(u8, name, "EndOfStream") or
@@ -374,14 +396,12 @@ fn isTimeout(err: anytype) bool {
         std.mem.eql(u8, name, "Timeout");
 }
 
-fn receiveHeadChecked(server: *http.Server, idle_timeout_ns: u64) !http.Server.Request {
-    if (idle_timeout_ns > 0) {
-        return server.receiveHead() catch |err| {
-            if (isTimeout(err)) return err;
-            return err;
-        };
-    }
-    return server.receiveHead();
+fn receiveHeadChecked(server: *http.Server, idle_timeout_ns: u64) std.http.Server.ReceiveHeadError!http.Server.Request {
+    // 注意：当前 Zig std.http.Server.receiveHead() 不支持原生超时参数。
+    // idle_timeout_ns 在此保留以备未来集成操作系统级超时（如 SO_RCVTIMEO）。
+    // 当前实现直接调用 receiveHead()，超时逻辑由连接层自行处理。
+    _ = idle_timeout_ns;
+    return try server.receiveHead();
 }
 
 fn handleDispatchError(self: *Self, ctx: *RequestContext, response: *Response, err: anytype) void {
@@ -430,7 +450,10 @@ fn respondStatusCode(response: *Response, status: http.Status) void {
 pub fn deinit(self: *Self) void {
     serverLog(&self.file_logger, .info, "Server shutting down", .{});
     self.running = false;
-    self.tcp_server.deinit(self.io);
+    if (!self.server_closed) {
+        self.server_closed = true;
+        self.tcp_server.deinit(self.io);
+    }
     if (self.file_logger) |*logger| {
         logger.deinit();
     }
@@ -463,8 +486,13 @@ pub fn shutdown(self: *Self) void {
     serverLog(&self.file_logger, .info, "Shutting down server gracefully...", .{});
     self.running = false;
     // 关闭监听套接字，强制唤醒阻塞在 accept 的调用
-    self.tcp_server.deinit(self.io);
+    // 加锁标记避免 deinit 重复关闭
+    if (!self.server_closed) {
+        self.server_closed = true;
+        self.tcp_server.deinit(self.io);
+    }
 }
+
 /// 等待所有活跃连接处理完毕（或超时）。
 /// 在 run() 中 accept 循环退出后自动调用。
 pub fn drainConnections(self: *Self) void {

@@ -126,6 +126,24 @@ pub const Parser = struct {
                 }
             }
 
+            // Parse Content-Type
+            var content_type: ?[]const u8 = null;
+            if (mem.indexOf(u8, headers, "Content-Type:")) |ct_idx| {
+                var start = ct_idx + "Content-Type:".len;
+                // Skip whitespace
+                while (start < headers.len and (headers[start] == ' ' or headers[start] == '\t')) {
+                    start += 1;
+                }
+                // Find end of line
+                var end = start;
+                while (end < headers.len and headers[end] != '\r' and headers[end] != '\n') {
+                    end += 1;
+                }
+                if (end > start) {
+                    content_type = headers[start..end];
+                }
+            }
+
             if (field_name == null) {
                 return error.InvalidMultipartFormat;
             }
@@ -141,7 +159,7 @@ pub const Parser = struct {
                 if (mem.indexOf(u8, rest, final_boundary)) |idx| {
                     // 最后一个部分
                     const data = rest[0..idx];
-                    try self.processField(field_name.?, file_name, null, data);
+                    try self.processField(field_name.?, file_name, content_type, data);
                     break;
                 }
                 return error.InvalidMultipartFormat;
@@ -151,7 +169,7 @@ pub const Parser = struct {
             rest = rest[data_end + end_boundary.len ..];
 
             // 处理字段
-            try self.processField(field_name.?, file_name, null, data);
+            try self.processField(field_name.?, file_name, content_type, data);
 
             // 检查是否结束
             if (mem.startsWith(u8, rest, "--")) {
@@ -231,4 +249,166 @@ fn extractBoundary(content_type: []const u8) ?[]const u8 {
         return content_type[start..end];
     }
     return null;
+}
+
+// ===========================================================================
+// 测试
+// ===========================================================================
+
+test "extractBoundary - extracts boundary from Content-Type" {
+    const ct = "multipart/form-data; boundary=----WebKitFormBoundaryabc123";
+    const boundary = extractBoundary(ct);
+    try std.testing.expectEqualStrings("----WebKitFormBoundaryabc123", boundary.?);
+}
+
+test "extractBoundary - returns null when no boundary" {
+    const ct = "multipart/form-data";
+    const boundary = extractBoundary(ct);
+    try std.testing.expect(boundary == null);
+}
+
+test "extractBoundary - boundary with trailing semicolon" {
+    const ct = "multipart/form-data; boundary=MyBoundary; charset=utf-8";
+    const boundary = extractBoundary(ct);
+    try std.testing.expectEqualStrings("MyBoundary", boundary.?);
+}
+
+test "Parser.init - wrong content type returns error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidContentType, Parser.init(allocator, "text/plain"));
+}
+
+test "Parser.init - valid content type" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    try std.testing.expectEqualStrings("BOUNDARY", parser.boundary);
+    try std.testing.expectEqual(@as(usize, 0), parser.fields.items.len);
+}
+
+test "Parser.parse - one text field" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    const body =
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"username\"\r\n" ++
+        "\r\n" ++
+        "alice\r\n" ++
+        "--BOUNDARY--\r\n";
+
+    try parser.parse(body);
+
+    try std.testing.expectEqual(@as(usize, 1), parser.fields.items.len);
+    const value = parser.getText("username") orelse @panic("field should exist");
+    try std.testing.expectEqualStrings("alice", value);
+}
+
+test "Parser.parse - multiple text fields" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    const body =
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"username\"\r\n" ++
+        "\r\n" ++
+        "alice\r\n" ++
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"country\"\r\n" ++
+        "\r\n" ++
+        "Canada\r\n" ++
+        "--BOUNDARY--\r\n";
+
+    try parser.parse(body);
+
+    try std.testing.expectEqual(@as(usize, 2), parser.fields.items.len);
+    try std.testing.expectEqualStrings("alice", parser.getText("username").?);
+    try std.testing.expectEqualStrings("Canada", parser.getText("country").?);
+}
+
+test "Parser.parse - file upload" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    const file_content = "Hello, this is a test file.";
+    const body =
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"avatar\"; filename=\"photo.png\"\r\n" ++
+        "Content-Type: image/png\r\n" ++
+        "\r\n" ++
+        file_content ++
+        "\r\n" ++
+        "--BOUNDARY--\r\n";
+
+    try parser.parse(body);
+
+    try std.testing.expectEqual(@as(usize, 1), parser.fields.items.len);
+    const file = parser.getFile("avatar") orelse @panic("file should exist");
+    try std.testing.expectEqualStrings("photo.png", file.file_name.?);
+    try std.testing.expectEqualStrings("image/png", file.content_type.?);
+    try std.testing.expectEqualStrings(file_content, file.data);
+}
+
+test "Parser.parse - mixed text and file fields" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    const body =
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"user\"\r\n" ++
+        "\r\n" ++
+        "bob\r\n" ++
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"resume\"; filename=\"cv.pdf\"\r\n" ++
+        "Content-Type: application/pdf\r\n" ++
+        "\r\n" ++
+        "PDF content here\r\n" ++
+        "--BOUNDARY--\r\n";
+
+    try parser.parse(body);
+
+    try std.testing.expectEqual(@as(usize, 2), parser.fields.items.len);
+    try std.testing.expectEqualStrings("bob", parser.getText("user").?);
+    const file = parser.getFile("resume") orelse @panic("file should exist");
+    try std.testing.expectEqualStrings("cv.pdf", file.file_name.?);
+    try std.testing.expectEqualStrings("application/pdf", file.content_type.?);
+}
+
+test "Parser.parse - invalid body returns error" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    // Missing headers
+    const invalid_body = "not a multipart body";
+    try std.testing.expectError(error.InvalidMultipartFormat, parser.parse(invalid_body));
+}
+
+test "Parser.getText - non-existent field returns null" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    const body =
+        "--BOUNDARY\r\n" ++
+        "Content-Disposition: form-data; name=\"age\"\r\n" ++
+        "\r\n" ++
+        "25\r\n" ++
+        "--BOUNDARY--\r\n";
+
+    try parser.parse(body);
+    try std.testing.expect(parser.getText("nonexistent") == null);
+}
+
+test "Parser.getFile - non-existent field returns null" {
+    const allocator = std.testing.allocator;
+    var parser = try Parser.init(allocator, "multipart/form-data; boundary=BOUNDARY");
+    defer parser.deinit();
+
+    try std.testing.expect(parser.getFile("nonexistent") == null);
 }
