@@ -23,7 +23,6 @@ pub const Validation = @import("validation.zig");
 pub const Background = @import("background.zig");
 pub const Http2 = @import("http2.zig");
 pub const Http2Full = @import("http2_full.zig");
-pub const Orm = @import("orm/root.zig");
 
 // ── New feature modules ──────────────────────────────────────────
 pub const Compression = @import("compression.zig");
