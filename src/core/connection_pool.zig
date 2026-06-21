@@ -179,7 +179,7 @@ pub fn ConnectionPool(
                     };
                     self.mutex.unlock(self.io);
 
-                    self.mutex.lock(self.io) catch unreachable;
+                    self.mutex.lockUncancelable(self.io);
                     self.active_count += 1;
                     self.total_created += 1;
                     self.mutex.unlock(self.io);
@@ -199,14 +199,14 @@ pub fn ConnectionPool(
                     return error.AcquireTimeout;
                 }
 
-                self.available.wait(self.io, &self.mutex) catch {};
+                self.available.waitUncancelable(self.io, &self.mutex);
                 self.mutex.unlock(self.io);
             }
         }
 
         /// Release a connection back to the pool.
         pub fn release(self: *Self, conn: *T) void {
-            self.mutex.lock(self.io) catch unreachable;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             if (self.closed) {
@@ -236,7 +236,7 @@ pub fn ConnectionPool(
 
         /// Close all connections and shut down the pool.
         pub fn close(self: *Self) void {
-            self.mutex.lock(self.io) catch unreachable;
+            self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.available.broadcast(self.io);
             self.mutex.unlock(self.io);
@@ -250,7 +250,7 @@ pub fn ConnectionPool(
 
         /// Get pool statistics.
         pub fn stats(self: *Self) Stats {
-            self.mutex.lock(self.io) catch unreachable;
+            self.mutex.lockUncancelable(self.io);
             const s = Stats{
                 .total_created = self.total_created,
                 .active_count = self.active_count,

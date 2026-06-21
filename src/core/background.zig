@@ -108,7 +108,7 @@ pub const BackgroundQueue = struct {
                 }
             }.run, .{t});
         }
-        _ = group.await(self.io) catch {};
+        _ = try group.await(self.io);
     }
 };
 
