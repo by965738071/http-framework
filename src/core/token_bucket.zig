@@ -147,7 +147,7 @@ pub const TokenBucket = struct {
 
 test "TokenBucket - init fills to capacity" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 100,
@@ -160,7 +160,7 @@ test "TokenBucket - init fills to capacity" {
 
 test "TokenBucket - consume tokens" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,
@@ -180,7 +180,7 @@ test "TokenBucket - consume tokens" {
 
 test "TokenBucket - refill over time" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 1000, // 1000 tokens/sec = 1 per ms
@@ -206,7 +206,7 @@ test "TokenBucket - refill over time" {
 
 test "TokenBucket - burst capacity" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10, // slow refill
@@ -226,7 +226,7 @@ test "TokenBucket - burst capacity" {
 
 test "TokenBucket - concurrent safety" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 1,
@@ -241,14 +241,19 @@ test "TokenBucket - concurrent safety" {
     var results = std.ArrayList(Result).empty;
     defer results.deinit(allocator);
 
+    // 用于保护 ArrayList 的互斥锁
+    var mu: std.Io.Mutex = .{ .state = .init(.unlocked) };
+
     // Spawn 200 concurrent consume attempts
     for (0..200) |_| {
         g.async(io, struct {
-            fn worker(b: *TokenBucket, res: *std.ArrayList(Result), alloc: std.mem.Allocator) void {
+            fn worker(b: *TokenBucket, res: *std.ArrayList(Result), alloc: std.mem.Allocator, m: *std.Io.Mutex, test_io: std.Io) void {
                 const r = b.tryConsume();
+                m.lockUncancelable(test_io);
+                defer m.unlock(test_io);
                 res.append(alloc, r) catch {};
             }
-        }.worker, .{ bucket, &results, allocator });
+        }.worker, .{ bucket, &results, allocator, &mu, io });
     }
 
     _ = g.await(io) catch {};
@@ -263,7 +268,7 @@ test "TokenBucket - concurrent safety" {
 
 test "TokenBucket - tryConsumeN consumes multiple tokens" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,
@@ -284,7 +289,7 @@ test "TokenBucket - tryConsumeN consumes multiple tokens" {
 
 test "TokenBucket - tryConsumeN edge cases" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,
@@ -301,7 +306,7 @@ test "TokenBucket - tryConsumeN edge cases" {
 
 test "TokenBucket - availableTokens" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 1000,
@@ -324,7 +329,7 @@ test "TokenBucket - availableTokens" {
 
 test "TokenBucket - capacity cap prevents overflow" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 1_000_000, // very fast refill
@@ -344,7 +349,7 @@ test "TokenBucket - capacity cap prevents overflow" {
 
 test "TokenBucket - initial_tokens = 0" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,
@@ -365,7 +370,7 @@ test "TokenBucket - initial_tokens = 0" {
 
 test "TokenBucket - getConfig returns config" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 50,
@@ -381,7 +386,7 @@ test "TokenBucket - getConfig returns config" {
 
 test "TokenBucket - process middleware returns next when tokens available" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,
@@ -398,7 +403,7 @@ test "TokenBucket - process middleware returns next when tokens available" {
 
 test "TokenBucket - process middleware denies when no tokens available" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bucket = try TokenBucket.init(allocator, io, .{
         .rate = 10,

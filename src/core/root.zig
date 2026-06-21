@@ -33,6 +33,7 @@ pub const TokenBucket = @import("token_bucket.zig");
 pub const ConnectionPool = @import("connection_pool.zig");
 pub const TemplateEngine = @import("template_engine.zig");
 pub const OpenApi = @import("openapi.zig");
+pub const IntegrationTest = @import("integration_test.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

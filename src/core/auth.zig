@@ -69,23 +69,14 @@ pub const AuthMiddleware = struct {
     config: AuthConfig,
     middle: Middle,
     allocator: std.mem.Allocator,
-    io: std.Io,
 
-    pub fn create(allocator: std.mem.Allocator, io: std.Io, config: AuthConfig) !*AuthMiddleware {
+    pub fn create(allocator: std.mem.Allocator, config: AuthConfig) !*AuthMiddleware {
         const ptr = try allocator.create(AuthMiddleware);
         errdefer allocator.destroy(ptr);
 
-        // Copy all string fields to owned memory
-        var cfg = config;
-        if (config.bearer_token) |t| cfg.bearer_token = try allocator.dupe(u8, t);
-        if (config.basic_username) |u| cfg.basic_username = try allocator.dupe(u8, u);
-        if (config.basic_password) |p| cfg.basic_password = try allocator.dupe(u8, p);
-        if (config.api_key) |k| cfg.api_key = try allocator.dupe(u8, k);
-
         ptr.* = .{
-            .config = cfg,
+            .config = config,
             .allocator = allocator,
-            .io = io,
             .middle = undefined,
         };
         ptr.middle = Middle.init(AuthMiddleware, ptr);
@@ -93,7 +84,6 @@ pub const AuthMiddleware = struct {
     }
 
     pub fn process(self: *AuthMiddleware, ctx: *RequestContext) anyerror!NextAction {
-        _ = self.io;
 
         // Try each enabled strategy in order
         if (self.config.custom_auth) |custom| {
@@ -116,10 +106,8 @@ pub const AuthMiddleware = struct {
     }
 
     pub fn deinit(self: *AuthMiddleware) void {
-        if (self.config.bearer_token) |t| self.allocator.free(t);
-        if (self.config.basic_username) |u| self.allocator.free(u);
-        if (self.config.basic_password) |p| self.allocator.free(p);
-        if (self.config.api_key) |k| self.allocator.free(k);
+        // String fields in self.config are borrowed from the caller,
+        // not owned — caller must keep them alive for the middleware's lifetime.
         self.allocator.destroy(self);
     }
 
@@ -250,10 +238,9 @@ test "AuthConfig defaults" {
 
 test "Bearer token flow - valid" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     const cfg = AuthConfig{ .bearer_token = "my-secret-token" };
-    var auth = try AuthMiddleware.create(allocator, io, cfg);
+    var auth = try AuthMiddleware.create(allocator, cfg);
     defer auth.deinit();
 
     // We can only test the checkBearer logic directly without a full request context
@@ -265,10 +252,9 @@ test "Bearer token flow - valid" {
 
 test "Bearer token flow - invalid" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     const cfg = AuthConfig{ .bearer_token = "valid-token" };
-    var auth = try AuthMiddleware.create(allocator, io, cfg);
+    var auth = try AuthMiddleware.create(allocator, cfg);
     defer auth.deinit();
 
     // Verify the token is stored
@@ -292,13 +278,12 @@ test "Bearer token flow - invalid" {
 
 test "Basic auth flow - encoded credentials" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     const cfg = AuthConfig{
         .basic_username = "admin",
         .basic_password = "secret123",
     };
-    var auth = try AuthMiddleware.create(allocator, io, cfg);
+    var auth = try AuthMiddleware.create(allocator, cfg);
     defer auth.deinit();
 
     try std.testing.expectEqualStrings("admin", auth.config.basic_username.?);
@@ -321,13 +306,12 @@ test "Basic auth flow - encoded credentials" {
 
 test "API key flow - header" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     const cfg = AuthConfig{
         .api_key = "my-api-key-123",
         .api_key_header = "X-API-Key",
     };
-    var auth = try AuthMiddleware.create(allocator, io, cfg);
+    var auth = try AuthMiddleware.create(allocator, cfg);
     defer auth.deinit();
 
     try std.testing.expectEqualStrings("my-api-key-123", auth.config.api_key.?);

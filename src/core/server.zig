@@ -615,7 +615,7 @@ test "graceful shutdown: drainConnections when no active connections" {
     var router = Router.init(allocator);
     defer router.deinit();
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var server = Self.init(allocator, io, test_config, router) catch {
         // 端口绑定失败时跳过测试
         return;
@@ -640,7 +640,7 @@ test "graceful shutdown: drainConnections respects timeout" {
     var router = Router.init(allocator);
     defer router.deinit();
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var server = Self.init(allocator, io, test_config, router) catch {
         return;
     };

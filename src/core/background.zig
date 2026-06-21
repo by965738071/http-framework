@@ -83,16 +83,32 @@ pub const BackgroundQueue = struct {
 
     /// 处理队列中所有待处理任务。
     ///
-    /// 逐个执行所有排队的任务，执行完毕后清空队列。
-    /// 通常在 HTTP 响应发送之后调用。
+    /// 将排队的任务并发提交到线程池执行，所有任务执行完毕后清空队列。
+    /// 调用线程会阻塞直到所有任务完成，但由于 drain 通常在
+    /// HTTP 响应发送之后调用，从 handler 视角看是 fire‑and‑forget。
     pub fn drain(self: *Self) !void {
         try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-
-        for (self.tasks.items) |task| {
-            task.callback(task.ctx);
+        const task_count = self.tasks.items.len;
+        if (task_count == 0) {
+            self.mutex.unlock(self.io);
+            return;
         }
+        const tasks_to_run = try self.allocator.alloc(Task, task_count);
+        @memcpy(tasks_to_run, self.tasks.items);
         self.tasks.clearRetainingCapacity();
+        self.mutex.unlock(self.io);
+        defer self.allocator.free(tasks_to_run);
+
+        // 使用 Group 并发执行所有任务（线程池 + 自动清理）
+        var group: std.Io.Group = .init;
+        for (tasks_to_run) |t| {
+            group.async(self.io, struct {
+                fn run(task: Task) void {
+                    task.callback(task.ctx);
+                }
+            }.run, .{t});
+        }
+        _ = group.await(self.io) catch {};
     }
 };
 
@@ -102,7 +118,7 @@ pub const BackgroundQueue = struct {
 
 test "BackgroundQueue: init and deinit" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bg = try BackgroundQueue.init(allocator, io);
     defer bg.deinit();
@@ -113,7 +129,7 @@ test "BackgroundQueue: init and deinit" {
 
 test "BackgroundQueue: submit and drain single task" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bg = try BackgroundQueue.init(allocator, io);
     defer bg.deinit();
@@ -136,7 +152,7 @@ test "BackgroundQueue: submit and drain single task" {
 
 test "BackgroundQueue: submit and drain multiple tasks" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bg = try BackgroundQueue.init(allocator, io);
     defer bg.deinit();
@@ -166,7 +182,7 @@ test "BackgroundQueue: submit and drain multiple tasks" {
 
 test "BackgroundQueue: tasks with different context types" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bg = try BackgroundQueue.init(allocator, io);
     defer bg.deinit();
@@ -203,7 +219,7 @@ test "BackgroundQueue: tasks with different context types" {
 
 test "BackgroundQueue: drain clears queue even without tasks" {
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
 
     var bg = try BackgroundQueue.init(allocator, io);
     defer bg.deinit();

@@ -64,7 +64,7 @@ pub const SessionManager = struct {
     pub fn getOrCreate(self: *Self, ctx: *RequestContext, res: *Response) ![]const u8 {
         // 1. 尝试从 Cookie 获取 session_id
         if (ctx.getCookie(self.cookie_name)) |session_id| {
-            if (self.sessions.get(session_id)) |*record| {
+            if (self.sessions.getPtr(session_id)) |record| {
                 const now = std.Io.Clock.now(.real, self.io_ctx).nanoseconds;
 
                 // 检查是否过期
@@ -88,13 +88,13 @@ pub const SessionManager = struct {
         // 使用 std.Io.randomSecure 生成安全随机数（遵循 SKILL.md）
         // 注意：需要传入 io 实例，通过 SessionManager.init 传入
         var random_bytes: [32]u8 = undefined;
-        self.io_ctx.randomSecure(&random_bytes);
+        try self.io_ctx.randomSecure(&random_bytes);
 
         // 生成 session_id（使用十六进制表示）
         const session_id = try std.fmt.allocPrint(
             self.allocator,
-            "sess_{s}",
-            .{std.fmt.fmtSliceHexUpper(&random_bytes)},
+            "sess{X}",
+            .{&random_bytes},
         );
 
         // 创建 Session 记录
@@ -109,7 +109,7 @@ pub const SessionManager = struct {
         try self.sessions.put(session_id, record);
 
         // 设置 Cookie（遵循标准格式）
-        try res.setCookie(self.cookie_name, session_id);
+        _ = try res.setCookie(self.cookie_name, session_id);
 
         // 触发清理（如果到了清理时间）
         self.maybeCleanup();
@@ -138,7 +138,8 @@ pub const SessionManager = struct {
     fn deleteSession(self: *Self, session_id: []const u8) void {
         if (self.sessions.fetchRemove(session_id)) |kv| {
             self.allocator.free(kv.value.id);
-            kv.value.data.deinit();
+            var rec = kv.value;
+            rec.data.deinit();
         }
     }
 

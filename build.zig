@@ -10,12 +10,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ORM tests (file-relative @import resolves automatically)
+    const ormMod = b.addModule("orm", .{
+        .root_source_file = b.path("src/orm/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("http_framework", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = coreMod },
+            .{ .name = "orm", .module = ormMod },
         },
     });
 
@@ -28,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "http_framework", .module = mod },
                 .{ .name = "core", .module = coreMod },
+                .{ .name = "orm", .module = ormMod },
             },
         }),
     });
@@ -44,10 +53,10 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // ORM tests (file-relative @import resolves automatically)
+    // ORM tests
     const orm_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/core/orm/root.zig"),
+            .root_source_file = b.path("src/orm/root.zig"),
             .target = target,
             .optimize = optimize,
         }),

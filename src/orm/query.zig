@@ -377,9 +377,14 @@ fn compareBool(op: Operator, a: bool, b: bool) bool {
 
 /// 从结构体实例中获取字段值（编译期反射）
 pub fn getFieldValue(comptime T: type, instance: T, field_name: []const u8) FieldValue {
-    inline for (std.meta.fields(T)) |f| {
-        if (std.mem.eql(u8, f.name, field_name)) {
-            const val = @field(instance, f.name);
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
+        _ = ftype;
+        if (std.mem.eql(u8, fname, field_name)) {
+            const val = @field(instance, fname);
             return toFieldValue(val);
         }
     }

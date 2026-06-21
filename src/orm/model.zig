@@ -26,14 +26,19 @@ pub fn fieldTypeOf(comptime T: type) FieldType {
 
 /// 自动从 Zig 结构体生成 TableSchema
 pub fn modelSchema(comptime T: type, comptime table_name: []const u8) TableSchema {
-    const fields_info = std.meta.fields(T);
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct type"),
+    };
+    const field_names = struct_info.field_names;
+    const field_types = struct_info.field_types;
     const fields = blk: {
-        var arr: [fields_info.len]FieldDef = undefined;
-        inline for (fields_info, 0..) |field, i| {
-            const is_id = std.mem.eql(u8, field.name, "id");
+        var arr: [field_names.len]FieldDef = undefined;
+        for (field_names, field_types, 0..) |name, typ, i| {
+            const is_id = std.mem.eql(u8, name, "id");
             arr[i] = .{
-                .name = field.name,
-                .field_type = fieldTypeOf(field.type),
+                .name = name,
+                .field_type = fieldTypeOf(typ),
                 .constraints = .{
                     .primary_key = is_id,
                     .auto_increment = is_id,
@@ -52,17 +57,22 @@ pub fn modelSchema(comptime T: type, comptime table_name: []const u8) TableSchem
 
 /// 模型辅助函数：生成模型的 Store 类型别名
 pub fn Model(comptime T: type, comptime table_name: []const u8) type {
-    const fields_info = std.meta.fields(T);
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct type"),
+    };
+    const field_names = struct_info.field_names;
+    const field_types = struct_info.field_types;
     const engine = @import("engine.zig");
 
     return struct {
-        const _fields: [fields_info.len]FieldDef = blk: {
-            var arr: [fields_info.len]FieldDef = undefined;
-            for (fields_info, 0..) |field, i| {
-                const is_id = std.mem.eql(u8, field.name, "id");
+        const _fields: [field_names.len]FieldDef = blk: {
+            var arr: [field_names.len]FieldDef = undefined;
+            for (field_names, field_types, 0..) |name, typ, i| {
+                const is_id = std.mem.eql(u8, name, "id");
                 arr[i] = .{
-                    .name = field.name,
-                    .field_type = fieldTypeOf(field.type),
+                    .name = name,
+                    .field_type = fieldTypeOf(typ),
                     .constraints = .{
                         .primary_key = is_id,
                         .auto_increment = is_id,

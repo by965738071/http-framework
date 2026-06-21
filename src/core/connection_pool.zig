@@ -271,7 +271,7 @@ pub fn ConnectionPool(
 
 test "ConnectionPool - acquire and release" {
     const test_allocator = std.testing.allocator;
-    const test_io = std.Io.Threaded.global_single_threaded.io();
+    const test_io = std.testing.io;
 
     const fn_acquire: AcquireFn(usize) = struct {
         fn acquire_fn(io_ctx: std.Io) anyerror!*usize {
@@ -315,7 +315,7 @@ test "ConnectionPool - acquire and release" {
 
 test "ConnectionPool - stats after acquire and release" {
     const test_allocator = std.testing.allocator;
-    const test_io = std.Io.Threaded.global_single_threaded.io();
+    const test_io = std.testing.io;
 
     const fn_acquire: AcquireFn(usize) = struct {
         fn acquire_fn(io_ctx: std.Io) anyerror!*usize {
@@ -373,7 +373,7 @@ test "ConnectionPool - stats after acquire and release" {
 
 test "ConnectionPool - close shuts down pool" {
     const test_allocator = std.testing.allocator;
-    const test_io = std.Io.Threaded.global_single_threaded.io();
+    const test_io = std.testing.io;
 
     const fn_acquire: AcquireFn(usize) = struct {
         fn acquire_fn(io_ctx: std.Io) anyerror!*usize {

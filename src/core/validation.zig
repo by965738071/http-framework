@@ -174,20 +174,21 @@ pub fn validateRequest(
     };
     errdefer result.deinit(allocator);
 
-    const fields = info.@"struct".fields;
-    inline for (fields) |field| {
-        const field_rules: []const FieldRule = @field(rules, field.name);
+    const struct_info = info.@"struct";
+    inline for (struct_info.field_names) |name| {
+        const field_rules: []const FieldRule = @field(rules, name);
 
         // 从请求中提取字段值
-        const value = getFieldValue(ctx, field.name);
+        const value = getFieldValue(ctx, name);
 
         // 校验
-        if (validateField(allocator, value, field_rules)) |err_msg| {
+        const maybe_err = validateField(allocator, value, field_rules) catch null;
+        if (maybe_err) |err_msg| {
             result.valid = false;
-            const key = try allocator.dupe(u8, field.name);
+            const key = try allocator.dupe(u8, name);
             errdefer allocator.free(key);
             try result.errors.put(allocator, key, err_msg);
-        } else |_| {}
+        }
     }
 
     return result;

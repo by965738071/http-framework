@@ -1,5 +1,6 @@
 //! 性能监控和指标收集
 //! 支持请求计数、延迟统计、活跃连接数等。
+//! 线程安全：所有公共方法都通过互斥锁保护。
 
 const std = @import("std");
 
@@ -13,16 +14,19 @@ pub const RequestMetrics = struct {
 
 pub const MetricsCollector = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     total_requests: u64 = 0,
     active_connections: u32 = 0,
     latencies: std.ArrayList(u64),
     /// 标记数据是否已被修改，需要重新排序才能计算百分位数
     sorted: bool = true,
+    /// 线程安全互斥锁（使用 std.Io.Mutex，需要 io 参数）
+    mutex: std.Io.Mutex = .{ .state = .init(.unlocked) },
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator, .latencies = .{ .items = &.{}, .capacity = 0 } };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
+        return .{ .allocator = allocator, .io = io, .latencies = .{ .items = &.{}, .capacity = 0 } };
     }
 
     pub fn deinit(self: *Self) void {
@@ -30,6 +34,8 @@ pub const MetricsCollector = struct {
     }
 
     pub fn recordRequest(self: *Self, metrics: RequestMetrics) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.total_requests += 1;
         if (self.latencies.items.len < 10000) {
             try self.latencies.append(self.allocator, metrics.latency_ns);
@@ -38,23 +44,34 @@ pub const MetricsCollector = struct {
     }
 
     pub fn connectionOpened(self: *Self) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.active_connections += 1;
     }
     pub fn connectionClosed(self: *Self) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.active_connections > 0) self.active_connections -= 1;
     }
 
     pub fn getP50(self: *Self) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.getPercentile(50);
     }
     pub fn getP95(self: *Self) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.getPercentile(95);
     }
     pub fn getP99(self: *Self) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.getPercentile(99);
     }
 
     fn getPercentile(self: *Self, percentile: u8) u64 {
+        // 调用者必须已经持有 mutex 锁
         const items = self.latencies.items;
         if (items.len == 0) return 0;
 
@@ -77,14 +94,15 @@ pub const MetricsCollector = struct {
     }
 
     pub fn generateReport(self: *Self, buffer: []u8) ![]u8 {
-        const report = try std.fmt.bufPrint(buffer, "requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return std.fmt.bufPrint(buffer, "requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
             self.total_requests,
             self.active_connections,
-            self.getP50(),
-            self.getP95(),
-            self.getP99(),
+            self.getPercentile(50),
+            self.getPercentile(95),
+            self.getPercentile(99),
         });
-        return report;
     }
 };
 
@@ -94,8 +112,9 @@ pub const MetricsCollector = struct {
 
 test "MetricsCollector.init initializes with zero counters" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var collector = MetricsCollector.init(allocator);
+    var collector = MetricsCollector.init(allocator, io);
     defer collector.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), collector.total_requests);
@@ -105,8 +124,9 @@ test "MetricsCollector.init initializes with zero counters" {
 
 test "MetricsCollector.recordRequest increments counter and stores latency" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var collector = MetricsCollector.init(allocator);
+    var collector = MetricsCollector.init(allocator, io);
     defer collector.deinit();
 
     try collector.recordRequest(.{
@@ -123,8 +143,9 @@ test "MetricsCollector.recordRequest increments counter and stores latency" {
 
 test "MetricsCollector.recordRequest with multiple requests" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var collector = MetricsCollector.init(allocator);
+    var collector = MetricsCollector.init(allocator, io);
     defer collector.deinit();
 
     try collector.recordRequest(.{ .method = "GET", .path = "/a", .status = 200, .latency_ns = 100, .timestamp = 1 });
@@ -137,8 +158,9 @@ test "MetricsCollector.recordRequest with multiple requests" {
 
 test "MetricsCollector getP50/P95/P99 with empty data returns zero" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var collector = MetricsCollector.init(allocator);
+    var collector = MetricsCollector.init(allocator, io);
     defer collector.deinit();
 
     // Empty latency list → early return 0 from getPercentile
@@ -149,8 +171,9 @@ test "MetricsCollector getP50/P95/P99 with empty data returns zero" {
 
 test "MetricsCollector.generateReport with empty data" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var collector = MetricsCollector.init(allocator);
+    var collector = MetricsCollector.init(allocator, io);
     defer collector.deinit();
 
     var buf: [512]u8 = undefined;
@@ -168,7 +191,9 @@ test "MetricsCollector.generateReport with empty data" {
 // ===========================================================================
 
 test "MetricsCollector - record and report" {
-    var m = MetricsCollector.init(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var m = MetricsCollector.init(allocator, io);
     defer m.deinit();
 
     try m.recordRequest(.{ .method = "GET", .path = "/", .status = 200, .latency_ns = 1000, .timestamp = 0 });
@@ -181,7 +206,9 @@ test "MetricsCollector - record and report" {
 }
 
 test "MetricsCollector - connection tracking" {
-    var m = MetricsCollector.init(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var m = MetricsCollector.init(allocator, io);
     defer m.deinit();
 
     m.connectionOpened();
@@ -196,7 +223,9 @@ test "MetricsCollector - connection tracking" {
 }
 
 test "MetricsCollector - percentiles" {
-    var m = MetricsCollector.init(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var m = MetricsCollector.init(allocator, io);
     defer m.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), m.getP50());

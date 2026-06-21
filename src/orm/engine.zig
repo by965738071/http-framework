@@ -285,12 +285,16 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 
 fn jsonObjectToType(comptime T: type, allocator: std.mem.Allocator, obj: std.json.ObjectMap) !T {
     var result: T = undefined;
-    inline for (std.meta.fields(T)) |field| {
-        const default_val = getDefaultForType(field.type);
-        if (obj.get(field.name)) |jval| {
-            @field(result, field.name) = try jsonValueToField(field.type, allocator, jval);
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, struct_info.field_types) |name, typ| {
+        const default_val = getDefaultForType(typ);
+        if (obj.get(name)) |jval| {
+            @field(result, name) = try jsonValueToField(typ, allocator, jval);
         } else {
-            @field(result, field.name) = default_val;
+            @field(result, name) = default_val;
         }
     }
     return result;
@@ -301,15 +305,16 @@ fn typeToJsonString(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
 
     try buf.append(allocator, '{');
-    const fields = std.meta.fields(T);
-    var first: bool = true;
-    inline for (fields) |field| {
-        if (!first) try buf.appendSlice(allocator, ", ");
-        first = false;
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, 0..) |name, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
         try buf.append(allocator, '"');
-        try buf.appendSlice(allocator, field.name);
+        try buf.appendSlice(allocator, name);
         try buf.appendSlice(allocator, "\": ");
-        try appendJsonField(allocator, &buf, @field(value, field.name));
+        try appendJsonField(allocator, &buf, @field(value, name));
     }
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
@@ -457,14 +462,18 @@ fn getDefaultForType(comptime T: type) T {
 }
 
 fn setFieldByIdentifier(comptime T: type, instance: *T, field_name: []const u8, value: anytype) void {
-    inline for (std.meta.fields(T)) |f| {
-        if (std.mem.eql(u8, f.name, field_name)) {
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
+        if (std.mem.eql(u8, fname, field_name)) {
             const ValueT = @TypeOf(value);
             switch (@typeInfo(ValueT)) {
                 .int, .comptime_int => {
-                    switch (@typeInfo(f.type)) {
-                        .int, .comptime_int => @field(instance, f.name) = @intCast(value),
-                        .float, .comptime_float => @field(instance, f.name) = @floatFromInt(value),
+                    switch (@typeInfo(ftype)) {
+                        .int, .comptime_int => @field(instance, fname) = @intCast(value),
+                        .float, .comptime_float => @field(instance, fname) = @floatFromInt(value),
                         else => {},
                     }
                 },
@@ -472,24 +481,24 @@ fn setFieldByIdentifier(comptime T: type, instance: *T, field_name: []const u8, 
                     // FieldValue union
                     switch (value) {
                         .integer => |v| {
-                            switch (@typeInfo(f.type)) {
-                                .int, .comptime_int => @field(instance, f.name) = @intCast(v),
-                                .float, .comptime_float => @field(instance, f.name) = @floatFromInt(v),
+                            switch (@typeInfo(ftype)) {
+                                .int, .comptime_int => @field(instance, fname) = @intCast(v),
+                                .float, .comptime_float => @field(instance, fname) = @floatFromInt(v),
                                 else => {},
                             }
                         },
                         .string => |v| {
-                            if (@typeInfo(f.type) == .pointer) {
-                                @field(instance, f.name) = v;
+                            if (@typeInfo(ftype) == .pointer) {
+                                @field(instance, fname) = v;
                             }
                         },
                         .boolean => |v| {
-                            if (f.type == bool) @field(instance, f.name) = v;
+                            if (ftype == bool) @field(instance, fname) = v;
                         },
                         .float => |v| {
-                            switch (@typeInfo(f.type)) {
-                                .float, .comptime_float => @field(instance, f.name) = @floatCast(v),
-                                .int, .comptime_int => @field(instance, f.name) = @intFromFloat(v),
+                            switch (@typeInfo(ftype)) {
+                                .float, .comptime_float => @field(instance, fname) = @floatCast(v),
+                                .int, .comptime_int => @field(instance, fname) = @intFromFloat(v),
                                 else => {},
                             }
                         },

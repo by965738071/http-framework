@@ -58,13 +58,13 @@ pub fn main(init: std.process.Init) !void {
     defer cors.deinit();
 
     var rate_limiter = try RateLimiter.RateLimiter.init(allocator, io, .{
-        .window_seconds = 60, .max_requests = 100,
+        .window_seconds = 60,
+        .max_requests = 100,
     });
     defer rate_limiter.deinit();
 
-    var metrics = MetricsCollector.MetricsCollector.init(allocator);
+    var metrics = MetricsCollector.MetricsCollector.init(allocator, io);
     defer metrics.deinit();
-
 
     // ── WebSocket 管理器 & 处理器 ─────────────────────
     var ws_manager = WebSocket.WebSocketManager.init(allocator, io);
