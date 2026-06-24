@@ -54,6 +54,9 @@ pub fn init(allocator: std.mem.Allocator) Self {
 pub fn deinit(self: *Self) void {
     for (self.routes.items) |r| {
         self.allocator.free(r.pattern);
+        if (r.middlewares.len > 0) {
+            self.allocator.free(r.middlewares);
+        }
     }
     self.routes.deinit(self.allocator);
 }
@@ -70,6 +73,7 @@ pub fn route(self: *Self, method: http.Method, pattern: []const u8, handler: Han
         .method = method,
         .pattern = owned_pattern,
         .handler = handler,
+        .middlewares = &.{},
     });
 }
 
@@ -82,11 +86,12 @@ pub fn routeWithMiddleware(
     middle: []const Middleware,
 ) !void {
     const owned_pattern = try self.allocator.dupe(u8, pattern);
+    const owned_middlewares = if (middle.len > 0) try self.allocator.dupe(Middleware, middle) else &.{};
     try self.routes.append(self.allocator, .{
         .method = method,
         .pattern = owned_pattern,
         .handler = handle,
-        .middlewares = middle,
+        .middlewares = owned_middlewares,
     });
 }
 

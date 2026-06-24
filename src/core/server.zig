@@ -242,6 +242,7 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
                     requestLog(&self.file_logger, "Too many recoverable errors ({d}), closing connection", .{recoverable_errors});
                     break;
                 }
+                // 协议错误不可恢复，直接关闭连接
                 break;
             } else if (isTimeout(head_err)) {
                 requestLog(&self.file_logger, "Idle timeout, closing connection", .{});
@@ -290,11 +291,15 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
             const action = if (c.process(&ctx)) |a| a else |_| .next;
             // 预检请求直接响应 204（除非被 CORS 策略阻止，如 block_unauthorized）
             if (action == .respond) {
-                c.addCorsHeaders(&ctx, &response) catch {};
+                c.addCorsHeaders(&ctx, &response) catch |cors_err| {
+                    requestLog(&self.file_logger, "[CORS] Failed to add headers: {}", .{cors_err});
+                };
                 // 使用 blocked_status（如 403 Forbidden）或默认 204 No Content
                 const status = if (ctx.blocked_status) |s| s else std.http.Status.no_content;
                 _ = response.statusCode(status);
-                response.text("") catch {};
+                response.text("") catch |text_err| {
+                    requestLog(&self.file_logger, "[CORS] Failed to write empty response: {}", .{text_err});
+                };
                 ctx.deinit();
                 response.deinit();
                 if (!http_request.head.keep_alive) break;
@@ -306,7 +311,9 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
                 break;
             }
             // 正常请求：注入 CORS 响应头
-            c.addCorsHeaders(&ctx, &response) catch {};
+            c.addCorsHeaders(&ctx, &response) catch |cors_err| {
+                requestLog(&self.file_logger, "[CORS] Failed to add headers: {}", .{cors_err});
+            };
         }
 
         // --- 步骤 4: 路由分发 ---
@@ -347,7 +354,9 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
                 .status = @intFromEnum(response.status),
                 .latency_ns = @as(u64, @intCast(latency)),
                 .timestamp = @intCast(dispatch_start),
-            }) catch {};
+            }) catch |metrics_err| {
+                requestLog(&self.file_logger, "[METRICS] recordRequest failed: {}", .{metrics_err});
+            };
         }
 
         // WebSocket 升级后跳出 keep-alive
