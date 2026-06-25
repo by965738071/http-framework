@@ -427,34 +427,38 @@ pub fn toFieldValue(value: anytype) FieldValue {
 
 /// 从 FieldValue 设置结构体字段
 pub fn setFieldFromValue(comptime T: type, instance: *T, field_name: []const u8, value: FieldValue) void {
-    inline for (std.meta.fields(T)) |f| {
-        if (std.mem.eql(u8, f.name, field_name)) {
-            switch (@typeInfo(f.type)) {
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
+        if (std.mem.eql(u8, fname, field_name)) {
+            switch (@typeInfo(ftype)) {
                 .int, .comptime_int => {
-                    @field(instance, f.name) = @intCast(value.integer);
+                    @field(instance, fname) = @intCast(value.integer);
                 },
                 .float, .comptime_float => {
-                    @field(instance, f.name) = @floatCast(value.float);
+                    @field(instance, fname) = @floatCast(value.float);
                 },
                 .bool => {
-                    @field(instance, f.name) = value.boolean;
+                    @field(instance, fname) = value.boolean;
                 },
                 .pointer => |ptr| {
                     if (ptr.size == .slice and ptr.child == u8) {
-                        @field(instance, f.name) = value.string;
+                        @field(instance, fname) = value.string;
                     }
                 },
                 .optional => {
-                    const Child = std.meta.Child(f.type);
+                    const Child = std.meta.Child(ftype);
                     switch (@typeInfo(Child)) {
                         .int, .comptime_int => {
-                            @field(instance, f.name) = @as(Child, @intCast(value.integer));
+                            @field(instance, fname) = @as(Child, @intCast(value.integer));
                         },
                         .float, .comptime_float => {
-                            @field(instance, f.name) = @as(Child, @floatCast(value.float));
+                            @field(instance, fname) = @as(Child, @floatCast(value.float));
                         },
                         .bool => {
-                            @field(instance, f.name) = value.boolean;
+                            @field(instance, fname) = value.boolean;
                         },
                         else => {},
                     }

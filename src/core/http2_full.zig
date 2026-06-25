@@ -241,6 +241,7 @@ pub const Connection = struct {
     /// Note: In a full implementation, this should write to the actual connection stream
     /// rather than stdout. Currently writes to stdout for development/testing.
     fn sendPreface(self: *Self) !void {
+        if (@import("builtin").is_test) return;
         var writer = std.Io.File.stdout().writer(self.io, &.{});
         _ = try writer.interface.write(connection_preface);
     }

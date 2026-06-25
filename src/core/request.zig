@@ -322,6 +322,13 @@ pub fn readBody(self: *Self) ![]const u8 {
         }
     }
 
+    // 没有 Content-Length 且没有 Transfer-Encoding 的请求没有 body，直接返回空
+    if (self.content_length == null and self.transfer_encoding == .none) {
+        self.body_read = true;
+        self.body_data = &.{};
+        return &.{};
+    }
+
     var temp_buf: [65536]u8 = undefined;
     const body_reader = self.request.readerExpectNone(&temp_buf);
 
