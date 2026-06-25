@@ -79,3 +79,106 @@ pub fn handle(self: *Self, ctx: *RequestContext, res: *Response) !void {
 pub fn deinit(self: *Self) void {
     _ = self;
 }
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "UserHandler.init - creates instance with args" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator, .{ .default_name = "Alice" });
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("Alice", handler.default_name);
+}
+
+test "UserHandler.init - different args produce different values" {
+    const allocator = std.testing.allocator;
+    const h1 = try Self.init(allocator, .{ .default_name = "Alice" });
+    defer allocator.destroy(h1);
+    const h2 = try Self.init(allocator, .{ .default_name = "Bob" });
+    defer allocator.destroy(h2);
+
+    try std.testing.expectEqualStrings("Alice", h1.default_name);
+    try std.testing.expectEqualStrings("Bob", h2.default_name);
+    try std.testing.expect(h1 != h2);
+}
+
+test "UserHandler.deinit - no-op does not crash" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator, .{ .default_name = "test" });
+    defer allocator.destroy(handler);
+
+    handler.deinit();
+}
+
+test "UserHandler - Handler.initPerRequestWith vtable integration" {
+    const allocator = std.testing.allocator;
+    const Handler = core.Handler;
+
+    const args = .{ .default_name = "John Doe" };
+    const handler = try Handler.initPerRequestWith(Self, allocator, args);
+    defer {
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            args: struct { default_name: []const u8 },
+        };
+        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
+        allocator.destroy(ctx);
+    }
+
+    // Create instance via vtable
+    const instance = try handler.vtable.create(handler.ptr);
+    const typed: *Self = @ptrCast(@alignCast(instance));
+    try std.testing.expectEqualStrings("John Doe", typed.default_name);
+
+    // Destroy via vtable
+    handler.vtable.destroy(handler.ptr, instance);
+}
+
+test "UserHandler.init - empty default_name" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator, .{ .default_name = "" });
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("", handler.default_name);
+}
+
+test "UserHandler.init - long default_name" {
+    const allocator = std.testing.allocator;
+    const long_name = "X" * *500;
+    const handler = try Self.init(allocator, .{ .default_name = long_name });
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings(long_name, handler.default_name);
+}
+
+test "UserHandler.init - unicode default_name" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator, .{ .default_name = "你好世界" });
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("你好世界", handler.default_name);
+}
+
+test "UserHandler - vtable creates distinct instances" {
+    const allocator = std.testing.allocator;
+    const Handler = core.Handler;
+
+    const handler = try Handler.initPerRequestWith(Self, allocator, .{ .default_name = "test" });
+    defer {
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            args: struct { default_name: []const u8 },
+        };
+        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
+        allocator.destroy(ctx);
+    }
+
+    const inst1 = try handler.vtable.create(handler.ptr);
+    const inst2 = try handler.vtable.create(handler.ptr);
+    defer handler.vtable.destroy(handler.ptr, inst1);
+    defer handler.vtable.destroy(handler.ptr, inst2);
+
+    try std.testing.expect(inst1 != inst2);
+}

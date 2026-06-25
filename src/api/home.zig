@@ -91,3 +91,88 @@ const HTML = "<!DOCTYPE html>\n" ++
     "  <p><em>Served by initPerRequest</em></p>\n" ++
     "</body>\n" ++
     "<html>";
+
+// =========================================================================
+// 测试
+// =========================================================================
+
+test "HomeHandler.init - creates instance with TITLE" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator);
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("My Awesome Zig Server", handler.title);
+}
+
+test "HomeHandler.initWithTitle - creates instance with custom title" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.initWithTitle(allocator, "Custom Title");
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("Custom Title", handler.title);
+}
+
+test "HomeHandler.deinit - no-op does not crash" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.init(allocator);
+    defer allocator.destroy(handler);
+
+    handler.deinit();
+}
+
+test "HomeHandler - TITLE constant is correct" {
+    try std.testing.expectEqualStrings("My Awesome Zig Server", TITLE);
+}
+
+test "HomeHandler - HTML contains title" {
+    try std.testing.expect(std.mem.indexOf(u8, HTML, TITLE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, HTML, "<!DOCTYPE html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HTML, "</body>") != null);
+}
+
+test "HomeHandler - Handler.initPerRequest vtable integration" {
+    const allocator = std.testing.allocator;
+    const Handler = core.Handler;
+
+    const handler = try Handler.initPerRequest(Self, allocator);
+    defer {
+        const ctx: *std.mem.Allocator = @ptrCast(@alignCast(handler.ptr));
+        allocator.destroy(ctx);
+    }
+
+    // Create instance via vtable
+    const instance = try handler.vtable.create(handler.ptr);
+    const typed: *Self = @ptrCast(@alignCast(instance));
+    try std.testing.expectEqualStrings("My Awesome Zig Server", typed.title);
+
+    // Destroy via vtable
+    handler.vtable.destroy(handler.ptr, instance);
+}
+
+test "HomeHandler - init returns distinct instances" {
+    const allocator = std.testing.allocator;
+    const h1 = try Self.init(allocator);
+    defer allocator.destroy(h1);
+    const h2 = try Self.init(allocator);
+    defer allocator.destroy(h2);
+
+    try std.testing.expect(h1 != h2);
+    try std.testing.expectEqualStrings(h1.title, h2.title);
+}
+
+test "HomeHandler - initWithTitle with empty string" {
+    const allocator = std.testing.allocator;
+    const handler = try Self.initWithTitle(allocator, "");
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings("", handler.title);
+}
+
+test "HomeHandler - initWithTitle with long string" {
+    const allocator = std.testing.allocator;
+    const long_title = "A" * *1000;
+    const handler = try Self.initWithTitle(allocator, long_title);
+    defer allocator.destroy(handler);
+
+    try std.testing.expectEqualStrings(long_title, handler.title);
+}

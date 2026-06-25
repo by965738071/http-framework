@@ -296,3 +296,518 @@ test "RateLimiter: over-limit returns respond-equivalent" {
     // 4 > 3 max, still within 1s window → rate-limited → would trigger .respond
     try std.testing.expect(rl.isRateLimited("over-limit-client", 500_000_000));
 }
+
+// =========================================================================
+// 补充测试：updateRecord
+// =========================================================================
+
+test "updateRecord: 首次请求应创建 count=1 的记录" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    try rl.updateRecord("client-new", 10_000_000_000);
+
+    const record = rl.records.get("client-new").?;
+    try std.testing.expectEqual(@as(u32, 1), record.count);
+    try std.testing.expectEqual(@as(i128, 10_000_000_000), record.window_start);
+}
+
+test "updateRecord: 同一窗口内 count 递增" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    try rl.updateRecord("client-inc", 10_000_000_000);
+    try rl.updateRecord("client-inc", 15_000_000_000);
+    try rl.updateRecord("client-inc", 20_000_000_000);
+
+    const record = rl.records.get("client-inc").?;
+    try std.testing.expectEqual(@as(u32, 3), record.count);
+    // 窗口起始时间不变
+    try std.testing.expectEqual(@as(i128, 10_000_000_000), record.window_start);
+}
+
+test "updateRecord: 跨窗口后 count 重置为 1" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 第一个窗口：3 次请求
+    try rl.updateRecord("client-reset", 10_000_000_000);
+    try rl.updateRecord("client-reset", 15_000_000_000);
+    try rl.updateRecord("client-reset", 20_000_000_000);
+
+    // 第二个窗口：距首次请求超过 60s
+    try rl.updateRecord("client-reset", 70_000_000_000);
+
+    const record = rl.records.get("client-reset").?;
+    try std.testing.expectEqual(@as(u32, 1), record.count);
+    // 窗口起始时间更新到新窗口
+    try std.testing.expectEqual(@as(i128, 70_000_000_000), record.window_start);
+}
+
+test "updateRecord: 多个不同 identifier 独立计数" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    try rl.updateRecord("client-a", 10_000_000_000);
+    try rl.updateRecord("client-b", 10_000_000_000);
+    try rl.updateRecord("client-a", 15_000_000_000);
+
+    try std.testing.expectEqual(@as(u32, 2), rl.records.get("client-a").?.count);
+    try std.testing.expectEqual(@as(u32, 1), rl.records.get("client-b").?.count);
+    // 确认共有 2 条记录
+    try std.testing.expectEqual(@as(u32, 2), rl.records.count());
+}
+
+// =========================================================================
+// 补充测试：isRateLimited 边界条件
+// =========================================================================
+
+test "isRateLimited: count 恰好等于 max_requests 时被限制" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 5 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const key = try allocator.dupe(u8, "exact-client");
+    try rl.records.put(allocator, key, .{ .count = 5, .window_start = 0 });
+
+    // count == max_requests → 被限制
+    try std.testing.expect(rl.isRateLimited("exact-client", 10_000_000_000));
+}
+
+test "isRateLimited: count 等于 max_requests-1 时不被限制" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 5 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const key = try allocator.dupe(u8, "under-client");
+    try rl.records.put(allocator, key, .{ .count = 4, .window_start = 0 });
+
+    // count == max_requests - 1 → 未被限制
+    try std.testing.expect(!rl.isRateLimited("under-client", 10_000_000_000));
+}
+
+test "isRateLimited: 无记录的新 identifier 不被限制" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 1 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 无记录 → 未被限制
+    try std.testing.expect(!rl.isRateLimited("brand-new-client", 10_000_000_000));
+}
+
+test "isRateLimited: 不同窗口秒数配置影响过期判断" {
+    const allocator = std.testing.allocator;
+
+    // 短窗口: 10 秒
+    const config = RateLimitConfig{ .window_seconds = 10, .max_requests = 3 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const key = try allocator.dupe(u8, "short-window-client");
+    try rl.records.put(allocator, key, .{ .count = 3, .window_start = 0 });
+
+    // 5s（在 10s 窗口内）→ 被限制
+    try std.testing.expect(rl.isRateLimited("short-window-client", 5_000_000_000));
+
+    // 10s（恰好到达窗口边界）→ 未被限制（now - window_start >= window_ns）
+    try std.testing.expect(!rl.isRateLimited("short-window-client", 10_000_000_000));
+
+    // 11s（超过窗口）→ 未被限制
+    try std.testing.expect(!rl.isRateLimited("short-window-client", 11_000_000_000));
+}
+
+// =========================================================================
+// 补充测试：addRateLimitHeaders
+// =========================================================================
+
+test "addRateLimitHeaders: 有记录时设置三个 X-RateLimit-* 头" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 插入记录: count=3
+    const key = try allocator.dupe(u8, "header-client");
+    try rl.records.put(allocator, key, .{ .count = 3, .window_start = 0 });
+
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+
+    try rl.addRateLimitHeaders(&res, "header-client", 10_000_000_000);
+
+    // 应设置 3 个头
+    try std.testing.expectEqual(@as(usize, 3), res.headers.items.len);
+    try std.testing.expectEqualStrings("X-RateLimit-Limit", res.headers.items[0].name);
+    try std.testing.expectEqualStrings("X-RateLimit-Remaining", res.headers.items[1].name);
+    try std.testing.expectEqualStrings("X-RateLimit-Reset", res.headers.items[2].name);
+}
+
+test "addRateLimitHeaders: 无记录时不设置头" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 10 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+
+    // identifier 无记录 → 不设置头
+    try rl.addRateLimitHeaders(&res, "unknown-client", 10_000_000_000);
+    try std.testing.expectEqual(@as(usize, 0), res.headers.items.len);
+}
+
+test "addRateLimitHeaders: remaining = 0 当 count >= max_requests" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 5 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // count == max_requests → remaining 应为 0
+    const key = try allocator.dupe(u8, "full-client");
+    try rl.records.put(allocator, key, .{ .count = 5, .window_start = 0 });
+
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+
+    try rl.addRateLimitHeaders(&res, "full-client", 10_000_000_000);
+
+    // 头数量正确
+    try std.testing.expectEqual(@as(usize, 3), res.headers.items.len);
+}
+
+test "addRateLimitHeaders: remaining = max_requests - count 当 count < max_requests" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .window_seconds = 60, .max_requests = 100 };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // count = 70, max = 100 → remaining = 30
+    const key = try allocator.dupe(u8, "partial-client");
+    try rl.records.put(allocator, key, .{ .count = 70, .window_start = 0 });
+
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+
+    try rl.addRateLimitHeaders(&res, "partial-client", 10_000_000_000);
+
+    // 头数量正确
+    try std.testing.expectEqual(@as(usize, 3), res.headers.items.len);
+}
+
+// =========================================================================
+// 补充测试：getIdentifier
+// =========================================================================
+
+test "getIdentifier: 使用 identifier_header 配置时从请求头获取标识" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{
+        .per_ip = true,
+        .identifier_header = "X-API-Key",
+    };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-API-Key: my-secret-key\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier != null);
+    try std.testing.expectEqualStrings("my-secret-key", identifier.?);
+}
+
+test "getIdentifier: 使用 per_ip 配置时从 X-Forwarded-For 获取 IP" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .per_ip = true, .identifier_header = null };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Forwarded-For: 192.168.1.1, 10.0.0.1\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier != null);
+    // X-Forwarded-For 取第一个 IP
+    try std.testing.expectEqualStrings("192.168.1.1", identifier.?);
+}
+
+test "getIdentifier: 使用 per_ip 配置时从 X-Real-IP 获取 IP" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .per_ip = true, .identifier_header = null };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Real-IP: 10.0.0.5\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier != null);
+    try std.testing.expectEqualStrings("10.0.0.5", identifier.?);
+}
+
+test "getIdentifier: 全局模式返回 \"global\"" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .per_ip = false, .identifier_header = null };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier != null);
+    try std.testing.expectEqualStrings("global", identifier.?);
+}
+
+test "getIdentifier: identifier_header 优先于 per_ip" {
+    const allocator = std.testing.allocator;
+    // 同时设置了 identifier_header 和 per_ip
+    const config = RateLimitConfig{
+        .per_ip = true,
+        .identifier_header = "X-API-Key",
+    };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 请求同时有 IP 头和 API Key 头
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Forwarded-For: 192.168.1.1\r\n" ++
+        "X-API-Key: api-key-123\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // identifier_header 优先 → 返回 API Key 而非 IP
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier != null);
+    try std.testing.expectEqualStrings("api-key-123", identifier.?);
+}
+
+test "getIdentifier: identifier_header 对应的请求头不存在时返回 null" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{
+        .per_ip = false,
+        .identifier_header = "X-API-Key",
+    };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 请求中没有 X-API-Key 头
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // header 不存在 → 返回 null
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier == null);
+}
+
+test "getIdentifier: per_ip 无 IP 头时返回 null" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{ .per_ip = true, .identifier_header = null };
+    var rl = try RateLimiter.init(allocator, undefined, config);
+    defer rl.deinit();
+
+    // 请求中没有 X-Forwarded-For 或 X-Real-IP
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // 无 IP 头 → 返回 null
+    const identifier = rl.getIdentifier(&ctx);
+    try std.testing.expect(identifier == null);
+}
+
+// =========================================================================
+// 补充测试：process（完整流程）
+// =========================================================================
+
+test "process: 未超限时返回 .next 并更新记录" {
+    const allocator = std.testing.allocator;
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 10,
+        .per_ip = true,
+        .identifier_header = null,
+    };
+    var rl = try RateLimiter.init(allocator, std.testing.io, config);
+    defer rl.deinit();
+
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Forwarded-For: 10.0.0.1\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const action = try rl.process(&ctx);
+    try std.testing.expectEqual(Middleware.NextAction.next, action);
+
+    // 应该创建了记录
+    try std.testing.expectEqual(@as(u32, 1), rl.records.count());
+}
+
+test "process: 无标识头时返回 .next（放行请求）" {
+    const allocator = std.testing.allocator;
+    // 配置 per_ip=true 但请求中无 IP 头
+    const config = RateLimitConfig{
+        .window_seconds = 60,
+        .max_requests = 10,
+        .per_ip = true,
+        .identifier_header = null,
+    };
+    var rl = try RateLimiter.init(allocator, std.testing.io, config);
+    defer rl.deinit();
+
+    // 无 X-Forwarded-For / X-Real-IP
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // 无法识别客户端 → 返回 .next
+    const action = try rl.process(&ctx);
+    try std.testing.expectEqual(Middleware.NextAction.next, action);
+
+    // 不应创建记录
+    try std.testing.expectEqual(@as(u32, 0), rl.records.count());
+}

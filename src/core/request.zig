@@ -1210,5 +1210,6 @@ test "Self - content type checks" {
     try std.testing.expect(ctx.isJson());
     try std.testing.expect(!ctx.isForm());
     try std.testing.expect(!ctx.isMultipartForm());
+    
     try std.testing.expect(ctx.hasContentType("application/json; charset=utf-8"));
 }

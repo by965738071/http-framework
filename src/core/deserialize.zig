@@ -16,21 +16,6 @@
 const std = @import("std");
 const mem = std.mem;
 
-/// Wraps a deserialized value with an ArenaAllocator for unified cleanup.
-pub fn Parsed(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        value: T,
-        arena: *std.heap.ArenaAllocator,
-
-        pub fn deinit(self: *Self) void {
-            const allocator = self.arena.child_allocator;
-            self.arena.deinit();
-            allocator.destroy(self.arena);
-        }
-    };
-}
-
 pub const DeserializeError = error{
     EmptyBody,
     UnsupportedContentType,
@@ -41,33 +26,22 @@ pub const DeserializeError = error{
     TypeMismatch,
 };
 
+/// &#31867;&#22411;&#21035;&#21517;&#65292;&#26041;&#20415;&#22806;&#37096;&#24341;&#29992;
+pub const Parsed = std.json.Parsed;
+
 // ===========================================================================
 // JSON Deserialization
 // ===========================================================================
 
-/// Parse a JSON request body into type T.
-/// Uses an ArenaAllocator to manage all heap memory.
+/// &#23558; JSON body &#35299;&#26512;&#20026;&#31867;&#22411; T&#12290;
+/// &#20869;&#37096;&#20351;&#29992; ArenaAllocator&#65292;&#35843;&#29992;&#32773;&#21482;&#38656; `defer parsed.deinit()`&#12290;
 pub fn parseJson(
     comptime T: type,
     allocator: std.mem.Allocator,
     body: []const u8,
-) DeserializeError!Parsed(T) {
-    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.EmptyBody;
-    arena.* = std.heap.ArenaAllocator.init(allocator);
-    const arena_alloc = arena.allocator();
-
-    const parsed = std.json.parseFromSlice(T, arena_alloc, body, .{}) catch {
-        arena.deinit();
-        allocator.destroy(arena);
-        return error.InvalidJson;
-    };
-
-    return Parsed(T){
-        .value = parsed.value,
-        .arena = arena,
-    };
+) DeserializeError!std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, body, .{}) catch return error.InvalidJson;
 }
-
 // ===========================================================================
 // Form Deserialization (comptime reflection)
 // ===========================================================================
@@ -85,12 +59,8 @@ pub fn parseForm(
     allocator: std.mem.Allocator,
     body: []const u8,
 ) DeserializeError!Parsed(T) {
-    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.EmptyBody;
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.InvalidForm;
     arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
     const arena_alloc = arena.allocator();
 
     var pairs = FormPairs.init(body);
@@ -105,7 +75,6 @@ pub fn parseForm(
     const field_types = info.@"struct".field_types;
     const field_attrs = info.@"struct".field_attrs;
 
-    // Initialize fields with their compile-time default values (e.g. `age: u32 = 30`)
     inline for (field_names, field_types, field_attrs) |field_name, field_type, field_attr| {
         if (field_attr.defaultValue(field_type)) |default_val| {
             @field(result, field_name) = default_val;
@@ -118,11 +87,15 @@ pub fn parseForm(
     while (pairs.next()) |pair| {
         inline for (field_names, field_types, 0..) |field_name, field_type, i| {
             if (mem.eql(u8, pair.key, field_name)) {
-                @field(result, field_name) = try parseFormField(
+                @field(result, field_name) = parseFormField(
                     field_type,
                     arena_alloc,
                     pair.value,
-                );
+                ) catch {
+                    arena.deinit();
+                    allocator.destroy(arena);
+                    return error.TypeMismatch;
+                };
                 set_fields[i] = true;
             }
         }
@@ -134,9 +107,10 @@ pub fn parseForm(
             if (field_info == .optional) {
                 @field(result, field_name) = null;
             } else if (field_attr.default_value_ptr == null) {
+                arena.deinit();
+                allocator.destroy(arena);
                 return error.MissingField;
             }
-            // else: field has a default value (already set above), keep it
         }
     }
 
@@ -328,4 +302,350 @@ test "parseForm missing required field" {
 
     const result = parseForm(T, allocator, "name=Alice");
     try std.testing.expectError(error.MissingField, result);
+}
+
+// ===========================================================================
+// JSON deserialization tests
+// ===========================================================================
+
+test "parseJson all field types" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, age: u32, active: bool };
+
+    var parsed = try parseJson(T, allocator, "{\"name\":\"Bob\",\"age\":25,\"active\":true}");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Bob", parsed.value.name);
+    try std.testing.expectEqual(@as(u32, 25), parsed.value.age);
+    try std.testing.expect(parsed.value.active);
+}
+
+test "parseJson invalid returns InvalidJson" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8 };
+
+    const result = parseJson(T, allocator, "{not valid json}");
+    try std.testing.expectError(error.InvalidJson, result);
+}
+
+test "parseJson empty body returns InvalidJson" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8 };
+
+    const result = parseJson(T, allocator, "");
+    try std.testing.expectError(error.InvalidJson, result);
+}
+
+test "parseJson nested objects" {
+    const allocator = std.testing.allocator;
+    const Address = struct { city: []const u8, zip: []const u8 };
+    const T = struct { name: []const u8, address: Address };
+
+    var parsed = try parseJson(T, allocator, "{\"name\":\"Alice\",\"address\":{\"city\":\"NYC\",\"zip\":\"10001\"}}");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expectEqualStrings("NYC", parsed.value.address.city);
+    try std.testing.expectEqualStrings("10001", parsed.value.address.zip);
+}
+
+test "parseJson optional fields present" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, nickname: ?[]const u8 = null, age: ?u32 = null };
+
+    var parsed = try parseJson(T, allocator, "{\"name\":\"Alice\",\"nickname\":\"Al\",\"age\":30}");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expectEqualStrings("Al", parsed.value.nickname.?);
+    try std.testing.expectEqual(@as(u32, 30), parsed.value.age.?);
+}
+
+test "parseJson optional fields absent" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, nickname: ?[]const u8 = null, age: ?u32 = null };
+
+    var parsed = try parseJson(T, allocator, "{\"name\":\"Alice\"}");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expect(parsed.value.nickname == null);
+    try std.testing.expect(parsed.value.age == null);
+}
+
+// ===========================================================================
+// Form integer / float parsing tests
+// ===========================================================================
+
+test "parseForm integer field u32" {
+    const allocator = std.testing.allocator;
+    const T = struct { count: u32 };
+
+    var parsed = try parseForm(T, allocator, "count=42");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 42), parsed.value.count);
+}
+
+test "parseForm integer field i32 negative" {
+    const allocator = std.testing.allocator;
+    const T = struct { temperature: i32 };
+
+    var parsed = try parseForm(T, allocator, "temperature=-10");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(i32, -10), parsed.value.temperature);
+}
+
+test "parseForm integer field u64" {
+    const allocator = std.testing.allocator;
+    const T = struct { big: u64 };
+
+    var parsed = try parseForm(T, allocator, "big=1000000000000");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u64, 1000000000000), parsed.value.big);
+}
+
+test "parseForm integer field i64" {
+    const allocator = std.testing.allocator;
+    const T = struct { offset: i64 };
+
+    var parsed = try parseForm(T, allocator, "offset=-9999");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(i64, -9999), parsed.value.offset);
+}
+
+test "parseForm float field f32" {
+    const allocator = std.testing.allocator;
+    const T = struct { ratio: f32 };
+
+    var parsed = try parseForm(T, allocator, "ratio=3.14");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(f32, 3.14), parsed.value.ratio);
+}
+
+test "parseForm float field f64" {
+    const allocator = std.testing.allocator;
+    const T = struct { precision: f64 };
+
+    var parsed = try parseForm(T, allocator, "precision=2.718281828");
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(f64, 2.718281828), parsed.value.precision);
+}
+
+// ===========================================================================
+// Form bool edge cases
+// ===========================================================================
+
+test "parseForm bool with 1 is true" {
+    const allocator = std.testing.allocator;
+    const T = struct { flag: bool };
+
+    var parsed = try parseForm(T, allocator, "flag=1");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.flag);
+}
+
+test "parseForm bool with 0 is false" {
+    const allocator = std.testing.allocator;
+    const T = struct { flag: bool };
+
+    var parsed = try parseForm(T, allocator, "flag=0");
+    defer parsed.deinit();
+
+    try std.testing.expect(!parsed.value.flag);
+}
+
+// ===========================================================================
+// Form multi-field and separator tests
+// ===========================================================================
+
+test "parseForm multiple fields mixed types" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, age: u32, score: f64, active: bool };
+
+    var parsed = try parseForm(T, allocator, "name=Bob&age=25&score=9.5&active=true");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Bob", parsed.value.name);
+    try std.testing.expectEqual(@as(u32, 25), parsed.value.age);
+    try std.testing.expectEqual(@as(f64, 9.5), parsed.value.score);
+    try std.testing.expect(parsed.value.active);
+}
+
+test "parseForm semicolon separator" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, age: u32 };
+
+    var parsed = try parseForm(T, allocator, "name=Alice;age=30");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expectEqual(@as(u32, 30), parsed.value.age);
+}
+
+// ===========================================================================
+// URL decoding tests (via parseForm)
+// ===========================================================================
+
+test "parseForm url decode %20 to space" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8 };
+
+    var parsed = try parseForm(T, allocator, "name=Hello%20World");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Hello World", parsed.value.name);
+}
+
+test "parseForm url decode %2F to slash" {
+    const allocator = std.testing.allocator;
+    const T = struct { path: []const u8 };
+
+    var parsed = try parseForm(T, allocator, "path=a%2Fb%2Fc");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("a/b/c", parsed.value.path);
+}
+
+test "parseForm url decode plus to space" {
+    const allocator = std.testing.allocator;
+    const T = struct { q: []const u8 };
+
+    var parsed = try parseForm(T, allocator, "q=hello+world");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("hello world", parsed.value.q);
+}
+
+test "parseForm url decode mixed encoding" {
+    const allocator = std.testing.allocator;
+    const T = struct { msg: []const u8 };
+
+    var parsed = try parseForm(T, allocator, "msg=foo+bar%21baz");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("foo bar!baz", parsed.value.msg);
+}
+
+test "parseForm url decode no encoding needed" {
+    const allocator = std.testing.allocator;
+    const T = struct { plain: []const u8 };
+
+    var parsed = try parseForm(T, allocator, "plain=hello");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("hello", parsed.value.plain);
+}
+
+// ===========================================================================
+// Optional field and default value tests
+// ===========================================================================
+
+test "parseForm optional empty value is null" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, tag: ?[]const u8 };
+
+    var parsed = try parseForm(T, allocator, "name=Alice&tag=");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expect(parsed.value.tag == null);
+}
+
+test "parseForm default value overridden by form" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, role: []const u8 = "user" };
+
+    var parsed = try parseForm(T, allocator, "name=Alice&role=admin");
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expectEqualStrings("admin", parsed.value.role);
+}
+
+// ===========================================================================
+// FormPairs edge cases (tested indirectly)
+// ===========================================================================
+
+test "parseForm key without value defaults to bool true" {
+    const allocator = std.testing.allocator;
+    const T = struct { active: bool };
+
+    var parsed = try parseForm(T, allocator, "active");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.active);
+}
+
+test "parseForm empty body for all-optional struct" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: ?[]const u8, age: ?u32 };
+
+    var parsed = try parseForm(T, allocator, "");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.name == null);
+    try std.testing.expect(parsed.value.age == null);
+}
+
+// ===========================================================================
+// Parsed lifecycle tests
+// ===========================================================================
+
+test "Parsed deinit releases all memory" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, bio: []const u8 };
+
+    // If arena cleanup is broken, the testing allocator will report a leak.
+    var parsed = try parseJson(T, allocator, "{\"name\":\"Alice\",\"bio\":\"A person\"}");
+    try std.testing.expectEqualStrings("Alice", parsed.value.name);
+    try std.testing.expectEqualStrings("A person", parsed.value.bio);
+    parsed.deinit();
+}
+
+test "multiple parsed instances do not interfere" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8 };
+
+    var a = try parseJson(T, allocator, "{\"name\":\"first\"}");
+    var b = try parseForm(T, allocator, "name=second");
+    defer a.deinit();
+    defer b.deinit();
+
+    try std.testing.expectEqualStrings("first", a.value.name);
+    try std.testing.expectEqualStrings("second", b.value.name);
+}
+
+// ===========================================================================
+// Error case tests
+// ===========================================================================
+
+test "parseForm invalid integer returns TypeMismatch" {
+    const allocator = std.testing.allocator;
+    const T = struct { age: u32 };
+
+    const result = parseForm(T, allocator, "age=notanumber");
+    try std.testing.expectError(error.TypeMismatch, result);
+}
+
+test "parseForm invalid float returns TypeMismatch" {
+    const allocator = std.testing.allocator;
+    const T = struct { score: f64 };
+
+    const result = parseForm(T, allocator, "score=abc");
+    try std.testing.expectError(error.TypeMismatch, result);
+}
+
+test "parseForm negative for unsigned returns TypeMismatch" {
+    const allocator = std.testing.allocator;
+    const T = struct { count: u32 };
+
+    const result = parseForm(T, allocator, "count=-5");
+    try std.testing.expectError(error.TypeMismatch, result);
 }

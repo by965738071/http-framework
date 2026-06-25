@@ -562,3 +562,813 @@ test "toFieldValue string" {
     const v = toFieldValue("hello");
     try std.testing.expectEqualStrings("hello", v.string);
 }
+
+// =========================================================================
+// Operator.symbol tests
+// =========================================================================
+
+test "Operator.symbol Eq" {
+    try std.testing.expectEqualStrings("=", Operator.Eq.symbol());
+}
+
+test "Operator.symbol Neq" {
+    try std.testing.expectEqualStrings("!=", Operator.Neq.symbol());
+}
+
+test "Operator.symbol Gt" {
+    try std.testing.expectEqualStrings(">", Operator.Gt.symbol());
+}
+
+test "Operator.symbol Gte" {
+    try std.testing.expectEqualStrings(">=", Operator.Gte.symbol());
+}
+
+test "Operator.symbol Lt" {
+    try std.testing.expectEqualStrings("<", Operator.Lt.symbol());
+}
+
+test "Operator.symbol Lte" {
+    try std.testing.expectEqualStrings("<=", Operator.Lte.symbol());
+}
+
+test "Operator.symbol Like" {
+    try std.testing.expectEqualStrings("LIKE", Operator.Like.symbol());
+}
+
+test "Operator.symbol In" {
+    try std.testing.expectEqualStrings("IN", Operator.In.symbol());
+}
+
+test "Operator.symbol NotIn" {
+    try std.testing.expectEqualStrings("NOT IN", Operator.NotIn.symbol());
+}
+
+test "Operator.symbol IsNull" {
+    try std.testing.expectEqualStrings("IS NULL", Operator.IsNull.symbol());
+}
+
+test "Operator.symbol IsNotNull" {
+    try std.testing.expectEqualStrings("IS NOT NULL", Operator.IsNotNull.symbol());
+}
+
+// =========================================================================
+// QueryBuilder method tests
+// =========================================================================
+
+test "QueryBuilder.select sets query type" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.select();
+    try std.testing.expectEqual(QueryType.select, qb.query_type);
+}
+
+test "QueryBuilder.selectFields sets query type and fields" {
+    const User = struct { id: u64, name: []const u8 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.selectFields(&.{ "id", "name" });
+    try std.testing.expectEqual(QueryType.select, qb.query_type);
+    try std.testing.expect(qb.selected_fields != null);
+    try std.testing.expectEqual(@as(usize, 2), qb.selected_fields.?.len);
+    try std.testing.expectEqualStrings("id", qb.selected_fields.?[0]);
+    try std.testing.expectEqualStrings("name", qb.selected_fields.?[1]);
+}
+
+test "QueryBuilder.count sets query type" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.count();
+    try std.testing.expectEqual(QueryType.count, qb.query_type);
+}
+
+test "QueryBuilder.insert sets query type and data" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.insert(.{ .id = 1, .name = "Alice", .age = 30 });
+    try std.testing.expectEqual(QueryType.insert, qb.query_type);
+    try std.testing.expect(qb.data != null);
+    try std.testing.expectEqual(@as(u64, 1), qb.data.?.id);
+    try std.testing.expectEqualStrings("Alice", qb.data.?.name);
+    try std.testing.expectEqual(@as(u32, 30), qb.data.?.age);
+}
+
+test "QueryBuilder.update sets query type and fields" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.update(.{ .id = 1, .name = "Bob", .age = 25 }, &.{"name"});
+    try std.testing.expectEqual(QueryType.update, qb.query_type);
+    try std.testing.expect(qb.data != null);
+    try std.testing.expectEqualStrings("Bob", qb.data.?.name);
+    try std.testing.expect(qb.update_fields != null);
+    try std.testing.expectEqual(@as(usize, 1), qb.update_fields.?.len);
+    try std.testing.expectEqualStrings("name", qb.update_fields.?[0]);
+}
+
+test "QueryBuilder.delete sets query type" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.delete();
+    try std.testing.expectEqual(QueryType.delete, qb.query_type);
+}
+
+test "QueryBuilder.andWhere adds AND condition" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "id", .{ .integer = 1 })
+        .andWhere(.Gt, "age", .{ .integer = 18 });
+
+    try std.testing.expectEqual(@as(usize, 2), qb.conditions.items.len);
+    try std.testing.expectEqual(Logic.And, qb.conditions.items[0].logic);
+    try std.testing.expectEqual(Logic.And, qb.conditions.items[1].logic);
+}
+
+test "QueryBuilder.orWhere adds OR condition" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "id", .{ .integer = 1 })
+        .orWhere(.Eq, "name", .{ .string = "Bob" });
+
+    try std.testing.expectEqual(@as(usize, 2), qb.conditions.items.len);
+    try std.testing.expectEqual(Logic.And, qb.conditions.items[0].logic);
+    try std.testing.expectEqual(Logic.Or, qb.conditions.items[1].logic);
+}
+
+test "QueryBuilder.limit sets limit_value" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.limit(10);
+    try std.testing.expectEqual(@as(?usize, 10), qb.limit_value);
+}
+
+test "QueryBuilder.offset sets offset_value" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.offset(5);
+    try std.testing.expectEqual(@as(?usize, 5), qb.offset_value);
+}
+
+test "QueryBuilder.isFindAll true when no conditions" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    try std.testing.expect(qb.isFindAll());
+}
+
+test "QueryBuilder.isFindAll false when has conditions" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "id", .{ .integer = 1 });
+    try std.testing.expect(!qb.isFindAll());
+}
+
+// =========================================================================
+// matches() with multiple conditions
+// =========================================================================
+
+test "QueryBuilder matches with AND conditions" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Gt, "age", .{ .integer = 18 })
+        .andWhere(.Eq, "active", .{ .boolean = true });
+
+    const user_match = User{ .id = 1, .name = "Alice", .age = 25 };
+    try std.testing.expect(qb.matches(user_match));
+
+    const user_fail_age = User{ .id = 2, .name = "Bob", .age = 16 };
+    try std.testing.expect(!qb.matches(user_fail_age));
+
+    const user_fail_active = User{ .id = 3, .name = "Charlie", .age = 30, .active = false };
+    try std.testing.expect(!qb.matches(user_fail_active));
+}
+
+test "QueryBuilder matches with OR conditions" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "name", .{ .string = "Alice" })
+        .orWhere(.Eq, "name", .{ .string = "Bob" });
+
+    const user_alice = User{ .id = 1, .name = "Alice", .age = 25 };
+    try std.testing.expect(qb.matches(user_alice));
+
+    const user_bob = User{ .id = 2, .name = "Bob", .age = 30 };
+    try std.testing.expect(qb.matches(user_bob));
+
+    const user_charlie = User{ .id = 3, .name = "Charlie", .age = 20 };
+    try std.testing.expect(!qb.matches(user_charlie));
+}
+
+test "QueryBuilder matches with Like operator" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Like, "name", .{ .string = "Ali" });
+
+    const user = User{ .id = 1, .name = "Alice", .age = 25 };
+    try std.testing.expect(qb.matches(user));
+
+    const user2 = User{ .id = 2, .name = "Bob", .age = 30 };
+    try std.testing.expect(!qb.matches(user2));
+}
+
+test "QueryBuilder matches with Neq operator" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Neq, "age", .{ .integer = 30 });
+
+    const user = User{ .id = 1, .name = "Alice", .age = 25 };
+    try std.testing.expect(qb.matches(user));
+
+    const user2 = User{ .id = 2, .name = "Bob", .age = 30 };
+    try std.testing.expect(!qb.matches(user2));
+}
+
+test "QueryBuilder matches with string conditions" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "name", .{ .string = "Alice" });
+
+    const user = User{ .id = 1, .name = "Alice", .age = 25 };
+    try std.testing.expect(qb.matches(user));
+
+    const user2 = User{ .id = 2, .name = "Bob", .age = 30 };
+    try std.testing.expect(!qb.matches(user2));
+}
+
+test "QueryBuilder matches with boolean conditions" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+
+    _ = qb.where(.Eq, "active", .{ .boolean = false });
+
+    const user_active = User{ .id = 1, .name = "Alice", .age = 25, .active = true };
+    try std.testing.expect(!qb.matches(user_active));
+
+    const user_inactive = User{ .id = 2, .name = "Bob", .age = 30, .active = false };
+    try std.testing.expect(qb.matches(user_inactive));
+}
+
+test "QueryBuilder matches with Gt/Lt/Lte/Gte operators" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+
+    // Gt
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.Gt, "age", .{ .integer = 20 });
+        const user = User{ .id = 1, .name = "A", .age = 25 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 2, .name = "B", .age = 20 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+    // Gte
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.Gte, "age", .{ .integer = 20 });
+        const user = User{ .id = 1, .name = "A", .age = 20 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 2, .name = "B", .age = 19 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+    // Lt
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.Lt, "age", .{ .integer = 30 });
+        const user = User{ .id = 1, .name = "A", .age = 25 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 2, .name = "B", .age = 30 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+    // Lte
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.Lte, "age", .{ .integer = 30 });
+        const user = User{ .id = 1, .name = "A", .age = 30 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 2, .name = "B", .age = 31 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+}
+
+test "QueryBuilder matches with IsNull and IsNotNull" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const allocator = std.testing.allocator;
+
+    // IsNull on integer (0 is null)
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.IsNull, "id", .{ .integer = 0 });
+        const user = User{ .id = 0, .name = "A", .age = 25 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 1, .name = "B", .age = 30 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+    // IsNotNull on string (empty is null)
+    {
+        var qb = QueryBuilder(User).init(allocator);
+        defer qb.deinit();
+        _ = qb.where(.IsNotNull, "name", .{ .string = "" });
+        const user = User{ .id = 1, .name = "Alice", .age = 25 };
+        try std.testing.expect(qb.matches(user));
+        const user2 = User{ .id = 2, .name = "", .age = 30 };
+        try std.testing.expect(!qb.matches(user2));
+    }
+}
+
+// =========================================================================
+// applySorting tests
+// =========================================================================
+
+test "QueryBuilder applySorting Desc direction" {
+    const User = struct { id: u64, age: u32 };
+    const allocator = std.testing.allocator;
+
+    var list = std.ArrayList(User).empty;
+    defer list.deinit(allocator);
+    try list.append(allocator, .{ .id = 1, .age = 20 });
+    try list.append(allocator, .{ .id = 2, .age = 30 });
+    try list.append(allocator, .{ .id = 3, .age = 25 });
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.orderBy("age", .Desc);
+    _ = qb.applySorting(&list);
+
+    try std.testing.expectEqual(@as(u32, 30), list.items[0].age);
+    try std.testing.expectEqual(@as(u32, 25), list.items[1].age);
+    try std.testing.expectEqual(@as(u32, 20), list.items[2].age);
+}
+
+test "QueryBuilder applySorting multiple sort clauses" {
+    const User = struct { id: u64, age: u32 };
+    const allocator = std.testing.allocator;
+
+    var list = std.ArrayList(User).empty;
+    defer list.deinit(allocator);
+    try list.append(allocator, .{ .id = 1, .age = 25 });
+    try list.append(allocator, .{ .id = 2, .age = 25 });
+    try list.append(allocator, .{ .id = 3, .age = 20 });
+    try list.append(allocator, .{ .id = 4, .age = 30 });
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.orderBy("age", .Asc).orderBy("id", .Desc);
+    _ = qb.applySorting(&list);
+
+    try std.testing.expectEqual(@as(u32, 20), list.items[0].age);
+    // Both have age 25, sorted by id Desc: id=2 before id=1
+    try std.testing.expectEqual(@as(u64, 2), list.items[1].id);
+    try std.testing.expectEqual(@as(u64, 1), list.items[2].id);
+    try std.testing.expectEqual(@as(u32, 30), list.items[3].age);
+}
+
+// =========================================================================
+// applyPagination edge cases
+// =========================================================================
+
+test "QueryBuilder applyPagination offset beyond length" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+
+    var list = std.ArrayList(User).empty;
+    defer list.deinit(allocator);
+    try list.append(allocator, .{ .id = 1 });
+    try list.append(allocator, .{ .id = 2 });
+    try list.append(allocator, .{ .id = 3 });
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.offset(10).limit(5);
+    _ = qb.applyPagination(&list);
+
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "QueryBuilder applyPagination limit 0" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+
+    var list = std.ArrayList(User).empty;
+    defer list.deinit(allocator);
+    try list.append(allocator, .{ .id = 1 });
+    try list.append(allocator, .{ .id = 2 });
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.limit(0);
+    _ = qb.applyPagination(&list);
+
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "QueryBuilder applyPagination only offset" {
+    const User = struct { id: u64 };
+    const allocator = std.testing.allocator;
+
+    var list = std.ArrayList(User).empty;
+    defer list.deinit(allocator);
+    var i: u64 = 0;
+    while (i < 5) : (i += 1) {
+        try list.append(allocator, .{ .id = i });
+    }
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.offset(2);
+    _ = qb.applyPagination(&list);
+
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(@as(u64, 2), list.items[0].id);
+}
+
+// =========================================================================
+// toFieldValue tests
+// =========================================================================
+
+test "toFieldValue float" {
+    const v = toFieldValue(@as(f64, 3.14));
+    try std.testing.expectEqual(@as(f64, 3.14), v.float);
+}
+
+test "toFieldValue bool true" {
+    const v = toFieldValue(true);
+    try std.testing.expectEqual(true, v.boolean);
+}
+
+test "toFieldValue bool false" {
+    const v = toFieldValue(false);
+    try std.testing.expectEqual(false, v.boolean);
+}
+
+test "toFieldValue optional some integer" {
+    const val: ?i32 = 42;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(@as(i64, 42), v.integer);
+}
+
+test "toFieldValue optional none integer" {
+    const val: ?i32 = null;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(@as(i64, 0), v.integer);
+}
+
+test "toFieldValue optional some bool" {
+    const val: ?bool = true;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(true, v.boolean);
+}
+
+test "toFieldValue optional none bool" {
+    const val: ?bool = null;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(false, v.boolean);
+}
+
+test "toFieldValue optional some float" {
+    const val: ?f32 = 2.5;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(@as(f64, 2.5), v.float);
+}
+
+test "toFieldValue optional none float" {
+    const val: ?f32 = null;
+    const v = toFieldValue(val);
+    try std.testing.expectEqual(@as(f64, 0.0), v.float);
+}
+
+test "toFieldValue comptime int" {
+    const v = toFieldValue(100);
+    try std.testing.expectEqual(@as(i64, 100), v.integer);
+}
+
+test "toFieldValue comptime float" {
+    const v = toFieldValue(1.5);
+    try std.testing.expectEqual(@as(f64, 1.5), v.float);
+}
+
+// =========================================================================
+// getFieldValue tests
+// =========================================================================
+
+test "getFieldValue for u64 field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const user = User{ .id = 42, .name = "Alice", .age = 25 };
+    const v = getFieldValue(User, user, "id");
+    try std.testing.expectEqual(@as(i64, 42), v.integer);
+}
+
+test "getFieldValue for string field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const user = User{ .id = 1, .name = "Alice", .age = 25 };
+    const v = getFieldValue(User, user, "name");
+    try std.testing.expectEqualStrings("Alice", v.string);
+}
+
+test "getFieldValue for u32 field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const user = User{ .id = 1, .name = "Alice", .age = 30 };
+    const v = getFieldValue(User, user, "age");
+    try std.testing.expectEqual(@as(i64, 30), v.integer);
+}
+
+test "getFieldValue for bool field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const user = User{ .id = 1, .name = "Alice", .age = 25, .active = false };
+    const v = getFieldValue(User, user, "active");
+    try std.testing.expectEqual(false, v.boolean);
+}
+
+// =========================================================================
+// setFieldFromValue tests
+// =========================================================================
+
+test "setFieldFromValue int field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    var user = User{ .id = 0, .name = "", .age = 0 };
+    setFieldFromValue(User, &user, "id", .{ .integer = 99 });
+    try std.testing.expectEqual(@as(u64, 99), user.id);
+}
+
+test "setFieldFromValue string field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    var user = User{ .id = 0, .name = "", .age = 0 };
+    setFieldFromValue(User, &user, "name", .{ .string = "Bob" });
+    try std.testing.expectEqualStrings("Bob", user.name);
+}
+
+test "setFieldFromValue bool field" {
+    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    var user = User{ .id = 0, .name = "", .age = 0, .active = false };
+    setFieldFromValue(User, &user, "active", .{ .boolean = true });
+    try std.testing.expect(user.active);
+}
+
+test "setFieldFromValue float field" {
+    const Item = struct { id: u64, price: f64 };
+    var item = Item{ .id = 1, .price = 0.0 };
+    setFieldFromValue(Item, &item, "price", .{ .float = 19.99 });
+    try std.testing.expectEqual(@as(f64, 19.99), item.price);
+}
+
+// =========================================================================
+// compareValues tests
+// =========================================================================
+
+test "compareValues integer equal" {
+    const result = compareValues(.{ .integer = 5 }, .{ .integer = 5 });
+    try std.testing.expectEqual(std.math.Order.eq, result);
+}
+
+test "compareValues integer less" {
+    const result = compareValues(.{ .integer = 3 }, .{ .integer = 7 });
+    try std.testing.expectEqual(std.math.Order.lt, result);
+}
+
+test "compareValues integer greater" {
+    const result = compareValues(.{ .integer = 10 }, .{ .integer = 2 });
+    try std.testing.expectEqual(std.math.Order.gt, result);
+}
+
+test "compareValues string equal" {
+    const result = compareValues(.{ .string = "abc" }, .{ .string = "abc" });
+    try std.testing.expectEqual(std.math.Order.eq, result);
+}
+
+test "compareValues string less" {
+    const result = compareValues(.{ .string = "aaa" }, .{ .string = "bbb" });
+    try std.testing.expectEqual(std.math.Order.lt, result);
+}
+
+test "compareValues string greater" {
+    const result = compareValues(.{ .string = "zzz" }, .{ .string = "aaa" });
+    try std.testing.expectEqual(std.math.Order.gt, result);
+}
+
+test "compareValues float equal" {
+    const result = compareValues(.{ .float = 1.5 }, .{ .float = 1.5 });
+    try std.testing.expectEqual(std.math.Order.eq, result);
+}
+
+test "compareValues float less" {
+    const result = compareValues(.{ .float = 1.0 }, .{ .float = 2.0 });
+    try std.testing.expectEqual(std.math.Order.lt, result);
+}
+
+test "compareValues float greater" {
+    const result = compareValues(.{ .float = 3.0 }, .{ .float = 1.0 });
+    try std.testing.expectEqual(std.math.Order.gt, result);
+}
+
+test "compareValues boolean equal" {
+    const result = compareValues(.{ .boolean = true }, .{ .boolean = true });
+    try std.testing.expectEqual(std.math.Order.eq, result);
+}
+
+test "compareValues boolean false less than true" {
+    const result = compareValues(.{ .boolean = false }, .{ .boolean = true });
+    try std.testing.expectEqual(std.math.Order.lt, result);
+}
+
+test "compareValues boolean true greater than false" {
+    const result = compareValues(.{ .boolean = true }, .{ .boolean = false });
+    try std.testing.expectEqual(std.math.Order.gt, result);
+}
+
+test "compareValues mismatched types returns eq" {
+    const result = compareValues(.{ .integer = 5 }, .{ .string = "five" });
+    try std.testing.expectEqual(std.math.Order.eq, result);
+}
+
+// =========================================================================
+// evaluateCondition tests
+// =========================================================================
+
+test "evaluateCondition Eq integer" {
+    const cond = WhereCondition{ .field = "id", .operator = .Eq, .value = .{ .integer = 42 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 42 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 43 }));
+}
+
+test "evaluateCondition Neq integer" {
+    const cond = WhereCondition{ .field = "id", .operator = .Neq, .value = .{ .integer = 42 } };
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 42 }));
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 43 }));
+}
+
+test "evaluateCondition Gt integer" {
+    const cond = WhereCondition{ .field = "age", .operator = .Gt, .value = .{ .integer = 18 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 18 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 10 }));
+}
+
+test "evaluateCondition Lt integer" {
+    const cond = WhereCondition{ .field = "age", .operator = .Lt, .value = .{ .integer = 30 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 30 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 35 }));
+}
+
+test "evaluateCondition Gte integer" {
+    const cond = WhereCondition{ .field = "age", .operator = .Gte, .value = .{ .integer = 18 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 18 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 17 }));
+}
+
+test "evaluateCondition Lte integer" {
+    const cond = WhereCondition{ .field = "age", .operator = .Lte, .value = .{ .integer = 30 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
+    try std.testing.expect(evaluateCondition(cond, .{ .integer = 30 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 31 }));
+}
+
+test "evaluateCondition Like string" {
+    const cond = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "Ali" } };
+    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+}
+
+test "evaluateCondition Eq string" {
+    const cond = WhereCondition{ .field = "name", .operator = .Eq, .value = .{ .string = "Alice" } };
+    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+}
+
+test "evaluateCondition Neq string" {
+    const cond = WhereCondition{ .field = "name", .operator = .Neq, .value = .{ .string = "Alice" } };
+    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Alice" }));
+    try std.testing.expect(evaluateCondition(cond, .{ .string = "Bob" }));
+}
+
+test "evaluateCondition IsNull" {
+    // integer 0 is null
+    try std.testing.expect(evaluateCondition(
+        WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
+        .{ .integer = 0 },
+    ));
+    try std.testing.expect(!evaluateCondition(
+        WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
+        .{ .integer = 1 },
+    ));
+    // empty string is null
+    try std.testing.expect(evaluateCondition(
+        WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
+        .{ .string = "" },
+    ));
+    try std.testing.expect(!evaluateCondition(
+        WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
+        .{ .string = "hello" },
+    ));
+}
+
+test "evaluateCondition IsNotNull" {
+    // integer 0 is null, so IsNotNull should return false
+    try std.testing.expect(!evaluateCondition(
+        WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
+        .{ .integer = 0 },
+    ));
+    try std.testing.expect(evaluateCondition(
+        WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
+        .{ .integer = 1 },
+    ));
+    // empty string is null
+    try std.testing.expect(!evaluateCondition(
+        WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
+        .{ .string = "" },
+    ));
+    try std.testing.expect(evaluateCondition(
+        WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
+        .{ .string = "hello" },
+    ));
+}
+
+test "evaluateCondition Eq float" {
+    const cond = WhereCondition{ .field = "price", .operator = .Eq, .value = .{ .float = 9.99 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .float = 9.99 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .float = 10.0 }));
+}
+
+test "evaluateCondition Gt float" {
+    const cond = WhereCondition{ .field = "price", .operator = .Gt, .value = .{ .float = 10.0 } };
+    try std.testing.expect(evaluateCondition(cond, .{ .float = 15.0 }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .float = 5.0 }));
+}
+
+test "evaluateCondition Eq bool" {
+    const cond = WhereCondition{ .field = "active", .operator = .Eq, .value = .{ .boolean = true } };
+    try std.testing.expect(evaluateCondition(cond, .{ .boolean = true }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .boolean = false }));
+}
+
+test "evaluateCondition Neq bool" {
+    const cond = WhereCondition{ .field = "active", .operator = .Neq, .value = .{ .boolean = true } };
+    try std.testing.expect(!evaluateCondition(cond, .{ .boolean = true }));
+    try std.testing.expect(evaluateCondition(cond, .{ .boolean = false }));
+}
+
+test "evaluateCondition mismatched types returns false" {
+    const cond = WhereCondition{ .field = "id", .operator = .Eq, .value = .{ .integer = 42 } };
+    try std.testing.expect(!evaluateCondition(cond, .{ .string = "42" }));
+}
+
+test "evaluateCondition Gt/Lt/Lte/Gte on bool returns false" {
+    const gt_cond = WhereCondition{ .field = "active", .operator = .Gt, .value = .{ .boolean = false } };
+    try std.testing.expect(!evaluateCondition(gt_cond, .{ .boolean = true }));
+    const lt_cond = WhereCondition{ .field = "active", .operator = .Lt, .value = .{ .boolean = false } };
+    try std.testing.expect(!evaluateCondition(lt_cond, .{ .boolean = false }));
+}

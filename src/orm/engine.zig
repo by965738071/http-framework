@@ -600,3 +600,761 @@ test "JsonStore update and delete" {
     const gone = try store.findById(id);
     try std.testing.expect(gone == null);
 }
+
+// ── Comprehensive tests ─────────────────────────────
+
+const TestUser = struct {
+    id: u64 = 0,
+    name: []const u8,
+    email: []const u8,
+};
+
+const test_schema = TableSchema{
+    .table_name = "test_engine_users",
+    .fields = &.{
+        .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+        .{ .name = "name", .field_type = .string },
+        .{ .name = "email", .field_type = .string },
+    },
+};
+
+test "findAll with no conditions returns all rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    // All three users should be present
+    var found_alice = false;
+    var found_bob = false;
+    var found_charlie = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.name, "Alice")) found_alice = true;
+        if (std.mem.eql(u8, r.name, "Bob")) found_bob = true;
+        if (std.mem.eql(u8, r.name, "Charlie")) found_charlie = true;
+    }
+    try std.testing.expect(found_alice);
+    try std.testing.expect(found_bob);
+    try std.testing.expect(found_charlie);
+    _ = arena_alloc; // suppress unused warning
+}
+
+test "findAll with where conditions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "Bob" });
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("Bob", results[0].name);
+    try std.testing.expectEqualStrings("bob@test.com", results[0].email);
+}
+
+test "findAll with Neq condition" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Neq, "name", .{ .string = "Alice" });
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("Bob", results[0].name);
+}
+
+test "findOne found" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "Alice" });
+
+    const result = try store.findOne(&qb);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("Alice", result.?.name);
+    try std.testing.expectEqualStrings("alice@test.com", result.?.email);
+}
+
+test "findOne not found" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "NonExistent" });
+
+    const result = try store.findOne(&qb);
+    try std.testing.expect(result == null);
+}
+
+test "findById found" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const id1 = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    const found = try store.findById(id1);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("Alice", found.?.name);
+}
+
+test "findById not found" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    const found = try store.findById(9999);
+    try std.testing.expect(found == null);
+}
+
+test "count with no conditions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+
+    const c = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, 2), c);
+}
+
+test "count with where conditions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Alice2", .email = "alice2@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "Alice" });
+
+    const c = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, 1), c);
+}
+
+test "count returns 0 when no matches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "NonExistent" });
+
+    const c = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, 0), c);
+}
+
+test "all returns copy of all rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    const all_rows = try store.all();
+    defer allocator.free(all_rows);
+
+    try std.testing.expectEqual(@as(usize, 2), all_rows.len);
+    try std.testing.expectEqualStrings("Alice", all_rows[0].name);
+    try std.testing.expectEqualStrings("Bob", all_rows[1].name);
+}
+
+test "truncate clears all data" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    try store.truncate();
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    const c = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, 0), c);
+}
+
+test "truncate resets auto-increment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    try store.truncate();
+
+    // After truncate, next insert should get id=1 again
+    const id = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+    try std.testing.expectEqual(@as(u64, 1), id);
+}
+
+test "insert auto-incrementing ids" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const id1 = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    const id2 = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    const id3 = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    try std.testing.expectEqual(@as(u64, 1), id1);
+    try std.testing.expectEqual(@as(u64, 2), id2);
+    try std.testing.expectEqual(@as(u64, 3), id3);
+}
+
+test "update with update_fields partial update" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+    _ = qb.update(.{ .id = id, .name = "Alice Updated", .email = "alice@test.com" }, &.{"name"});
+
+    const updated = try store.update(&qb);
+    try std.testing.expectEqual(@as(usize, 1), updated);
+
+    const found = try store.findById(id);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("Alice Updated", found.?.name);
+    try std.testing.expectEqualStrings("alice@test.com", found.?.email);
+}
+
+test "update multiple rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    // Update all rows with id > 0 (all of them)
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Gt, "id", .{ .integer = 0 });
+    _ = qb.update(.{ .id = 0, .name = "Updated", .email = "updated@test.com" }, &.{"email"});
+
+    const updated = try store.update(&qb);
+    try std.testing.expectEqual(@as(usize, 3), updated);
+
+    const all_rows = try store.all();
+    defer allocator.free(all_rows);
+    for (all_rows) |row| {
+        try std.testing.expectEqualStrings("updated@test.com", row.email);
+    }
+}
+
+test "delete removes matching rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    const id2 = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = @intCast(id2) });
+
+    const deleted = try store.delete(&qb);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    var count_qb = QueryBuilder(TestUser).init(allocator);
+    defer count_qb.deinit();
+    const remaining = try store.count(&count_qb);
+    try std.testing.expectEqual(@as(usize, 2), remaining);
+
+    const gone = try store.findById(id2);
+    try std.testing.expect(gone == null);
+}
+
+test "delete no match returns 0" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = 9999 });
+
+    const deleted = try store.delete(&qb);
+    try std.testing.expectEqual(@as(usize, 0), deleted);
+}
+
+test "findAll with sorting ascending" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.orderBy("name", .Asc);
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("Alice", results[0].name);
+    try std.testing.expectEqualStrings("Bob", results[1].name);
+    try std.testing.expectEqualStrings("Charlie", results[2].name);
+}
+
+test "findAll with sorting descending" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.orderBy("name", .Desc);
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("Charlie", results[0].name);
+    try std.testing.expectEqualStrings("Bob", results[1].name);
+    try std.testing.expectEqualStrings("Alice", results[2].name);
+}
+
+test "empty store findAll returns empty" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "empty store count returns 0" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+
+    const c = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, 0), c);
+}
+
+test "empty store all returns empty" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const all_rows = try store.all();
+    defer allocator.free(all_rows);
+
+    try std.testing.expectEqual(@as(usize, 0), all_rows.len);
+}
+
+test "empty store findById returns null" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const found = try store.findById(1);
+    try std.testing.expect(found == null);
+}
+
+test "empty store findOne returns null" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "name", .{ .string = "Nobody" });
+
+    const result = try store.findOne(&qb);
+    try std.testing.expect(result == null);
+}
+
+test "update with no match returns 0" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = 9999 });
+    _ = qb.update(.{ .id = 0, .name = "Ghost", .email = "ghost@test.com" }, &.{"name"});
+
+    const updated = try store.update(&qb);
+    try std.testing.expectEqual(@as(usize, 0), updated);
+}
+
+test "all returns independent copy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    const all_rows1 = try store.all();
+    defer allocator.free(all_rows1);
+
+    const all_rows2 = try store.all();
+    defer allocator.free(all_rows2);
+
+    // Both should have the same content but be independent allocations
+    try std.testing.expectEqual(all_rows1.len, all_rows2.len);
+    try std.testing.expectEqualStrings(all_rows1[0].name, all_rows2[0].name);
+    // Pointer addresses should differ (independent copy)
+    try std.testing.expect(all_rows1.ptr != all_rows2.ptr);
+}
+
+test "flush persists data to disk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    // Explicit flush (already done by insert, but test the API)
+    try store.flush();
+
+    // Re-open with arena to avoid tracking string allocs from json deserialization
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var store2 = try Store.open(arena.allocator(), io, ".test_data");
+    defer {
+        store2.truncate() catch {};
+        store2.close();
+    }
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    const c = try store2.count(&qb);
+    try std.testing.expectEqual(@as(usize, 2), c);
+}
+
+test "multiple inserts and findAll with limit and offset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Dave", .email = "dave@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Eve", .email = "eve@test.com" });
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.orderBy("name", .Asc).limit(2).offset(1);
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+
+    // Sorted: Alice, Bob, Charlie, Dave, Eve
+    // offset=1 skips Alice, limit=2 gives Bob and Charlie
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("Bob", results[0].name);
+    try std.testing.expectEqualStrings("Charlie", results[1].name);
+}
+
+test "delete all rows with no conditions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+
+    // No where conditions matches all rows
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.delete();
+
+    const deleted = try store.delete(&qb);
+    try std.testing.expectEqual(@as(usize, 2), deleted);
+
+    var count_qb = QueryBuilder(TestUser).init(allocator);
+    defer count_qb.deinit();
+    const c = try store.count(&count_qb);
+    try std.testing.expectEqual(@as(usize, 0), c);
+}
+
+test "insert preserves field values" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+
+    const found = try store.findById(id);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqual(@as(u64, id), found.?.id);
+    try std.testing.expectEqualStrings("Alice", found.?.name);
+    try std.testing.expectEqualStrings("alice@test.com", found.?.email);
+}
+
+test "Gte and Lte operators" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close();
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
+    _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
+
+    // id >= 2 should match Bob (id=2) and Charlie (id=3)
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Gte, "id", .{ .integer = 2 });
+
+    const results = try store.findAll(&qb);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+
+    // id <= 1 should match Alice (id=1)
+    var qb2 = QueryBuilder(TestUser).init(allocator);
+    defer qb2.deinit();
+    _ = qb2.where(.Lte, "id", .{ .integer = 1 });
+
+    const results2 = try store.findAll(&qb2);
+    defer allocator.free(results2);
+    try std.testing.expectEqual(@as(usize, 1), results2.len);
+    try std.testing.expectEqualStrings("Alice", results2[0].name);
+}

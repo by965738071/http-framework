@@ -62,6 +62,10 @@ pub const modelSchema = @import("model.zig").modelSchema;
 pub const toFieldValue = @import("query.zig").toFieldValue;
 pub const getFieldValue = @import("query.zig").getFieldValue;
 
+test {
+    @import("std").testing.refAllDecls(@This());
+}
+
 // ── 测试 ──────────────────────────────────────────
 
 test "ORM persistence - data survives reopen" {
