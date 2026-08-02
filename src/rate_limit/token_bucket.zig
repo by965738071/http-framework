@@ -24,8 +24,8 @@
 //! ```
 
 const std = @import("std");
-const Middleware = @import("middleware.zig");
-const RequestContext = @import("request.zig");
+const Middleware = @import("../core/middleware.zig");
+const RequestContext = @import("../core/request.zig");
 
 /// Token bucket configuration
 pub const Config = struct {

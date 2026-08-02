@@ -151,7 +151,7 @@ pub const BodySignature = struct {
 };
 
 /// RequestContext import for verify
-const RequestContext = @import("request.zig");
+const RequestContext = @import("../core/request.zig");
 
 // ===========================================================================
 // Tests

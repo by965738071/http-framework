@@ -356,9 +356,9 @@ fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.j
                 if (std.meta.stringToEnum(T, value.string)) |e| return e;
             }
             if (value == .integer) {
-                return @enumFromInt(@as(std.meta.Tag(T), @intCast(value.integer)));
+                return @fromBackingInt(@intCast(@as(std.meta.Tag(T), @intCast(value.integer))));
             }
-            return @enumFromInt(@as(std.meta.Tag(T), 0));
+            return @fromBackingInt(@intCast(@as(std.meta.Tag(T), 0)));
         },
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     }
@@ -456,7 +456,7 @@ fn getDefaultForType(comptime T: type) T {
         .bool => false,
         .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8) "" else @compileError("Unsupported"),
         .optional => null,
-        .@"enum" => @enumFromInt(@as(std.meta.Tag(T), 0)),
+        .@"enum" => @fromBackingInt(@intCast(@as(std.meta.Tag(T), 0))),
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     };
 }

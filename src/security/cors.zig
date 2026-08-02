@@ -4,9 +4,9 @@
 //! 符合 CORS 规范，支持预检请求（OPTIONS）。
 
 const std = @import("std");
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
-const Middleware = @import("middleware.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
+const Middleware = @import("../core/middleware.zig");
 
 /// CORS 配置
 pub const CorsConfig = struct {

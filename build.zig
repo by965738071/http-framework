@@ -4,12 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const coreMod = b.addModule("core", .{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ORM tests (file-relative @import resolves automatically)
     const ormMod = b.addModule("orm", .{
         .root_source_file = b.path("src/orm/root.zig"),
@@ -22,7 +16,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "core", .module = coreMod },
             .{ .name = "orm", .module = ormMod },
         },
     });
@@ -35,7 +28,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "http_framework", .module = mod },
-                .{ .name = "core", .module = coreMod },
                 .{ .name = "orm", .module = ormMod },
             },
         }),
@@ -63,16 +55,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_orm_tests = b.addRunArtifact(orm_tests);
 
-    // Core tests (src/core/*.zig test blocks)
-    const core_tests = b.addTest(.{ .root_module = coreMod });
-    const run_core_tests = b.addRunArtifact(core_tests);
-
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_orm_tests.step);
-    test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 }

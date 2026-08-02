@@ -7,8 +7,8 @@ const mem = std.mem;
 const io = std.Io;
 
 const Allocator = std.mem.Allocator;
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
 
 /// Session 数据（键值对存储）
 pub const SessionData = std.StringHashMap([]const u8);

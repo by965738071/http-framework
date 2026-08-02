@@ -11,7 +11,7 @@ const RequestContext = @import("request.zig");
 const freeHashMap = RequestContext.freeHashMap;
 const Response = @import("response.zig");
 const Middleware = @import("middleware.zig");
-const Handler = @import("handler.zig");
+const Handler = @import("../handler/handler.zig");
 const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
 
 /// 单条路由记录

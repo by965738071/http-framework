@@ -8,10 +8,10 @@
 //! Auth result is stored in `ctx.user_data` for downstream handlers.
 
 const std = @import("std");
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
-const NextAction = @import("middleware.zig").NextAction;
-const Middle = @import("middleware.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
+const NextAction = @import("../core/middleware.zig").NextAction;
+const Middle = @import("../core/middleware.zig");
 
 /// Auth result stored in ctx after successful validation
 pub const AuthInfo = struct {

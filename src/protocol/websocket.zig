@@ -5,8 +5,8 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
 
 // =========================================================================
 // WebSocket 管理器（生产级）

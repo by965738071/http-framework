@@ -13,12 +13,12 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-const core = @import("root.zig");
-const Router = core.Router;
-const Handler = core.Handler;
-const RequestContext = core.RequestContext;
-const Response = core.Response;
-const Middleware = core.Middleware;
+const fw = @import("../root.zig");
+const Router = fw.Router;
+const Handler = fw.Handler;
+const RequestContext = fw.RequestContext;
+const Response = fw.Response;
+const Middleware = fw.Middleware;
 
 /// 创建模拟 HTTP 请求上下文
 fn createMockRequest(

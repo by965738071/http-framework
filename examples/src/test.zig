@@ -45,10 +45,10 @@ test "Route with param" {
 }
 
 test "HTTP status codes" {
-    try testing.expectEqual(@as(u16, 200), @intFromEnum(std.http.Status.ok));
-    try testing.expectEqual(@as(u16, 404), @intFromEnum(std.http.Status.not_found));
-    try testing.expectEqual(@as(u16, 500), @intFromEnum(std.http.Status.internal_server_error));
-    try testing.expectEqual(@as(u16, 429), @intFromEnum(std.http.Status.too_many_requests));
+    try testing.expectEqual(@as(u16, 200), @backingInt(std.http.Status.ok));
+    try testing.expectEqual(@as(u16, 404), @backingInt(std.http.Status.not_found));
+    try testing.expectEqual(@as(u16, 500), @backingInt(std.http.Status.internal_server_error));
+    try testing.expectEqual(@as(u16, 429), @backingInt(std.http.Status.too_many_requests));
 }
 
 test "Config defaults" {

@@ -148,7 +148,7 @@ pub const RotatingFileLogger = struct {
             };
         }
         pub fn atLeast(l: Level, min: Level) bool {
-            return @intFromEnum(l) <= @intFromEnum(min);
+            return @backingInt(l) <= @backingInt(min);
         }
     };
 

@@ -5,9 +5,9 @@
 const std = @import("std");
 const mem = std.mem;
 
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
-const Middleware = @import("middleware.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
+const Middleware = @import("../core/middleware.zig");
 
 /// 速率限制配置
 pub const RateLimitConfig = struct {

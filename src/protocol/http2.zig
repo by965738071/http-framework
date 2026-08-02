@@ -12,8 +12,8 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
 
 /// HTTP/2 配置
 pub const Http2Config = struct {

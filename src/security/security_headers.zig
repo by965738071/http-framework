@@ -15,9 +15,9 @@
 //! ```
 
 const std = @import("std");
-const RequestContext = @import("request.zig");
-const Response = @import("response.zig");
-const Middleware = @import("middleware.zig");
+const RequestContext = @import("../core/request.zig");
+const Response = @import("../core/response.zig");
+const Middleware = @import("../core/middleware.zig");
 
 /// 安全头配置
 ///

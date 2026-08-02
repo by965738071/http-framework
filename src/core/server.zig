@@ -26,14 +26,14 @@ const builtin = @import("builtin");
 const http = std.http;
 const net = std.Io.net;
 
-const Config = @import("config.zig").Config;
+const Config = @import("../config/config.zig").Config;
 const RequestContext = @import("request.zig");
 const Response = @import("response.zig");
 const Router = @import("router.zig");
 const RotatingFileLogger = @import("logger.zig").RotatingFileLogger;
-const MetricsCollector = @import("metrics.zig").MetricsCollector;
-const CorsMiddleware = @import("cors.zig").CorsMiddleware;
-const BackgroundQueue = @import("background.zig").BackgroundQueue;
+const MetricsCollector = @import("../observability/metrics.zig").MetricsCollector;
+const CorsMiddleware = @import("../security/cors.zig").CorsMiddleware;
+const BackgroundQueue = @import("../background/background.zig").BackgroundQueue;
 
 /// 每个连接的读取缓冲区大小（必须能容纳最大 HTTP 头部）
 const READ_BUF_SIZE: usize = 16384;
@@ -351,7 +351,7 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
             m.recordRequest(.{
                 .method = @tagName(ctx.method),
                 .path = ctx.path,
-                .status = @intFromEnum(response.status),
+                .status = @backingInt(response.status),
                 .latency_ns = @as(u64, @intCast(latency)),
                 .timestamp = @intCast(dispatch_start),
             }) catch |metrics_err| {

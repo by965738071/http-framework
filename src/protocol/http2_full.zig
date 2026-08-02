@@ -109,7 +109,7 @@ pub const FrameHeader = struct {
         buf[0] = @intCast(self.length >> 16);
         buf[1] = @intCast((self.length >> 8) & 0xFF);
         buf[2] = @intCast(self.length & 0xFF);
-        buf[3] = @intFromEnum(self.type);
+        buf[3] = @backingInt(self.type);
         buf[4] = self.flags;
         buf[5] = @intCast((self.stream_id >> 24) & 0xFF);
         buf[6] = @intCast((self.stream_id >> 16) & 0xFF);
@@ -435,7 +435,7 @@ pub const Connection = struct {
             @intCast((last_stream_id >> 16) & 0xFF),
             @intCast((last_stream_id >> 8) & 0xFF),
             @intCast(last_stream_id & 0xFF),
-            @intFromEnum(error_code),
+            @backingInt(error_code),
             0,
             0,
             0,

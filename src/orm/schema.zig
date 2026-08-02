@@ -456,11 +456,11 @@ test "Migration with multiple operations" {
 }
 
 test "FieldType enum ordinal values" {
-    try std.testing.expectEqual(@as(u3, 0), @intFromEnum(FieldType.integer));
-    try std.testing.expectEqual(@as(u3, 1), @intFromEnum(FieldType.string));
-    try std.testing.expectEqual(@as(u3, 2), @intFromEnum(FieldType.float));
-    try std.testing.expectEqual(@as(u3, 3), @intFromEnum(FieldType.boolean));
-    try std.testing.expectEqual(@as(u3, 4), @intFromEnum(FieldType.datetime));
-    try std.testing.expectEqual(@as(u3, 5), @intFromEnum(FieldType.json_text));
-    try std.testing.expectEqual(@as(u3, 6), @intFromEnum(FieldType.text));
+    try std.testing.expectEqual(@as(u3, 0), @backingInt(FieldType.integer));
+    try std.testing.expectEqual(@as(u3, 1), @backingInt(FieldType.string));
+    try std.testing.expectEqual(@as(u3, 2), @backingInt(FieldType.float));
+    try std.testing.expectEqual(@as(u3, 3), @backingInt(FieldType.boolean));
+    try std.testing.expectEqual(@as(u3, 4), @backingInt(FieldType.datetime));
+    try std.testing.expectEqual(@as(u3, 5), @backingInt(FieldType.json_text));
+    try std.testing.expectEqual(@as(u3, 6), @backingInt(FieldType.text));
 }

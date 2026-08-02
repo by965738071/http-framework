@@ -32,8 +32,8 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-const Multipart = @import("multipart.zig");
-const deserialize = @import("deserialize.zig");
+const Multipart = @import("../multipart/multipart.zig");
+const deserialize = @import("../codec/deserialize.zig");
 
 /// 用户数据容器 — 包含不透明指针和销毁函数
 /// 任何模块都可以存入自定义数据，框架会通过 destroyFn 自动释放
@@ -1210,6 +1210,6 @@ test "Self - content type checks" {
     try std.testing.expect(ctx.isJson());
     try std.testing.expect(!ctx.isForm());
     try std.testing.expect(!ctx.isMultipartForm());
-    
+
     try std.testing.expect(ctx.hasContentType("application/json; charset=utf-8"));
 }

@@ -79,7 +79,7 @@ pub const StreamWriter = struct {
         // 手动构造状态行和响应头
         var buf: [512]u8 = undefined;
         const status_text = statusText(self.response.status);
-        const status_line = try std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.response.status), status_text });
+        const status_line = try std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\n", .{ @backingInt(self.response.status), status_text });
         _ = try rw.write(status_line);
 
         try self.response.headers.append(self.response.allocator, .{ .name = "Content-Type", .value = self.content_type });

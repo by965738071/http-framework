@@ -4,19 +4,19 @@
 
 const std = @import("std");
 const Io = std.Io;
-const core = @import("core");
-const Server = core.Server;
-const Router = core.Router;
-const RequestContext = core.RequestContext;
-const Response = core.Response;
-const Handler = core.Handler;
-const Config = core.Config;
-const WebSocket = core.WebSocket;
-const Static = core.Static;
-const WsEchoHandler = core.WsEchoHandler;
-const CorsMiddleware = core.Cors;
-const RateLimiter = core.RateLimiter;
-const MetricsCollector = core.Metrics;
+const fw = @import("http_framework");
+const Server = fw.Server;
+const Router = fw.Router;
+const RequestContext = fw.RequestContext;
+const Response = fw.Response;
+const Handler = fw.Handler;
+const Config = fw.Config;
+const WebSocket = fw.WebSocket;
+const Static = fw.Static;
+const WsEchoHandler = fw.WsEchoHandler;
+const CorsMiddleware = fw.Cors;
+const RateLimiter = fw.RateLimiter;
+const MetricsCollector = fw.Metrics;
 const HomeHandler = @import("api/home.zig");
 const UserHandler = @import("api/user.zig");
 
@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
     // ── 服务器配置 ─────────────────────────────────────
-    const config: core.Config.Config = .{
+    const config: fw.Config.Config = .{
         .log_file_path = "./log/zighttp.log",
         .log_async_enabled = true,
     };
