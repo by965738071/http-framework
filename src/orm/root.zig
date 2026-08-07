@@ -29,7 +29,7 @@
 //!
 //! // 3. 打开数据库
 //! var store = try UserStore.open(allocator, "./data");
-//! defer store.close();
+//! defer store.close() catch {};
 //!
 //! // 4. CRUD
 //! const id = try store.insert(.{ .id = 0, .username = "alice", .email = "alice@example.com" });
@@ -91,7 +91,7 @@ test "ORM persistence - data survives reopen" {
     {
         var store = try Store.open(store_alloc, io, ".test_data");
         defer {
-            store.close();
+            store.close() catch {};
         }
         _ = try store.insert(.{ .id = 0, .name = "Alice", .age = 30 });
         _ = try store.insert(.{ .id = 0, .name = "Bob", .age = 25 });
@@ -102,7 +102,7 @@ test "ORM persistence - data survives reopen" {
         var store = try Store.open(store_alloc, io, ".test_data");
         defer {
             store.truncate() catch {};
-            store.close();
+            store.close() catch {};
         }
 
         var qb = Query(User).init(allocator);
@@ -137,7 +137,7 @@ test "ORM integration - full CRUD lifecycle" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     // Insert

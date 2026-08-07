@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
     // ── 服务器配置 ─────────────────────────────────────
-    const config: fw.Config.Config = .{
+    const config: fw.Config = .{
         .log_file_path = "./log/zighttp.log",
         .log_async_enabled = true,
     };

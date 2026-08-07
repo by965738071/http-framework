@@ -51,9 +51,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             const cwd = std.Io.Dir.cwd();
 
             // Ensure data directory exists
-            cwd.createDirPath(self.io, data_dir) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
+            try cwd.createDirPath(self.io, data_dir);
 
             // Try to create the empty file if it doesn't exist
             const file_path = try self.tableFilePath();
@@ -66,8 +64,10 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             return self;
         }
 
-        pub fn close(self: *Self) void {
-            self.flush() catch {};
+        /// 关闭存储：先持久化未写入的数据，再释放资源。
+        /// 若 flush 失败会向上传播错误 — 由调用方决定如何处理。
+        pub fn close(self: *Self) !void {
+            try self.flush();
             self.rows.deinit(self.allocator);
             self.allocator.free(self.data_dir);
             self.allocator.destroy(self);
@@ -542,7 +542,7 @@ test "JsonStore insert and find" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -573,7 +573,7 @@ test "JsonStore update and delete" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id = try store.insert(.{ .id = 0, .name = "Bob" });
@@ -625,7 +625,7 @@ test "findAll with no conditions returns all rows" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -665,7 +665,7 @@ test "findAll with where conditions" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -691,7 +691,7 @@ test "findAll with Neq condition" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -715,7 +715,7 @@ test "findOne found" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -738,7 +738,7 @@ test "findOne not found" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -758,7 +758,7 @@ test "findById found" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id1 = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -776,7 +776,7 @@ test "findById not found" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -792,7 +792,7 @@ test "count with no conditions" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -812,7 +812,7 @@ test "count with where conditions" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -834,7 +834,7 @@ test "count returns 0 when no matches" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -854,7 +854,7 @@ test "all returns copy of all rows" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -875,7 +875,7 @@ test "truncate clears all data" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -896,7 +896,7 @@ test "truncate resets auto-increment" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -916,7 +916,7 @@ test "insert auto-incrementing ids" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id1 = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -935,7 +935,7 @@ test "update with update_fields partial update" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -961,7 +961,7 @@ test "update multiple rows" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -991,7 +991,7 @@ test "delete removes matching rows" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1021,7 +1021,7 @@ test "delete no match returns 0" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1041,7 +1041,7 @@ test "findAll with sorting ascending" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Charlie", .email = "charlie@test.com" });
@@ -1068,7 +1068,7 @@ test "findAll with sorting descending" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1095,7 +1095,7 @@ test "empty store findAll returns empty" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     var qb = QueryBuilder(TestUser).init(allocator);
@@ -1114,7 +1114,7 @@ test "empty store count returns 0" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     var qb = QueryBuilder(TestUser).init(allocator);
@@ -1131,7 +1131,7 @@ test "empty store all returns empty" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const all_rows = try store.all();
@@ -1147,7 +1147,7 @@ test "empty store findById returns null" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const found = try store.findById(1);
@@ -1161,7 +1161,7 @@ test "empty store findOne returns null" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     var qb = QueryBuilder(TestUser).init(allocator);
@@ -1179,7 +1179,7 @@ test "update with no match returns 0" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1200,7 +1200,7 @@ test "all returns independent copy" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1225,7 +1225,7 @@ test "flush persists data to disk" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1240,7 +1240,7 @@ test "flush persists data to disk" {
     var store2 = try Store.open(arena.allocator(), io, ".test_data");
     defer {
         store2.truncate() catch {};
-        store2.close();
+        store2.close() catch {};
     }
 
     var qb = QueryBuilder(TestUser).init(allocator);
@@ -1256,7 +1256,7 @@ test "multiple inserts and findAll with limit and offset" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1286,7 +1286,7 @@ test "delete all rows with no conditions" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1313,7 +1313,7 @@ test "insert preserves field values" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
@@ -1332,7 +1332,7 @@ test "Gte and Lte operators" {
     var store = try Store.open(allocator, io, ".test_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });

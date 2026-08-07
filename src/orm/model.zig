@@ -307,7 +307,7 @@ test "Model.Store type exists and can be instantiated" {
     var store = try M.Store.open(std.testing.allocator, io, ".test_model_store_data");
     defer {
         store.truncate() catch {};
-        store.close();
+        store.close() catch {};
     }
     try std.testing.expectEqualStrings("test_model_store", store.table_name);
 }

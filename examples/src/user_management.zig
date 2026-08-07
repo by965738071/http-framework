@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 初始化数据库
     user_store = try UserStore.open(allocator, io, DATA_DIR);
-    defer user_store.close();
+    defer user_store.close() catch {};
 
     // 添加种子数据
     try seedData(allocator);

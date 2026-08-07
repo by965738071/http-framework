@@ -19,9 +19,9 @@
 //! ```
 
 const std = @import("std");
-const core = @import("core");
-const RequestContext = core.RequestContext;
-const Response = core.Response;
+const fw = @import("http_framework");
+const RequestContext = fw.RequestContext;
+const Response = fw.Response;
 
 /// 用户信息处理器
 /// 每次请求创建一个新实例，处理完毕后自动销毁。
@@ -114,7 +114,7 @@ test "UserHandler.deinit - no-op does not crash" {
 
 test "UserHandler - Handler.initPerRequestWith vtable integration" {
     const allocator = std.testing.allocator;
-    const Handler = core.Handler;
+    const Handler = fw.Handler;
 
     const args = .{ .default_name = "John Doe" };
     const handler = try Handler.initPerRequestWith(Self, allocator, args);
@@ -163,7 +163,7 @@ test "UserHandler.init - unicode default_name" {
 
 test "UserHandler - vtable creates distinct instances" {
     const allocator = std.testing.allocator;
-    const Handler = core.Handler;
+    const Handler = fw.Handler;
 
     const handler = try Handler.initPerRequestWith(Self, allocator, .{ .default_name = "test" });
     defer {

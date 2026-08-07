@@ -17,9 +17,9 @@
 //! ```
 
 const std = @import("std");
-const core = @import("core");
-const RequestContext = core.RequestContext;
-const Response = core.Response;
+const fw = @import("http_framework");
+const RequestContext = fw.RequestContext;
+const Response = fw.Response;
 
 /// Home 页面处理器
 ///
@@ -132,7 +132,7 @@ test "HomeHandler - HTML contains title" {
 
 test "HomeHandler - Handler.initPerRequest vtable integration" {
     const allocator = std.testing.allocator;
-    const Handler = core.Handler;
+    const Handler = fw.Handler;
 
     const handler = try Handler.initPerRequest(Self, allocator);
     defer {
