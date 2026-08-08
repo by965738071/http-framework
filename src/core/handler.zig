@@ -33,8 +33,8 @@
 //! ```
 
 const std = @import("std");
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
+const RequestContext = @import("request.zig");
+const Response = @import("response.zig");
 
 const Handler = @This();
 
@@ -57,6 +57,11 @@ const VTable = struct {
     /// `ctx` = `Handler.ptr`（可从中获取分配器）。
     /// `instance` = `create` 的返回值。
     destroy: *const fn (ctx: *anyopaque, instance: *anyopaque) void,
+
+    /// 释放注册时创建的上下文（`Handler.ptr`）。
+    /// 单例/纯函数模式为空操作 — 指针归调用方所有；
+    /// 请求级模式释放 `initPerRequest(With)` 分配的一次性 Context。
+    deinit_context: *const fn (ctx: *anyopaque) void,
 };
 
 // ===========================================================================
@@ -85,6 +90,9 @@ pub fn fromFn(comptime func: *const fn (*RequestContext, *Response) anyerror!voi
             .destroy = struct {
                 fn destroy(_: *anyopaque, _: *anyopaque) void {}
             }.destroy,
+            .deinit_context = struct {
+                fn deinit_context(_: *anyopaque) void {}
+            }.deinit_context,
         },
     };
 }
@@ -110,6 +118,10 @@ pub fn init(comptime T: type, ptr: *T) Handler {
             .destroy = struct {
                 fn destroy(_: *anyopaque, _: *anyopaque) void {}
             }.destroy,
+            .deinit_context = struct {
+                // 单例：ptr 归调用方所有，释放由调用方负责
+                fn deinit_context(_: *anyopaque) void {}
+            }.deinit_context,
         },
     };
 }
@@ -179,6 +191,12 @@ pub fn initPerRequest(comptime T: type, allocator: std.mem.Allocator) !Handler {
                     c.alloc.destroy(self);
                 }
             }.destroy,
+            .deinit_context = struct {
+                fn deinit_context(any: *anyopaque) void {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    c.alloc.destroy(c);
+                }
+            }.deinit_context,
         },
     };
 }
@@ -241,8 +259,27 @@ pub fn initPerRequestWith(
                     c.alloc.destroy(self);
                 }
             }.destroy,
+            .deinit_context = struct {
+                fn deinit_context(any: *anyopaque) void {
+                    const c: *Context = @ptrCast(@alignCast(any));
+                    c.alloc.destroy(c);
+                }
+            }.deinit_context,
         },
     };
+}
+
+// ===========================================================================
+// 注册上下文清理
+// ===========================================================================
+
+/// 释放注册时分配的上下文（`Handler.ptr`）。
+///
+/// 单例/纯函数模式为空操作 — 指针归调用方所有；
+/// 请求级模式释放 `initPerRequest(With)` 一次性分配的 Context。
+/// `Router.deinit()` 会自动对每条路由调用本方法。
+pub fn deinit(self: *const Handler) void {
+    self.vtable.deinit_context(self.ptr);
 }
 
 // ===========================================================================
@@ -350,12 +387,7 @@ test "Handler.initPerRequest - new instance per request and deinit called" {
     PerRequest.deinit_id = 999;
 
     const handler = try Handler.initPerRequest(PerRequest, allocator);
-    defer {
-        // 释放 initPerRequest 分配的 Context
-        // Context = struct { alloc: Allocator } 布局与 Allocator 一致
-        const ctx: *std.mem.Allocator = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx);
-    }
+    defer handler.deinit();
 
     // 第一次请求 — 应创建新实例 id=0
     const inst1 = try handler.vtable.create(handler.ptr);
@@ -491,15 +523,7 @@ test "Handler.initPerRequestWith - args passed through and deinit called" {
 
     const args = TestArgs{ .name = "test-handler", .value = 42 };
     const handler = try Handler.initPerRequestWith(PerRequestWith, allocator, args);
-    defer {
-        // 释放 initPerRequestWith 分配的 Context（含 alloc + args）
-        const Context = struct {
-            alloc: std.mem.Allocator,
-            args: TestArgs,
-        };
-        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx);
-    }
+    defer handler.deinit();
 
     // 第一次请求 — 应创建新实例并正确保存 args
     const inst1 = try handler.vtable.create(handler.ptr);

@@ -103,10 +103,11 @@ const AppState = struct {
 const TimingMiddleware = struct {
     state: *AppState,
 
-    pub fn process(self: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
         // 计数
         _ = self.state.request_count.fetchAdd(1, .monotonic);
         _ = ctx;
+        _ = res;
         return .next;
     }
 };
@@ -118,7 +119,8 @@ const TimingMiddleware = struct {
 const RequireAuthMiddleware = struct {
     state: *AppState,
 
-    pub fn process(self: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
         // 1. 检查 Bearer token
         if (ctx.getHeader("Authorization")) |auth| {
             if (std.mem.startsWith(u8, auth, "Bearer ")) {
@@ -540,12 +542,12 @@ pub fn main(init: std.process.Init) !void {
     router.notFound(Handler.fromFn(notFoundHandler));
 
     // ── 启动服务器 ────────────────────────────────────
-    const config = Config.Config{ .port = 9000 };
-    var server = try Server.init(allocator, io, config, router);
+    const config = Config{ .port = 9000 };
+    var server = try Server.init(allocator, io, config, &router);
     defer server.deinit();
 
-    // 设置后台任务队列（server 会在请求处理后自动 drain）
-    server.setBackgroundQueue(&state.bg_queue);
+    // 后台任务队列实现 core.Worker，Server 按固定间隔 tick 它
+    server.setWorker(state.bg_queue.worker());
 
     std.log.info("API Server starting on http://127.0.0.1:9000", .{});
     std.log.info("Endpoints:", .{});

@@ -98,7 +98,8 @@ const App = struct {
 const SessionAuthMiddleware = struct {
     app: *App,
 
-    pub fn process(self: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
         // 白名单：不检查认证的端点
         if (std.mem.eql(u8, ctx.path, "/") or
             std.mem.eql(u8, ctx.path, "/api/hello") or
@@ -131,7 +132,8 @@ const SessionAuthMiddleware = struct {
 const AdminRoleMiddleware = struct {
     app: *App,
 
-    pub fn process(self: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
         const sid = ctx.getCookie("session_id") orelse {
             ctx.blocked_status = .forbidden;
             return .err;
@@ -471,11 +473,11 @@ pub fn main(init: std.process.Init) !void {
     router.notFound(Handler.fromFn(notFoundHandler));
 
     // ── 启动服务器 ──────────────────────────────────────
-    const config = Config.Config{ .port = 9000 };
-    var server = try Server.init(allocator, io, config, router);
+    const config = Config{ .port = 9000 };
+    var server = try Server.init(allocator, io, config, &router);
     defer server.deinit();
 
-    server.setBackgroundQueue(&app.bg_queue);
+    server.setWorker(app.bg_queue.worker());
 
     std.log.info("Fullstack Demo starting on http://127.0.0.1:9000", .{});
     std.log.info("Endpoints:", .{});

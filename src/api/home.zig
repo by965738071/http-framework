@@ -135,10 +135,7 @@ test "HomeHandler - Handler.initPerRequest vtable integration" {
     const Handler = fw.Handler;
 
     const handler = try Handler.initPerRequest(Self, allocator);
-    defer {
-        const ctx: *std.mem.Allocator = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx);
-    }
+    defer handler.deinit();
 
     // Create instance via vtable
     const instance = try handler.vtable.create(handler.ptr);

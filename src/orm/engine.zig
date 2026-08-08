@@ -4,7 +4,8 @@
 //! 每个"表"对应一个 `.json` 文件，每个文件包含一个 JSON 数组。
 //!
 //! # 线程安全
-//! 使用 `std.Thread.Mutex` 保护文件读写操作。
+//! 所有公开方法通过 `std.Io.Mutex` 互斥保护 `rows`/`next_id` 与文件写入，
+//! 可被并发请求安全共享。
 //!
 //! # 存储格式
 //! 文件内容为 JSON 数组：
@@ -20,6 +21,7 @@ const schema_mod = @import("schema.zig");
 const query_mod = @import("query.zig");
 
 const TableSchema = schema_mod.TableSchema;
+const FieldValue = schema_mod.FieldValue;
 const QueryBuilder = query_mod.QueryBuilder;
 
 /// JSON 文件存储引擎
@@ -32,8 +34,20 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         next_id: u64,
         rows: std.ArrayList(T),
         dirty: bool,
+        /// 主键 id -> rows 下标，提供 O(1) 的 findById
+        id_index: std.AutoHashMap(u64, usize) = undefined,
+        /// 保护并发读写（rows、next_id、文件 flush）
+        mutex: std.Io.Mutex = .init,
 
         const Self = @This();
+
+        fn lock(self: *Self) !void {
+            return self.mutex.lock(self.io);
+        }
+
+        fn unlock(self: *Self) void {
+            self.mutex.unlock(self.io);
+        }
 
         /// 打开（或创建）一个数据表
         pub fn open(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !*Self {
@@ -46,6 +60,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 .next_id = 1,
                 .rows = std.ArrayList(T).empty,
                 .dirty = false,
+                .id_index = std.AutoHashMap(u64, usize).init(allocator),
             };
 
             const cwd = std.Io.Dir.cwd();
@@ -67,9 +82,14 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         /// 关闭存储：先持久化未写入的数据，再释放资源。
         /// 若 flush 失败会向上传播错误 — 由调用方决定如何处理。
         pub fn close(self: *Self) !void {
-            try self.flush();
+            try self.lock();
+            errdefer self.unlock();
+            try self.flushUnlocked();
             self.rows.deinit(self.allocator);
+            self.id_index.deinit();
             self.allocator.free(self.data_dir);
+            // mutex 是结构体的一部分，必须先解锁再销毁
+            self.unlock();
             self.allocator.destroy(self);
         }
 
@@ -118,18 +138,28 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 if (jrow != .object) continue;
                 const row = try jsonObjectToType(T, self.allocator, jrow.object);
                 try self.rows.append(self.allocator, row);
+                const rows_len = self.rows.items.len;
 
                 if (jrow.object.get("id")) |id_val| {
                     if (id_val == .integer) {
                         const row_id: u64 = @intCast(id_val.integer);
                         if (row_id > max_id) max_id = row_id;
+                        try self.id_index.put(row_id, rows_len - 1);
                     }
                 }
             }
             self.next_id = max_id + 1;
         }
 
+        /// 持久化未写入的数据（公开入口，加锁）。
         pub fn flush(self: *Self) !void {
+            try self.lock();
+            defer self.unlock();
+            try self.flushUnlocked();
+        }
+
+        /// 持久化未写入的数据（调用方必须已持有锁）。
+        fn flushUnlocked(self: *Self) !void {
             if (!self.dirty) return;
 
             const file_path = try self.tableFilePath();
@@ -176,18 +206,29 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         // ── CRUD ────────────────────────────────────────
 
         pub fn insert(self: *Self, row: T) !u64 {
+            try self.lock();
+            defer self.unlock();
+
             const id = self.next_id;
             self.next_id += 1;
 
             var new_row = row;
+            applyDefaults(&new_row);
             setFieldByIdentifier(T, &new_row, "id", id);
+            // 唯一约束校验（与其它已存在行比较）
+            try self.checkUnique(new_row, null);
+
             try self.rows.append(self.allocator, new_row);
+            try self.id_index.put(id, self.rows.items.len - 1);
             self.dirty = true;
-            try self.flush();
+            try self.flushUnlocked();
             return id;
         }
 
         pub fn findAll(self: *Self, query: *QueryBuilder(T)) ![]T {
+            try self.lock();
+            defer self.unlock();
+
             var results = std.ArrayList(T).empty;
             errdefer results.deinit(self.allocator);
 
@@ -200,6 +241,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         pub fn findOne(self: *Self, query: *QueryBuilder(T)) !?T {
+            try self.lock();
+            defer self.unlock();
+
             for (self.rows.items) |row| {
                 if (query.matches(row)) return row;
             }
@@ -207,13 +251,17 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         pub fn findById(self: *Self, id: u64) !?T {
-            for (self.rows.items) |row| {
-                if (getFieldId(T, row) == id) return row;
-            }
-            return null;
+            try self.lock();
+            defer self.unlock();
+
+            const idx = self.id_index.get(id) orelse return null;
+            return self.rows.items[idx];
         }
 
         pub fn update(self: *Self, query: *QueryBuilder(T)) !usize {
+            try self.lock();
+            defer self.unlock();
+
             if (query.data == null) return 0;
             var updated_count: usize = 0;
 
@@ -224,6 +272,18 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         for (fields) |field_name| {
                             const val = query_mod.getFieldValue(T, query.data.?, field_name);
                             setFieldByIdentifier(T, &updated, field_name, val);
+                            // 若该字段是唯一约束字段，需校验不与其它行冲突
+                            if (schema.field(field_name)) |fd| {
+                                if (fd.constraints.unique) {
+                                    const new_val = query_mod.getFieldValue(T, updated, field_name);
+                                    for (self.rows.items, 0..) |other, oi| {
+                                        if (oi == idx) continue;
+                                        if (fieldValuesEqual(new_val, query_mod.getFieldValue(T, other, field_name))) {
+                                            return error.UniqueViolation;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else {
                         updated = query.data.?;
@@ -236,29 +296,42 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             if (updated_count > 0) {
                 self.dirty = true;
-                try self.flush();
+                try self.flushUnlocked();
             }
             return updated_count;
         }
 
         pub fn delete(self: *Self, query: *QueryBuilder(T)) !usize {
+            try self.lock();
+            defer self.unlock();
+
             var deleted_count: usize = 0;
             var i: usize = self.rows.items.len;
             while (i > 0) {
                 i -= 1;
                 if (query.matches(self.rows.items[i])) {
+                    const rid = getFieldId(T, self.rows.items[i]);
+                    _ = self.id_index.remove(rid);
                     _ = self.rows.orderedRemove(i);
+                    // 移除后，所有下标 > i 的行索引都要减 1
+                    var it = self.id_index.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* > i) entry.value_ptr.* -= 1;
+                    }
                     deleted_count += 1;
                 }
             }
             if (deleted_count > 0) {
                 self.dirty = true;
-                try self.flush();
+                try self.flushUnlocked();
             }
             return deleted_count;
         }
 
         pub fn count(self: *Self, query: *QueryBuilder(T)) !usize {
+            try self.lock();
+            defer self.unlock();
+
             var c: usize = 0;
             for (self.rows.items) |row| {
                 if (query.matches(row)) c += 1;
@@ -267,16 +340,114 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         pub fn all(self: *Self) ![]T {
+            try self.lock();
+            defer self.unlock();
+
             const result = try self.allocator.alloc(T, self.rows.items.len);
             @memcpy(result, self.rows.items);
             return result;
         }
 
         pub fn truncate(self: *Self) !void {
+            try self.lock();
+            defer self.unlock();
+
             self.rows.clearRetainingCapacity();
+            self.id_index.clearRetainingCapacity();
             self.next_id = 1;
             self.dirty = true;
-            try self.flush();
+            try self.flushUnlocked();
+        }
+
+        // ── 易用性增强（新增便捷方法）──────────────────
+
+        /// 按任意字段查找单条（Equals）。字段值自动转换为 FieldValue。
+        pub fn findBy(self: *Self, comptime field: []const u8, value: anytype) !?T {
+            var qb = QueryBuilder(T).init(self.allocator);
+            defer qb.deinit();
+            _ = qb.where(.Eq, field, query_mod.toFieldValue(value));
+            return self.findOne(&qb);
+        }
+
+        /// 按主键更新整行（id 自动保留）。返回是否更新到记录。
+        pub fn updateById(self: *Self, id: u64, data: T) !bool {
+            var qb = QueryBuilder(T).init(self.allocator);
+            defer qb.deinit();
+            _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+            _ = qb.update(data, null);
+            const n = try self.update(&qb);
+            return n > 0;
+        }
+
+        /// 按主键删除。返回是否删除到记录。
+        pub fn deleteById(self: *Self, id: u64) !bool {
+            var qb = QueryBuilder(T).init(self.allocator);
+            defer qb.deinit();
+            _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+            _ = qb.delete();
+            const n = try self.delete(&qb);
+            return n > 0;
+        }
+
+        /// 分页查询（按 id 升序）。page 从 0 开始。
+        pub fn paginate(self: *Self, page: usize, per_page: usize) ![]T {
+            var qb = QueryBuilder(T).init(self.allocator);
+            defer qb.deinit();
+            _ = qb.orderBy("id", .Asc).limit(per_page).offset(page * per_page);
+            return self.findAll(&qb);
+        }
+
+        // ── 内部辅助 ────────────────────────────────
+
+        /// 判断两个 FieldValue 是否相等（字符串按内容比较）。
+        fn fieldValuesEqual(a: FieldValue, b: FieldValue) bool {
+            return switch (a) {
+                .integer => |x| b == .integer and x == b.integer,
+                .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+                .float => |x| b == .float and x == b.float,
+                .boolean => |x| b == .boolean and x == b.boolean,
+                .datetime => |x| b == .datetime and x == b.datetime,
+                .json_text => |x| b == .json_text and std.mem.eql(u8, x, b.json_text),
+                .text => |x| b == .text and std.mem.eql(u8, x, b.text),
+            };
+        }
+
+        /// 校验唯一约束：row 的 unique 字段不得与（除 except_id 外）其它行冲突。
+        fn checkUnique(self: *const Self, row: T, except_id: ?u64) !void {
+            for (schema.fields) |f| {
+                if (!f.constraints.unique) continue;
+                const v = query_mod.getFieldValue(T, row, f.name);
+                for (self.rows.items) |other| {
+                    if (except_id != null and getFieldId(T, other) == except_id.?) continue;
+                    if (fieldValuesEqual(v, query_mod.getFieldValue(T, other, f.name))) {
+                        return error.UniqueViolation;
+                    }
+                }
+            }
+        }
+
+        /// 插入时：对设置了 default_value 且当前为零值的字段填入默认值。
+        fn applyDefaults(row: *T) void {
+            for (schema.fields) |f| {
+                if (f.constraints.default_value) |dv| {
+                    const cur = query_mod.getFieldValue(T, row.*, f.name);
+                    if (isZeroValue(cur)) {
+                        query_mod.setFieldFromValue(T, row, f.name, dv);
+                    }
+                }
+            }
+        }
+
+        fn isZeroValue(v: FieldValue) bool {
+            return switch (v) {
+                .integer => |x| x == 0,
+                .string => |x| x.len == 0,
+                .float => |x| x == 0.0,
+                .boolean => |x| !x,
+                .datetime => |x| x == 0,
+                .json_text => |x| x.len == 0,
+                .text => |x| x.len == 0,
+            };
         }
     };
 }
@@ -1357,4 +1528,183 @@ test "Gte and Lte operators" {
     defer allocator.free(results2);
     try std.testing.expectEqual(@as(usize, 1), results2.len);
     try std.testing.expectEqualStrings("Alice", results2[0].name);
+}
+
+test "concurrent inserts are thread-safe" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    const num_threads: usize = 4;
+    const per_thread: usize = 25;
+
+    const ThreadCtx = struct {
+        store: *Store,
+    };
+
+    var ctx = ThreadCtx{ .store = store };
+    var threads: [num_threads]std.Thread = undefined;
+    for (0..num_threads) |t| {
+        threads[t] = try std.Thread.spawn(.{}, struct {
+            fn run(c: *ThreadCtx) void {
+                for (0..per_thread) |_| {
+                    _ = c.store.insert(.{ .id = 0, .name = "t", .email = "e@t.com" }) catch return;
+                }
+            }
+        }.run, .{&ctx});
+    }
+    for (threads) |th| th.join();
+
+    var qb = QueryBuilder(TestUser).init(allocator);
+    defer qb.deinit();
+    const total = try store.count(&qb);
+    try std.testing.expectEqual(@as(usize, num_threads * per_thread), total);
+
+    // 所有 id 应唯一且连续（1..N），证明 next_id 自增在并发下无竞争
+    const all_rows = try store.all();
+    defer allocator.free(all_rows);
+    for (all_rows, 0..) |row, i| {
+        try std.testing.expectEqual(@as(u64, i + 1), row.id);
+    }
+}
+
+test "findById uses index and survives deletions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    const a = try store.insert(.{ .id = 0, .name = "A", .email = "a@x.com" });
+    const b = try store.insert(.{ .id = 0, .name = "B", .email = "b@x.com" });
+    const c = try store.insert(.{ .id = 0, .name = "C", .email = "c@x.com" });
+
+    try std.testing.expectEqualStrings("A", (try store.findById(a)).?.name);
+    try std.testing.expectEqualStrings("B", (try store.findById(b)).?.name);
+    try std.testing.expectEqualStrings("C", (try store.findById(c)).?.name);
+
+    // 删除中间行后，主键索引必须保持一致
+    try std.testing.expect((try store.deleteById(b)));
+    try std.testing.expect((try store.findById(b)) == null);
+    try std.testing.expectEqualStrings("A", (try store.findById(a)).?.name);
+    try std.testing.expectEqualStrings("C", (try store.findById(c)).?.name);
+}
+
+test "updateById replaces row and preserves id" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    const id = try store.insert(.{ .id = 0, .name = "A", .email = "a@x.com" });
+    try std.testing.expect((try store.updateById(id, .{ .id = id, .name = "A2", .email = "a2@x.com" })));
+    const f = try store.findById(id);
+    try std.testing.expectEqualStrings("A2", f.?.name);
+    try std.testing.expectEqualStrings("a2@x.com", f.?.email);
+    try std.testing.expectEqual(@as(u64, id), f.?.id);
+
+    try std.testing.expect(!(try store.updateById(9999, .{ .id = 9999, .name = "x", .email = "x@x.com" })));
+}
+
+test "findBy finds by arbitrary field" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@x.com" });
+    const f = try store.findBy("email", "alice@x.com");
+    try std.testing.expect(f != null);
+    try std.testing.expectEqualStrings("Alice", f.?.name);
+    const none = try store.findBy("email", "nobody@x.com");
+    try std.testing.expect(none == null);
+}
+
+test "paginate returns id-ordered pages" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    var i: u64 = 0;
+    while (i < 10) : (i += 1) _ = try store.insert(.{ .id = 0, .name = "u", .email = "e@x.com" });
+
+    const p0 = try store.paginate(0, 4);
+    defer allocator.free(p0);
+    try std.testing.expectEqual(@as(usize, 4), p0.len);
+    try std.testing.expectEqual(@as(u64, 1), p0[0].id);
+
+    const p1 = try store.paginate(1, 4);
+    defer allocator.free(p1);
+    try std.testing.expectEqual(@as(u64, 5), p1[0].id);
+
+    const p2 = try store.paginate(2, 4);
+    defer allocator.free(p2);
+    try std.testing.expectEqual(@as(usize, 2), p2.len);
+    try std.testing.expectEqual(@as(u64, 9), p2[0].id);
+}
+
+test "unique constraint enforced on insert" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, email: []const u8 };
+    const sch = TableSchema{
+        .table_name = "uniq_users",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "email", .field_type = .string, .constraints = .{ .unique = true } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    _ = try store.insert(.{ .id = 0, .email = "dup@x.com" });
+    try std.testing.expectError(error.UniqueViolation, store.insert(.{ .id = 0, .email = "dup@x.com" }));
+}
+
+test "default_value applied on insert" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, role: []const u8 };
+    const sch = TableSchema{
+        .table_name = "def_users",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "role", .field_type = .string, .constraints = .{ .default_value = FieldValue{ .string = "user" } } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    const id = try store.insert(.{ .id = 0, .role = "" });
+    const f = try store.findById(id);
+    try std.testing.expectEqualStrings("user", f.?.role);
 }

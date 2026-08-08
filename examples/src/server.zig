@@ -63,7 +63,8 @@ const AppState = struct {
 // =========================================================================
 
 const LoggingMiddleware = struct {
-    pub fn process(_: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(_: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
         std.log.info("[LOG] {s} {s}", .{ @tagName(ctx.method), ctx.path });
         return .next;
     }
@@ -74,8 +75,9 @@ const LoggingMiddleware = struct {
 // =========================================================================
 
 const TimingMiddleware = struct {
-    pub fn process(_: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(_: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
         _ = ctx;
+        _ = res;
         return .next;
     }
 };
@@ -389,7 +391,18 @@ pub fn main(init: std.process.Init) !void {
     ));
 
     // 静态文件
-    var static_server = Static.init(allocator, io, "public", "/static");
+    // 兼容从不同工作目录启动（仓库根 / examples / examples/zig-out/bin）：
+    // 向上查找第一个存在的 public 目录，避免相对路径解析失败。
+    const public_candidates = [_][]const u8{ "public", "../public", "../../public" };
+    var public_root: []const u8 = "public";
+    for (public_candidates) |cand| {
+        const probe = try std.fs.path.join(allocator, &.{ cand, "index.html" });
+        defer allocator.free(probe);
+        _ = std.Io.Dir.cwd().statFile(io, probe, .{}) catch continue;
+        public_root = cand;
+        break;
+    }
+    var static_server = Static.init(allocator, io, public_root, "/static");
     try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
     // ── 受保护路由（需要中间件）────────────────────
@@ -421,12 +434,13 @@ pub fn main(init: std.process.Init) !void {
     router.notFound(Handler.fromFn(notFoundHandler));
 
     // ── 启动服务器 ───────────────────────────────────
-    const config = Config.Config{ .port = 9000 };
-    var server = try Server.init(allocator, io, config, router);
+    const config = Config{ .port = 9000 };
+    var server = try Server.init(allocator, io, config, &router);
     defer server.deinit();
 
-    server.setCors(cors);
-    server.setBackgroundQueue(&state.bg_queue);
+    // CORS 走全局中间件；后台队列实现 core.Worker，由 Server 周期 tick。
+    try router.use(&.{cors.middleware});
+    server.setWorker(state.bg_queue.worker());
 
     std.log.info("Server starting on http://127.0.0.1:9000", .{});
     std.log.info("Endpoints:", .{});

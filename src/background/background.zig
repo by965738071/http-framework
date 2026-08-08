@@ -19,11 +19,15 @@
 //! // 在 handler 中提交后台任务
 //! try bg.submit(EmailTask, &email, EmailTask.send);
 //!
-//! // 在 server 的 keep-alive 循环中（响应发送后）执行
+//! // 交给 Server 周期性排空（BackgroundQueue 实现 core.Worker）
+//! server.setWorker(bg.worker());
+//!
+//! // 或者自己控制节奏
 //! try bg.drain();
 //! ```
 
 const std = @import("std");
+const core = @import("core");
 
 /// 单个后台任务
 pub const Task = struct {
@@ -109,6 +113,21 @@ pub const BackgroundQueue = struct {
             }.run, .{t});
         }
         _ = try group.await(self.io);
+    }
+
+    // ---- core.Worker 实现 ----
+
+    /// 由 Server 按固定间隔调用。drain 失败（内存不足等）静默重试下一轮——
+    /// 任务仍在队列里，不会丢。
+    pub fn tick(self: *Self) void {
+        self.drain() catch |err| {
+            std.log.warn("BackgroundQueue drain failed: {}", .{err});
+        };
+    }
+
+    /// 取得可注入 `server.setWorker()` 的接口句柄。
+    pub fn worker(self: *Self) core.Worker {
+        return core.Worker.init(Self, self);
     }
 };
 

@@ -1,8 +1,17 @@
 //! 性能监控和指标收集
 //! 支持请求计数、延迟统计、活跃连接数等。
 //! 线程安全：所有公共方法都通过互斥锁保护。
+//!
+//! `MetricsCollector` 实现 `core.RequestObserver`——把它交给 Server：
+//!
+//! ```zig
+//! var metrics = MetricsCollector.init(allocator, io);
+//! defer metrics.deinit();
+//! server.setObserver(metrics.observer());
+//! ```
 
 const std = @import("std");
+const core = @import("core");
 
 pub const RequestMetrics = struct {
     method: []const u8,
@@ -41,6 +50,25 @@ pub const MetricsCollector = struct {
             try self.latencies.append(self.allocator, metrics.latency_ns);
             self.sorted = false;
         }
+    }
+
+    // ---- core.RequestObserver 实现 ----
+
+    /// 由 Server 在每个请求结束时调用。
+    /// 观测失败（如内存不足）静默丢弃——绝不能影响请求处理。
+    pub fn record(self: *Self, info: core.RequestInfo) void {
+        self.recordRequest(.{
+            .method = @tagName(info.method),
+            .path = info.route_pattern orelse "unmatched",
+            .status = @backingInt(info.status),
+            .latency_ns = info.latency_ns,
+            .timestamp = 0,
+        }) catch {};
+    }
+
+    /// 取得可注入 `server.setObserver()` 的接口句柄。
+    pub fn observer(self: *Self) core.RequestObserver {
+        return core.RequestObserver.init(Self, self);
     }
 
     pub fn connectionOpened(self: *Self) void {

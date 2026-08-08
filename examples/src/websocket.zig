@@ -58,8 +58,8 @@ pub fn main(init: std.process.Init) !void {
     router.notFound(http_framework.Handler.fromFn(notFoundHandler));
 
     // ── 启动服务器 ────────────────────────────────────────
-    const config = http_framework.Config.Config{};
-    var server = try http_framework.Server.init(allocator, io, config, router);
+    const config = http_framework.Config{};
+    var server = try http_framework.Server.init(allocator, io, config, &router);
     defer server.deinit();
 
     std.log.info("WebSocket example server starting...", .{});

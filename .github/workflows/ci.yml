@@ -16,12 +16,30 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.17.0-dev.1567+f0354179a
 
       - name: Build for Ubuntu
-        run: |
-          zig build
+        run: zig build
 
       - name: Build for Windows GNU
-        run: |
-          zig build -Dtarget=x86_64-windows-gnu
+        run: zig build -Dtarget=x86_64-windows-gnu
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1567+f0354179a
+
+      - name: Run unit & integration tests
+        run: zig build test
+
+      - name: Build examples
+        working-directory: examples
+        run: zig build
+
+      - name: Run examples tests
+        working-directory: examples
+        run: zig build test

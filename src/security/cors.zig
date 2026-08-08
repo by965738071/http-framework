@@ -4,9 +4,9 @@
 //! 符合 CORS 规范，支持预检请求（OPTIONS）。
 
 const std = @import("std");
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const Middleware = @import("../core/middleware.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const Middleware = @import("core").Middleware;
 
 /// CORS 配置
 pub const CorsConfig = struct {
@@ -53,10 +53,9 @@ pub const CorsMiddleware = struct {
         return ptr;
     }
 
-    /// 处理请求 - 检查 CORS 来源是否允许。
-    /// 注意：响应头的添加通过 `addCorsHeaders()` 单独调用，
-    /// 因为中间件 VTable 不传递 Response 参数。
-    pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
+    /// 处理请求 - 检查 CORS 来源是否允许，并直接注入 CORS 响应头。
+    /// （中间件 VTable 现在传递 Response，无需再单独调用 addCorsHeaders。）
+    pub fn process(self: *Self, ctx: *RequestContext, res: *Response) !Middleware.NextAction {
         const origin = ctx.getHeader("Origin");
 
         if (origin == null) {
@@ -74,11 +73,19 @@ pub const CorsMiddleware = struct {
             return .next;
         }
 
-        // 预检请求：标记为 respond（框架在分发前处理）
+        // 预检请求：添加 CORS 头并直接响应，不进入路由表。
+        //
+        // 状态码必须由中间件自己指定。Router 在 `.respond` 时只会套用
+        // `ctx.blocked_status`，不设就是默认 200——预检回 200 虽然不算错，
+        // 但 204 才是规范推荐、也是这个框架一直以来的行为。
         if (ctx.method == .OPTIONS and ctx.getHeader("Access-Control-Request-Method") != null) {
+            try self.addCorsHeaders(ctx, res);
+            ctx.blocked_status = .no_content;
             return .respond;
         }
 
+        // 正常请求：注入 CORS 响应头
+        try self.addCorsHeaders(ctx, res);
         return .next;
     }
 
@@ -102,7 +109,8 @@ pub const CorsMiddleware = struct {
         return false;
     }
 
-    /// 添加 CORS 响应头到 Response
+    /// 添加 CORS 响应头到 Response。
+    /// （Response.header 内部会复制 value，此处构造的临时字符串用后即释放。）
     pub fn addCorsHeaders(self: *const Self, ctx: *RequestContext, res: *Response) !void {
         const origin = ctx.getHeader("Origin") orelse return;
 
@@ -125,6 +133,7 @@ pub const CorsMiddleware = struct {
                 try methods_list.appendSlice(self.allocator, @tagName(method));
             }
             const methods_str = try methods_list.toOwnedSlice(self.allocator);
+            defer self.allocator.free(methods_str);
             _ = try res.header("Access-Control-Allow-Methods", methods_str);
         }
 
@@ -136,6 +145,7 @@ pub const CorsMiddleware = struct {
                 try headers_list.appendSlice(self.allocator, header);
             }
             const headers_str = try headers_list.toOwnedSlice(self.allocator);
+            defer self.allocator.free(headers_str);
             _ = try res.header("Access-Control-Allow-Headers", headers_str);
         }
 
@@ -149,6 +159,7 @@ pub const CorsMiddleware = struct {
                 try exposed_list.appendSlice(self.allocator, header);
             }
             const exposed_str = try exposed_list.toOwnedSlice(self.allocator);
+            defer self.allocator.free(exposed_str);
             _ = try res.header("Access-Control-Expose-Headers", exposed_str);
         }
 
@@ -160,6 +171,7 @@ pub const CorsMiddleware = struct {
         // Access-Control-Max-Age (for preflight)
         if (ctx.method == .OPTIONS) {
             const max_age_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.config.max_age});
+            defer self.allocator.free(max_age_str);
             _ = try res.header("Access-Control-Max-Age", max_age_str);
         }
     }
@@ -316,7 +328,9 @@ test "process - 无 Origin 头返回 next" {
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }
 
@@ -334,7 +348,9 @@ test "process - Origin 允许返回 next" {
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }
 
@@ -353,7 +369,9 @@ test "process - Origin 禁止且 block_unauthorized 返回 respond 且 forbidden
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.respond, action);
     try std.testing.expect(tc.ctx.blocked_status == .forbidden);
 }
@@ -373,7 +391,9 @@ test "process - Origin 禁止但未设置 block 则返回 next" {
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
     try std.testing.expect(tc.ctx.blocked_status == null);
 }
@@ -393,7 +413,9 @@ test "process - OPTIONS 预检请求返回 respond" {
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.respond, action);
 }
 
@@ -411,7 +433,9 @@ test "process - OPTIONS 但无 Request-Method 头返回 next" {
     });
     defer cors.deinit();
 
-    const action = try cors.process(&tc.ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try cors.process(&tc.ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }
 

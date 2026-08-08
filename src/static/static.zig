@@ -10,9 +10,9 @@
 const std = @import("std");
 const mem = std.mem;
 
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const Handler = @import("../handler/handler.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const Handler = @import("core").Handler;
 
 /// 简化的静态文件服务器
 allocator: std.mem.Allocator,

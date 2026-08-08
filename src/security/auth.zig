@@ -8,10 +8,10 @@
 //! Auth result is stored in `ctx.user_data` for downstream handlers.
 
 const std = @import("std");
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const NextAction = @import("../core/middleware.zig").NextAction;
-const Middle = @import("../core/middleware.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const NextAction = @import("core").NextAction;
+const Middle = @import("core").Middleware;
 
 /// Auth result stored in ctx after successful validation
 pub const AuthInfo = struct {
@@ -83,7 +83,8 @@ pub const AuthMiddleware = struct {
         return ptr;
     }
 
-    pub fn process(self: *AuthMiddleware, ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *AuthMiddleware, ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
 
         // Try each enabled strategy in order
         if (self.config.custom_auth) |custom| {

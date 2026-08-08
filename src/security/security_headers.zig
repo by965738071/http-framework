@@ -15,9 +15,9 @@
 //! ```
 
 const std = @import("std");
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const Middleware = @import("../core/middleware.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const Middleware = @import("core").Middleware;
 
 /// 安全头配置
 ///
@@ -85,10 +85,10 @@ pub const SecurityHeaders = struct {
         return ptr;
     }
 
-    /// VTable 中间件入口：安全头中间件为透传，不拦截请求。
-    pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
-        _ = self;
+    /// VTable 中间件入口：直接向响应注入所有配置的安全头，不拦截请求。
+    pub fn process(self: *Self, ctx: *RequestContext, res: *Response) !Middleware.NextAction {
         _ = ctx;
+        try self.addHeaders(res);
         return .next;
     }
 
@@ -326,15 +326,19 @@ test "SecurityHeaders null values omit headers" {
     }
 }
 
-test "SecurityHeaders middleware VTable process returns next" {
+test "SecurityHeaders middleware VTable process adds headers and returns next" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const sh = try SecurityHeaders.create(allocator, io, .{});
     defer sh.deinit();
 
-    // VTable process 应该返回 .next（透传）
+    // VTable process 直接向响应注入安全头并返回 .next（透传）
     const dummy_ctx: *RequestContext = @ptrFromInt(0x1000);
-    const action = try sh.middleware.process(dummy_ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try sh.middleware.process(dummy_ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
+    // 默认配置下应注入安全头
+    try std.testing.expect(res.headers.items.len > 0);
 }

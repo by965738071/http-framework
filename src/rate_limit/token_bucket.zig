@@ -24,8 +24,9 @@
 //! ```
 
 const std = @import("std");
-const Middleware = @import("../core/middleware.zig");
-const RequestContext = @import("../core/request.zig");
+const Middleware = @import("core").Middleware;
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
 
 /// Token bucket configuration
 pub const Config = struct {
@@ -114,7 +115,8 @@ pub const TokenBucket = struct {
     }
 
     /// Middleware VTable: process request
-    pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
+    pub fn process(self: *Self, ctx: *RequestContext, res: *Response) !Middleware.NextAction {
+        _ = res;
         switch (self.tryConsume()) {
             .allowed => return .next,
             .denied => {
@@ -397,7 +399,9 @@ test "TokenBucket - process middleware returns next when tokens available" {
 
     // ct is not dereferenced in the .allowed path, so a mock pointer is safe
     const ctx: *RequestContext = @ptrFromInt(0x1000);
-    const action = try bucket.process(ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try bucket.process(ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }
 
@@ -429,7 +433,9 @@ test "TokenBucket - process middleware denies when no tokens available" {
         .headers_parsed = false,
         .blocked_status = null,
     };
-    const action = try bucket.process(&ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try bucket.process(&ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.respond, action);
     try std.testing.expectEqual(@as(std.http.Status, .too_many_requests), ctx.blocked_status.?);
 }

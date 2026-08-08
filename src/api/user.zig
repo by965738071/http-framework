@@ -118,14 +118,7 @@ test "UserHandler - Handler.initPerRequestWith vtable integration" {
 
     const args = .{ .default_name = "John Doe" };
     const handler = try Handler.initPerRequestWith(Self, allocator, args);
-    defer {
-        const Context = struct {
-            alloc: std.mem.Allocator,
-            args: struct { default_name: []const u8 },
-        };
-        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx);
-    }
+    defer handler.deinit();
 
     // Create instance via vtable
     const instance = try handler.vtable.create(handler.ptr);
@@ -166,14 +159,7 @@ test "UserHandler - vtable creates distinct instances" {
     const Handler = fw.Handler;
 
     const handler = try Handler.initPerRequestWith(Self, allocator, .{ .default_name = "test" });
-    defer {
-        const Context = struct {
-            alloc: std.mem.Allocator,
-            args: struct { default_name: []const u8 },
-        };
-        const ctx: *Context = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx);
-    }
+    defer handler.deinit();
 
     const inst1 = try handler.vtable.create(handler.ptr);
     const inst2 = try handler.vtable.create(handler.ptr);

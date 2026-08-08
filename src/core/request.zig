@@ -4,36 +4,15 @@
 //!
 //! # 设计说明
 //!
-//! 用户常见的请求处理中通常只需要少数几个 header 或 query 参数（甚至一个都不需要）。
-//! 如果每次请求都全量解析所有 headers 到 HashMap，会造成大量不必要的堆分配和释放。
-//!
-//! 优化策略：
-//!
-//! | 方案 | 分配 | 查询速度 | 适用场景 |
-//! |------|------|---------|---------|
-//! | 全量解析到 HashMap（旧方案） | 每次请求 O(n) alloc | O(1) | 需要频繁随机访问 |
-//! | 每次线性扫描（当前方案） | 零分配 | O(n) | 读取少量参数 |
-//! | 混合：先线性扫描，缓存命中结果 | 仅首次 O(1) alloc | 首次 O(n)，后续 O(1) | 大部分场景 |
-//!
-//! 当前实现采用 **线性扫描 + 结果缓存** 策略：
-//! - 不预先解析 headers/query/cookies
-//! - 首次 `getHeader` / `getQuery` / `getCookie` 时线性扫描
-//! - 扫描结果**不缓存**（避免分配），因为同一请求中重复读取同一 key 的情况极少
-//! - 路径参数（`path_params`）仍需 HashMap，因为路由分发时会批量设置多个参数
-//!
-//! # 零分配路径
-//!
-//! 如果 handler 完全不需要 header/query/cookie，则 `Self.init` 只做：
-//! - 1 次 `StringHashMap.init`（path_params 用，条目为空）
-//! - 无 dupe 分配
-//! - `deinit` 只有一次 HashMap deinit
+//! - 请求头：`getHeader` 线性扫描原始头部，零分配、不缓存。
+//! - 查询参数：`getQuery` 首次调用时全量解析并缓存到 HashMap
+//!   （key 直接引用请求缓冲区，零复制；value 为自有内存，统一释放）。
+//! - 表单参数：`getForm` 与 `getQuery` 行为一致（URL 解码 + 缓存）。
+//! - 路径参数：`path_params` 由路由分发写入（key/value 均为自有内存）。
 
 const std = @import("std");
 const http = std.http;
 const mem = std.mem;
-
-const Multipart = @import("../multipart/multipart.zig");
-const deserialize = @import("../codec/deserialize.zig");
 
 /// 用户数据容器 — 包含不透明指针和销毁函数
 /// 任何模块都可以存入自定义数据，框架会通过 destroyFn 自动释放
@@ -55,15 +34,16 @@ version: http.Version,
 path_params: std.StringHashMapUnmanaged([]const u8),
 
 // ---- 查询参数缓存（延迟初始化的 HashMap） ----
+// key 引用请求缓冲区（零复制），value 为自有内存
 query_params: ?std.StringHashMapUnmanaged([]const u8) = null,
+
+// ---- 表单参数缓存（延迟初始化，key/value 均为自有内存） ----
+form_params: ?std.StringHashMapUnmanaged([]const u8) = null,
 
 // ---- 请求体 ----
 content_type: ?[]const u8,
 content_length: ?u64,
 transfer_encoding: http.TransferEncoding,
-
-// ---- Multipart 解析器（延迟初始化） ----
-multipart_parser: ?*Multipart.Parser = null,
 
 // ---- 原始请求引用 ----
 request: *http.Server.Request,
@@ -85,7 +65,18 @@ user_data: ?UserData = null,
 blocked_status: ?http.Status = null,
 
 // ---- websocket ----
-is_websocket: bool = false, // 新增
+is_websocket: bool = false,
+
+/// 是否信任代理头（X-Forwarded-For / X-Real-IP）。
+/// 由 Server 从 config.trust_proxy_headers 注入；默认 false（防伪造）。
+trust_proxy: bool = false,
+
+/// 匹配到的路由模式（由 Router 设置，用于 metrics 标签，避免高基数原始路径）
+route_pattern: ?[]const u8 = null,
+
+/// 请求体读取失败标记：socket 上可能残留未消费的字节，
+/// keep-alive 连接不可复用，Server 在响应后必须关闭连接。
+poisoned: bool = false,
 
 const Self = @This();
 
@@ -146,9 +137,14 @@ pub fn init(
 
 /// 释放所有堆分配的资源
 pub fn deinit(self: *Self) void {
-    // 释放查询参数缓存
+    // 释放查询参数缓存（key 是请求缓冲区的引用，只释放 value）
     if (self.query_params) |*qp| {
-        freeHashMap(qp, self.allocator);
+        freeValuesOnly(qp, self.allocator);
+    }
+
+    // 释放表单参数缓存（key/value 均为自有内存）
+    if (self.form_params) |*fp| {
+        freeHashMap(fp, self.allocator);
     }
 
     // 只有 path_params 一定需要释放
@@ -157,12 +153,6 @@ pub fn deinit(self: *Self) void {
     // 释放 body 数据
     if (self.body_data) |data| {
         self.allocator.free(data);
-    }
-
-    // 释放 multipart 解析器
-    if (self.multipart_parser) |parser| {
-        parser.deinit();
-        self.allocator.destroy(parser);
     }
 
     // 通过注册的销毁函数释放用户数据（通用、类型安全）
@@ -196,6 +186,8 @@ pub fn getHeader(self: *const Self, key: []const u8) ?[]const u8 {
 ///
 /// 首次调用时全量解析 query string 并缓存到 HashMap 中，
 /// 后续所有 `getQuery()` 调用均为 O(1) 查询。
+/// key 直接引用请求缓冲区（零复制）；value 为解码后的自有内存，
+/// 在请求上下文 deinit 时统一释放。
 ///
 /// 返回的 slice 在请求上下文的生命周期内有效。
 pub fn getQuery(self: *Self, key: []const u8) ?[]const u8 {
@@ -208,46 +200,25 @@ pub fn getQuery(self: *Self, key: []const u8) ?[]const u8 {
         while (pairs.next()) |pair| {
             if (pair.len == 0) continue;
 
+            // key 引用 query 缓冲区（与请求同生命周期），无需复制
             const eq_idx = mem.indexOfScalar(u8, pair, '=');
-            if (eq_idx) |idx| {
-                const k = pair[0..idx];
-                const raw_v = pair[idx + 1 ..];
+            const k = if (eq_idx) |idx| pair[0..idx] else pair;
+            const raw_v = if (eq_idx) |idx| pair[idx + 1 ..] else "";
 
-                // URL 解码值只在需要时分配
-                const value = if (mem.indexOfAny(u8, raw_v, "%+")) |_|
-                    (urlDecode(self.allocator, raw_v) catch raw_v)
-                else
-                    raw_v;
+            // value 统一为自有内存（解码或复制），deinit 时统一释放
+            const value = if (mem.indexOfAny(u8, raw_v, "%+") != null)
+                (urlDecode(self.allocator, raw_v) catch continue)
+            else
+                (self.allocator.dupe(u8, raw_v) catch continue);
 
-                const key_dup = self.allocator.dupe(u8, k) catch continue;
-                if (value.ptr != raw_v.ptr) {
-                    // value 是 urlDecode 分配的新内存，所有权转移给 HashMap
-                    self.query_params.?.put(self.allocator, key_dup, value) catch {
-                        self.allocator.free(key_dup);
-                    };
-                } else {
-                    // value 指向原始 query 缓冲区，需要复制一份
-                    const val_dup = self.allocator.dupe(u8, value) catch {
-                        self.allocator.free(key_dup);
-                        continue;
-                    };
-                    self.query_params.?.put(self.allocator, key_dup, val_dup) catch {
-                        self.allocator.free(key_dup);
-                        self.allocator.free(val_dup);
-                    };
-                }
-            } else {
-                // 没有 '=' 的参数，值为空字符串
-                const key_dup = self.allocator.dupe(u8, pair) catch continue;
-                const val_dup = self.allocator.dupe(u8, "") catch {
-                    self.allocator.free(key_dup);
-                    continue;
-                };
-                self.query_params.?.put(self.allocator, key_dup, val_dup) catch {
-                    self.allocator.free(key_dup);
-                    self.allocator.free(val_dup);
-                };
-            }
+            // 重复 key（?a=1&a=2）时保持「后者覆盖」语义，但必须先释放
+            // 被覆盖的旧 value——直接 put 会把它泄漏掉。
+            const gop = self.query_params.?.getOrPut(self.allocator, k) catch {
+                self.allocator.free(value);
+                continue;
+            };
+            if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = value;
         }
     }
 
@@ -308,10 +279,17 @@ pub fn iterateHeaders(self: *const Self) http.HeaderIterator {
 /// 读取请求体（支持 `Content-Length` 和 `Transfer-Encoding: chunked`）。
 ///
 /// 幂等方法：多次调用返回相同数据，仅首次实际读取。
+///
+/// 注意：读取失败（如 BodyTooLarge、连接中断）会将连接标记为 poisoned，
+/// Server 会在响应后关闭连接——因为 socket 上可能残留未消费的字节，
+/// 继续复用会把残余 body 误认为下一个请求的头部。
 pub fn readBody(self: *Self) ![]const u8 {
     if (self.body_read) {
         return self.body_data orelse error.BodyAlreadyRead;
     }
+
+    // 此后任何错误都意味着 socket 上的 body 未被完整消费 → 连接不可复用
+    errdefer self.poisoned = true;
 
     // 检查 Content-Length 是否超过限制
     if (self.body_size_limit > 0) {
@@ -329,13 +307,16 @@ pub fn readBody(self: *Self) ![]const u8 {
         return &.{};
     }
 
-    var temp_buf: [65536]u8 = undefined;
+    var temp_buf: [16384]u8 = undefined;
     const body_reader = self.request.readerExpectNone(&temp_buf);
 
     var result = try std.ArrayList(u8).initCapacity(self.allocator, 256);
+    // BodyTooLarge / 读错误都会在这里退出，累积缓冲区必须回收，
+    // 否则攻击者可以用重复的超大请求把内存打爆。
+    errdefer result.deinit(self.allocator);
 
     var total_read: u64 = 0;
-    var chunk_buf: [65536]u8 = undefined;
+    var chunk_buf: [16384]u8 = undefined;
     while (true) {
         const n = try body_reader.readSliceShort(&chunk_buf);
         if (n == 0) break;
@@ -351,138 +332,19 @@ pub fn readBody(self: *Self) ![]const u8 {
     self.body_read = true;
     self.body_data = try result.toOwnedSlice(self.allocator);
 
-    // 通过 bodyReader 验证请求体可被流式读取
-    var reader = self.bodyReader();
-    if (self.body_data.?.len > 0) {
-        var buf: [1]u8 = undefined;
-        _ = try reader.read(&buf);
-    }
-
     return self.body_data.?;
 }
 
-/// 返回一个 reader，用于流式读取请求体（避免一次性加载到内存）。
-/// 当前 std.http.Server.Request 不直接支持流式读取，所以提供一个缓冲的 reader 包装。
-/// reader 在请求体末尾返回 0（EndOfStream）。
+/// 返回一个 reader，用于增量读取已缓冲的请求体数据。
 ///
-/// 注意：bodyReader 返回的 reader 读取的是 `readBody()` 已缓冲的数据，
-/// 因此需要先调用 `readBody()` 将请求体读入内存。
+/// 注意：这不是真正的流式读取——它读取的是 `readBody()` 已缓冲到内存的数据，
+/// 因此需要先调用 `readBody()`。真正的流式（边收边处理）当前不支持，
+/// 大文件上传请使用 `multipart` 模块。
 pub fn bodyReader(self: *const Self) BodyReader {
     return .{
         .data = self.body_data orelse "",
         .pos = 0,
     };
-}
-
-/// 将请求体解析为指定类型的 JSON 值
-///
-/// ⚠️ 已废弃：请使用 `bodyAs(T)` 替代，它提供更好的内存管理。
-/// 此函数保留向后兼容，但返回的值可能包含悬挂指针（对于含 slice 字段的类型）。
-pub fn json(self: *Self, comptime T: type) !T {
-    const body = try self.readBody();
-    const parsed = try std.json.parseFromSlice(T, self.allocator, body, .{});
-    defer parsed.deinit();
-    return parsed.value;
-}
-
-/// 根据 Content-Type 自动反序列化请求体为类型 T
-///
-/// 支持的 Content-Type：
-/// - `application/json` → JSON 解析
-/// - `application/x-www-form-urlencoded` → form 解析（comptime 反射）
-///
-/// 返回 `Parsed(T)`，调用方需在使用完毕后调用 `parsed.deinit()` 释放内存。
-///
-/// # 使用示例
-///
-/// ```zig
-/// const CreateUser = struct {
-///     name: []const u8,
-///     age: u32,
-///     email: []const u8,
-/// };
-///
-/// fn handler(ctx: *Self, res: *Response) !void {
-///     var parsed = try ctx.bodyAs(CreateUser);
-///     defer parsed.deinit();
-///
-///     const user = parsed.value;
-///     std.log.info("name={s}, age={d}", .{ user.name, user.age });
-/// }
-/// ```
-pub fn bodyAs(self: *Self, comptime T: type) !deserialize.Parsed(T) {
-    const body = try self.readBody();
-
-    if (body.len == 0) {
-        return error.EmptyBody;
-    }
-
-    const ct = self.content_type orelse return error.NoContentType;
-
-    if (std.ascii.indexOfIgnoreCase(ct, "application/json") != null) {
-        return deserialize.parseJson(T, self.allocator, body);
-    }
-
-    if (std.ascii.indexOfIgnoreCase(ct, "application/x-www-form-urlencoded") != null) {
-        return deserialize.parseForm(T, self.allocator, body);
-    }
-
-    return error.UnsupportedContentType;
-}
-
-/// 将 URL 查询参数反序列化为结构体 T
-///
-/// 查询字符串格式与 form-urlencoded 相同（`key=value&key=value`），
-/// 直接复用 `parseForm` 的 comptime 反射逻辑。
-///
-/// 返回 `Parsed(T)`，调用方需在使用完毕后调用 `parsed.deinit()` 释放内存。
-///
-/// # 使用示例
-///
-/// ```zig
-/// const ListQuery = struct {
-///     page: u32 = 1,
-///     limit: u32 = 20,
-///     sort: ?[]const u8,
-/// };
-///
-/// fn handler(ctx: *Self, res: *Response) !void {
-///     var parsed = try ctx.queryAs(ListQuery);
-///     defer parsed.deinit();
-///
-///     const q = parsed.value;
-///     std.log.info("page={d}, limit={d}", .{ q.page, q.limit });
-/// }
-/// ```
-pub fn queryAs(self: *Self, comptime T: type) !deserialize.Parsed(T) {
-    if (self.query.len == 0) {
-        return error.EmptyBody;
-    }
-    return deserialize.parseForm(T, self.allocator, self.query);
-}
-
-/// 获取 Multipart 表单解析器（延迟初始化）
-pub fn getMultipart(self: *Self) !*Multipart.Parser {
-    if (self.multipart_parser) |parser| {
-        return parser;
-    }
-
-    // 检查是否为 multipart/form-data
-    const ct = self.content_type orelse return error.NotMultipart;
-    if (std.mem.indexOfIgnoreCase(u8, ct, "multipart/form-data") == null) {
-        return error.NotMultipart;
-    }
-
-    // 创建解析器
-    const parser = try self.allocator.create(Multipart.Parser);
-    parser.* = try Multipart.Parser.init(self.allocator, ct);
-    self.multipart_parser = parser;
-
-    // 解析请求体
-    const body = try self.readBody();
-    try parser.parse(body);
-
-    return parser;
 }
 
 // =========================================================================
@@ -528,8 +390,15 @@ pub fn isAjax(self: *const Self) bool {
     return std.ascii.eqlIgnoreCase(header, "XMLHttpRequest");
 }
 
-/// 获取客户端 IP 地址（从请求头或连接信息）
+/// 获取客户端 IP 地址。
+///
+/// 仅当 `trust_proxy = true`（由 Server 从 config.trust_proxy_headers 注入）
+/// 时才解析 X-Forwarded-For / X-Real-IP 代理头——直连部署下这些头可被
+/// 客户端任意伪造，默认不信任。
+/// 无法确定（未启用代理信任或 std API 暂不支持取对端地址）时返回 null。
 pub fn getClientIp(self: *const Self) ?[]const u8 {
+    if (!self.trust_proxy) return null;
+
     // 尝试从常见代理头获取
     if (self.getHeader("X-Forwarded-For")) |header| {
         // X-Forwarded-For: client, proxy1, proxy2
@@ -584,30 +453,48 @@ pub fn isMultipartForm(self: *const Self) bool {
 // Form 参数（延迟解析，不缓存）
 // =========================================================================
 
-/// 获取表单字段值。
+/// 获取表单字段值（application/x-www-form-urlencoded）。
 ///
-/// 需要先调用 `readBody()` 读取请求体。
-/// 每次调用都会线性扫描 body 数据，不分配、不缓存。
+/// 首次调用时读取请求体并全量解析（URL 解码 key 和 value），
+/// 缓存到 HashMap，后续调用为 O(1) 查询。与 `getQuery` 行为一致。
+///
+/// 返回的 slice 在请求上下文的生命周期内有效。
 pub fn getForm(self: *Self, key: []const u8) ?[]const u8 {
-    const body = self.readBody() catch return null;
-    if (body.len == 0) return null;
+    if (self.form_params == null) {
+        const body = self.readBody() catch return null;
+        self.form_params = std.StringHashMapUnmanaged([]const u8).empty;
 
-    var pairs = mem.splitScalar(u8, body, '&');
-    while (pairs.next()) |pair| {
-        if (pair.len == 0) continue;
+        var pairs = mem.splitScalar(u8, body, '&');
+        while (pairs.next()) |pair| {
+            if (pair.len == 0) continue;
 
-        const eq_idx = mem.indexOfScalar(u8, pair, '=');
-        if (eq_idx) |idx| {
-            if (mem.eql(u8, pair[0..idx], key)) {
-                return pair[idx + 1 ..];
+            const eq_idx = mem.indexOfScalar(u8, pair, '=');
+            const raw_k = if (eq_idx) |idx| pair[0..idx] else pair;
+            const raw_v = if (eq_idx) |idx| pair[idx + 1 ..] else "";
+
+            // key/value 都做 URL 解码并持有自有内存
+            const k = urlDecode(self.allocator, raw_k) catch continue;
+            const v = urlDecode(self.allocator, raw_v) catch {
+                self.allocator.free(k);
+                continue;
+            };
+
+            // 重复 key 时 put 会保留旧 key、替换 value，于是新 key 和旧 value
+            // 都成了没人释放的孤儿。用 getOrPut 显式处理这两块内存。
+            const gop = self.form_params.?.getOrPut(self.allocator, k) catch {
+                self.allocator.free(k);
+                self.allocator.free(v);
+                continue;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(k); // map 里已有等值的 key，这份多余
+                self.allocator.free(gop.value_ptr.*); // 被覆盖的旧 value
             }
-        } else {
-            if (mem.eql(u8, pair, key)) {
-                return "";
-            }
+            gop.value_ptr.* = v;
         }
     }
-    return null;
+
+    return self.form_params.?.get(key);
 }
 
 // =========================================================================
@@ -619,6 +506,15 @@ pub fn freeHashMap(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.
     var it = map.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    map.deinit(allocator);
+}
+
+/// 只释放 `StringHashMapUnmanaged` 中的 value（key 为外部缓冲区的引用，不释放）
+fn freeValuesOnly(map: *std.StringHashMapUnmanaged([]const u8), allocator: std.mem.Allocator) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
         allocator.free(entry.value_ptr.*);
     }
     map.deinit(allocator);
@@ -884,6 +780,32 @@ test "Self.getQuery - multiple params" {
     try std.testing.expect(ctx.getQuery("missing") == null);
 }
 
+test "Self.getQuery - duplicate keys keep last value without leaking" {
+    // testing.allocator 会在 deinit 后报告泄漏：
+    // 旧实现用 put 覆盖 value，被覆盖的那份永远没人释放。
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /api?a=1&a=2&a=3 HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("3", ctx.getQuery("a").?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.query_params.?.count());
+}
+
 test "Self.getQuery - url encoded" {
     const allocator = std.testing.allocator;
     const request_bytes = "GET /api?q=hello+world&lang=zh%2Fcn HTTP/1.1\r\n" ++
@@ -1023,6 +945,7 @@ test "Self.getClientIp - X-Forwarded-For" {
 
     var ctx = try Self.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
+    ctx.trust_proxy = true;
 
     // Should return the first IP in the list
     try std.testing.expectEqualStrings("192.168.1.1", ctx.getClientIp().?);
@@ -1047,6 +970,7 @@ test "Self.getClientIp - X-Real-IP" {
 
     var ctx = try Self.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
+    ctx.trust_proxy = true;
 
     try std.testing.expectEqualStrings("10.0.0.5", ctx.getClientIp().?);
 }
@@ -1071,6 +995,30 @@ test "Self.getClientIp - no IP headers" {
     var ctx = try Self.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
+    try std.testing.expect(ctx.getClientIp() == null);
+}
+
+test "Self.getClientIp - proxy headers ignored when not trusted" {
+    const allocator = std.testing.allocator;
+    const request_bytes = "GET /test HTTP/1.1\r\n" ++
+        "X-Forwarded-For: 1.2.3.4\r\n" ++
+        "\r\n";
+
+    const head = try std.http.Server.Request.Head.parse(request_bytes);
+    var server: std.http.Server = .{
+        .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+        .out = undefined,
+    };
+    var req: std.http.Server.Request = .{
+        .server = &server,
+        .head = head,
+        .head_buffer = request_bytes,
+    };
+
+    var ctx = try Self.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // 默认 trust_proxy = false：XFF 头被忽略（防伪造）
     try std.testing.expect(ctx.getClientIp() == null);
 }
 

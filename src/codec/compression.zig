@@ -178,53 +178,6 @@ pub const Compressor = struct {
             .identity => try self.allocator.dupe(u8, data),
         };
     }
-
-    /// Stream-compress data from a reader to a writer.
-    pub fn compressStream(
-        self: *const Self,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-        algo: Algorithm,
-    ) !void {
-        switch (algo) {
-            .gzip => {
-                var cbuf: [std.compress.flate.max_window_len]u8 = undefined;
-                var c = std.compress.flate.Compress.init(
-                    writer,
-                    &cbuf,
-                    .gzip,
-                    switch (self.config.gzip_level) {
-                        0 => .fastest,
-                        1 => .default,
-                        2 => .default,
-                        3 => .default,
-                        4 => .default,
-                        5 => .default,
-                        6 => .default,
-                        else => .best,
-                    },
-                ) catch return error.CompressionFailed;
-                var buf: [std.Io.default_reader_read_size]u8 = undefined;
-                while (true) {
-                    const n = try reader.interface.read(&buf);
-                    if (n == 0) break;
-                    c.writer.writeAll(buf[0..n]) catch return error.CompressionFailed;
-                }
-                c.finish() catch return error.CompressionFailed;
-            },
-            .br => {
-                return error.CompressionFailed; // Brotli removed in Zig 0.17-dev
-            },
-            .identity => {
-                var buf: [std.Io.default_reader_read_size]u8 = undefined;
-                while (true) {
-                    const n = try reader.interface.read(&buf);
-                    if (n == 0) break;
-                    try writer.interface.write(buf[0..n]);
-                }
-            },
-        }
-    }
 };
 
 // ===========================================================================
@@ -304,16 +257,4 @@ test "Compression.compress identity passthrough" {
     const result = try comp.compress(data, .identity);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.eql(u8, data, result));
-}
-
-// Helper for repeating strings in tests
-fn repeatString(s: []const u8, count: usize) []u8 {
-    const allocator = std.testing.allocator;
-    var list = std.ArrayList(u8).empty;
-    defer list.deinit(allocator);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        list.appendSlice(allocator, s) catch @panic("OOM");
-    }
-    return list.toOwnedSlice(allocator);
 }

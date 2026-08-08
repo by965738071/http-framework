@@ -133,10 +133,11 @@ pub fn ConnectionPool(
         /// Acquire a connection (blocks up to timeout).
         pub fn acquire(self: *Self) anyerror!*T {
             const start = std.Io.Clock.now(.real, self.io).nanoseconds;
-            var waited: bool = false;
 
             while (true) {
-                _ = self.mutex.lock(self.io) catch unreachable;
+                // lock 会在任务被取消时返回 error.Canceled——这是完全可达的
+                // （优雅关闭就会触发），不能 `catch unreachable` 直接 panic。
+                try self.mutex.lock(self.io);
 
                 if (self.closed) {
                     self.mutex.unlock(self.io);
@@ -158,15 +159,13 @@ pub fn ConnectionPool(
                     }
 
                     entry.last_used = std.Io.Clock.now(.real, self.io).nanoseconds;
-                    if (waited) {
-                        try self.mutex.lock(self.io);
-                        _ = std.Io.Clock.now(.real, self.io); // just touch to avoid warning
-                        self.total_created += 0; // no new creation
-                        self.mutex.unlock(self.io);
-                    }
 
-                    // Increment active count since this connection is now in use
+                    // active_count 受 mutex 保护，这里必须在锁内自增：
+                    // 之前是在 unlock 之后裸自增，多个 acquire 并发时会丢计数，
+                    // 进而让 max_total 限流失效。
+                    self.mutex.lockUncancelable(self.io);
                     self.active_count += 1;
+                    self.mutex.unlock(self.io);
 
                     return @as(*T, @ptrCast(@alignCast(entry.connection)));
                 }
@@ -187,11 +186,9 @@ pub fn ConnectionPool(
                     return conn;
                 }
 
-                // Wait for a connection to be released
-                if (!waited) {
-                    waited = true;
-                }
-
+                // Wait for a connection to be released.
+                // 注意：waitUncancelable 没有截止时间，超时只在每次被唤醒后
+                // 重新入循环时检查——若始终无人 release，这里会一直阻塞。
                 const elapsed: i128 = std.Io.Clock.now(.real, self.io).nanoseconds - start;
                 const remaining = @as(i128, self.config.acquire_timeout_ns) - elapsed;
                 if (remaining <= 0) {

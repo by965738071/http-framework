@@ -33,39 +33,36 @@ pub const Config = struct {
     /// 连接空闲超时（纳秒），0 表示无超时
     idle_timeout_ns: u64 = 30_000_000_000, // 30 秒
 
+    /// 最大并发连接数（0 表示不限制）。
+    /// 达到上限时 accept 循环会阻塞，新连接由内核 backlog 排队，
+    /// 形成背压，避免连接洪峰耗尽文件描述符/内存资源。
+    max_connections: u32 = 10000,
+
     /// 请求体最大字节数（0 表示不限制）
     body_size_limit: u64 = 10 * 1024 * 1024, // 10MB 默认限制
 
     /// 是否启用访问日志
     access_log_enabled: bool = true,
 
-    // =========================================================================
-    // 文件日志配置
-    // =========================================================================
+    /// 是否信任代理头（X-Forwarded-For / X-Real-IP）用于获取客户端 IP。
+    /// 仅在服务器部署于可信反向代理之后时开启；
+    /// 直连部署开启会导致客户端可任意伪造 IP（绕过限流/审计）。
+    trust_proxy_headers: bool = false,
 
-    /// 日志文件路径（null 表示不写文件日志）
-    log_file_path: ?[]const u8 = null,
-
-    /// 单个日志文件最大字节数（默认 10MB）
-    log_max_file_size: u64 = 10 * 1024 * 1024,
-
-    /// 最大日志备份数量（默认 10）
-    log_max_backup_files: u32 = 10,
-
-    /// 是否压缩轮转后的日志文件
-    log_compress_rotated: bool = true,
-
-    /// 是否异步写日志
-    log_async_enabled: bool = false,
-
-    /// 是否按日轮转日志文件
-    log_rotate_daily: bool = true,
+    // 注：文件日志的轮转/压缩/异步等配置**不在这里**。
+    // 核心只认识 `core.Logger` 接口，具体实现（含其配置）属于 observability：
+    //
+    //     var flog = try FileLogger.init(allocator, io, "logs/app.log", .{ ... });
+    //     defer flog.deinit();
+    //     server.setLogger(flog.logger());
 
     // =========================================================================
     // TLS/HTTPS 配置
     // =========================================================================
 
-    /// 是否启用 HTTPS/TLS
+    /// 是否启用 HTTPS/TLS。
+    /// 注意：TLS 尚未实现——启用后 Server.init 会返回 error.TlsNotSupported，
+    /// 而不是静默退回明文 HTTP。生产环境请使用反向代理（nginx 等）终结 TLS。
     tls_enabled: bool = false,
 
     /// TLS 证书文件路径（PEM 格式）
@@ -97,13 +94,9 @@ test "Config.defaults - returns default values" {
     try std.testing.expectEqual(true, config.keep_alive_enabled);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), config.idle_timeout_ns);
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), config.body_size_limit);
+    try std.testing.expectEqual(@as(u32, 10000), config.max_connections);
     try std.testing.expectEqual(true, config.access_log_enabled);
-    try std.testing.expectEqual(@as(?[]const u8, null), config.log_file_path);
-    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), config.log_max_file_size);
-    try std.testing.expectEqual(@as(u32, 10), config.log_max_backup_files);
-    try std.testing.expectEqual(true, config.log_compress_rotated);
-    try std.testing.expectEqual(false, config.log_async_enabled);
-    try std.testing.expectEqual(true, config.log_rotate_daily);
+    try std.testing.expectEqual(false, config.trust_proxy_headers);
     try std.testing.expectEqual(false, config.tls_enabled);
     try std.testing.expectEqual(@as(?[]const u8, null), config.tls_cert_file);
     try std.testing.expectEqual(@as(?[]const u8, null), config.tls_key_file);
@@ -139,24 +132,6 @@ test "Config - TLS enabled configuration" {
     try std.testing.expectEqual(true, config.tls_enabled);
     try std.testing.expectEqualStrings("/etc/certs/server.crt", config.tls_cert_file.?);
     try std.testing.expectEqualStrings("/etc/certs/server.key", config.tls_key_file.?);
-}
-
-test "Config - log configuration" {
-    const config = Config{
-        .log_file_path = "/var/log/server.log",
-        .log_max_file_size = 100 * 1024 * 1024,
-        .log_max_backup_files = 5,
-        .log_compress_rotated = false,
-        .log_async_enabled = true,
-        .log_rotate_daily = false,
-    };
-
-    try std.testing.expectEqualStrings("/var/log/server.log", config.log_file_path.?);
-    try std.testing.expectEqual(@as(u64, 100 * 1024 * 1024), config.log_max_file_size);
-    try std.testing.expectEqual(@as(u32, 5), config.log_max_backup_files);
-    try std.testing.expectEqual(false, config.log_compress_rotated);
-    try std.testing.expectEqual(true, config.log_async_enabled);
-    try std.testing.expectEqual(false, config.log_rotate_daily);
 }
 
 test "Config - TLS with custom port" {

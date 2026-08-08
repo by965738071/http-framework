@@ -11,12 +11,13 @@ const RequestContext = fw.RequestContext;
 const Response = fw.Response;
 const Handler = fw.Handler;
 const Config = fw.Config;
-const WebSocket = fw.WebSocket;
 const Static = fw.Static;
+const WebSocketManager = fw.WebSocketManager;
 const WsEchoHandler = fw.WsEchoHandler;
-const CorsMiddleware = fw.Cors;
+const CorsMiddleware = fw.CorsMiddleware;
 const RateLimiter = fw.RateLimiter;
-const MetricsCollector = fw.Metrics;
+const MetricsCollector = fw.MetricsCollector;
+const FileLogger = fw.FileLogger;
 const HomeHandler = @import("api/home.zig");
 const UserHandler = @import("api/user.zig");
 
@@ -51,23 +52,27 @@ pub fn main(init: std.process.Init) !void {
     defer router.deinit();
 
     // ── CORS / RateLimiter / Metrics ───────────────
-    var cors = try CorsMiddleware.CorsMiddleware.init(allocator, .{
+    var cors = try CorsMiddleware.init(allocator, .{
         .allowed_origins = &.{"*"},
         .allowed_methods = &.{.GET},
     });
     defer cors.deinit();
 
-    var rate_limiter = try RateLimiter.RateLimiter.init(allocator, io, .{
+    // CORS 是普通的全局中间件，Server 不再为它开专用钩子。
+    // 全局中间件在路由匹配之前执行，因此 OPTIONS 预检照样能绕过路由表。
+    try router.use(&.{cors.middleware});
+
+    var rate_limiter = try RateLimiter.init(allocator, io, .{
         .window_seconds = 60,
         .max_requests = 100,
     });
     defer rate_limiter.deinit();
 
-    var metrics = MetricsCollector.MetricsCollector.init(allocator, io);
+    var metrics = MetricsCollector.init(allocator, io);
     defer metrics.deinit();
 
     // ── WebSocket 管理器 & 处理器 ─────────────────────
-    var ws_manager = WebSocket.WebSocketManager.init(allocator, io);
+    var ws_manager = WebSocketManager.init(allocator, io);
     defer ws_manager.deinit();
 
     var ws_echo = try WsEchoHandler.init(allocator, &ws_manager);
@@ -116,14 +121,17 @@ pub fn main(init: std.process.Init) !void {
     var static_server = Static.init(allocator, io, static_dir, "/static");
     try router.route(.GET, "/static/*", Handler.init(Static, &static_server));
 
-    // ── 服务器配置 ─────────────────────────────────────
-    const config: fw.Config = .{
-        .log_file_path = "./log/zighttp.log",
-        .log_async_enabled = true,
-    };
-    var server = try Server.init(allocator, io, config, router);
+    // ── 日志：core 只认 Logger 接口，轮转/异步都在 observability 里 ──
+    var file_logger = try FileLogger.init(allocator, io, "./log/zighttp.log", .{
+        .async_enabled = true,
+        .min_level = .debug,
+    });
+    defer file_logger.deinit();
+
+    // ── 服务器 ─────────────────────────────────────────
+    var server = try Server.init(allocator, io, Config{}, &router);
     defer server.deinit();
-    server.setCors(cors);
-    server.setMetrics(&metrics);
+    server.setLogger(file_logger.logger());
+    server.setObserver(metrics.observer());
     try server.run();
 }

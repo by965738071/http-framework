@@ -135,8 +135,9 @@ pub fn QueryBuilder(comptime T: type) type {
             return self;
         }
 
-        /// 设置数据用于 UPDATE
-        pub fn update(self: *Self, data: T, fields: []const []const u8) *Self {
+        /// 设置数据用于 UPDATE。
+        /// `fields` 为要更新的字段名；传 null 表示整行替换（id 由引擎保留）。
+        pub fn update(self: *Self, data: T, fields: ?[]const []const u8) *Self {
             self.query_type = .update;
             self.data = data;
             self.update_fields = fields;
@@ -253,11 +254,10 @@ pub fn QueryBuilder(comptime T: type) type {
                     rows.clearRetainingCapacity();
                     return;
                 }
-                // 移除前 off 个元素
-                var i: usize = 0;
-                while (i < off) : (i += 1) {
-                    _ = rows.orderedRemove(0);
-                }
+                // 单次前向拷贝实现 offset 跳过，避免 O(offset*N) 的逐个移除
+                const new_len = rows.items.len - off;
+                std.mem.copyForwards(T, rows.items[0..new_len], rows.items[off..]);
+                rows.shrinkRetainingCapacity(new_len);
             }
             if (self.limit_value) |lim| {
                 if (rows.items.len > lim) {
@@ -280,7 +280,13 @@ fn compareValues(a: FieldValue, b: FieldValue) std.math.Order {
             else => .eq,
         },
         .float => |va| switch (b) {
-            .float => |vb| std.math.order(@as(i64, @intFromFloat(va * 1_000_000.0)), @as(i64, @intFromFloat(vb * 1_000_000.0))),
+            .float => |vb| std.math.order(va, vb),
+            // 数值与整数比较时统一为 f64 再比较
+            .integer => |vb| std.math.order(va, @as(f64, @floatFromInt(vb))),
+            else => .eq,
+        },
+        .datetime => |va| switch (b) {
+            .datetime, .integer => |vb| std.math.order(va, vb),
             else => .eq,
         },
         .boolean => |va| switch (b) {
@@ -361,10 +367,76 @@ fn compareString(op: Operator, a: []const u8, b: []const u8) bool {
     return switch (op) {
         .Eq => std.mem.eql(u8, a, b),
         .Neq => !std.mem.eql(u8, a, b),
-        .Like => std.mem.indexOf(u8, a, b) != null,
+        // SQL 风格 LIKE：% 匹配任意子串，_ 匹配单个字符（大小写不敏感）
+        .Like => likeMatch(a, b),
         .In, .NotIn => false,
         else => false,
     };
+}
+
+/// 支持 `%`（任意子串）与 `_`（单个字符）的通配匹配，大小写不敏感。
+fn likeMatch(haystack: []const u8, pattern: []const u8) bool {
+    // 无通配符时退化为大小写不敏感的子串包含匹配
+    if (std.mem.indexOfAny(u8, pattern, "%_") == null) {
+        return ciContains(haystack, pattern);
+    }
+    return likeMatchRecursive(haystack, pattern);
+}
+
+/// 大小写不敏感的子串包含判断（不分配内存）。
+fn ciContains(haystack: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (pattern.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + pattern.len <= haystack.len) : (start += 1) {
+        var i: usize = 0;
+        while (i < pattern.len) : (i += 1) {
+            if (!asciiCiEq(haystack[start + i], pattern[i])) break;
+        } else return true;
+    }
+    return false;
+}
+
+fn likeMatchRecursive(haystack: []const u8, pattern: []const u8) bool {
+    var i: usize = 0; // pattern 下标
+    var j: usize = 0; // haystack 下标
+    var star: usize = 0;
+    var has_star = false;
+    var mark: usize = 0;
+
+    while (j < haystack.len) {
+        if (i < pattern.len and (pattern[i] == '_' or asciiCiEq(pattern[i], haystack[j]))) {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if (i < pattern.len and pattern[i] == '%') {
+            has_star = true;
+            star = i;
+            i += 1;
+            mark = j;
+            continue;
+        }
+        if (has_star) {
+            i = star + 1;
+            mark += 1;
+            j = mark;
+            continue;
+        }
+        return false;
+    }
+    // 消费尾部连续的 %（匹配空串）
+    while (i < pattern.len and pattern[i] == '%') i += 1;
+    return i == pattern.len;
+}
+
+fn asciiCiEq(a: u8, b: u8) bool {
+    return asciiToLower(a) == asciiToLower(b);
+}
+
+fn asciiToLower(c: u8) u8 {
+    if (c >= 'A' and c <= 'Z') return c + 32;
+    return c;
 }
 
 fn compareBool(op: Operator, a: bool, b: bool) bool {
@@ -1371,4 +1443,31 @@ test "evaluateCondition Gt/Lt/Lte/Gte on bool returns false" {
     try std.testing.expect(!evaluateCondition(gt_cond, .{ .boolean = true }));
     const lt_cond = WhereCondition{ .field = "active", .operator = .Lt, .value = .{ .boolean = false } };
     try std.testing.expect(!evaluateCondition(lt_cond, .{ .boolean = false }));
+}
+
+test "Like supports % and _ wildcards (case-insensitive)" {
+    const cond = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "ali%" } };
+    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
+    try std.testing.expect(evaluateCondition(cond, .{ .string = "ALISON" }));
+    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+
+    const cond2 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "A_i%" } };
+    try std.testing.expect(evaluateCondition(cond2, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(cond2, .{ .string = "Alyce" }));
+
+    const cond3 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "%ice" } };
+    try std.testing.expect(evaluateCondition(cond3, .{ .string = "Alice" }));
+
+    const cond4 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "%li%" } };
+    try std.testing.expect(evaluateCondition(cond4, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(cond4, .{ .string = "Bob" }));
+}
+
+test "compareValues float ordering no overflow" {
+    // 之前用 *1e6 缩放到 i64，大数值会溢出；直接比较 f64。
+    const a = FieldValue{ .float = 1_000_000_000.5 };
+    const b = FieldValue{ .float = 2_000_000_000.25 };
+    try std.testing.expect(std.math.Order.gt == compareValues(b, a));
+    try std.testing.expect(std.math.Order.lt == compareValues(a, b));
+    try std.testing.expect(std.math.Order.eq == compareValues(a, a));
 }

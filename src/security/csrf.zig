@@ -13,7 +13,7 @@
 //! defer csrf.deinit();
 //!
 //! // 在路由中间件链中验证
-//! _ = try csrf.process(&ctx);
+//! _ = try csrf.process(&ctx, &res);
 //!
 //! // 在响应中设置 CSRF Cookie
 //! const token = try csrf.generateToken();
@@ -23,9 +23,9 @@
 
 const std = @import("std");
 const http = std.http;
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const Middleware = @import("../core/middleware.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const Middleware = @import("core").Middleware;
 
 /// CSRF 防护配置
 pub const CsrfConfig = struct {
@@ -100,8 +100,10 @@ pub const CsrfMiddleware = struct {
     ///
     /// - GET / HEAD / OPTIONS 等安全方法直接放行，无需验证。
     /// - 其他方法（POST / PUT / DELETE 等）：从请求头或表单中提取 token 与 Cookie 比对。
-    /// - 验证失败时设置 `ctx.blocked_status = .forbidden` 并返回 `.err`。
-    pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
+    /// - 验证失败时设置 `ctx.blocked_status = .forbidden` 并返回 `.err`
+    ///   （框架保证客户端收到 403 响应）。
+    pub fn process(self: *Self, ctx: *RequestContext, res: *Response) !Middleware.NextAction {
+        _ = res;
         // 安全方法直接放行
         if (self.isMethodIgnored(ctx.method)) {
             return .next;
@@ -307,6 +309,8 @@ test "CsrfMiddleware middleware VTable process" {
         .body_data = null,
         .headers_parsed = false,
     };
-    const action = try csrf.middleware.process(&ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try csrf.middleware.process(&ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 }

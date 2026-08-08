@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const mem = std.mem;
-const RequestContext = @import("../core/request.zig");
+const RequestContext = @import("core").RequestContext;
 
 /// 校验错误类型
 pub const ValidationError = error{

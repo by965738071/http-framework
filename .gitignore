@@ -3,6 +3,6 @@
 zig-out
 .DS_Store
 /examples/.zig-cache
-/example/zig-out
 /log
 .test_data/
+.test_model_store_data/

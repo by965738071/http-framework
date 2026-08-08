@@ -150,8 +150,9 @@ test "integration - middleware can block request" {
     defer router.deinit();
 
     const BlockMiddleware = struct {
-        pub fn process(self: *@This(), ctx: *RequestContext) anyerror!Middleware.NextAction {
+        pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!Middleware.NextAction {
             _ = self;
+            _ = res;
             ctx.blocked_status = .forbidden;
             return .respond;
         }
@@ -171,6 +172,8 @@ test "integration - middleware can block request" {
     const dispatched = try router.dispatch(&ctx, &res);
     try std.testing.expect(dispatched);
     try std.testing.expectEqual(@as(http.Status, .forbidden), ctx.blocked_status.?);
+    // 拦截路径：状态码已写入响应
+    try std.testing.expectEqual(@as(http.Status, .forbidden), res.status);
 }
 
 test "integration - middleware passes through with .next" {
@@ -184,8 +187,9 @@ test "integration - middleware passes through with .next" {
 
     const PassMiddleware = struct {
         called: *bool,
-        pub fn process(self: *@This(), ctx: *RequestContext) anyerror!Middleware.NextAction {
+        pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!Middleware.NextAction {
             _ = ctx;
+            _ = res;
             self.called.* = true;
             return .next;
         }
@@ -213,8 +217,9 @@ test "integration - middleware can return .err" {
     defer router.deinit();
 
     const ErrMiddleware = struct {
-        pub fn process(_: *@This(), ctx: *RequestContext) anyerror!Middleware.NextAction {
+        pub fn process(_: *@This(), ctx: *RequestContext, res: *Response) anyerror!Middleware.NextAction {
             _ = ctx;
+            _ = res;
             return .err;
         }
     };
@@ -306,12 +311,7 @@ test "integration - per-request handler gets fresh instance each time" {
     PerReqHandler.results_list = &instance_ids;
 
     const handler = try Handler.initPerRequestWith(PerReqHandler, allocator, {});
-    defer {
-        // Context cleanup - get the Context struct from handler.ptr
-        const Context = struct { alloc: std.mem.Allocator, args: void };
-        const ctx_ptr: *Context = @ptrCast(@alignCast(handler.ptr));
-        allocator.destroy(ctx_ptr);
-    }
+    // Context 由 router.deinit() 通过 handler.deinit() 统一回收
     try router.route(.GET, "/per-req", handler);
 
     // 第一次请求
@@ -359,6 +359,16 @@ test "integration - POST to GET-only route returns 405" {
     const dispatched = try router.dispatch(&ctx, &res);
     try std.testing.expect(dispatched);
     try std.testing.expect(!handler_called);
+    // 405：状态码已设置，且带 Allow 头
+    try std.testing.expectEqual(@as(http.Status, .method_not_allowed), res.status);
+    var has_allow = false;
+    for (res.headers.items) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Allow")) {
+            try std.testing.expectEqualStrings("GET", hdr.value);
+            has_allow = true;
+        }
+    }
+    try std.testing.expect(has_allow);
 }
 
 // ===========================================================================

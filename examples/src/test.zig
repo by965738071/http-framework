@@ -52,7 +52,7 @@ test "HTTP status codes" {
 }
 
 test "Config defaults" {
-    const cfg = http_framework.Config.Config{};
+    const cfg = http_framework.Config{};
     try testing.expectEqualStrings("127.0.0.1", cfg.address);
     try testing.expectEqual(@as(u16, 9000), cfg.port);
     try testing.expectEqual(true, cfg.access_log_enabled);

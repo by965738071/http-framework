@@ -7,7 +7,7 @@
 //! ```zig
 //! const CreateUser = struct { name: []const u8, age: u32, email: []const u8 };
 //! fn handler(ctx: *RequestContext, res: *Response) !void {
-//!     var parsed = try ctx.bodyAs(CreateUser);
+//!     var parsed = try codec.bodyAs(CreateUser, ctx);
 //!     defer parsed.deinit();
 //!     const user = parsed.value;
 //! }
@@ -26,15 +26,15 @@ pub const DeserializeError = error{
     TypeMismatch,
 };
 
-/// &#31867;&#22411;&#21035;&#21517;&#65292;&#26041;&#20415;&#22806;&#37096;&#24341;&#29992;
+/// 类型别名，方便外部引用
 pub const Parsed = std.json.Parsed;
 
 // ===========================================================================
 // JSON Deserialization
 // ===========================================================================
 
-/// &#23558; JSON body &#35299;&#26512;&#20026;&#31867;&#22411; T&#12290;
-/// &#20869;&#37096;&#20351;&#29992; ArenaAllocator&#65292;&#35843;&#29992;&#32773;&#21482;&#38656; `defer parsed.deinit()`&#12290;
+/// 将 JSON body 解析为类型 T。
+/// 内部使用 ArenaAllocator，调用者只需 `defer parsed.deinit()`。
 pub fn parseJson(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -49,11 +49,11 @@ pub fn parseJson(
 /// Parse a form-urlencoded body into type T using comptime reflection.
 ///
 /// Supported field types:
-/// - []const u8, [:0]const u8, []u8 � URL-decoded copy
-/// - Integers (i8..i64, u8..u64) � parsed from string
-/// - Floats (f32, f64) � parsed from string
-/// - bool � "true"/"1" = true, else false
-/// - ?T � optional, null if missing
+/// - []const u8, [:0]const u8, []u8 — URL-decoded copy
+/// - Integers (i8..i64, u8..u64) — parsed from string
+/// - Floats (f32, f64) — parsed from string
+/// - bool — "true"/"1" = true, else false
+/// - ?T — optional, null if missing
 pub fn parseForm(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -226,6 +226,56 @@ const FormPairs = struct {
         return .{ .key = segment, .value = "true" };
     }
 };
+
+// ===========================================================================
+// RequestContext 便捷入口
+// ===========================================================================
+//
+// 这两个函数以前是 `RequestContext` 的方法，现在下沉到 codec：
+// core 不该知道 JSON 和 form 的存在，反序列化是可选能力。
+// 调用方式从 `ctx.bodyAs(T)` 变为 `codec.bodyAs(T, ctx)`。
+
+const RequestContext = @import("core").RequestContext;
+
+/// 根据 Content-Type 自动把请求体反序列化为类型 T。
+///
+/// - `application/json` → JSON 解析
+/// - `application/x-www-form-urlencoded` → form 解析（comptime 反射）
+///
+/// 返回 `Parsed(T)`，调用方需在用完后 `parsed.deinit()`。
+///
+/// ```zig
+/// const CreateUser = struct { name: []const u8, age: u32 };
+///
+/// fn handler(ctx: *RequestContext, res: *Response) !void {
+///     var parsed = try codec.bodyAs(CreateUser, ctx);
+///     defer parsed.deinit();
+///     const user = parsed.value;
+/// }
+/// ```
+pub fn bodyAs(comptime T: type, ctx: *RequestContext) !Parsed(T) {
+    const body = try ctx.readBody();
+    if (body.len == 0) return error.EmptyBody;
+
+    const ct = ctx.content_type orelse return error.NoContentType;
+
+    if (std.ascii.findIgnoreCase(ct, "application/json") != null) {
+        return parseJson(T, ctx.allocator, body);
+    }
+    if (std.ascii.findIgnoreCase(ct, "application/x-www-form-urlencoded") != null) {
+        return parseForm(T, ctx.allocator, body);
+    }
+    return error.UnsupportedContentType;
+}
+
+/// 把 URL 查询串反序列化为结构体 T。
+///
+/// 查询串与 form-urlencoded 同格式（`key=value&key=value`），直接复用
+/// `parseForm` 的 comptime 反射逻辑。
+pub fn queryAs(comptime T: type, ctx: *RequestContext) !Parsed(T) {
+    if (ctx.query.len == 0) return error.EmptyBody;
+    return parseForm(T, ctx.allocator, ctx.query);
+}
 
 // ===========================================================================
 // Tests

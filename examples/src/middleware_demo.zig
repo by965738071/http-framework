@@ -66,7 +66,8 @@ const RateLimitConfig = http_framework.RateLimitConfig;
 const LoggingMiddleware = struct {
     label: []const u8,
 
-    pub fn process(self: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(self: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
+        _ = res;
         std.log.info("[{s}] {s} {s}", .{
             self.label,
             @tagName(ctx.method),
@@ -81,17 +82,12 @@ const LoggingMiddleware = struct {
 // =========================================================================
 
 const CustomHeadersMiddleware = struct {
-    pub fn process(_: *@This(), ctx: *RequestContext) anyerror!NextAction {
+    pub fn process(_: *@This(), ctx: *RequestContext, res: *Response) anyerror!NextAction {
         _ = ctx;
-        return .next;
-    }
-
-    /// 在 handler 返回后、响应发送前调用（通过框架 hook）
-    /// 这里演示：在 process 中直接返回 .next，
-    /// 然后在 handler 中手动调用 addCustomHeaders
-    pub fn addHeaders(_: *@This(), res: *Response) !void {
+        // 中间件现在可以直接操作 Response：添加自定义响应头
         _ = try res.header("X-Powered-By", "ZigHTTP-Framework");
         _ = try res.header("X-Request-ID", "demo-id-12345");
+        return .next;
     }
 };
 
@@ -297,12 +293,12 @@ pub fn main(init: std.process.Init) !void {
     router.notFound(Handler.fromFn(notFoundHandler));
 
     // ── 启动服务器 ────────────────────────────────────
-    const config = Config.Config{ .port = 9000 };
-    var server = try Server.init(allocator, io, config, router);
+    const config = Config{ .port = 9000 };
+    var server = try Server.init(allocator, io, config, &router);
     defer server.deinit();
 
-    // 设置 CORS（Server 级别，对所有请求生效）
-    server.setCors(cors);
+    // CORS 是普通的全局中间件：路由匹配之前执行，OPTIONS 预检照样绕过路由表。
+    try router.use(&.{cors.middleware});
 
     std.log.info("Middleware Demo Server starting on http://127.0.0.1:9000", .{});
     std.log.info("Middlewares active:", .{});

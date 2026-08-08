@@ -252,6 +252,39 @@ fn extractBoundary(content_type: []const u8) ?[]const u8 {
 }
 
 // ===========================================================================
+// RequestContext 便捷入口
+// ===========================================================================
+//
+// 以前是 `ctx.getMultipart()`，由 RequestContext 持有解析器并在 deinit 时释放。
+// 现在 core 不认识 multipart，解析器的生命周期归调用方：
+//
+// ```zig
+// var form = try multipart.from(ctx);
+// defer form.deinit();
+// if (form.getFile("avatar")) |f| { ... }
+// ```
+
+const RequestContext = @import("core").RequestContext;
+
+/// 读取请求体并解析为 multipart 表单。
+///
+/// 返回值由调用方持有，用完后必须 `deinit()`。
+/// Content-Type 不是 `multipart/form-data` 时返回 `error.NotMultipart`。
+pub fn from(ctx: *RequestContext) !Parser {
+    const ct = ctx.content_type orelse return error.NotMultipart;
+    if (std.ascii.findIgnoreCase(ct, "multipart/form-data") == null) {
+        return error.NotMultipart;
+    }
+
+    var parser = try Parser.init(ctx.allocator, ct);
+    errdefer parser.deinit();
+
+    const body = try ctx.readBody();
+    try parser.parse(body);
+    return parser;
+}
+
+// ===========================================================================
 // 测试
 // ===========================================================================
 

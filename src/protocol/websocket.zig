@@ -5,8 +5,8 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
 
 // =========================================================================
 // WebSocket 管理器（生产级）
@@ -199,34 +199,6 @@ pub const WebSocketManager = struct {
         data: []const u8,
     ) !void {
         try ws.writeMessage(data, .pong);
-    }
-
-    /// 关闭 WebSocket 连接
-    pub fn close(
-        self: *Self,
-        ws: *http.Server.WebSocket,
-        code: ?u16,
-        reason: ?[]const u8,
-        conn_id: []const u8,
-    ) !void {
-        const reason_len = if (reason) |r| r.len else 0;
-        var close_frame = std.ArrayList(u8).init(self.allocator);
-        defer close_frame.deinit();
-
-        try close_frame.ensureTotalCapacity(2 + reason_len);
-
-        const status_code = code orelse 1000;
-        try close_frame.writer().writeInt(u16, status_code, .big);
-        if (reason) |r| {
-            try close_frame.appendSlice(r);
-        }
-
-        try ws.writeMessage(close_frame.items, .connection_close);
-
-        // 使用 cleanupConnection 清理
-        self.cleanupConnection(conn_id);
-
-        std.log.info("WebSocket closed: {s}", .{conn_id});
     }
 
     /// 广播消息到所有活跃连接

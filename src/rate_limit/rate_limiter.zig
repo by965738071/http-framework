@@ -5,9 +5,9 @@
 const std = @import("std");
 const mem = std.mem;
 
-const RequestContext = @import("../core/request.zig");
-const Response = @import("../core/response.zig");
-const Middleware = @import("../core/middleware.zig");
+const RequestContext = @import("core").RequestContext;
+const Response = @import("core").Response;
+const Middleware = @import("core").Middleware;
 
 /// 速率限制配置
 pub const RateLimitConfig = struct {
@@ -58,7 +58,8 @@ pub const RateLimiter = struct {
     }
 
     /// 处理请求 - 检查速率限制
-    pub fn process(self: *Self, ctx: *RequestContext) !Middleware.NextAction {
+    pub fn process(self: *Self, ctx: *RequestContext, res: *Response) !Middleware.NextAction {
+        _ = res;
         // 获取客户端标识符
         const identifier = self.getIdentifier(ctx) orelse {
             // 无法识别客户端（如无 IP、无标识头），放行请求
@@ -566,6 +567,7 @@ test "getIdentifier: 使用 per_ip 配置时从 X-Forwarded-For 获取 IP" {
 
     var ctx = try RequestContext.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
+    ctx.trust_proxy = true; // 模拟部署在可信代理之后
 
     const identifier = rl.getIdentifier(&ctx);
     try std.testing.expect(identifier != null);
@@ -597,6 +599,7 @@ test "getIdentifier: 使用 per_ip 配置时从 X-Real-IP 获取 IP" {
 
     var ctx = try RequestContext.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
+    ctx.trust_proxy = true; // 模拟部署在可信代理之后
 
     const identifier = rl.getIdentifier(&ctx);
     try std.testing.expect(identifier != null);
@@ -765,8 +768,11 @@ test "process: 未超限时返回 .next 并更新记录" {
 
     var ctx = try RequestContext.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
+    ctx.trust_proxy = true; // 模拟部署在可信代理之后
 
-    const action = try rl.process(&ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try rl.process(&ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 
     // 应该创建了记录
@@ -805,7 +811,9 @@ test "process: 无标识头时返回 .next（放行请求）" {
     defer ctx.deinit();
 
     // 无法识别客户端 → 返回 .next
-    const action = try rl.process(&ctx);
+    var res = Response.init(allocator, undefined);
+    defer res.deinit();
+    const action = try rl.process(&ctx, &res);
     try std.testing.expectEqual(Middleware.NextAction.next, action);
 
     // 不应创建记录

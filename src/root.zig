@@ -1,84 +1,123 @@
-//! By convention, root.zig is the root source file when making a package.
+//! `http_framework` — 伞形聚合模块
 //!
-//! This file re‑exports the public API of the HTTP framework so that
-//! external projects can simply `@import("http-framework")` and access all
-//! the core types and functions.
+//! 一次 `@import("http_framework")` 拿到全部能力，适合快速起步。
+//!
+//! # 想要更小的依赖面？直接依赖子模块
+//!
+//! 每个子模块都是 build.zig 里独立注册的模块，可以单独 import：
+//!
+//! ```zig
+//! const core = @import("core");           // 只要 HTTP 解析 + 路由 + 请求/响应
+//! const codec = @import("codec");         // 加上 JSON / form 反序列化
+//! const security = @import("security");   // 加上 CORS / 鉴权 / CSRF
+//! ```
+//!
+//! # 依赖方向
+//!
+//! `core` 不 import 任何其它模块，这一点由 build.zig 的模块边界强制保证。
+//! 所有 addon 单向依赖 core，反向依赖在编译期就无法通过。
+//!
+//! core 通过 `Logger` / `RequestObserver` / `Worker` 三个接口接纳外部实现，
+//! 横切逻辑（CORS、鉴权、限流）一律走 `router.use()`。
 
 const std = @import("std");
 
-// ── Core HTTP server modules ──────────────────────────────────────
-pub const Config = @import("./config/config.zig").Config;
-pub const Server = @import("./core/server.zig").Server;
-pub const Router = @import("./core/router.zig");
-pub const RequestContext = @import("./core/request.zig");
-pub const Response = @import("./core/response.zig");
-pub const Handler = @import("./handler/handler.zig");
-pub const Middleware = @import("./core/middleware.zig");
-pub const NextAction = @import("./core/middleware.zig").NextAction;
-pub const RouteGroup = @import("./core/router.zig").RouteGroup;
-pub const ConnectionPool = @import("./core/connection_pool.zig");
+// ── 子模块（推荐直接依赖需要的那个）────────────────────────────────
+pub const core = @import("core");
+pub const codec = @import("codec");
+pub const multipart = @import("multipart");
+pub const security = @import("security");
+pub const observability = @import("observability");
+pub const background = @import("background");
+pub const session = @import("session");
+pub const static = @import("static");
+pub const rate_limit = @import("rate_limit");
+pub const protocol = @import("protocol");
+pub const policy = @import("policy");
+pub const template = @import("template");
+pub const pool = @import("pool");
+pub const orm = @import("orm");
+
+// ── core：最小 HTTP 服务器 ─────────────────────────────────────────
+pub const Config = core.Config;
+pub const Server = core.Server;
+pub const Router = core.Router;
+pub const RouteGroup = core.RouteGroup;
+pub const RequestContext = core.RequestContext;
+pub const Response = core.Response;
+pub const Handler = core.Handler;
+pub const Middleware = core.Middleware;
+pub const NextAction = core.NextAction;
+
+/// core 的三个扩展点接口（由 addon 实现）
+pub const Logger = core.Logger;
+pub const LogLevel = core.LogLevel;
+pub const StdLogger = core.StdLogger;
+pub const RequestObserver = core.RequestObserver;
+pub const RequestInfo = core.RequestInfo;
+pub const Worker = core.Worker;
 
 // ── Security ──────────────────────────────────────────────────────
-pub const Auth = @import("./security/auth.zig");
-pub const AuthMiddleware = @import("./security/auth.zig").AuthMiddleware;
-pub const AuthConfig = @import("./security/auth.zig").AuthConfig;
-pub const AuthInfo = @import("./security/auth.zig").AuthInfo;
-pub const AuthStrategy = @import("./security/auth.zig").AuthStrategy;
-pub const Cors = @import("./security/cors.zig");
-pub const CorsMiddleware = @import("./security/cors.zig").CorsMiddleware;
-pub const CorsConfig = @import("./security/cors.zig").CorsConfig;
-pub const Csrf = @import("./security/csrf.zig");
-pub const SecurityHeaders = @import("./security/security_headers.zig");
+pub const AuthMiddleware = security.AuthMiddleware;
+pub const AuthConfig = security.AuthConfig;
+pub const AuthInfo = security.AuthInfo;
+pub const AuthStrategy = security.AuthStrategy;
+pub const CorsMiddleware = security.CorsMiddleware;
+pub const CorsConfig = security.CorsConfig;
+pub const CsrfMiddleware = security.CsrfMiddleware;
+pub const SecurityHeaders = security.SecurityHeaders;
 
 // ── Rate Limiting ─────────────────────────────────────────────────
-pub const RateLimiter = @import("./rate_limit/rate_limiter.zig");
-pub const RateLimitConfig = @import("./rate_limit/rate_limiter.zig").RateLimitConfig;
-pub const TokenBucket = @import("./rate_limit/token_bucket.zig");
+pub const RateLimiter = rate_limit.RateLimiter;
+pub const RateLimitConfig = rate_limit.RateLimitConfig;
+pub const TokenBucket = rate_limit.TokenBucket;
 
 // ── Session ───────────────────────────────────────────────────────
-pub const Session = @import("./session/session.zig");
-pub const SessionManager = @import("./session/session.zig").SessionManager;
-pub const SessionData = @import("./session/session.zig").SessionData;
+pub const SessionManager = session.SessionManager;
+pub const SessionData = session.SessionData;
 
-// ── Codec / Serialization ─────────────────────────────────────────
-pub const Deserialize = @import("./codec/deserialize.zig");
-pub const Compression = @import("./codec/compression.zig");
-pub const BodySignature = @import("./codec/body_signature.zig");
-pub const Validation = @import("./codec/validation.zig");
-
-// ── Protocol Extensions ───────────────────────────────────────────
-pub const WebSocket = @import("./protocol/websocket.zig");
-pub const WebSocketManager = @import("./protocol/websocket.zig").WebSocketManager;
-pub const WsEchoHandler = @import("./protocol/websocket.zig").WsEchoHandler;
-pub const Http2 = @import("./protocol/http2.zig");
-pub const Http2Full = @import("./protocol/http2_full.zig");
-
-// ── Static / Template ─────────────────────────────────────────────
-pub const Static = @import("./static/static.zig");
-pub const Template = @import("./template/template.zig");
-pub const TemplateEngine = @import("./template/template_engine.zig");
+// ── Codec ─────────────────────────────────────────────────────────
+/// `codec.bodyAs(T, ctx)` / `codec.queryAs(T, ctx)` —— 以前的 `ctx.bodyAs(T)`
+pub const bodyAs = codec.bodyAs;
+pub const queryAs = codec.queryAs;
+pub const Compression = codec.compression;
+pub const BodySignature = codec.body_signature;
+pub const Validation = codec.validation;
 
 // ── Multipart ─────────────────────────────────────────────────────
-pub const Multipart = @import("./multipart/multipart.zig");
+/// `multipart.from(ctx)` —— 以前的 `ctx.getMultipart()`
+pub const MultipartParser = multipart.Parser;
+
+// ── Protocol ──────────────────────────────────────────────────────
+pub const WebSocketManager = protocol.WebSocketManager;
+pub const WsEchoHandler = protocol.WsEchoHandler;
+
+// ── Static / Template ─────────────────────────────────────────────
+pub const Static = static;
+pub const Template = template.Template;
 
 // ── Observability ─────────────────────────────────────────────────
-pub const Metrics = @import("./observability/metrics.zig");
-pub const OpenApi = @import("./observability/openapi.zig");
+/// 实现 `core.Logger`：`server.setLogger(file_logger.logger())`
+pub const FileLogger = observability.FileLogger;
+/// 实现 `core.RequestObserver`：`server.setObserver(metrics.observer())`
+pub const MetricsCollector = observability.MetricsCollector;
+pub const OpenApi = observability.openapi;
 
 // ── Policy ────────────────────────────────────────────────────────
-pub const Csp = @import("./policy/csp.zig");
-pub const SRI = @import("./policy/sri.zig");
+pub const CspBuilder = policy.CspBuilder;
+pub const SRIHash = policy.SRIHash;
 
 // ── Background ────────────────────────────────────────────────────
-pub const Background = @import("./background/background.zig");
-pub const BackgroundQueue = @import("./background/background.zig").BackgroundQueue;
+/// 实现 `core.Worker`：`server.setWorker(bg.worker())`
+pub const BackgroundQueue = background.BackgroundQueue;
+
+// ── Pool ──────────────────────────────────────────────────────────
+/// 通用连接池（独立可用，尚未接入 Server 的 accept 循环）
+pub const ConnectionPool = pool;
 
 // ── Test ──────────────────────────────────────────────────────────
-pub const IntegrationTest = @import("./test/integration_test.zig");
-
-// Optional: expose the entire core module for advanced use
-pub const Core = @import("./core/root.zig");
+pub const IntegrationTest = @import("test/integration_test.zig");
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
 }
