@@ -46,8 +46,18 @@ pub const RouteGroup = core.RouteGroup;
 pub const RequestContext = core.RequestContext;
 pub const Response = core.Response;
 pub const Handler = core.Handler;
+
+/// 流式响应句柄，由 `res.stream(buffer, .{})` 返回。
+/// 大文件下载 / SSE / 流式 JSON 用它，避免整个响应体进内存。
+pub const ResponseStream = core.ResponseStream;
+pub const StreamOptions = core.StreamOptions;
+
 pub const Middleware = core.Middleware;
 pub const NextAction = core.NextAction;
+
+/// `server.stats()` 的返回类型：连接数、快路径失效计数、内存池计数。
+/// 喂给 `MetricsCollector.recordServerStats()` 或自己渲染成 /metrics。
+pub const ServerStats = core.Server.Stats;
 
 /// core 的三个扩展点接口（由 addon 实现）
 pub const Logger = core.Logger;
@@ -112,7 +122,11 @@ pub const SRIHash = policy.SRIHash;
 pub const BackgroundQueue = background.BackgroundQueue;
 
 // ── Pool ──────────────────────────────────────────────────────────
-/// 通用连接池（独立可用，尚未接入 Server 的 accept 循环）
+/// **出站**连接池：给数据库/HTTP 客户端复用长连接用的通用容器。
+///
+/// 和 Server 内部的 `core.ConnStatePool` 是两回事，别搞混：
+/// 后者池化的是「入站连接的读写缓冲 + 每请求 arena」，由 accept 循环
+/// 自动使用，不需要也不应该由调用方管。
 pub const ConnectionPool = pool;
 
 // ── Test ──────────────────────────────────────────────────────────

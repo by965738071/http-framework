@@ -170,16 +170,21 @@ pub const AuthMiddleware = struct {
     // ── Result helpers ────────────────────────────────
 
     fn authOk(self: *AuthMiddleware, ctx: *RequestContext, strategy: AuthStrategy) !NextAction {
-        // Heap-allocate AuthInfo (freed via destroyAuthInfo in ctx.deinit)
-        const info_ptr = try self.allocator.create(AuthInfo);
-        errdefer self.allocator.destroy(info_ptr);
+        // AuthInfo 及其字段一律用 **ctx.allocator** 分配，不能用 self.allocator：
+        // 释放它的是 `destroyAuthInfo`，而框架调用该函数时传的正是 ctx.allocator。
+        // 两者不是同一个分配器时（请求 arena vs 中间件自己的 GPA），
+        // 这个错配不会报错、也不会崩，只会安静地泄漏。
+        const alloc = ctx.allocator;
+
+        const info_ptr = try alloc.create(AuthInfo);
+        errdefer alloc.destroy(info_ptr);
 
         info_ptr.* = .{ .strategy = strategy };
 
         switch (strategy) {
             .bearer => {
                 const header = ctx.getHeader("Authorization").?;
-                info_ptr.token = try self.allocator.dupe(u8, header["Bearer ".len..]);
+                info_ptr.token = try alloc.dupe(u8, header["Bearer ".len..]);
             },
             .basic => {
                 const header = ctx.getHeader("Authorization").?;
@@ -188,22 +193,23 @@ pub const AuthMiddleware = struct {
                 try std.base64.standard.Decoder.decode(&dec_buf, encoded);
                 const decoded_len2 = base64DecodedLen(encoded);
                 const colon = std.mem.indexOfScalar(u8, dec_buf[0..decoded_len2], ':') orelse 0;
-                info_ptr.username = try self.allocator.dupe(u8, dec_buf[0..colon]);
+                info_ptr.username = try alloc.dupe(u8, dec_buf[0..colon]);
             },
             .api_key => {
                 if (ctx.getHeader(self.config.api_key_header)) |key| {
-                    info_ptr.api_key = try self.allocator.dupe(u8, key);
+                    info_ptr.api_key = try alloc.dupe(u8, key);
                 } else if (self.config.api_key_query) {
                     if (ctx.getQuery("api_key")) |key| {
-                        info_ptr.api_key = try self.allocator.dupe(u8, key);
+                        info_ptr.api_key = try alloc.dupe(u8, key);
                     }
                 }
             },
             .custom => {},
         }
 
-        // Store in context for downstream handlers（框架通过 destroyAuthInfo 自动释放）
-        ctx.setUserData(@ptrCast(info_ptr), destroyAuthInfo);
+        // 存入上下文供下游 handler 取用（框架在 ctx.deinit 时调 destroyAuthInfo）。
+        // 按 AuthInfo 这个类型占一个槽位，不会覆盖其它中间件写入的数据。
+        try ctx.setUserData(info_ptr, destroyAuthInfo);
 
         return .next;
     }

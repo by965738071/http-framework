@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "user_management", .src = "src/user_management.zig", .uses_orm = true },
         .{ .name = "admin_system", .src = "src/admin_system.zig", .uses_orm = true },
         .{ .name = "websocket", .src = "src/websocket.zig", .uses_orm = false },
+        .{ .name = "streaming", .src = "src/streaming.zig", .uses_orm = false },
+        .{ .name = "streaming_upload", .src = "src/streaming_upload.zig", .uses_orm = false },
     };
 
     var server_exe: ?*std.Build.Step.Compile = null;

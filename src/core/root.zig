@@ -29,6 +29,8 @@ const std = @import("std");
 // ── HTTP 基元 ─────────────────────────────────────────────────────
 pub const RequestContext = @import("request.zig");
 pub const Response = @import("response.zig");
+pub const ResponseStream = Response.Stream;
+pub const StreamOptions = Response.StreamOptions;
 pub const Handler = @import("handler.zig");
 pub const Middleware = @import("middleware.zig");
 pub const NextAction = @import("middleware.zig").NextAction;
@@ -41,6 +43,13 @@ pub const RouteGroup = @import("router.zig").RouteGroup;
 // ── 服务器 ────────────────────────────────────────────────────────
 pub const Server = @import("server.zig").Server;
 pub const Config = @import("config.zig").Config;
+
+// 连接内存复用。`ConnStatePool` 由 Server 内部管理，导出主要是为了
+// 让运维侧能读到 `PoolStats`（内存池什么时候失效是可观测指标）。
+pub const conn_state = @import("conn_state.zig");
+pub const ConnState = conn_state.ConnState;
+pub const ConnStatePool = conn_state.ConnStatePool;
+pub const PoolStats = conn_state.Stats;
 
 // ── 扩展点接口（由 addon 实现）────────────────────────────────────
 pub const log = @import("log.zig");

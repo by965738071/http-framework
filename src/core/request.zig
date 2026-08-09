@@ -14,11 +14,30 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
-/// 用户数据容器 — 包含不透明指针和销毁函数
-/// 任何模块都可以存入自定义数据，框架会通过 destroyFn 自动释放
+/// 用户数据槽位 — 按类型索引的不透明指针 + 销毁函数。
+///
+/// # 为什么是链表而不是单个字段
+///
+/// 早期版本 `user_data` 是**一个**槽位，`setUserData` 直接覆盖：
+///
+/// ```zig
+/// self.user_data = .{ .ptr = data, .destroyFn = destroyFn };
+/// ```
+///
+/// 于是两个中间件谁都不能同时用它——鉴权中间件写入 AuthInfo，
+/// 会话中间件随后写入 Session，前者的 `destroyFn` 永远不会被调用（泄漏），
+/// 而下游 `getUserData(AuthInfo)` 会把 Session 指针**当成 AuthInfo 返回**
+/// （类型混淆，比泄漏更糟）。中间件链一旦超过一个消费者就是错的。
+///
+/// 现在按 `@typeName(T)` 索引，每个类型一个槽位，互不干扰。
+/// 用单链表而不是 HashMap：实际槽位数是个位数，链表省掉哈希表的
+/// 初始化分配，遍历也在缓存里。
 pub const UserData = struct {
+    /// `@typeName(T)`。同一个 T 在任何地方求值都得到相等的字符串。
+    key: []const u8,
     ptr: *anyopaque,
     destroyFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+    next: ?*UserData = null,
 };
 
 allocator: std.mem.Allocator,
@@ -48,18 +67,40 @@ transfer_encoding: http.TransferEncoding,
 // ---- 原始请求引用 ----
 request: *http.Server.Request,
 
+/// 请求头原始字节的自有副本，`null` 表示直接引用 `request.head_buffer`。
+///
+/// # 为什么需要这个副本
+///
+/// `request.head_buffer` 是**连接读缓冲区的一段切片**，std 明确写了
+/// "invalidated by any subsequent consumption of the input stream"——
+/// 一旦开始读 body，body 字节就会覆盖掉它。实测 64KiB 的 POST 之后
+/// `ctx.path` 会变成 `"bbbbbb"`（body 的内容），而访问日志恰恰是在
+/// handler 跑完之后才打印 `ctx.path`。
+///
+/// 所以带 body 的请求在 `init` 时就把 head 复制到请求 arena，
+/// `path` / `query` / `content_type` 全部改指向副本。不带 body 的请求
+/// （绝大多数 GET/HEAD）没有覆盖风险，保持零拷贝。
+head_copy: ?[]const u8 = null,
+
 // ---- 内部状态 ----
 body_read: bool,
 body_data: ?[]const u8,
 
+/// 已通过 `bodyStream()` 接管 body 读取。与 `body_read` 互斥。
+body_streaming: bool = false,
+
 /// 请求体大小限制（字节），0 表示不限制
 body_size_limit: u64 = 0,
+
+/// 超过此值的请求体不再整体缓冲，`readBody()` 直接报错要求改用
+/// `bodyStream()`。0 表示不启用。由 Server 从 `config.lazy_read_size` 注入。
+lazy_read_size: u64 = 0,
 
 // ---- 延迟解析标志 ----
 headers_parsed: bool,
 
-// ---- 用户数据（中间件传递） ----
-user_data: ?UserData = null,
+// ---- 用户数据（中间件传递），按类型索引的单链表 ----
+user_data: ?*UserData = null,
 
 // ---- 中间件拦截状态码 ----
 blocked_status: ?http.Status = null,
@@ -113,8 +154,22 @@ pub fn init(
     // 从 target 中分离 path 和 query string
     const target = head.target;
     const query_start = mem.indexOfScalar(u8, target, '?');
-    const path = if (query_start) |idx| target[0..idx] else target;
-    const query = if (query_start) |idx| target[idx + 1 ..] else "";
+    var path = if (query_start) |idx| target[0..idx] else target;
+    var query = if (query_start) |idx| target[idx + 1 ..] else "";
+    var content_type = head.content_type;
+
+    // 只有「会去读 body」的请求才需要保护 head：读 body 会把 head 冲掉。
+    // 无 body 的请求走零拷贝路径。
+    const has_body = head.content_length != null or head.transfer_encoding != .none;
+    const original_head = request.head_buffer;
+    var head_copy: ?[]const u8 = null;
+    if (has_body) {
+        const copy = try allocator.dupe(u8, original_head);
+        head_copy = copy;
+        path = rebase(path, original_head, copy);
+        query = rebase(query, original_head, copy);
+        if (content_type) |ct| content_type = rebase(ct, original_head, copy);
+    }
 
     return Self{
         .allocator = allocator,
@@ -124,15 +179,25 @@ pub fn init(
         .query = query,
         .version = head.version,
         .path_params = std.StringHashMapUnmanaged([]const u8).empty,
-        .content_type = head.content_type,
+        .content_type = content_type,
         .content_length = head.content_length,
         .transfer_encoding = head.transfer_encoding,
         .request = request,
+        .head_copy = head_copy,
         .body_read = false,
         .body_data = null,
         .headers_parsed = false,
         .user_data = null,
     };
+}
+
+/// 把 `old` 里的一段切片平移到 `new`（两者内容相同、长度相同）。
+/// 不落在 `old` 范围内的切片（例如空字符串字面量）原样返回。
+fn rebase(slice: []const u8, old: []const u8, new: []const u8) []const u8 {
+    const s = @intFromPtr(slice.ptr);
+    const base = @intFromPtr(old.ptr);
+    if (s < base or s + slice.len > base + old.len) return slice;
+    return new[s - base ..][0..slice.len];
 }
 
 /// 释放所有堆分配的资源
@@ -155,9 +220,20 @@ pub fn deinit(self: *Self) void {
         self.allocator.free(data);
     }
 
-    // 通过注册的销毁函数释放用户数据（通用、类型安全）
-    if (self.user_data) |ud| {
+    // 释放 head 副本（零拷贝路径下为 null，没有东西要还）
+    if (self.head_copy) |copy| {
+        self.allocator.free(copy);
+    }
+
+    // 逐个调用注册的销毁函数。链表本身也是 self.allocator 分配的，
+    // 顺带释放——用 arena 时这两次 free 都是 no-op，用通用分配器时才真正生效。
+    var node = self.user_data;
+    self.user_data = null;
+    while (node) |ud| {
+        const next = ud.next;
         ud.destroyFn(ud.ptr, self.allocator);
+        self.allocator.destroy(ud);
+        node = next;
     }
 }
 
@@ -167,9 +243,9 @@ pub fn deinit(self: *Self) void {
 
 /// 获取请求头值（大小写不敏感）。
 ///
-/// 首次调用时线性扫描原始头部数据，不缓存、不分配。
+/// 线性扫描原始头部数据，不缓存、不分配。读过 body 之后依然可用。
 pub fn getHeader(self: *const Self, key: []const u8) ?[]const u8 {
-    var it = self.request.iterateHeaders();
+    var it = self.iterateHeaders();
     while (it.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, key)) {
             return header.value;
@@ -268,8 +344,16 @@ pub fn getParam(self: *const Self, key: []const u8) ?[]const u8 {
 
 /// 获取所有请求头（不常用 API，仍返回迭代器）。
 /// 注意：每次调用都会重新扫描，不做缓存。
+///
+/// 扫描的是 `headBytes()` 而不是 `request.iterateHeaders()`——后者断言
+/// `reader.state == .received_head`，读过 body 之后调用会直接崩掉进程。
 pub fn iterateHeaders(self: *const Self) http.HeaderIterator {
-    return self.request.iterateHeaders();
+    return http.HeaderIterator.init(self.headBytes());
+}
+
+/// 请求头原始字节：有副本用副本，没有就直接引用连接缓冲区。
+fn headBytes(self: *const Self) []const u8 {
+    return self.head_copy orelse self.request.head_buffer;
 }
 
 // =========================================================================
@@ -283,20 +367,40 @@ pub fn iterateHeaders(self: *const Self) http.HeaderIterator {
 /// 注意：读取失败（如 BodyTooLarge、连接中断）会将连接标记为 poisoned，
 /// Server 会在响应后关闭连接——因为 socket 上可能残留未消费的字节，
 /// 继续复用会把残余 body 误认为下一个请求的头部。
+///
+/// 配了 `lazy_read_size` 且 `Content-Length` 超过它时返回
+/// `error.BodyTooLargeToBuffer`，此时**一个字节都还没读**，
+/// 调用方可以改用 `bodyStream()` 边收边处理。
+///
+/// 请求带 `Expect: 100-continue` 时会先回一句 `100 Continue` 再读
+/// （客户端正等着这个才肯发 body）。头里写了别的 expect 值则返回
+/// `error.HttpExpectationFailed`，Server 映射成 417。
 pub fn readBody(self: *Self) ![]const u8 {
     if (self.body_read) {
         return self.body_data orelse error.BodyAlreadyRead;
     }
+    if (self.body_streaming) return error.BodyIsStreaming;
 
-    // 此后任何错误都意味着 socket 上的 body 未被完整消费 → 连接不可复用
-    errdefer self.poisoned = true;
+    // ---- 预检查：此时 socket 还没被动过 ----
+    // 这几个分支要不要 poison 得分开判断，所以不能套在下面那个
+    // 统一的 errdefer 里。
 
-    // 检查 Content-Length 是否超过限制
+    // 超过硬上限 → 413。客户端此刻还在往 socket 里灌 body，
+    // 我们不打算读它，连接只能关掉。
     if (self.body_size_limit > 0) {
         if (self.content_length) |cl| {
             if (cl > self.body_size_limit) {
+                self.poisoned = true;
                 return error.BodyTooLarge;
             }
+        }
+    }
+
+    // 超过缓冲阈值 → 提示调用方改用流式。**不 poison**：
+    // handler 完全可以接着调 bodyStream() 把它读完，连接仍可复用。
+    if (self.lazy_read_size > 0) {
+        if (self.content_length) |cl| {
+            if (cl > self.lazy_read_size) return error.BodyTooLargeToBuffer;
         }
     }
 
@@ -307,8 +411,11 @@ pub fn readBody(self: *Self) ![]const u8 {
         return &.{};
     }
 
+    // 此后任何错误都意味着 socket 上的 body 未被完整消费 → 连接不可复用
+    errdefer self.poisoned = true;
+
     var temp_buf: [16384]u8 = undefined;
-    const body_reader = self.request.readerExpectNone(&temp_buf);
+    const body_reader = try self.request.readerExpectContinue(&temp_buf);
 
     var result = try std.ArrayList(u8).initCapacity(self.allocator, 256);
     // BodyTooLarge / 读错误都会在这里退出，累积缓冲区必须回收，
@@ -335,11 +442,60 @@ pub fn readBody(self: *Self) ![]const u8 {
     return self.body_data.?;
 }
 
+/// 流式读取请求体：直接从连接上增量读，**不整体进内存**。
+///
+/// 这是 `readBody()` 的替代品，用于大上传（转存文件、边收边算哈希、
+/// 边收边转发）。`readBody()` 会把整个 body 攒进内存，10GB 的上传就是
+/// 10GB 的堆；`bodyStream()` 的内存占用只有 `buffer` 本身。
+///
+/// # 用法
+///
+/// ```zig
+/// var buf: [64 * 1024]u8 = undefined;
+/// const reader = try ctx.bodyStream(&buf);
+/// var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+/// var chunk: [8192]u8 = undefined;
+/// while (true) {
+///     const n = try reader.readSliceShort(&chunk);
+///     if (n == 0) break;
+///     hasher.update(chunk[0..n]);
+/// }
+/// ```
+///
+/// # 契约
+///
+/// - `buffer` 的生命周期必须覆盖整个读取过程（栈数组可以，但别让它先出作用域）。
+/// - 与 `readBody()` 互斥，且自身只能调用一次；违反返回 `error.BodyAlreadyRead`
+///   / `error.BodyIsStreaming`（std 那边是 `assert`，直接崩，所以这里挡在前面）。
+/// - **应当读到 EOF**（`readSliceShort` 返回 0）。没读完不会崩，但 socket 上
+///   会残留本请求的 body 字节，框架只能关掉这条连接（丢掉 keep-alive 复用）
+///   来避免残余字节被当成下一个请求的头部。
+///
+/// 与 `readBody()` 一样会处理 `Expect: 100-continue`。用的是
+/// `readerExpectContinue` 而不是 `readerExpectNone`——后者
+/// `assert(head.expect == null)`，而 curl 上传大文件时默认就会带这个头，
+/// 等于任何人都能用一条 `curl --data-binary @bigfile` 把进程打崩。
+pub fn bodyStream(self: *Self, buffer: []u8) !*std.Io.Reader {
+    if (self.body_read) return error.BodyAlreadyRead;
+    if (self.body_streaming) return error.BodyIsStreaming;
+    self.body_streaming = true;
+    return self.request.readerExpectContinue(buffer);
+}
+
+/// 本请求的 body 是否已从连接上完整消费干净。
+///
+/// 只在 `bodyStream()` 之后才有判断意义：Server 用它决定还能不能复用连接。
+pub fn bodyDrained(self: *const Self) bool {
+    return switch (self.request.server.reader.state) {
+        .ready => true,
+        else => false,
+    };
+}
+
 /// 返回一个 reader，用于增量读取已缓冲的请求体数据。
 ///
 /// 注意：这不是真正的流式读取——它读取的是 `readBody()` 已缓冲到内存的数据，
-/// 因此需要先调用 `readBody()`。真正的流式（边收边处理）当前不支持，
-/// 大文件上传请使用 `multipart` 模块。
+/// 因此需要先调用 `readBody()`。真正的流式（边收边处理）请用 `bodyStream()`。
 pub fn bodyReader(self: *const Self) BodyReader {
     return .{
         .data = self.body_data orelse "",
@@ -351,10 +507,18 @@ pub fn bodyReader(self: *const Self) BodyReader {
 // 用户数据（中间件传递）
 // =========================================================================
 
-/// 设置用户自定义数据（需同时提供销毁函数）
+/// 存入用户自定义数据，按 `data` 的指向类型索引。
 ///
-/// `destroyFn` 负责释放在 data 中持有的所有堆分配资源。
-/// 框架会在 Self.deinit() 时自动调用它。
+/// 槽位是**按类型**的：鉴权中间件存 `*AuthInfo`、会话中间件存 `*SessionData`，
+/// 两者互不覆盖，下游各取各的。同一个类型重复 set 才算覆盖——
+/// 此时旧值的 `destroyFn` 会被立即调用，不会泄漏。
+///
+/// `data` 必须用 `ctx.allocator` 分配：`destroyFn` 收到的正是这个分配器。
+/// （用别的分配器 create、却让框架拿 `ctx.allocator` 去 destroy，
+///   是一个安静到几乎发现不了的错配。）
+///
+/// `destroyFn` 负责释放 data 自身及其持有的所有资源，
+/// 框架在 `Self.deinit()` 时自动调用。
 ///
 /// # 使用示例
 /// ```zig
@@ -363,21 +527,58 @@ pub fn bodyReader(self: *const Self) BodyReader {
 ///     allocator.free(data.name);
 ///     allocator.destroy(data);
 /// }
-/// ctx.setUserData(@ptrCast(my_data), destroyMyData);
+/// const my_data = try ctx.allocator.create(MyData);
+/// my_data.* = .{ .name = try ctx.allocator.dupe(u8, "x") };
+/// try ctx.setUserData(my_data, destroyMyData);
 /// ```
 pub fn setUserData(
     self: *Self,
-    data: *anyopaque,
+    data: anytype,
     destroyFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
-) void {
-    self.user_data = .{ .ptr = data, .destroyFn = destroyFn };
+) !void {
+    const Ptr = @typeInfo(@TypeOf(data));
+    if (Ptr != .pointer or Ptr.pointer.size != .one) {
+        @compileError("setUserData 需要一个单项指针 `*T`，收到的是 " ++ @typeName(@TypeOf(data)));
+    }
+    const T = Ptr.pointer.child;
+    // 拦住旧的 `ctx.setUserData(@ptrCast(p), ...)` 写法：`*anyopaque` 能编过，
+    // 但所有类型都会挤进 "anyopaque" 这一个 key，等于把刚修好的多槽又退化成单槽。
+    if (T == anyopaque) {
+        @compileError("setUserData 不接受 *anyopaque——请直接传 *T，槽位要靠类型来分");
+    }
+    const key = @typeName(T);
+
+    // 同类型已存在 → 就地替换，先把旧值销毁掉
+    var node = self.user_data;
+    while (node) |ud| : (node = ud.next) {
+        if (!mem.eql(u8, ud.key, key)) continue;
+        ud.destroyFn(ud.ptr, self.allocator);
+        ud.ptr = @ptrCast(data);
+        ud.destroyFn = destroyFn;
+        return;
+    }
+
+    const ud = try self.allocator.create(UserData);
+    ud.* = .{
+        .key = key,
+        .ptr = @ptrCast(data),
+        .destroyFn = destroyFn,
+        .next = self.user_data,
+    };
+    self.user_data = ud;
 }
 
-/// 获取用户自定义数据
-/// 调用方需知道具体的类型 T，通过 comptime 参数进行指针转换
+/// 取出此前用 `setUserData` 存入的 `*T`，没有则返回 null。
+///
+/// 按 `@typeName(T)` 精确匹配：取错类型只会得到 null，
+/// 不会像从前那样把别人的指针强转成 T 返回。
 pub fn getUserData(self: *const Self, comptime T: type) ?*T {
-    const data = self.user_data orelse return null;
-    return @ptrCast(@alignCast(data.ptr));
+    const key = @typeName(T);
+    var node = self.user_data;
+    while (node) |ud| : (node = ud.next) {
+        if (mem.eql(u8, ud.key, key)) return @ptrCast(@alignCast(ud.ptr));
+    }
+    return null;
 }
 
 // =========================================================================
@@ -558,9 +759,41 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 // 测试
 // =========================================================================
 
+/// 用户数据测试类型。必须在文件作用域声明：Zig 里两处分别写出的匿名
+/// `struct { value: u32 }` 是**两个不同的类型**，`@typeName` 也不同，
+/// 写在测试函数里会让 set / get 落到不同的槽位上。
+const TestUserData = struct { value: u32 };
+const TestOtherData = struct { name: []const u8 };
+
+/// 测试用的 `http.Server.Request` 载体。
+///
+/// 必须就地初始化：`req.server` 指向同结构里的 `server` 字段，
+/// 按值返回会让这个指针指向已经消失的栈帧。
+const TestRequest = struct {
+    server: std.http.Server,
+    req: std.http.Server.Request,
+
+    fn init(self: *TestRequest, request_bytes: []const u8) !void {
+        self.server = .{
+            .reader = .{ .in = undefined, .state = .received_head, .interface = undefined, .max_head_len = 4096 },
+            .out = undefined,
+        };
+        self.req = .{
+            .server = &self.server,
+            .head = try std.http.Server.Request.Head.parse(request_bytes),
+            .head_buffer = request_bytes,
+        };
+    }
+};
+
 fn testDestroyMyData(ptr: *anyopaque, a: std.mem.Allocator) void {
-    const T = struct { value: u32 };
-    const data: *T = @ptrCast(@alignCast(ptr));
+    const data: *TestUserData = @ptrCast(@alignCast(ptr));
+    a.destroy(data);
+}
+
+fn testDestroyOtherData(ptr: *anyopaque, a: std.mem.Allocator) void {
+    const data: *TestOtherData = @ptrCast(@alignCast(ptr));
+    a.free(data.name);
     a.destroy(data);
 }
 
@@ -1065,15 +1298,70 @@ test "Self.userData - set and get" {
     var ctx = try Self.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
-    const MyData = struct { value: u32 };
-    const my_data = try allocator.create(MyData);
+    const my_data = try allocator.create(TestUserData);
     my_data.* = .{ .value = 42 };
 
-    ctx.setUserData(@ptrCast(my_data), testDestroyMyData);
+    try ctx.setUserData(my_data, testDestroyMyData);
 
-    const retrieved = ctx.getUserData(MyData);
+    const retrieved = ctx.getUserData(TestUserData);
     try std.testing.expect(retrieved != null);
     try std.testing.expectEqual(@as(u32, 42), retrieved.?.value);
+}
+
+test "userData: 两个中间件写入不同类型时互不覆盖" {
+    const allocator = std.testing.allocator;
+    var req_holder: TestRequest = undefined;
+    try req_holder.init("GET /test HTTP/1.1\r\n\r\n");
+    var ctx = try Self.init(allocator, std.testing.io, &req_holder.req);
+    defer ctx.deinit();
+
+    // 中间件 A（比如鉴权）
+    const a = try allocator.create(TestUserData);
+    a.* = .{ .value = 7 };
+    try ctx.setUserData(a, testDestroyMyData);
+
+    // 中间件 B（比如会话）——从前这一步会把 A 的槽位直接盖掉
+    const b = try allocator.create(TestOtherData);
+    b.* = .{ .name = try allocator.dupe(u8, "session-abc") };
+    try ctx.setUserData(b, testDestroyOtherData);
+
+    // 两者都还在，且各自拿到的是自己的类型
+    try std.testing.expectEqual(@as(u32, 7), ctx.getUserData(TestUserData).?.value);
+    try std.testing.expectEqualStrings("session-abc", ctx.getUserData(TestOtherData).?.name);
+    // deinit 会调用两个 destroyFn；漏掉任何一个，testing.allocator 都会报泄漏
+}
+
+test "userData: 取未存入的类型返回 null，而不是别人的指针" {
+    const allocator = std.testing.allocator;
+    var req_holder: TestRequest = undefined;
+    try req_holder.init("GET /test HTTP/1.1\r\n\r\n");
+    var ctx = try Self.init(allocator, std.testing.io, &req_holder.req);
+    defer ctx.deinit();
+
+    const a = try allocator.create(TestUserData);
+    a.* = .{ .value = 1 };
+    try ctx.setUserData(a, testDestroyMyData);
+
+    // 从前这里会把 *TestUserData 强转成 *TestOtherData 返回（类型混淆）
+    try std.testing.expectEqual(@as(?*TestOtherData, null), ctx.getUserData(TestOtherData));
+}
+
+test "userData: 同类型重复写入会销毁旧值而不是泄漏" {
+    const allocator = std.testing.allocator;
+    var req_holder: TestRequest = undefined;
+    try req_holder.init("GET /test HTTP/1.1\r\n\r\n");
+    var ctx = try Self.init(allocator, std.testing.io, &req_holder.req);
+    defer ctx.deinit();
+
+    const first = try allocator.create(TestUserData);
+    first.* = .{ .value = 1 };
+    try ctx.setUserData(first, testDestroyMyData);
+
+    const second = try allocator.create(TestUserData);
+    second.* = .{ .value = 2 };
+    try ctx.setUserData(second, testDestroyMyData); // first 在此被销毁
+
+    try std.testing.expectEqual(@as(u32, 2), ctx.getUserData(TestUserData).?.value);
 }
 
 test "Self.blocked_status - set and get" {
@@ -1160,4 +1448,343 @@ test "Self - content type checks" {
     try std.testing.expect(!ctx.isMultipartForm());
 
     try std.testing.expect(ctx.hasContentType("application/json; charset=utf-8"));
+}
+
+// =========================================================================
+// 请求体读取测试
+//
+// 上面那些测试都用 `.in = undefined` 的假 server，碰不到真正的 body 读取。
+// 下面这个 harness 拿 `std.Io.Reader.fixed` 喂一段完整的请求报文，
+// 走 `Server.receiveHead()` 得到真 Request，body 路径就都能覆盖到了。
+// =========================================================================
+
+/// comptime 重复一段字节串。
+/// （这个 Zig 版本已经没有 `**` 运算符了，`*` `*` 会被当成两个 token 解析。）
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    // 放进容器作用域的 const 才有静态生命周期，可以安全取地址。
+    return &struct {
+        const value = blk: {
+            var buf: [s.len * n]u8 = undefined;
+            for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+            break :blk buf;
+        };
+    }.value;
+}
+
+/// 必须 `var h: BodyHarness = undefined; try h.init(...)` 原地初始化——
+/// `server` 持有 `&self.in` / `&self.out`，harness 不能在 init 后被移动。
+const BodyHarness = struct {
+    in: std.Io.Reader,
+    out: std.Io.Writer,
+    server: http.Server,
+    request: http.Server.Request,
+
+    fn init(self: *BodyHarness, raw_request: []const u8, out_storage: []u8) !void {
+        self.in = .fixed(raw_request);
+        self.out = .fixed(out_storage);
+        self.server = http.Server.init(&self.in, &self.out);
+        self.request = try self.server.receiveHead();
+    }
+};
+
+test "readBody - 读完之后 header 与 path 依然可用" {
+    // 回归测试：`getHeader` 曾经直接调 `request.iterateHeaders()`，
+    // 而后者断言 `reader.state == .received_head`——读过 body 就 assert 崩，
+    // 任何「先读 body 再看鉴权头」的 handler 都能被远程打挂。
+    const allocator = std.testing.allocator;
+    const raw = "POST /upload?a=1 HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "X-Probe: hello-probe\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("hello", try ctx.readBody());
+
+    // 崩溃回归：这一行以前会 assert failure
+    try std.testing.expectEqualStrings("hello-probe", ctx.getHeader("X-Probe").?);
+    try std.testing.expectEqualStrings("/upload", ctx.path);
+    try std.testing.expectEqualStrings("a=1", ctx.query);
+    try std.testing.expectEqualStrings("text/plain", ctx.content_type.?);
+}
+
+test "readBody - 带 body 的请求持有自己的 head 副本" {
+    // std 明确写了 head_buffer「invalidated by any subsequent consumption
+    // of the input stream」。带 body 的请求必须复制，否则 64KiB 的 POST
+    // 之后 ctx.path 会变成 body 的内容（实测过）。
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.head_copy != null);
+    // path 必须落在副本里，而不是还指着连接缓冲区
+    const copy = ctx.head_copy.?;
+    const p = @intFromPtr(ctx.path.ptr);
+    try std.testing.expect(p >= @intFromPtr(copy.ptr) and p < @intFromPtr(copy.ptr) + copy.len);
+}
+
+test "readBody - 无 body 的请求走零拷贝，不复制 head" {
+    const allocator = std.testing.allocator;
+    const raw = "GET /p HTTP/1.1\r\nHost: x\r\nX-Probe: v\r\n\r\n";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.head_copy == null);
+    try std.testing.expectEqualStrings("v", ctx.getHeader("X-Probe").?);
+    try std.testing.expectEqualStrings("", try ctx.readBody());
+}
+
+test "readBody - 超过 body_size_limit 返回 413 并毒化连接" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ repeat("x", 100);
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+    ctx.body_size_limit = 10;
+
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody());
+    // 客户端还在发那 100 字节，我们没读，连接不能复用
+    try std.testing.expect(ctx.poisoned);
+}
+
+test "readBody - 超过 lazy_read_size 报错但不毒化连接" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ repeat("x", 100);
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+    ctx.lazy_read_size = 10;
+
+    try std.testing.expectError(error.BodyTooLargeToBuffer, ctx.readBody());
+    // 关键区别：一个字节都没读，handler 还能改用 bodyStream() 接着处理
+    try std.testing.expect(!ctx.poisoned);
+    try std.testing.expect(!ctx.body_read);
+}
+
+test "readBody - lazy_read_size 之内的请求照常缓冲" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+    ctx.lazy_read_size = 1024;
+
+    try std.testing.expectEqualStrings("hello", try ctx.readBody());
+}
+
+test "bodyStream - 增量读到 EOF，body 不进内存" {
+    const allocator = std.testing.allocator;
+    const payload = repeat("abcdefghij", 10); // 100 字节
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ payload;
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    var stream_buf: [16]u8 = undefined;
+    const reader = try ctx.bodyStream(&stream_buf);
+
+    var total: usize = 0;
+    var chunk: [7]u8 = undefined; // 故意用不整除的粒度
+    while (true) {
+        const n = try reader.readSliceShort(&chunk);
+        if (n == 0) break;
+        try std.testing.expectEqualStrings(payload[total..][0..n], chunk[0..n]);
+        total += n;
+    }
+
+    try std.testing.expectEqual(@as(usize, 100), total);
+    // body 从没被缓冲过
+    try std.testing.expect(ctx.body_data == null);
+    // 读干净了，连接可以复用
+    try std.testing.expect(ctx.bodyDrained());
+}
+
+test "bodyStream - 与 readBody 互斥" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    _ = try ctx.readBody();
+    var stream_buf: [16]u8 = undefined;
+    // std 那边是 assert（直接崩），所以必须在框架层挡住
+    try std.testing.expectError(error.BodyAlreadyRead, ctx.bodyStream(&stream_buf));
+}
+
+test "bodyStream - 开流之后 readBody 被拒绝" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    var stream_buf: [16]u8 = undefined;
+    _ = try ctx.bodyStream(&stream_buf);
+    try std.testing.expectError(error.BodyIsStreaming, ctx.readBody());
+    try std.testing.expectError(error.BodyIsStreaming, ctx.bodyStream(&stream_buf));
+}
+
+test "bodyStream - 没读完时 bodyDrained 为 false" {
+    // Server 靠这个判断决定要不要关连接：socket 上还压着本请求的 body，
+    // 复用的话残余字节会被当成下一个请求的头部。
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ repeat("x", 100);
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    var stream_buf: [16]u8 = undefined;
+    const reader = try ctx.bodyStream(&stream_buf);
+
+    var chunk: [10]u8 = undefined;
+    _ = try reader.readSliceShort(&chunk); // 只读一小段就撒手
+
+    try std.testing.expect(ctx.body_streaming);
+    try std.testing.expect(!ctx.bodyDrained());
+}
+
+test "readBody - Expect: 100-continue 先回 100 再读" {
+    // 崩溃回归：以前用的是 readerExpectNone，它 assert(head.expect == null)。
+    // curl 上传大文件默认就带这个头，一条命令就能把进程打崩。
+    const allocator = std.testing.allocator;
+    const raw = "POST /up HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Expect: 100-continue\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("hello", try ctx.readBody());
+    // 客户端在等这一句才肯发 body
+    try std.testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", h.out.buffered());
+}
+
+test "bodyStream - Expect: 100-continue 同样处理" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /up HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Expect: 100-continue\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    var stream_buf: [64]u8 = undefined;
+    const reader = try ctx.bodyStream(&stream_buf);
+    var chunk: [16]u8 = undefined;
+    const n = try reader.readSliceShort(&chunk);
+
+    try std.testing.expectEqualStrings("hello", chunk[0..n]);
+    try std.testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", h.out.buffered());
+}
+
+test "readBody - 无法满足的 expect 值返回 HttpExpectationFailed" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /up HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Expect: something-else\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    // Server 把它映射成 417 Expectation Failed
+    try std.testing.expectError(error.HttpExpectationFailed, ctx.readBody());
+}
+
+test "bodyStream - chunked 编码也能流式读" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /p HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n" ++
+        "6\r\n world\r\n" ++
+        "0\r\n\r\n";
+
+    var out_storage: [1024]u8 = undefined;
+    var h: BodyHarness = undefined;
+    try h.init(raw, &out_storage);
+
+    var ctx = try Self.init(allocator, std.testing.io, &h.request);
+    defer ctx.deinit();
+
+    var stream_buf: [64]u8 = undefined;
+    const reader = try ctx.bodyStream(&stream_buf);
+
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(allocator);
+    var chunk: [4]u8 = undefined;
+    while (true) {
+        const n = try reader.readSliceShort(&chunk);
+        if (n == 0) break;
+        try acc.appendSlice(allocator, chunk[0..n]);
+    }
+
+    try std.testing.expectEqualStrings("hello world", acc.items);
+    try std.testing.expect(ctx.bodyDrained());
 }

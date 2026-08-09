@@ -20,16 +20,30 @@ const RequestContext = fw.RequestContext;
 const Response = fw.Response;
 const Middleware = fw.Middleware;
 
-/// 创建模拟 HTTP 请求上下文
+/// 模拟请求的后备存储。
+///
+/// `RequestContext` 不复制请求报文：`ctx.path` / header 值 / `ctx.request`
+/// 全都是指向原始字节和 `http.Server.Request` 的指针。所以这两块内存必须
+/// 活得比 ctx 长——由调用方在自己的栈帧上持有本结构，而不是放在
+/// `createMockRequest` 的栈帧里（那样函数一返回 ctx 就全是悬垂指针，
+/// 测试能不能过纯看运气）。
+const MockStorage = struct {
+    head_buf: [4096]u8 = undefined,
+    req: http.Server.Request = undefined,
+};
+
+/// 创建模拟 HTTP 请求上下文。
+///
+/// `storage` 必须在整个 ctx 生命周期内保持有效且不被移动。
 fn createMockRequest(
+    storage: *MockStorage,
     allocator: std.mem.Allocator,
     method: http.Method,
     target: []const u8,
     headers: ?[]const []const u8,
     body: ?[]const u8,
 ) !RequestContext {
-    // 使用栈缓冲区构建原始 HTTP 请求头
-    var buf: [4096]u8 = undefined;
+    const buf = &storage.head_buf;
     var pos: usize = 0;
 
     // 请求行
@@ -58,8 +72,8 @@ fn createMockRequest(
     // 用 Head.parse 解析请求头
     const head = try http.Server.Request.Head.parse(raw_headers);
 
-    // 构建 http.Server.Request
-    var req = http.Server.Request{
+    // 构建 http.Server.Request（存进调用方的 storage，地址才稳定）
+    storage.req = .{
         .server = undefined,
         .head = head,
         .head_buffer = raw_headers,
@@ -67,7 +81,7 @@ fn createMockRequest(
     };
 
     // 初始化 RequestContext
-    var ctx = try RequestContext.init(allocator, std.testing.io, &req);
+    var ctx = try RequestContext.init(allocator, std.testing.io, &storage.req);
 
     // 如果有请求体，手动设置
     if (body) |b| {
@@ -110,7 +124,8 @@ test "integration - router dispatches GET static route to handler" {
     var h = BoolFlag{ .flag = &handled };
     try router.route(.GET, "/hello", Handler.init(BoolFlag, &h));
 
-    var ctx = try createMockRequest(allocator, .GET, "/hello", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/hello", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -129,7 +144,8 @@ test "integration - router returns 404 for unknown route" {
     var nf = BoolFlag{ .flag = &not_found_called };
     router.notFound(Handler.init(BoolFlag, &nf));
 
-    var ctx = try createMockRequest(allocator, .GET, "/unknown", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/unknown", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -164,7 +180,8 @@ test "integration - middleware can block request" {
     var noop = NoopHandler{};
     try router.routeWithMiddleware(.GET, "/blocked", Handler.init(NoopHandler, &noop), &.{mw});
 
-    var ctx = try createMockRequest(allocator, .GET, "/blocked", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/blocked", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -200,7 +217,8 @@ test "integration - middleware passes through with .next" {
     var h = BoolFlag{ .flag = &handler_called };
     try router.routeWithMiddleware(.GET, "/pass", Handler.init(BoolFlag, &h), &.{mw});
 
-    var ctx = try createMockRequest(allocator, .GET, "/pass", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/pass", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -231,7 +249,8 @@ test "integration - middleware can return .err" {
     var h = BoolFlag{ .flag = &handler_called };
     try router.routeWithMiddleware(.GET, "/err", Handler.init(BoolFlag, &h), &.{mw});
 
-    var ctx = try createMockRequest(allocator, .GET, "/err", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/err", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -261,14 +280,16 @@ test "integration - singleton handler preserves state between calls" {
     var counter = Counter{};
     try router.route(.GET, "/count", Handler.init(Counter, &counter));
 
-    var ctx1 = try createMockRequest(allocator, .GET, "/count", null, null);
+    var ctx1_storage: MockStorage = .{};
+    var ctx1 = try createMockRequest(&ctx1_storage, allocator, .GET, "/count", null, null);
     defer ctx1.deinit();
     var res1 = try createMockResponse(allocator, &ctx1);
     defer res1.deinit();
     _ = try router.dispatch(&ctx1, &res1);
     try std.testing.expectEqual(@as(u32, 1), counter.count);
 
-    var ctx2 = try createMockRequest(allocator, .GET, "/count", null, null);
+    var ctx2_storage: MockStorage = .{};
+    var ctx2 = try createMockRequest(&ctx2_storage, allocator, .GET, "/count", null, null);
     defer ctx2.deinit();
     var res2 = try createMockResponse(allocator, &ctx2);
     defer res2.deinit();
@@ -316,7 +337,8 @@ test "integration - per-request handler gets fresh instance each time" {
 
     // 第一次请求
     {
-        var ctx = try createMockRequest(allocator, .GET, "/per-req", null, null);
+        var ctx_storage: MockStorage = .{};
+        var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/per-req", null, null);
         defer ctx.deinit();
         var res = try createMockResponse(allocator, &ctx);
         defer res.deinit();
@@ -325,7 +347,8 @@ test "integration - per-request handler gets fresh instance each time" {
 
     // 第二次请求
     {
-        var ctx = try createMockRequest(allocator, .GET, "/per-req", null, null);
+        var ctx_storage: MockStorage = .{};
+        var ctx = try createMockRequest(&ctx_storage, allocator, .GET, "/per-req", null, null);
         defer ctx.deinit();
         var res = try createMockResponse(allocator, &ctx);
         defer res.deinit();
@@ -351,7 +374,8 @@ test "integration - POST to GET-only route returns 405" {
     var h = BoolFlag{ .flag = &handler_called };
     try router.route(.GET, "/data", Handler.init(BoolFlag, &h));
 
-    var ctx = try createMockRequest(allocator, .POST, "/data", null, null);
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .POST, "/data", null, null);
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();
@@ -364,11 +388,118 @@ test "integration - POST to GET-only route returns 405" {
     var has_allow = false;
     for (res.headers.items) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "Allow")) {
-            try std.testing.expectEqualStrings("GET", hdr.value);
+            // 注册的是 GET，但 HEAD 会自动回落到它，Allow 必须如实列出两个
+            try std.testing.expectEqualStrings("GET, HEAD", hdr.value);
             has_allow = true;
         }
     }
     try std.testing.expect(has_allow);
+}
+
+// ===========================================================================
+// 测试：HEAD 自动回落（RFC 9110 §9.3.2）
+// ===========================================================================
+
+test "integration - HEAD falls back to the GET route" {
+    const allocator = std.testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    var handler_called = false;
+    var h = BoolFlag{ .flag = &handler_called };
+    try router.route(.GET, "/data", Handler.init(BoolFlag, &h));
+
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .HEAD, "/data", null, null);
+    defer ctx.deinit();
+    var res = try createMockResponse(allocator, &ctx);
+    defer res.deinit();
+
+    const dispatched = try router.dispatch(&ctx, &res);
+    try std.testing.expect(dispatched);
+    // GET 的 handler 被复用，而不是 405
+    try std.testing.expect(handler_called);
+    try std.testing.expectEqual(@as(http.Status, .ok), res.status);
+}
+
+test "integration - explicit HEAD route wins over the GET fallback" {
+    const allocator = std.testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    var get_called = false;
+    var head_called = false;
+    var get_h = BoolFlag{ .flag = &get_called };
+    var head_h = BoolFlag{ .flag = &head_called };
+
+    // GET 先注册：如果回落逻辑不先探显式 HEAD，就会错误地命中 GET
+    try router.route(.GET, "/data", Handler.init(BoolFlag, &get_h));
+    try router.route(.HEAD, "/data", Handler.init(BoolFlag, &head_h));
+
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .HEAD, "/data", null, null);
+    defer ctx.deinit();
+    var res = try createMockResponse(allocator, &ctx);
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    try std.testing.expect(head_called);
+    try std.testing.expect(!get_called);
+}
+
+test "integration - HEAD on a POST-only route still returns 405" {
+    const allocator = std.testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    var handler_called = false;
+    var h = BoolFlag{ .flag = &handler_called };
+    try router.route(.POST, "/submit", Handler.init(BoolFlag, &h));
+
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .HEAD, "/submit", null, null);
+    defer ctx.deinit();
+    var res = try createMockResponse(allocator, &ctx);
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    try std.testing.expect(!handler_called);
+    // 回落到 GET 也没有 GET 路由 → 依然 405，且 Allow 里不该出现 HEAD
+    try std.testing.expectEqual(@as(http.Status, .method_not_allowed), res.status);
+    for (res.headers.items) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Allow")) {
+            try std.testing.expectEqualStrings("POST", hdr.value);
+        }
+    }
+}
+
+test "integration - HEAD keeps path params from the GET route" {
+    const allocator = std.testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const ParamCapture = struct {
+        seen: *[]const u8,
+        pub fn handle(self: *@This(), c: *RequestContext, _: *Response) !void {
+            self.seen.* = c.getParam("id") orelse "";
+        }
+    };
+    var seen: []const u8 = "";
+    var h = ParamCapture{ .seen = &seen };
+    try router.route(.GET, "/users/:id", Handler.init(ParamCapture, &h));
+
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .HEAD, "/users/42", null, null);
+    defer ctx.deinit();
+    var res = try createMockResponse(allocator, &ctx);
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    try std.testing.expectEqualStrings("42", seen);
 }
 
 // ===========================================================================
@@ -391,7 +522,8 @@ test "integration - handler can read request body" {
     var h = BodyCapture{ .dest = &body_content };
     try router.route(.POST, "/echo", Handler.init(BodyCapture, &h));
 
-    var ctx = try createMockRequest(allocator, .POST, "/echo", null, "hello-body");
+    var ctx_storage: MockStorage = .{};
+    var ctx = try createMockRequest(&ctx_storage, allocator, .POST, "/echo", null, "hello-body");
     defer ctx.deinit();
     var res = try createMockResponse(allocator, &ctx);
     defer res.deinit();

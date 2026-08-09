@@ -266,16 +266,28 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
         }
     }
 
+    // RFC 9110 §9.3.2：HEAD 与 GET 语义完全相同，只是不返回响应体。
+    // 所以支持 GET 的资源必须同时支持 HEAD，否则 curl -I、健康检查、
+    // 各种爬虫探活都会拿到 405。
+    //
+    // 显式注册的 HEAD 路由优先——这里先探一遍有没有，没有才回落到 GET。
+    // 响应体不用 Router 操心：`std.http` 依据请求方法自动丢弃
+    // （见 `Response.Stream.isEliding`）。
+    const effective_method: http.Method = if (ctx.method == .HEAD and !self.hasRouteFor(.HEAD, ctx.path))
+        .GET
+    else
+        ctx.method;
+
     // 记录 pattern 匹配但 method 不匹配的路由方法（用于 405 的 Allow 头）
     var allowed_methods_buf: [16]http.Method = undefined;
     var allowed_methods_len: usize = 0;
 
     for (self.routes.items) |r| {
         // 第一轮：无分配 dry-run 匹配（不提取路径参数）
-        if (!matchPattern(r.pattern, ctx.path, null, null)) continue;
+        if (!matchPattern(r.pattern, ctx.path, null)) continue;
 
         // pattern 匹配但 method 不匹配 → 记录，继续寻找完整匹配
-        if (r.method != ctx.method) {
+        if (r.method != effective_method) {
             if (allowed_methods_len < allowed_methods_buf.len) {
                 // 去重
                 var dup = false;
@@ -293,8 +305,8 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
             continue;
         }
 
-        // 第二轮：完整匹配（提取路径参数，可能分配内存）
-        if (!matchPattern(r.pattern, ctx.path, self.allocator, ctx)) {
+        // 第二轮：完整匹配（提取路径参数，用 ctx.allocator 分配）
+        if (!matchPattern(r.pattern, ctx.path, ctx)) {
             // dry-run 已成功，这里失败只可能是分配失败
             return error.OutOfMemory;
         }
@@ -308,7 +320,9 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
 
         if (r.param_validator) |validator| {
             if (!validator(ctx)) {
-                freeHashMap(&ctx.path_params, self.allocator);
+                // 用 ctx.allocator 释放：这些 key/value 就是 matchPattern
+                // 刚用它分配出来的
+                freeHashMap(&ctx.path_params, ctx.allocator);
                 ctx.path_params = std.StringHashMapUnmanaged([]const u8).empty;
                 continue;
             }
@@ -375,6 +389,21 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
         });
         _ = res.statusCode(.method_not_allowed);
 
+        // GET 可用就意味着 HEAD 也可用（上面的自动回落），Allow 里必须如实列出，
+        // 否则客户端会以为 HEAD 不被支持
+        if (allowed_methods_len < allowed_methods_buf.len) {
+            var has_get = false;
+            var has_head = false;
+            for (allowed_methods_buf[0..allowed_methods_len]) |m| {
+                if (m == .GET) has_get = true;
+                if (m == .HEAD) has_head = true;
+            }
+            if (has_get and !has_head) {
+                allowed_methods_buf[allowed_methods_len] = .HEAD;
+                allowed_methods_len += 1;
+            }
+        }
+
         // 拼接 Allow 头（如 "GET, POST"）
         var allow_buf: [128]u8 = undefined;
         var fbs = std.Io.Writer.fixed(&allow_buf);
@@ -403,23 +432,38 @@ pub fn dispatch(self: *const Self, ctx: *RequestContext, res: *Response) !bool {
     return false;
 }
 
+/// 是否存在能处理 `method` + `path` 的路由。
+///
+/// 用 dry-run 匹配，不提取路径参数、零分配。仅供 HEAD 自动回落判断"有没有
+/// 显式注册的 HEAD 路由"——显式注册的必须优先于回落到 GET。
+fn hasRouteFor(self: *const Self, method: http.Method, path: []const u8) bool {
+    for (self.routes.items) |r| {
+        if (r.method != method) continue;
+        if (matchPattern(r.pattern, path, null)) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // 路径模式匹配
 // ---------------------------------------------------------------------------
 
 /// 路径模式匹配。
 ///
-/// `allocator`/`ctx` 同时为 null 时是 dry-run 模式：只判断是否匹配，
-/// 不提取路径参数、零堆分配。两者同时非 null 时才会提取参数写入
-/// `ctx.path_params`（key/value 均为自有内存）。
+/// `ctx` 为 null 时是 dry-run 模式：只判断是否匹配，不提取路径参数、
+/// 零堆分配。非 null 时才会提取参数写入 `ctx.path_params`。
+///
+/// 分配器**只能**取自 `ctx.allocator`，不额外接一个参数。
+/// 从前这里是 `matchPattern(pattern, path, allocator, ctx)` 两个独立参数，
+/// 调用方传了 Router 自己的 allocator——而 `ctx.deinit()` 是拿
+/// `ctx.allocator` 去释放这些 key/value 的。两个分配器碰巧相同的时候一切正常，
+/// 一旦 ctx 换成每请求 arena，路径参数就变成了每个请求都漏一份的堆内存。
+/// 把参数去掉之后，这种错配在类型上就写不出来了。
 fn matchPattern(
     pattern: []const u8,
     path: []const u8,
-    allocator: ?std.mem.Allocator,
     ctx: ?*RequestContext,
 ) bool {
-    std.debug.assert((allocator == null) == (ctx == null));
-
     if (pattern.len == 0 and path.len == 0) return true;
 
     // Strip leading/trailing slashes for consistent matching
@@ -438,8 +482,8 @@ fn matchPattern(
                 (clean_path.len == clean_prefix.len or clean_path[clean_prefix.len] == '/'));
 
         if (boundary_ok) {
-            const alloc = allocator orelse return true; // dry-run：匹配成功
-            const c = ctx.?;
+            const c = ctx orelse return true; // dry-run：匹配成功
+            const alloc = c.allocator;
 
             var remaining = clean_path[clean_prefix.len..];
             // Strip leading slash from remaining path for consistency
@@ -486,8 +530,8 @@ fn matchPattern(
     if (path_parts.next() != null) return false;
 
     // dry-run：结构匹配成功，不提取参数
-    const alloc = allocator orelse return true;
-    const c = ctx.?;
+    const c = ctx orelse return true;
+    const alloc = c.allocator;
 
     for (params_buf[0..params_len]) |param| {
         const key_dup = alloc.dupe(u8, param.key) catch return false;
@@ -538,7 +582,7 @@ test "trimSlash" {
 test "matchPattern - static path" {
     const allocator = std.testing.allocator;
     var ctx = RequestContext{
-        .allocator = undefined,
+        .allocator = allocator, // matchPattern 从这里取分配器，不能是 undefined
         .io = undefined,
         .method = .GET,
         .path = "/users",
@@ -558,15 +602,15 @@ test "matchPattern - static path" {
         freeHashMap(&ctx.path_params, allocator);
     }
 
-    try std.testing.expect(matchPattern("users", "/users", allocator, &ctx));
-    try std.testing.expect(!matchPattern("users", "/posts", allocator, &ctx));
-    try std.testing.expect(!matchPattern("users/123", "/users", allocator, &ctx));
+    try std.testing.expect(matchPattern("users", "/users", &ctx));
+    try std.testing.expect(!matchPattern("users", "/posts", &ctx));
+    try std.testing.expect(!matchPattern("users/123", "/users", &ctx));
 }
 
 test "matchPattern - path params" {
     const allocator = std.testing.allocator;
     var ctx = RequestContext{
-        .allocator = undefined,
+        .allocator = allocator, // matchPattern 从这里取分配器，不能是 undefined
         .io = undefined,
         .method = .GET,
         .path = "/users/42",
@@ -586,14 +630,14 @@ test "matchPattern - path params" {
         freeHashMap(&ctx.path_params, allocator);
     }
 
-    try std.testing.expect(matchPattern("users/:id", "/users/42", allocator, &ctx));
+    try std.testing.expect(matchPattern("users/:id", "/users/42", &ctx));
     try std.testing.expectEqualStrings("42", ctx.path_params.get("id").?);
 }
 
 test "matchPattern - wildcard" {
     const allocator = std.testing.allocator;
     var ctx = RequestContext{
-        .allocator = undefined,
+        .allocator = allocator, // matchPattern 从这里取分配器，不能是 undefined
         .io = undefined,
         .method = .GET,
         .path = "/static/js/app.js",
@@ -613,7 +657,7 @@ test "matchPattern - wildcard" {
         freeHashMap(&ctx.path_params, allocator);
     }
 
-    try std.testing.expect(matchPattern("static/*", "/static/js/app.js", allocator, &ctx));
+    try std.testing.expect(matchPattern("static/*", "/static/js/app.js", &ctx));
     try std.testing.expectEqualStrings("js/app.js", ctx.path_params.get("*").?);
 }
 
@@ -621,16 +665,16 @@ test "matchPattern - wildcard respects segment boundary" {
     // dry-run 模式（无分配）足以验证匹配与否
     // `static/*` 只能吃掉 static 段之后的内容，不能匹配同前缀的兄弟路径，
     // 否则 /staticky/secret 会被静态文件处理器接管（目录穿越/信息泄露）。
-    try std.testing.expect(!matchPattern("static/*", "/staticky/secret", null, null));
-    try std.testing.expect(!matchPattern("static/*", "/static-private/x", null, null));
+    try std.testing.expect(!matchPattern("static/*", "/staticky/secret", null));
+    try std.testing.expect(!matchPattern("static/*", "/static-private/x", null));
 
     // 正常场景仍然匹配
-    try std.testing.expect(matchPattern("static/*", "/static/js/app.js", null, null));
-    try std.testing.expect(matchPattern("static/*", "/static", null, null));
-    try std.testing.expect(matchPattern("static/*", "/static/", null, null));
+    try std.testing.expect(matchPattern("static/*", "/static/js/app.js", null));
+    try std.testing.expect(matchPattern("static/*", "/static", null));
+    try std.testing.expect(matchPattern("static/*", "/static/", null));
 
     // 根通配符匹配一切
-    try std.testing.expect(matchPattern("*", "/anything/at/all", null, null));
+    try std.testing.expect(matchPattern("*", "/anything/at/all", null));
 }
 
 test "RouteGroup - basic routing with prefix" {
@@ -705,7 +749,7 @@ test "RouteGroup - shared middlewares are attached" {
 test "matchPattern - trailing slash" {
     const allocator = std.testing.allocator;
     var ctx = RequestContext{
-        .allocator = undefined,
+        .allocator = allocator, // matchPattern 从这里取分配器，不能是 undefined
         .io = undefined,
         .method = .GET,
         .path = "/users/",
@@ -725,8 +769,8 @@ test "matchPattern - trailing slash" {
         freeHashMap(&ctx.path_params, allocator);
     }
 
-    try std.testing.expect(matchPattern("users", "/users/", allocator, &ctx));
-    try std.testing.expect(!matchPattern("users/posts", "/users/", allocator, &ctx));
+    try std.testing.expect(matchPattern("users", "/users/", &ctx));
+    try std.testing.expect(!matchPattern("users/posts", "/users/", &ctx));
 }
 
 // 全局中间件测试用的容器级共享状态（inner fn 无法捕获 test 局部变量）

@@ -29,6 +29,9 @@ pub const MetricsCollector = struct {
     latencies: std.ArrayList(u64),
     /// 标记数据是否已被修改，需要重新排序才能计算百分位数
     sorted: bool = true,
+    /// 最近一次 `server.stats()` 快照（由 `recordServerStats` 写入）。
+    /// 从没记录过时为 null，报告里相应段落整段省略。
+    server_stats: ?core.Server.Stats = null,
     /// 线程安全互斥锁（使用 std.Io.Mutex，需要 io 参数）
     mutex: std.Io.Mutex = .{ .state = .init(.unlocked) },
 
@@ -69,6 +72,23 @@ pub const MetricsCollector = struct {
     /// 取得可注入 `server.setObserver()` 的接口句柄。
     pub fn observer(self: *Self) core.RequestObserver {
         return core.RequestObserver.init(Self, self);
+    }
+
+    /// 记录一次 `server.stats()` 快照，并入 `generateReport` 的输出。
+    ///
+    /// 这是**拉**模型，不是观察者回调：这些计数是服务器的连续状态，
+    /// 不挂在任何单个请求上。典型用法是在后台 Worker 的 tick 里
+    /// 或者 `/metrics` 路由的 handler 里调一次：
+    ///
+    /// ```zig
+    /// metrics.recordServerStats(server.stats());
+    /// ```
+    ///
+    /// 只保留最近一次快照，不做时间序列——序列该由 Prometheus 那一侧攒。
+    pub fn recordServerStats(self: *Self, s: core.Server.Stats) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.server_stats = s;
     }
 
     pub fn connectionOpened(self: *Self) void {
@@ -124,13 +144,44 @@ pub const MetricsCollector = struct {
     pub fn generateReport(self: *Self, buffer: []u8) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return std.fmt.bufPrint(buffer, "requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
+
+        var w = std.Io.Writer.fixed(buffer);
+        try w.print("requests: {d}\nactive_conn: {d}\np50_ns: {d}\np95_ns: {d}\np99_ns: {d}\n", .{
             self.total_requests,
             self.active_connections,
             self.getPercentile(50),
             self.getPercentile(95),
             self.getPercentile(99),
         });
+
+        // 快路径失效计数。三个 0 才是稳态；任何一个持续增长都指向
+        // 一处具体的配置错配（见 core.Server.Stats 的字段注释）。
+        if (self.server_stats) |s| {
+            try w.print(
+                \\srv_total_conn: {d}
+                \\srv_active_req: {d}
+                \\srv_accept_errors: {d}
+                \\srv_inline_fallbacks: {d}
+                \\srv_conn_state_failures: {d}
+                \\pool_hits: {d}
+                \\pool_misses: {d}
+                \\pool_discarded: {d}
+                \\pool_idle: {d}
+                \\
+            , .{
+                s.total_connections,
+                s.active_requests,
+                s.accept_errors,
+                s.inline_fallbacks,
+                s.conn_state_failures,
+                s.pool.pool_hits,
+                s.pool.pool_misses,
+                s.pool.discarded,
+                s.pool.idle,
+            });
+        }
+
+        return w.buffered();
     }
 };
 
@@ -148,6 +199,42 @@ test "MetricsCollector.init initializes with zero counters" {
     try std.testing.expectEqual(@as(u64, 0), collector.total_requests);
     try std.testing.expectEqual(@as(u32, 0), collector.active_connections);
     try std.testing.expectEqual(@as(usize, 0), collector.latencies.items.len);
+}
+
+test "generateReport: 没记录过服务器快照时不输出 srv_/pool_ 段" {
+    const allocator = std.testing.allocator;
+    var collector = MetricsCollector.init(allocator, std.testing.io);
+    defer collector.deinit();
+
+    var buf: [1024]u8 = undefined;
+    const report = try collector.generateReport(&buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, report, "requests: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "pool_hits") == null);
+}
+
+test "generateReport: 服务器快照里的快路径失效计数会出现在报告里" {
+    const allocator = std.testing.allocator;
+    var collector = MetricsCollector.init(allocator, std.testing.io);
+    defer collector.deinit();
+
+    collector.recordServerStats(.{
+        .active_connections = 3,
+        .active_requests = 2,
+        .total_connections = 100,
+        .accept_errors = 1,
+        .inline_fallbacks = 7,
+        .conn_state_failures = 0,
+        .pool = .{ .pool_hits = 90, .pool_misses = 10, .discarded = 4, .idle = 12 },
+    });
+
+    var buf: [1024]u8 = undefined;
+    const report = try collector.generateReport(&buf);
+
+    // 这三个是定位配置错配的关键信号，必须能被抓到
+    try std.testing.expect(std.mem.indexOf(u8, report, "srv_inline_fallbacks: 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "pool_misses: 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "srv_conn_state_failures: 0") != null);
 }
 
 test "MetricsCollector.recordRequest increments counter and stores latency" {

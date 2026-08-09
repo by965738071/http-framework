@@ -41,10 +41,22 @@ const observer_mod = @import("observer.zig");
 const RequestObserver = observer_mod.RequestObserver;
 const RequestInfo = observer_mod.RequestInfo;
 const Worker = @import("worker.zig").Worker;
+const conn_state_mod = @import("conn_state.zig");
+const ConnState = conn_state_mod.ConnState;
+const ConnStatePool = conn_state_mod.ConnStatePool;
+const PoolStats = conn_state_mod.Stats;
 
-/// 每个连接的读/写缓冲区上限（config 可配置更小值，超过此值会被截断）
-const MAX_READ_BUF_SIZE: usize = 64 * 1024;
-const MAX_WRITE_BUF_SIZE: usize = 64 * 1024;
+/// 读/写缓冲区的下限。
+///
+/// 这里只兜底最小值，**不设上限**：缓冲区改成按 config 堆分配之后，
+/// 配多大就真占多大，没有理由再截断用户的意图。
+/// （从前的 64KiB 上限是栈分配时代的产物——栈帧按编译期常量开，
+///   config 调小一个字节都省不下来，只能靠常量封顶。）
+///
+/// 下限仍然必要：`std.http.Server.receiveHead` 要求整个请求头装得进读缓冲，
+/// 缓冲区太小会让所有请求都变成 `HttpHeadersOversize`。
+const MIN_READ_BUF_SIZE: usize = 2 * 1024;
+const MIN_WRITE_BUF_SIZE: usize = 512;
 
 /// 后台 Worker 的 tick 间隔（纳秒）
 const WORKER_TICK_INTERVAL_NS: u64 = 50_000_000; // 50ms
@@ -77,6 +89,22 @@ worker: ?Worker = null,
 
 /// 当前活跃连接数（原子操作，含 keep-alive 空闲等待中的连接）
 active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+/// 累计接受过的连接数
+total_connections: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+/// `accept` 返回错误的次数（不含关服时的取消）
+accept_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+/// 派发不出并发任务、只能在 accept 线程上就地处理连接的次数。
+///
+/// 这个数只要不是 0，就说明 `max_connections` 配得比底层 `Io` 实际能跑的
+/// 并发任务数还高——信号量放行了，但 `Io` 已经没有容量了。
+/// 详见 `acceptLoop` 里的处理。
+inline_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+/// 因内存不足借不到 ConnState 而放弃的连接数
+conn_state_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
 /// 当前正在处理中的请求数（原子操作，优雅关闭的等待对象）。
 ///
@@ -112,6 +140,12 @@ conn_semaphore: std.Io.Semaphore = .{ .permits = 0 },
 /// 关闭时再用 `cancel` 收尾（对已结束的任务是 no-op）。
 conn_group: std.Io.Group = .init,
 
+/// 连接内存池：读缓冲 + 写缓冲 + 每请求 arena。
+///
+/// 每条连接从这里借一套，连接结束时归还。缓冲区因此**跨连接复用**，
+/// 而不是每条连接现开一份（更不是每条连接在栈上开固定 128KiB）。
+conn_pool: ConnStatePool,
+
 const Self = @This();
 pub const Server = Self;
 
@@ -137,9 +171,52 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, router: *R
         .tcp_server = tcp_server,
         .router = router,
         .config = config,
+        .conn_pool = ConnStatePool.init(allocator, .{
+            .read_size = @max(config.read_buffer_size, MIN_READ_BUF_SIZE),
+            .write_size = @max(config.write_buffer_size, MIN_WRITE_BUF_SIZE),
+            .pool_size = config.conn_pool_size,
+        }),
     };
     server.conn_semaphore.permits = config.max_connections;
     return server;
+}
+
+/// 服务器运行时快照。
+///
+/// 这些数字里最值钱的是**快路径什么时候失效**：`pool_misses`、
+/// `inline_fallbacks`、`conn_state_failures` 都是「配置和实际负载对不上」
+/// 的直接证据，而不是内部实现细节。拿它们喂 metrics 比看 QPS 更能定位问题。
+pub const Stats = struct {
+    /// 当前活跃连接数（含 keep-alive 空闲等待中的）
+    active_connections: u32,
+    /// 当前正在处理中的请求数
+    active_requests: u32,
+    /// 累计接受过的连接数
+    total_connections: u64,
+    /// accept 出错次数（不含关服取消）
+    accept_errors: u64,
+    /// 并发容量耗尽、退化为就地处理的次数。
+    /// **非 0 说明 `max_connections` 高于底层 Io 的并发上限。**
+    inline_fallbacks: u64,
+    /// 内存不足借不到 ConnState 而放弃的连接数
+    conn_state_failures: u64,
+    /// 连接内存池计数。`pool_misses` 持续增长说明 `conn_pool_size`
+    /// 低于实际并发（每条溢出连接都要现场堆分配）；`discarded`
+    /// 增长说明峰值已过、池在缩容。稳态下两者都应停止增长。
+    pool: PoolStats,
+};
+
+/// 取运行时快照。可从任意线程调用。
+pub fn stats(self: *Self) Stats {
+    return .{
+        .active_connections = self.active_connections.load(.monotonic),
+        .active_requests = self.active_requests.load(.monotonic),
+        .total_connections = self.total_connections.load(.monotonic),
+        .accept_errors = self.accept_errors.load(.monotonic),
+        .inline_fallbacks = self.inline_fallbacks.load(.monotonic),
+        .conn_state_failures = self.conn_state_failures.load(.monotonic),
+        .pool = self.conn_pool.stats(self.io),
+    };
 }
 
 /// 注入日志实现（如 `observability.FileLogger`）。
@@ -265,24 +342,45 @@ fn acceptLoop(self: *Self) void {
                 break;
             }
             // 其它错误（如 fd 暂时耗尽）→ 记录并继续
+            _ = self.accept_errors.fetchAdd(1, .monotonic);
             self.serverLog(.warn, "Accept error: {}", .{accept_err});
             continue;
         };
 
+        _ = self.total_connections.fetchAdd(1, .monotonic);
+
         // 为每个新 TCP 连接派发一个并发任务。
-        // 许可由 handleConnection 在连接结束时归还；若派发失败则此处归还。
+        // 许可由 handleConnection 在连接结束时归还（无论走哪条路径）。
+        const Dispatch = struct {
+            fn handler(ctx: *Self, sock: net.Stream) void {
+                handleConnection(ctx, sock);
+            }
+        };
         self.conn_group.concurrent(
             self.io,
-            struct {
-                fn handler(ctx: *Self, sock: net.Stream, task_io: std.Io) void {
-                    handleConnection(ctx, sock, task_io);
-                }
-            }.handler,
-            .{ self, stream, self.io },
+            Dispatch.handler,
+            .{ self, stream },
         ) catch |conc_err| {
-            if (self.config.max_connections > 0) self.conn_semaphore.post(self.io);
-            stream.close(self.io);
-            self.serverLog(.warn, "Concurrency limit reached, dropped connection: {}", .{conc_err});
+            // 到这里说明信号量放行了、但底层 Io 已经没有并发容量
+            // ——`max_connections` 配得比 Io 实际能跑的任务数还高。
+            //
+            // 从前这里直接 `stream.close()`：客户端收到一个 RST，
+            // 日志只写一句"并发上限"，请求就这么凭空消失了。这不是背压，
+            // 是丢流量——真正的背压应该让**新连接排队**，而不是把已经
+            // 三次握手完成的连接扔掉。
+            //
+            // 改成 `Group.async`：它不返回错误，派发不出去就在当前线程
+            // 就地执行。代价是这条连接处理完之前 accept 循环不再收新连接，
+            // 内核 backlog 替我们排队——这正是想要的形状。
+            // 单线程 Io 下这也是服务器唯一能工作的路径。
+            _ = self.inline_fallbacks.fetchAdd(1, .monotonic);
+            self.serverLog(
+                .warn,
+                "Io concurrency exhausted ({}), handling connection inline; " ++
+                    "consider lowering max_connections (currently {d}) to match the Io concurrency limit",
+                .{ conc_err, self.config.max_connections },
+            );
+            self.conn_group.async(self.io, Dispatch.handler, .{ self, stream });
         };
     }
 }
@@ -381,7 +479,8 @@ const IdleTimeoutReader = struct {
 };
 
 /// 处理一个完整的 TCP 连接生命周期。
-fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
+fn handleConnection(self: *Self, stream: net.Stream) void {
+    const io = self.io;
     defer stream.close(io);
     // 归还并发连接许可（与 accept 循环的获取配对）
     const release_conn = self.config.max_connections > 0;
@@ -395,16 +494,18 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
     _ = self.active_connections.fetchAdd(1, .monotonic);
     defer _ = self.active_connections.fetchSub(1, .monotonic);
 
-    // 每个连接分配一次读写缓冲区，而不是每个请求。
-    // 缓冲区大小取 config 值，并以编译期上限截断（栈分配）。
-    var read_buf: [MAX_READ_BUF_SIZE]u8 = undefined;
-    var write_buf: [MAX_WRITE_BUF_SIZE]u8 = undefined;
-    const read_size = @min(self.config.read_buffer_size, MAX_READ_BUF_SIZE);
-    const write_size = @min(self.config.write_buffer_size, MAX_WRITE_BUF_SIZE);
+    // 从池里借一套「读缓冲 + 写缓冲 + 每请求 arena」。稳态下这只是摘一个链表节点；
+    // 池空时会现场堆分配（计入 pool_misses），仍然不会卡住 accept。
+    const state = self.conn_pool.acquire(io) catch |err| {
+        _ = self.conn_state_failures.fetchAdd(1, .monotonic);
+        self.serverLog(.warn, "Out of memory allocating connection state: {}", .{err});
+        return;
+    };
+    defer self.conn_pool.release(io, state);
 
     // 空闲超时由读取器自己带 deadline，不能用 SO_RCVTIMEO（见 IdleTimeoutReader）
-    var reader = IdleTimeoutReader.init(stream, io, read_buf[0..read_size], self.config.idle_timeout_ns);
-    var writer = stream.writer(io, write_buf[0..write_size]);
+    var reader = IdleTimeoutReader.init(stream, io, state.read_buf, self.config.idle_timeout_ns);
+    var writer = stream.writer(io, state.write_buf);
 
     var http_server = http.Server.init(&reader.interface, &writer.interface);
 
@@ -438,8 +539,12 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
 
         // --- 步骤 2: 处理单个请求 ---
         _ = self.active_requests.fetchAdd(1, .monotonic);
-        const keep = self.processRequest(io, &http_request, &recoverable_errors);
+        const keep = self.processRequest(io, state, &http_request, &recoverable_errors);
         _ = self.active_requests.fetchSub(1, .monotonic);
+
+        // 一次性回收本请求的全部分配。留一段容量给同一连接上的下个请求，
+        // 否则 keep-alive 的每个请求都要重新向 OS 要内存。
+        state.resetArena(self.config.request_arena_retain_bytes);
 
         if (recoverable_errors >= max_recoverable_errors) {
             self.requestLog("Too many recoverable errors ({d}), closing connection", .{recoverable_errors});
@@ -450,19 +555,31 @@ fn handleConnection(self: *Self, stream: net.Stream, io: std.Io) void {
 }
 
 /// 处理单个 HTTP 请求。返回 true 表示连接可继续复用（keep-alive）。
+///
+/// `state` 提供每请求 arena。ctx / response 的所有分配都走它，
+/// 请求结束后由调用方一次 `resetArena` 回收——单次 `free` 在 arena 上是
+/// no-op，这正是想要的：请求路径上不再有逐块归还的开销。
+///
+/// 因此**不要把 ctx / response 分配的内存存到请求之外**（会话存储、
+/// 后台队列等），它在下一个请求开始前就失效了。跨请求存活的数据请用
+/// 各 addon 自己的 allocator。
 fn processRequest(
     self: *Self,
     io: std.Io,
+    state: *ConnState,
     http_request: *http.Server.Request,
     recoverable_errors: *u32,
 ) bool {
+    const arena = state.allocator();
+
     // --- 初始化请求上下文 ---
-    var ctx = RequestContext.init(self.allocator, io, http_request) catch |ctx_err| {
+    var ctx = RequestContext.init(arena, io, http_request) catch |ctx_err| {
         self.requestLog("[ERROR] RequestContext init failed: {}", .{ctx_err});
         return false;
     };
     defer ctx.deinit();
     ctx.body_size_limit = self.config.body_size_limit;
+    ctx.lazy_read_size = self.config.lazy_read_size;
     ctx.trust_proxy = self.config.trust_proxy_headers;
 
     // 记录请求到达（访问日志，可配置关闭）
@@ -474,7 +591,7 @@ fn processRequest(
     }
 
     // --- 初始化响应构建器 ---
-    var response = Response.init(self.allocator, http_request);
+    var response = Response.init(arena, http_request);
     defer response.deinit();
     response.server_name = self.config.server_name;
     response.accept_encoding = ctx.getHeader("Accept-Encoding");
@@ -491,7 +608,7 @@ fn processRequest(
         });
         self.handleDispatchError(&ctx, &response, dispatch_err);
         recoverable_errors.* += 1;
-        return self.shouldKeepAlive(http_request, &ctx);
+        return self.shouldKeepAlive(http_request, &ctx, &response);
     };
 
     if (!matched) {
@@ -508,6 +625,13 @@ fn processRequest(
         response.text("") catch |send_err| {
             self.requestLog("[RESPONSE] fallback send failed: {}", .{send_err});
         };
+    } else if (response.stream_open) {
+        // handler 开了流但没 end()。响应头已经发出去了，这里补不回来，
+        // 只能记一笔并让 shouldKeepAlive 关掉连接（由 close 给客户端一个了断）。
+        self.requestLog("[RESPONSE] {s} {s} -> stream left open, closing connection", .{
+            @tagName(ctx.method),
+            ctx.path,
+        });
     }
 
     // 记录响应状态（访问日志）
@@ -530,13 +654,24 @@ fn processRequest(
         });
     }
 
-    return self.shouldKeepAlive(http_request, &ctx);
+    return self.shouldKeepAlive(http_request, &ctx, &response);
 }
 
 /// 判定当前请求处理后连接是否可继续复用。
-fn shouldKeepAlive(self: *Self, http_request: *http.Server.Request, ctx: *const RequestContext) bool {
+fn shouldKeepAlive(
+    self: *Self,
+    http_request: *http.Server.Request,
+    ctx: *const RequestContext,
+    response: *const Response,
+) bool {
+    // 流式响应没收尾：chunked 缺结束块 / content-length 没写满，
+    // 报文本身就是残缺的，复用连接只会让下一个请求跟着错位
+    if (response.stream_open) return false;
     // 请求体未完整消费：残余字节会污染下一个请求的解析，必须关闭
     if (ctx.poisoned) return false;
+    // handler 用 bodyStream() 开了流但没读到 EOF：同上，socket 上还压着
+    // 本请求的 body 字节，复用会把它们当成下一个请求的头部
+    if (ctx.body_streaming and !ctx.bodyDrained()) return false;
     // WebSocket 升级后连接已被接管/结束
     if (ctx.is_websocket) return false;
     if (self.shutting_down.load(.monotonic)) return false;
@@ -576,7 +711,8 @@ fn handleDispatchError(self: *Self, ctx: *RequestContext, response: *Response, e
     } else {
         // 默认错误映射：可识别的客户端错误返回对应状态码
         const status: http.Status = switch (err) {
-            error.BodyTooLarge => .payload_too_large,
+            error.BodyTooLarge, error.BodyTooLargeToBuffer => .payload_too_large,
+            error.HttpExpectationFailed => .expectation_failed,
             error.EmptyBody, error.NoContentType => .bad_request,
             error.UnsupportedContentType => .unsupported_media_type,
             else => .internal_server_error,
@@ -603,7 +739,16 @@ fn writeErrorResponse(writer: *std.Io.Writer, status: http.Status, body: []const
 pub fn deinit(self: *Self) void {
     self.serverLog(.info, "Server shutting down", .{});
     self.running.store(false, .monotonic);
+    self.shutting_down.store(true, .monotonic);
     self.closeListener();
+
+    // 必须先收干净连接任务，再销毁内存池：每条在跑的连接都持有一个借出的
+    // ConnState，池先死会让它们对着已释放的缓冲区读写。
+    // `run()` 正常返回时这里是 no-op（Group 的 token 已为 null），
+    // 但 deinit 也可能在没跑过 run() 的路径上被调用（测试、init 后即弃）。
+    self.conn_group.cancel(self.io);
+    self.conn_pool.deinit(self.io);
+
     // 摘掉 Router 持有的日志句柄：它可能指向 self.default_logger，
     // Router 比 Server 活得久时会变成悬垂指针。
     self.router.clearLogger();
@@ -854,6 +999,79 @@ test "graceful shutdown: 空闲 keep-alive 连接不拖慢 drain" {
 
     // 立即返回，而不是耗满 30s 超时
     try std.testing.expect(elapsed < 1_000_000_000);
+}
+
+test "连接池: 按 config 尺寸预分配，缓冲区不再是编译期常量" {
+    const allocator = std.testing.allocator;
+
+    var test_config = Config.defaults();
+    test_config.port = 0;
+    test_config.read_buffer_size = 4096;
+    test_config.write_buffer_size = 1024;
+    test_config.conn_pool_size = 8;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const io = std.testing.io;
+    var server = Self.init(allocator, io, test_config, &router) catch return;
+    defer server.deinit();
+
+    // 预分配到位：稳态并发下 acquire 全部走快路径
+    try std.testing.expectEqual(@as(u32, 8), server.stats().pool.idle);
+
+    // 借出来的缓冲区是 config 说的大小，不是从前那个 64KiB 编译期上限
+    const state = try server.conn_pool.acquire(io);
+    defer server.conn_pool.release(io, state);
+    try std.testing.expectEqual(@as(usize, 4096), state.read_buf.len);
+    try std.testing.expectEqual(@as(usize, 1024), state.write_buf.len);
+}
+
+test "连接池: 过小的 buffer 配置被抬到下限而不是让请求头永远装不下" {
+    const allocator = std.testing.allocator;
+
+    var test_config = Config.defaults();
+    test_config.port = 0;
+    test_config.read_buffer_size = 16; // 荒谬的小值
+    test_config.write_buffer_size = 1;
+    test_config.conn_pool_size = 1;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const io = std.testing.io;
+    var server = Self.init(allocator, io, test_config, &router) catch return;
+    defer server.deinit();
+
+    const state = try server.conn_pool.acquire(io);
+    defer server.conn_pool.release(io, state);
+    try std.testing.expectEqual(MIN_READ_BUF_SIZE, state.read_buf.len);
+    try std.testing.expectEqual(MIN_WRITE_BUF_SIZE, state.write_buf.len);
+}
+
+test "连接池: 并发超过池容量时落空计数可见" {
+    const allocator = std.testing.allocator;
+
+    var test_config = Config.defaults();
+    test_config.port = 0;
+    test_config.conn_pool_size = 1;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const io = std.testing.io;
+    var server = Self.init(allocator, io, test_config, &router) catch return;
+    defer server.deinit();
+
+    const a = try server.conn_pool.acquire(io); // 命中
+    const b = try server.conn_pool.acquire(io); // 池空 → 现场分配
+
+    const s = server.stats().pool;
+    try std.testing.expectEqual(@as(u64, 1), s.pool_hits);
+    try std.testing.expectEqual(@as(u64, 1), s.pool_misses);
+
+    server.conn_pool.release(io, a);
+    server.conn_pool.release(io, b);
 }
 
 test "Server.init: TLS enabled returns TlsNotSupported" {
