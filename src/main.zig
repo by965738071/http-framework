@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     // ── 解析命令行参数（获取静态文件目录）───────────────
 
     var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit(); // Windows/WASI 下迭代器持有内部缓冲，必须释放
     var static_dir: []const u8 = "public"; // 默认值
 
     while (args.next()) |arg| {

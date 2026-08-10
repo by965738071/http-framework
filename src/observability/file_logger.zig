@@ -719,12 +719,10 @@ pub const RotatingFileLogger = struct {
     // =================================================================
 
     fn ensureDir(io: std.Io, path: []const u8) void {
-        const sep = std.fs.path.sep;
-        if (std.mem.lastIndexOfScalar(u8, path, sep)) |idx| {
-            if (idx == 0) return;
-            const dir_path = path[0..idx];
-            std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
-        }
+        // dirname 在 Windows 上同时识别 '/' 和 '\'，直接用 sep 单字符查找会漏掉 "./log/x.log"。
+        const dir_path = std.fs.path.dirname(path) orelse return;
+        if (dir_path.len == 0) return;
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
     }
 };
 
