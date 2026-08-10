@@ -61,10 +61,8 @@ const MIN_WRITE_BUF_SIZE: usize = 512;
 /// 后台 Worker 的 tick 间隔（纳秒）
 const WORKER_TICK_INTERVAL_NS: u64 = 50_000_000; // 50ms
 
-/// run() 主线程轮询停止标志的间隔（纳秒）。
-/// 用轮询而不是 futex/条件变量：置位方可能是信号处理器，那里只允许原子写。
-const SHUTDOWN_POLL_INTERVAL_NS: u64 = 50_000_000; // 50ms
-
+/// run() 不再轮询停止标志：信号处理器/外部调用通过 `std.Io.Event.set`
+/// 做 futex 唤醒，`run()` 用 `Event.wait` 阻塞，无需轮询间隔常量。
 allocator: std.mem.Allocator,
 io: std.Io,
 tcp_server: net.Server,
@@ -125,6 +123,18 @@ running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// tcp_server 是否已被关闭（原子，防止 shutdown + deinit 双重释放）
 server_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+/// 关闭信号事件（futex 原语），代替 run() 里的 sleep 轮询。
+/// 信号处理器 / 外部调用通过 `shutdown()` 做原子置位 + futex 唤醒，
+/// `run()` 用 `Event.wait` 阻塞，不空转、不延迟。
+/// 初始为 `unset`；`set` 是 sticky 的（置位后保持），`run()` 只调用一次，无需 reset。
+shutdown_event: std.Io.Event = .unset,
+
+/// 优雅关闭 drain 用的完成事件（futex 原语），代替原 `drainConnections` 里的
+/// 10ms sleep 轮询。在途请求归零时由连接完成路径 `set`，`drainConnections` 用
+/// `Event.waitTimeout` 阻塞等待（带绝对截止时间）；超时则带剩余请求返回。
+/// `run()` 只调用一次，事件初始 `unset`，不会被提前置位。
+drain_event: std.Io.Event = .unset,
+
 /// 后台 drain 循环的句柄（shutdown 时取消并等待）
 bg_future: ?std.Io.Future(void) = null,
 
@@ -165,18 +175,13 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, router: *R
         .reuse_address = config.reuse_address,
     });
 
-    var server: Self = .{
-        .allocator = allocator,
-        .io = io,
-        .tcp_server = tcp_server,
-        .router = router,
-        .config = config,
-        .conn_pool = ConnStatePool.init(allocator, .{
-            .read_size = @max(config.read_buffer_size, MIN_READ_BUF_SIZE),
-            .write_size = @max(config.write_buffer_size, MIN_WRITE_BUF_SIZE),
-            .pool_size = config.conn_pool_size,
-        }),
-    };
+    const conn_pool = try ConnStatePool.init(allocator, .{
+        .read_size = @max(config.read_buffer_size, MIN_READ_BUF_SIZE),
+        .write_size = @max(config.write_buffer_size, MIN_WRITE_BUF_SIZE),
+        .pool_size = config.conn_pool_size,
+    });
+
+    var server: Self = .{ .allocator = allocator, .io = io, .tcp_server = tcp_server, .router = router, .config = config, .conn_pool = conn_pool };
     server.conn_semaphore.permits = config.max_connections;
     return server;
 }
@@ -250,22 +255,16 @@ pub fn run(self: *Self) !void {
     self.serverLog(.info, "Server listening on {s}:{d}", .{ self.config.address, self.config.port });
 
     // 设置信号处理（优雅关闭）
-    self.setupSignalHandlers() catch |err| {
-        self.serverLog(.warn, "Failed to setup signal handlers: {}", .{err});
-    };
-
+    try self.setupSignalHandlers();
     // 后台工作者：独立 tick 循环，与连接处理解耦。
     // （不挂在每个连接的请求循环上——那样没有请求时任务永远不会执行，
     //   且会阻塞该连接的后续请求。）
     if (self.worker != null) {
-        const future = self.io.concurrent(struct {
+        const future = try self.io.concurrent(struct {
             fn loop(s: *Self) void {
                 s.workerLoop();
             }
-        }.loop, .{self}) catch |err| blk: {
-            self.serverLog(.warn, "Failed to spawn worker loop: {}", .{err});
-            break :blk null;
-        };
+        }.loop, .{self});
         self.bg_future = future;
     }
 
@@ -274,8 +273,8 @@ pub fn run(self: *Self) !void {
     // 它的线程表里（Thread.current == null），对主线程取消是 no-op——
     // accept 会一直阻塞，唤醒不了。
     var accept_future = self.io.concurrent(struct {
-        fn loop(s: *Self) void {
-            s.acceptLoop();
+        fn loop(s: *Self) !void {
+            return s.acceptLoop();
         }
     }.loop, .{self}) catch |err| {
         // 派发失败就没法提供服务了。先收掉已经起来的 worker 循环——
@@ -289,10 +288,10 @@ pub fn run(self: *Self) !void {
         return err;
     };
 
-    // 主线程只等停止信号。
-    while (self.running.load(.monotonic)) {
-        self.io.sleep(std.Io.Duration{ .nanoseconds = SHUTDOWN_POLL_INTERVAL_NS }, .awake) catch break;
-    }
+    // 主线程只等停止信号。用 Event.wait 阻塞在 futex 上，而不是 sleep 轮询：
+    // 信号处理器 / 外部调用通过 shutdown() 做一次原子置位 + futex 唤醒，
+    // 这里立刻返回，不空转、不延迟。wait 是取消点，被打断时直接退出循环。
+    self.shutdown_event.wait(self.io) catch {};
 
     // =========================================================================
     // 优雅关闭：drain 阶段
@@ -302,7 +301,8 @@ pub fn run(self: *Self) !void {
 
     // 唤醒并等待 accept 循环退出。cancel 会持续给工作线程发信号，
     // 直到阻塞中的 accept 返回 error.Canceled 且任务真正结束。
-    accept_future.cancel(self.io);
+    // cancel 返回 accept 任务的错误结果（若其因并发耗尽而返回），关服阶段忽略。
+    accept_future.cancel(self.io) catch {};
 
     self.shutting_down.store(true, .monotonic);
 
@@ -317,14 +317,16 @@ pub fn run(self: *Self) !void {
 
     self.drainConnections();
 
-    // 收尾：drain 超时后仍然挂着的连接在这里被取消，同时释放任务组资源。
+    // 收尾：drain 超时后仍然挂起的连接在这里被取消，同时释放任务组资源。
     // 对已经跑完的连接任务是 no-op。
     self.conn_group.cancel(self.io);
 }
 
 /// accept 循环：接收连接并为每个连接派发处理任务。
 /// 运行在 `io.concurrent` 的工作线程上，靠 `Future.cancel` 唤醒退出。
-fn acceptLoop(self: *Self) void {
+/// 派发失败（`concurrent` 返回错误）即结束本循环并向上返回错误——
+/// 不在此就地执行，也不静默降级。
+fn acceptLoop(self: *Self) !void {
     while (self.running.load(.monotonic)) {
         // 并发连接限流：达到上限时阻塞 accept 线程，新连接由内核 backlog 排队。
         if (self.config.max_connections > 0) {
@@ -373,14 +375,14 @@ fn acceptLoop(self: *Self) void {
             // 就地执行。代价是这条连接处理完之前 accept 循环不再收新连接，
             // 内核 backlog 替我们排队——这正是想要的形状。
             // 单线程 Io 下这也是服务器唯一能工作的路径。
-            _ = self.inline_fallbacks.fetchAdd(1, .monotonic);
             self.serverLog(
                 .warn,
-                "Io concurrency exhausted ({}), handling connection inline; " ++
+                "Io concurrency exhausted ({}), dropping connection; " ++
                     "consider lowering max_connections (currently {d}) to match the Io concurrency limit",
                 .{ conc_err, self.config.max_connections },
             );
-            self.conn_group.async(self.io, Dispatch.handler, .{ self, stream });
+            stream.close(self.io);
+            return conc_err;
         };
     }
 }
@@ -540,7 +542,9 @@ fn handleConnection(self: *Self, stream: net.Stream) void {
         // --- 步骤 2: 处理单个请求 ---
         _ = self.active_requests.fetchAdd(1, .monotonic);
         const keep = self.processRequest(io, state, &http_request, &recoverable_errors);
-        _ = self.active_requests.fetchSub(1, .monotonic);
+        // 请求处理完：递减在途计数，归零时唤醒 drain（sticky 事件，set 一次即可）。
+        const prev = self.active_requests.fetchSub(1, .monotonic);
+        if (prev == 1) self.drain_event.set(io);
 
         // 一次性回收本请求的全部分配。留一段容量给同一连接上的下个请求，
         // 否则 keep-alive 的每个请求都要重新向 OS 要内存。
@@ -740,6 +744,9 @@ pub fn deinit(self: *Self) void {
     self.serverLog(.info, "Server shutting down", .{});
     self.running.store(false, .monotonic);
     self.shutting_down.store(true, .monotonic);
+    // 唤醒可能阻塞在 run() 的 Event.wait 上的主线程（与旧实现里
+    // run 轮询 running 标志的语义一致）。无等待者时 set 是 no-op。
+    self.shutdown_event.set(self.io);
     self.closeListener();
 
     // 必须先收干净连接任务，再销毁内存池：每条在跑的连接都持有一个借出的
@@ -800,16 +807,16 @@ fn setupSignalHandlers(self: *Self) !void {
 
 /// 请求停止服务器。可从任意线程调用，也可从信号处理器调用。
 ///
-/// 这里只做一次原子写，别加任何东西：
-/// - 本函数会在异步信号上下文中执行，只有原子写是 async-signal-safe 的；
-/// - 尤其不能在这里关监听套接字。accept 可能正阻塞在同一个 fd 上，
-///   别的线程 close 它并不会唤醒 accept，只会让它随后拿到 EBADF，
-///   而 std.Io.Threaded 把 EBADF 当作 programmer bug 直接 panic。
+/// 这里只做两件 async-signal-safe 的事，别加任何东西：
+/// - `running.store(false)`：原子写，信号安全；
+/// - `shutdown_event.set`：原子交换 + 裸 futex 唤醒（Threaded 后端是 `__ulock` /
+///   `futex` syscall，不持锁、不分配），同样信号安全。
 ///
-/// 真正的唤醒由 `run()` 里对 accept 任务的 `Future.cancel` 完成，
+/// 真正的 accept 唤醒由 `run()` 里对 accept 任务的 `Future.cancel` 完成，
 /// 监听套接字也在那之后才关闭。
 pub fn shutdown(self: *Self) void {
     self.running.store(false, .monotonic);
+    self.shutdown_event.set(self.io);
 }
 
 /// 等待处理中的请求跑完（或超时）。在 run() 中 accept 循环退出后自动调用。
@@ -817,8 +824,11 @@ pub fn shutdown(self: *Self) void {
 /// 等的是 `active_requests` 而不是 `active_connections`：keep-alive 空闲连接
 /// 阻塞在 receiveHead 上，等它们等于等满空闲超时。这些连接由调用方随后的
 /// `conn_group.cancel` 取消。
+///
+/// 阻塞在 `std.Io.Event`（`drain_event`）上（带绝对截止时间），而不是 10ms sleep
+/// 轮询：在途请求归零时由 `handleConnection` 的完成路径 `set` 唤醒。超时则带着
+/// 剩余在途请求返回，交给随后的 `conn_group.cancel` 收尾。
 pub fn drainConnections(self: *Self) void {
-    const drain_start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
     self.shutting_down.store(true, .monotonic);
 
     const initial = self.active_requests.load(.monotonic);
@@ -827,18 +837,21 @@ pub fn drainConnections(self: *Self) void {
         self.active_connections.load(.monotonic),
     });
 
-    while (self.active_requests.load(.monotonic) > 0) {
-        const elapsed = std.Io.Timestamp.now(self.io, .awake).nanoseconds - drain_start;
-        if (elapsed >= self.drain_timeout_ns) {
-            const remaining = self.active_requests.load(.monotonic);
-            self.serverLog(.warn, "Drain timeout reached after {d}s, {d} requests still in flight", .{
-                @divTrunc(elapsed, 1_000_000_000),
-                remaining,
-            });
-            break;
+    if (initial > 0) {
+        // 一次性绝对截止时间：总等待不超过 drain_timeout_ns（waitTimeout 内部用绝对
+        // 截止时间，反复进入也不会重置计时）。
+        const dur: std.Io.Clock.Duration = .{
+            .raw = std.Io.Duration{ .nanoseconds = self.drain_timeout_ns },
+            .clock = .awake,
+        };
+        const deadline: std.Io.Clock.Timestamp = std.Io.Clock.Timestamp.fromNow(self.io, dur);
+        const timeout: std.Io.Timeout = .{ .deadline = deadline };
+
+        // 阻塞在 drain_event 上直到在途请求归零（完成路径 set 唤醒），或超时。
+        // 完成路径只在计数归零时 set 一次，事件 sticky，不会丢唤醒。
+        while (self.active_requests.load(.monotonic) > 0) {
+            self.drain_event.waitTimeout(self.io, timeout) catch break;
         }
-        // 短暂休眠，避免忙等待（10ms）
-        self.io.sleep(std.Io.Duration{ .nanoseconds = 10_000_000 }, .awake) catch break;
     }
 
     const remaining = self.active_requests.load(.monotonic);

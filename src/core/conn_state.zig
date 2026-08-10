@@ -139,7 +139,7 @@ pub const ConnStatePool = struct {
     ///
     /// 预分配失败不算致命：能分配几个就用几个，剩下的等运行期按需创建。
     /// 启动阶段为了内存不够就拒绝启动，不划算。
-    pub fn init(gpa: std.mem.Allocator, opts: Options) Self {
+    pub fn init(gpa: std.mem.Allocator, opts: Options) !Self {
         var pool: Self = .{
             .gpa = gpa,
             .read_size = opts.read_size,
@@ -149,7 +149,7 @@ pub const ConnStatePool = struct {
 
         var i: u32 = 0;
         while (i < opts.pool_size) : (i += 1) {
-            const state = ConnState.create(gpa, opts.read_size, opts.write_size) catch break;
+            const state = try ConnState.create(gpa, opts.read_size, opts.write_size);
             state.next = pool.free_list;
             pool.free_list = state;
             pool.idle_count += 1;
@@ -232,7 +232,7 @@ test "ConnStatePool: 预分配后 acquire 走快路径" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = ConnStatePool.init(gpa, .{
+    var pool = try ConnStatePool.init(gpa, .{
         .read_size = 1024,
         .write_size = 512,
         .pool_size = 4,
@@ -260,7 +260,7 @@ test "ConnStatePool: 池空时回退到堆分配并计数" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = ConnStatePool.init(gpa, .{
+    var pool = try ConnStatePool.init(gpa, .{
         .read_size = 64,
         .write_size = 64,
         .pool_size = 1,
@@ -286,7 +286,7 @@ test "ConnStatePool: pool_size 为 0 时全部走堆分配" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = ConnStatePool.init(gpa, .{
+    var pool = try ConnStatePool.init(gpa, .{
         .read_size = 32,
         .write_size = 32,
         .pool_size = 0,
@@ -306,7 +306,7 @@ test "ConnState: arena 每请求 reset 后仍可继续分配" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = ConnStatePool.init(gpa, .{
+    var pool = try ConnStatePool.init(gpa, .{
         .read_size = 128,
         .write_size = 128,
         .pool_size = 1,
@@ -331,7 +331,7 @@ test "ConnStatePool: release 会清空上一条连接的 arena 数据" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = ConnStatePool.init(gpa, .{
+    var pool = try ConnStatePool.init(gpa, .{
         .read_size = 64,
         .write_size = 64,
         .pool_size = 1,
