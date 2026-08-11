@@ -355,8 +355,14 @@ fn acceptLoop(self: *Self) !void {
         // 为每个新 TCP 连接派发一个并发任务。
         // 许可由 handleConnection 在连接结束时归还（无论走哪条路径）。
         const Dispatch = struct {
+            // `conn_group` 的任务函数只能是 `void` 或 `error{Canceled}!void`，
+            // 所以这里把 `handleConnection` 的 `!void` 错误在边界收掉：
+            // 连接级错误（如 OOM）直接结束这条连接任务，由关服时的
+            // `conn_group.cancel` 统一回收。
             fn handler(ctx: *Self, sock: net.Stream) void {
-                handleConnection(ctx, sock);
+                handleConnection(ctx, sock) catch |err| {
+                    std.log.err( "server error :{}", .{err});
+                };
             }
         };
         self.conn_group.concurrent(
@@ -404,7 +410,9 @@ fn workerLoop(self: *Self) void {
 // =========================================================================
 
 /// 处理一个完整的 TCP 连接生命周期。
-fn handleConnection(self: *Self, stream: net.Stream) void {
+/// 返回 `!void`：连接级错误（如连接池借不到内存）向上传播，由 `conn_group`
+/// 的任务框架在关服 cancel 时丢弃；正常的连接关闭 / 协议错误已在函数内处理。
+fn handleConnection(self: *Self, stream: net.Stream) !void {
     const io = self.io;
     defer stream.close(io);
     // 归还并发连接许可（与 accept 循环的获取配对）
@@ -421,11 +429,8 @@ fn handleConnection(self: *Self, stream: net.Stream) void {
 
     // 从池里借一套「读缓冲 + 写缓冲 + 每请求 arena」。稳态下这只是摘一个链表节点；
     // 池空时会现场堆分配（计入 pool_misses），仍然不会卡住 accept。
-    const state = self.conn_pool.acquire(io) catch |err| {
-        _ = self.conn_state_failures.fetchAdd(1, .monotonic);
-        self.serverLog(.warn, "Out of memory allocating connection state: {}", .{err});
-        return;
-    };
+    // 借不到（OOM）直接向上传播错误，由任务框架在关服 cancel 时丢弃。
+    const state = try self.conn_pool.acquire(io);
     defer self.conn_pool.release(io, state);
 
     // 用标准库 `net.Reader` 读取 HTTP。它不带空闲超时：
