@@ -107,8 +107,9 @@ conn_state_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 /// 当前正在处理中的请求数（原子操作，优雅关闭的等待对象）。
 ///
 /// 关闭时等的是「请求」而不是「连接」：keep-alive 空闲连接会一直挂在
-/// receiveHead 上直到空闲超时（默认 30s），拿它当等待条件会让 Ctrl+C 卡半分钟。
-/// 空闲连接在 drain 之后由 `conn_group.cancel` 直接取消。
+/// receiveHead 上（当前读取器不带空闲超时，不会自行断开），拿它当等待条件
+/// 会让 Ctrl+C 一直卡到这些连接被取消。空闲连接在 drain 之后由
+/// `conn_group.cancel` 直接取消。
 active_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
 /// 优雅关闭等待超时（纳秒，默认 30 秒）
@@ -274,7 +275,7 @@ pub fn run(self: *Self) !void {
     // accept 会一直阻塞，唤醒不了。
     var accept_future = self.io.concurrent(struct {
         fn loop(s: *Self) !void {
-            return s.acceptLoop();
+            try s.acceptLoop();
         }
     }.loop, .{self}) catch |err| {
         // 派发失败就没法提供服务了。先收掉已经起来的 worker 循环——
@@ -402,84 +403,6 @@ fn workerLoop(self: *Self) void {
 // 连接处理（keep-alive 循环）
 // =========================================================================
 
-/// 带空闲超时的 socket 读取器。
-///
-/// 为什么不用 `SO_RCVTIMEO`：超时后 `read(2)` 返回 `EAGAIN`，而
-/// `std.Io.Threaded.netReadPosix` 把 `EAGAIN` 当成 programmer bug 直接 panic
-/// （它假定 fd 处于「阻塞且无超时」模式）。设了这个 socket 选项，
-/// 只要有连接空闲到期，整个进程就崩。
-///
-/// 改用 `io.operateTimeout`：POSIX 后端是 poll(2) + deadline，不额外起线程，
-/// 而且是取消点——关服时 `Group.cancel` 能把阻塞在这里的连接立刻唤醒。
-const IdleTimeoutReader = struct {
-    io: std.Io,
-    interface: std.Io.Reader,
-    stream: net.Stream,
-    timeout: std.Io.Timeout,
-    /// 具体失败原因。`Io.Reader` 只能回传 `error.ReadFailed`，
-    /// 真实错误存这里，供调用方区分「空闲超时」和「连接出错」。
-    err: ?Error = null,
-
-    const Error = std.Io.Operation.NetRead.Error || std.Io.OperateTimeoutError;
-
-    /// 一次 readv 最多用几个 iovec（与 std.Io.net 内部取值一致）
-    const max_iovecs_len = 8;
-
-    fn init(stream: net.Stream, io: std.Io, buffer: []u8, timeout_ns: u64) IdleTimeoutReader {
-        return .{
-            .io = io,
-            .interface = .{
-                .vtable = &.{ .stream = streamImpl, .readVec = readVec },
-                .buffer = buffer,
-                .seek = 0,
-                .end = 0,
-            },
-            .stream = stream,
-            .timeout = if (timeout_ns == 0)
-                .none
-            else
-                .{ .duration = .{
-                    .raw = std.Io.Duration{ .nanoseconds = @intCast(timeout_ns) },
-                    .clock = .awake,
-                } },
-        };
-    }
-
-    fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const dest = limit.slice(try io_w.writableSliceGreedy(1));
-        var data: [1][]u8 = .{dest};
-        const n = try readVec(io_r, &data);
-        io_w.advance(n);
-        return n;
-    }
-
-    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
-        const r: *IdleTimeoutReader = @alignCast(@fieldParentPtr("interface", io_r));
-        var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
-        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
-        const dest = iovecs_buffer[0..dest_n];
-
-        const result = r.io.operateTimeout(.{ .net_read = .{
-            .socket_handle = r.stream.socket.handle,
-            .data = dest,
-        } }, r.timeout) catch |err| {
-            r.err = err;
-            return error.ReadFailed;
-        };
-        const n = result.net_read catch |err| {
-            r.err = err;
-            return error.ReadFailed;
-        };
-
-        if (n == 0) return error.EndOfStream;
-        if (n > data_size) {
-            r.interface.end += n - data_size;
-            return data_size;
-        }
-        return n;
-    }
-};
-
 /// 处理一个完整的 TCP 连接生命周期。
 fn handleConnection(self: *Self, stream: net.Stream) void {
     const io = self.io;
@@ -505,8 +428,10 @@ fn handleConnection(self: *Self, stream: net.Stream) void {
     };
     defer self.conn_pool.release(io, state);
 
-    // 空闲超时由读取器自己带 deadline，不能用 SO_RCVTIMEO（见 IdleTimeoutReader）
-    var reader = IdleTimeoutReader.init(stream, io, state.read_buf, self.config.idle_timeout_ns);
+    // 用标准库 `net.Reader` 读取 HTTP。它不带空闲超时：
+    // 当前 `std.Io` 后端（含 Windows Threaded）暂不支持带超时的 socket 读，
+    // 空闲 keep-alive 连接靠客户端关闭或关服取消来释放。
+    var reader = stream.reader(io, state.read_buf);
     var writer = stream.writer(io, state.write_buf);
 
     var http_server = http.Server.init(&reader.interface, &writer.interface);
@@ -530,9 +455,9 @@ fn handleConnection(self: *Self, stream: net.Stream) void {
                 break;
             }
             // `error.ReadFailed` 不带原因，真实错误在 reader.err 里。
-            // 空闲超时和关服时的取消都是正常的连接结束，不记为错误。
+            // 关服时的取消（Canceled）是正常的连接结束，不记为错误。
             if (reader.err) |read_err| switch (read_err) {
-                error.Timeout, error.Canceled => break,
+                error.Canceled => break,
                 else => {},
             };
             self.requestLog("[REQUEST] receiveHead error: {}", .{head_err});
@@ -822,8 +747,9 @@ pub fn shutdown(self: *Self) void {
 /// 等待处理中的请求跑完（或超时）。在 run() 中 accept 循环退出后自动调用。
 ///
 /// 等的是 `active_requests` 而不是 `active_connections`：keep-alive 空闲连接
-/// 阻塞在 receiveHead 上，等它们等于等满空闲超时。这些连接由调用方随后的
-/// `conn_group.cancel` 取消。
+/// 会一直挂在 receiveHead 上（当前读取器不带空闲超时，不会自行断开），
+/// 只能由调用方随后的 `conn_group.cancel` 取消。所以不能等 `active_connections`，
+/// 否则会卡到 cancel 才结束。
 ///
 /// 阻塞在 `std.Io.Event`（`drain_event`）上（带绝对截止时间），而不是 10ms sleep
 /// 轮询：在途请求归零时由 `handleConnection` 的完成路径 `set` 唤醒。超时则带着

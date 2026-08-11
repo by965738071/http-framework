@@ -30,9 +30,6 @@ pub const Config = struct {
     /// 是否启用 HTTP keep-alive
     keep_alive_enabled: bool = true,
 
-    /// 连接空闲超时（纳秒），0 表示无超时
-    idle_timeout_ns: u64 = 30_000_000_000, // 30 秒
-
     /// 最大并发连接数（0 表示不限制）。
     /// 达到上限时 accept 循环会阻塞，新连接由内核 backlog 排队，
     /// 形成背压，避免连接洪峰耗尽文件描述符/内存资源。
@@ -133,7 +130,6 @@ test "Config.defaults - returns default values" {
     try std.testing.expectEqual(@as(usize, 16384), config.read_buffer_size);
     try std.testing.expectEqual(@as(usize, 8192), config.write_buffer_size);
     try std.testing.expectEqual(true, config.keep_alive_enabled);
-    try std.testing.expectEqual(@as(u64, 30_000_000_000), config.idle_timeout_ns);
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), config.body_size_limit);
     try std.testing.expectEqual(@as(u32, 10000), config.max_connections);
     try std.testing.expectEqual(@as(u32, 256), config.conn_pool_size);
@@ -162,7 +158,6 @@ test "Config - custom values override defaults" {
     // Unchanged fields should still be defaults
     try std.testing.expectEqual(@as(u31, 4096), config.tcp_backlog);
     try std.testing.expectEqual(true, config.reuse_address);
-    try std.testing.expectEqual(@as(u64, 30_000_000_000), config.idle_timeout_ns);
 }
 
 test "Config - TLS enabled configuration" {
