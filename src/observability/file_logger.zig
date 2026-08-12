@@ -70,6 +70,8 @@ pub const RotatingFileLogger = struct {
     current_day: u8,
     write_buf: ?[]u8,
     write_buf_end: usize,
+    /// UTC 偏移秒数（见 Config.utc_offset_seconds）
+    utc_offset_seconds: i64,
 
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -175,6 +177,9 @@ pub const RotatingFileLogger = struct {
         buf_size: usize = 8192,
         /// 启用异步写入后，log() 立即返回，后台线程负责写磁盘。
         async_enabled: bool = false,
+        /// UTC 偏移秒数，用于把日志时间戳和每日轮转转换为本地时区。
+        /// 东八区填 `8 * 3600`，西五区填 `-5 * 3600`，默认 0 表示 UTC。
+        utc_offset_seconds: i64 = 0,
     };
 
     // =================================================================
@@ -208,6 +213,7 @@ pub const RotatingFileLogger = struct {
             .min_level = config.min_level,
             .buf_size = config.buf_size,
             .async_enabled = config.async_enabled,
+            .utc_offset_seconds = config.utc_offset_seconds,
             .current_file = null,
             .current_size = 0,
             .current_year = 0,
@@ -285,14 +291,11 @@ pub const RotatingFileLogger = struct {
 
         if (self.async_enabled) {
             // 格式化 + 推入队列（后台写盘任务在首次入队时懒启动）
-            const now = std.Io.Timestamp.now(self.io, .real);
-            const secs = now.toSeconds();
-            const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
-            const day_secs = epoch.getDaySeconds();
+            const dt = self.currentDateTime();
 
             const msg = try std.fmt.allocPrint(self.allocator, "[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}][{s}] " ++ format ++ "\n", .{
-                self.current_year,          self.current_month,            self.current_day,
-                day_secs.getHoursIntoDay(), day_secs.getMinutesIntoHour(), day_secs.getSecondsIntoMinute(),
+                dt.date.year,                  dt.date.month,                    dt.date.day,
+                dt.day_secs.getHoursIntoDay(), dt.day_secs.getMinutesIntoHour(), dt.day_secs.getSecondsIntoMinute(),
                 Level.label(level),
             } ++ args);
             self.enqueueAsync(level, msg);
@@ -305,14 +308,11 @@ pub const RotatingFileLogger = struct {
 
         try self.checkRotation();
 
-        const now = std.Io.Timestamp.now(self.io, .real);
-        const secs = now.toSeconds();
-        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
-        const day_secs = epoch.getDaySeconds();
+        const dt = self.currentDateTime();
 
         try self.writeFormatted("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}][{s}] ", .{
-            self.current_year,          self.current_month,            self.current_day,
-            day_secs.getHoursIntoDay(), day_secs.getMinutesIntoHour(), day_secs.getSecondsIntoMinute(),
+            dt.date.year,                  dt.date.month,                    dt.date.day,
+            dt.day_secs.getHoursIntoDay(), dt.day_secs.getMinutesIntoHour(), dt.day_secs.getSecondsIntoMinute(),
             Level.label(level),
         });
         try self.writeFormatted(format ++ "\n", args);
@@ -422,23 +422,28 @@ pub const RotatingFileLogger = struct {
         try self.logStructured(.err, event, fields);
     }
 
-    /// 格式化 UTC ISO-8601 时间戳（如 2026-08-07T12:34:56Z）
+    /// 格式化本地时间 ISO-8601 时间戳（如 2026-08-07T12:34:56+08:00）
     fn formatTimestamp(self: *RotatingFileLogger, buf: *[25]u8) []const u8 {
-        const now = std.Io.Timestamp.now(self.io, .real);
-        const secs = now.toSeconds();
-        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(self.currentEpochSeconds()) };
         const epoch_day = epoch.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
         const day_secs = epoch.getDaySeconds();
 
-        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        const offset_minutes = @divTrunc(self.utc_offset_seconds, 60);
+        const off_hours = @divTrunc(offset_minutes, 60);
+        const off_mins = @rem(@abs(offset_minutes), 60);
+
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}{c}{d:0>2}:{d:0>2}", .{
             year_day.year,
             month_day.month.numeric(),
             @as(u8, month_day.day_index) + 1,
             day_secs.getHoursIntoDay(),
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
+            if (offset_minutes < 0) @as(u8, '-') else @as(u8, '+'),
+            @abs(off_hours),
+            off_mins,
         }) catch unreachable;
     }
 
@@ -513,10 +518,27 @@ pub const RotatingFileLogger = struct {
     // 内部 — 轮转（同步和异步共用）
     // =================================================================
 
-    fn getCurrentDate(self: *const RotatingFileLogger) Date {
+    /// 当前 epoch 秒数，已加上 UTC 偏移（日志时间戳与每日轮转统一按本地时间）。
+    fn currentEpochSeconds(self: *const RotatingFileLogger) i64 {
         const now = std.Io.Timestamp.now(self.io, .real);
-        const secs = now.toSeconds();
-        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+        return now.toSeconds() + self.utc_offset_seconds;
+    }
+
+    /// 当前本地日期 + 当日秒数。日志格式化直接用它，不依赖轮转缓存，
+    /// 否则异步模式下首条日志会打出 0000-00-00。
+    fn currentDateTime(self: *const RotatingFileLogger) struct { date: Date, day_secs: std.time.epoch.DaySeconds } {
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(self.currentEpochSeconds()) };
+        const epoch_day = epoch.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        return .{
+            .date = .{ .year = year_day.year, .month = month_day.month.numeric(), .day = @as(u8, month_day.day_index) + 1 },
+            .day_secs = epoch.getDaySeconds(),
+        };
+    }
+
+    fn getCurrentDate(self: *const RotatingFileLogger) Date {
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(self.currentEpochSeconds()) };
         const epoch_day = epoch.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -923,6 +945,7 @@ test "formatTimestamp produces ISO-8601 UTC" {
         .current_day = 7,
         .write_buf = null,
         .write_buf_end = 0,
+        .utc_offset_seconds = 0,
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .mutex = undefined,
@@ -932,14 +955,46 @@ test "formatTimestamp produces ISO-8601 UTC" {
     var buf: [25]u8 = undefined;
     const ts = logger.formatTimestamp(&buf);
 
-    // ISO-8601 UTC 格式：YYYY-MM-DDTHH:MM:SSZ，长度 20
-    try std.testing.expectEqual(@as(usize, 20), ts.len);
+    // ISO-8601 带偏移格式：YYYY-MM-DDTHH:MM:SS+00:00，长度 25
+    try std.testing.expectEqual(@as(usize, 25), ts.len);
     try std.testing.expectEqual(@as(u8, '-'), ts[4]);
     try std.testing.expectEqual(@as(u8, 'T'), ts[10]);
     try std.testing.expectEqual(@as(u8, ':'), ts[13]);
-    try std.testing.expectEqual(@as(u8, 'Z'), ts[19]);
+    try std.testing.expectEqual(@as(u8, '+'), ts[19]);
     // 不再是旧的占位时间戳
     try std.testing.expect(!std.mem.startsWith(u8, ts, "1970"));
+}
+
+test "formatTimestamp applies UTC offset" {
+    var logger = RotatingFileLogger{
+        .base_path = "test",
+        .max_file_size = 1024,
+        .max_backup_files = 1,
+        .compress_rotated = false,
+        .rotate_daily = false,
+        .min_level = .debug,
+        .buf_size = 0,
+        .async_enabled = false,
+        .current_file = null,
+        .current_size = 0,
+        .current_year = 2026,
+        .current_month = 8,
+        .current_day = 7,
+        .write_buf = null,
+        .write_buf_end = 0,
+        .utc_offset_seconds = 8 * 3600,
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .mutex = undefined,
+        .async_queue = null,
+    };
+
+    var buf: [25]u8 = undefined;
+    const ts = logger.formatTimestamp(&buf);
+
+    // 东八区偏移：末尾为 +08:00
+    try std.testing.expectEqual(@as(usize, 25), ts.len);
+    try std.testing.expectEqualStrings("+08:00", ts[19..25]);
 }
 
 /// 给测试用的临时文件名生成唯一后缀（纳秒时间戳 + 线程 id）。

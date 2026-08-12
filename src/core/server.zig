@@ -361,7 +361,7 @@ fn acceptLoop(self: *Self) !void {
             // `conn_group.cancel` 统一回收。
             fn handler(ctx: *Self, sock: net.Stream) void {
                 handleConnection(ctx, sock) catch |err| {
-                    std.log.err( "server error :{}", .{err});
+                    std.log.err("server error :{}", .{err});
                 };
             }
         };
@@ -497,13 +497,7 @@ fn handleConnection(self: *Self, stream: net.Stream) !void {
 /// 因此**不要把 ctx / response 分配的内存存到请求之外**（会话存储、
 /// 后台队列等），它在下一个请求开始前就失效了。跨请求存活的数据请用
 /// 各 addon 自己的 allocator。
-fn processRequest(
-    self: *Self,
-    io: std.Io,
-    state: *ConnState,
-    http_request: *http.Server.Request,
-    recoverable_errors: *u32,
-) bool {
+fn processRequest(self: *Self, io: std.Io, state: *ConnState, http_request: *http.Server.Request, recoverable_errors: *u32) bool {
     const arena = state.allocator();
 
     // --- 初始化请求上下文 ---

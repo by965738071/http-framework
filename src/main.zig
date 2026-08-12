@@ -126,6 +126,7 @@ pub fn main(init: std.process.Init) !void {
     var file_logger = try FileLogger.init(allocator, io, "./log/zighttp.log", .{
         .async_enabled = true,
         .min_level = .debug,
+        .utc_offset_seconds = 8 * 3600,
     });
     defer file_logger.deinit();
 

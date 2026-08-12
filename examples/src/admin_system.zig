@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 初始化数据库（JSON 文件存储）
     user_store = try UserStore.open(allocator, io, DATA_DIR);
-    
+
     defer user_store.close() catch {};
     product_store = try ProductStore.open(allocator, io, DATA_DIR);
     defer product_store.close() catch {};
