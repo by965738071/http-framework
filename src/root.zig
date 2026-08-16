@@ -1,137 +1,166 @@
-//! `http_framework` — 伞形聚合模块
+//! `http_framework` — 新架构伞形聚合模块
 //!
-//! 一次 `@import("http_framework")` 拿到全部能力，适合快速起步。
+//! 一次 `@import("http_framework")` 拿到全部能力。
 //!
-//! # 想要更小的依赖面？直接依赖子模块
+//! # 新架构 4 层
 //!
-//! 每个子模块都是 build.zig 里独立注册的模块，可以单独 import：
-//!
-//! ```zig
-//! const core = @import("core");           // 只要 HTTP 解析 + 路由 + 请求/响应
-//! const codec = @import("codec");         // 加上 JSON / form 反序列化
-//! const security = @import("security");   // 加上 CORS / 鉴权 / CSRF
+//! ```text
+//! http_protocol   字节 ↔ 报文（Request/Response/ConnectionLoop）
+//! http_app        生命周期 + 管道（Context/Handler/Middleware/AppError/Config/Lifecycle）
+//! http_router     radix trie 路由（Router/Trie）
+//! http_server     组装（Listener/ConnectionRunner/Shutdown/Server）
 //! ```
 //!
-//! # 依赖方向
-//!
-//! `core` 不 import 任何其它模块，这一点由 build.zig 的模块边界强制保证。
-//! 所有 addon 单向依赖 core，反向依赖在编译期就无法通过。
-//!
-//! core 通过 `Logger` / `RequestObserver` / `Worker` 三个接口接纳外部实现，
-//! 横切逻辑（CORS、鉴权、限流）一律走 `router.use()`。
+//! 回应 bug.md §1：core 不再是一个"最小核心"扛 5 层职责。
+//! 回应 bug.md §6：模块图是 DAG，不是星形。
+
+pub const http_protocol = @import("http_protocol");
+pub const http_app = @import("http_app");
+pub const http_router = @import("http_router");
+pub const http_server = @import("http_server");
+pub const http_security = @import("http_security");
+pub const http_session = @import("http_session");
+pub const http_rate_limit = @import("http_rate_limit");
+pub const http_static = @import("http_static");
+pub const http_codec = @import("http_codec");
+pub const http_multipart = @import("http_multipart");
+pub const http_compress = @import("http_compress");
+pub const http_logging = @import("http_logging");
+pub const orm = @import("http_orm");
+pub const http_websocket = @import("http_websocket");
+
+// ── http_protocol ──────────────────────────────────────────────
+pub const Request = http_protocol.Request;
+pub const Response = http_protocol.Response;
+pub const Cookie = http_protocol.Cookie;
+pub const Sink = http_protocol.Sink;
+pub const ConnectionLoop = http_protocol.ConnectionLoop;
+pub const BodyReader = http_protocol.BodyReader;
+
+// ── http_app ──────────────────────────────────────────────────
+pub const Context = http_app.Context;
+pub const RequestState = http_app.RequestState;
+pub const RequestConfig = http_app.RequestConfig;
+pub const Handler = http_app.Handler;
+pub const Middleware = http_app.Middleware;
+pub const Next = http_app.Next;
+pub const DynPipeline = http_app.DynPipeline;
+pub const Pipeline = http_app.Pipeline;
+pub const AppError = http_app.AppError;
+pub const ErrorRenderer = http_app.ErrorRenderer;
+pub const RequestId = http_app.RequestId;
+pub const RequestIdMiddleware = http_app.RequestIdMiddleware;
+pub const REQUEST_ID_HEADER = http_app.REQUEST_ID_HEADER;
+pub const Config = http_app.Config;
+pub const NetworkConfig = http_app.NetworkConfig;
+pub const HttpConfig = http_app.HttpConfig;
+pub const BodyConfig = http_app.BodyConfig;
+pub const PoolConfig = http_app.PoolConfig;
+pub const RuntimeState = http_app.RuntimeState;
+pub const ServerStats = http_app.ServerStats;
+pub const Event = http_app.Event;
+pub const EventData = http_app.EventData;
+pub const Hook = http_app.Hook;
+pub const Lifecycle = http_app.Lifecycle;
+pub const Arenas = http_app.Arenas;
+
+// ── http_router ──────────────────────────────────────────────
+pub const Router = http_router.Router;
+pub const Trie = http_router.Trie;
+
+// ── http_server ──────────────────────────────────────────────
+pub const Server = http_server.Server;
+pub const Listener = http_server.Listener;
+pub const ConnectionRunner = http_server.ConnectionRunner;
+pub const Shutdown = http_server.Shutdown;
+
+// ── http_security ─────────────────────────────────────────────
+pub const CsrfMiddleware = http_security.csrf.CsrfMiddleware;
+pub const CsrfConfig = http_security.csrf.CsrfConfig;
+pub const AuthMiddleware = http_security.auth.AuthMiddleware;
+pub const AuthConfig = http_security.auth.AuthConfig;
+pub const AuthInfo = http_security.auth.AuthInfo;
+pub const AuthStrategy = http_security.auth.AuthStrategy;
+pub const CorsMiddleware = http_security.cors.CorsMiddleware;
+pub const CorsConfig = http_security.cors.CorsConfig;
+pub const SecurityHeaders = http_security.security_headers.SecurityHeaders;
+pub const SecurityHeadersConfig = http_security.security_headers.SecurityHeadersConfig;
+pub const constantTimeEql = http_security.constantTimeEql;
+
+// ── http_session ───────────────────────────────────────────────
+pub const SessionManager = http_session.SessionManager;
+pub const SessionConfig = http_session.SessionConfig;
+pub const SessionData = http_session.SessionData;
+
+// ── http_rate_limit ───────────────────────────────────────────
+pub const RateLimiter = http_rate_limit.RateLimiter;
+pub const RateLimitConfig = http_rate_limit.RateLimitConfig;
+
+// ── http_static ───────────────────────────────────────────────
+pub const StaticFileServer = http_static.StaticFileServer;
+
+// ── http_codec ────────────────────────────────────────────────
+pub const parseJson = http_codec.parseJson;
+pub const JsonBody = http_codec.JsonBody;
+
+// ── http_multipart ───────────────────────────────────────────
+pub const FormData = http_multipart.FormData;
+pub const FileField = http_multipart.FileField;
+pub const multipartFrom = http_multipart.from;
+pub const parseMultipart = http_multipart.parseBody;
+pub const extractBoundary = http_multipart.extractBoundary;
+
+// ── http_compress ─────────────────────────────────────────────
+pub const CompressMiddleware = http_compress.CompressMiddleware;
+pub const CompressConfig = http_compress.CompressConfig;
+pub const CompressEncoding = http_compress.Encoding;
+pub const initStreamingEncoder = http_compress.initStreamingEncoder;
+pub const chooseCompressEncoding = http_compress.chooseEncoding;
+pub const shouldCompressContentType = http_compress.shouldCompressContentType;
+
+// ── http_logging ───────────────────────────────────────────────
+pub const Logger = http_logging.Logger;
+pub const LoggerConfig = http_logging.LoggerConfig;
+pub const FileOutputConfig = http_logging.FileOutputConfig;
+pub const LogLevel = http_logging.Level;
+pub const LogField = http_logging.Field;
+pub const LogValue = http_logging.Value;
+pub const LogFormat = http_logging.Format;
+pub const LogOutput = http_logging.Output;
+pub const LoggingMiddleware = http_logging.LoggingMiddleware;
+pub const LoggingHook = http_logging.LoggingHook;
+pub const fstr = http_logging.fstr;
+pub const fint = http_logging.fint;
+pub const fuint = http_logging.fuint;
+pub const ffloat = http_logging.ffloat;
+pub const fbool = http_logging.fbool;
+pub const fnull = http_logging.fnull;
+
+// ── http_orm ────────────────────────────────────────────────────
+pub const JsonStore = orm.JsonStore;
+pub const Model = orm.Model;
+pub const Query = orm.Query;
+pub const TableSchema = orm.TableSchema;
+pub const FieldDef = orm.FieldDef;
+pub const FieldType = orm.FieldType;
+pub const FieldValue = orm.FieldValue;
+pub const FieldConstraints = orm.FieldConstraints;
+pub const Operator = orm.Operator;
+pub const SortDirection = orm.SortDirection;
+pub const WhereCondition = orm.WhereCondition;
+
+// ── http_websocket ──────────────────────────────────────────────
+pub const WebSocket = http_websocket.WebSocket;
+pub const WsMessage = http_websocket.Message;
+pub const WsFrame = http_websocket.Frame;
+pub const OpCode = http_websocket.OpCode;
+pub const CloseCode = http_websocket.CloseCode;
+pub const wsHandshake = http_websocket.handshake;
+pub const wsComputeAcceptKey = http_websocket.computeAcceptKey;
+pub const wsEncodeFrame = http_websocket.encode;
+pub const wsDecodeFrame = http_websocket.decode;
 
 const std = @import("std");
-
-// ── 子模块（推荐直接依赖需要的那个）────────────────────────────────
-pub const core = @import("core");
-pub const codec = @import("codec");
-pub const multipart = @import("multipart");
-pub const security = @import("security");
-pub const observability = @import("observability");
-pub const background = @import("background");
-pub const session = @import("session");
-pub const static = @import("static");
-pub const rate_limit = @import("rate_limit");
-pub const protocol = @import("protocol");
-pub const policy = @import("policy");
-pub const template = @import("template");
-pub const pool = @import("pool");
-pub const orm = @import("orm");
-
-// ── core：最小 HTTP 服务器 ─────────────────────────────────────────
-pub const Config = core.Config;
-pub const Server = core.Server;
-pub const Router = core.Router;
-pub const RouteGroup = core.RouteGroup;
-pub const RequestContext = core.RequestContext;
-pub const Response = core.Response;
-pub const Handler = core.Handler;
-
-/// 流式响应句柄，由 `res.stream(buffer, .{})` 返回。
-/// 大文件下载 / SSE / 流式 JSON 用它，避免整个响应体进内存。
-pub const ResponseStream = core.ResponseStream;
-pub const StreamOptions = core.StreamOptions;
-
-pub const Middleware = core.Middleware;
-pub const NextAction = core.NextAction;
-
-/// `server.stats()` 的返回类型：连接数、快路径失效计数、内存池计数。
-/// 喂给 `MetricsCollector.recordServerStats()` 或自己渲染成 /metrics。
-pub const ServerStats = core.Server.Stats;
-
-/// core 的三个扩展点接口（由 addon 实现）
-pub const Logger = core.Logger;
-pub const LogLevel = core.LogLevel;
-pub const StdLogger = core.StdLogger;
-pub const RequestObserver = core.RequestObserver;
-pub const RequestInfo = core.RequestInfo;
-pub const Worker = core.Worker;
-
-// ── Security ──────────────────────────────────────────────────────
-pub const AuthMiddleware = security.AuthMiddleware;
-pub const AuthConfig = security.AuthConfig;
-pub const AuthInfo = security.AuthInfo;
-pub const AuthStrategy = security.AuthStrategy;
-pub const CorsMiddleware = security.CorsMiddleware;
-pub const CorsConfig = security.CorsConfig;
-pub const CsrfMiddleware = security.CsrfMiddleware;
-pub const SecurityHeaders = security.SecurityHeaders;
-
-// ── Rate Limiting ─────────────────────────────────────────────────
-pub const RateLimiter = rate_limit.RateLimiter;
-pub const RateLimitConfig = rate_limit.RateLimitConfig;
-pub const TokenBucket = rate_limit.TokenBucket;
-
-// ── Session ───────────────────────────────────────────────────────
-pub const SessionManager = session.SessionManager;
-pub const SessionData = session.SessionData;
-
-// ── Codec ─────────────────────────────────────────────────────────
-/// `codec.bodyAs(T, ctx)` / `codec.queryAs(T, ctx)` —— 以前的 `ctx.bodyAs(T)`
-pub const bodyAs = codec.bodyAs;
-pub const queryAs = codec.queryAs;
-pub const Compression = codec.compression;
-pub const BodySignature = codec.body_signature;
-pub const Validation = codec.validation;
-
-// ── Multipart ─────────────────────────────────────────────────────
-/// `multipart.from(ctx)` —— 以前的 `ctx.getMultipart()`
-pub const MultipartParser = multipart.Parser;
-
-// ── Protocol ──────────────────────────────────────────────────────
-pub const WebSocketManager = protocol.WebSocketManager;
-pub const WsEchoHandler = protocol.WsEchoHandler;
-
-// ── Static / Template ─────────────────────────────────────────────
-pub const Static = static;
-pub const Template = template.Template;
-
-// ── Observability ─────────────────────────────────────────────────
-/// 实现 `core.Logger`：`server.setLogger(file_logger.logger())`
-pub const FileLogger = observability.FileLogger;
-/// 实现 `core.RequestObserver`：`server.setObserver(metrics.observer())`
-pub const MetricsCollector = observability.MetricsCollector;
-pub const OpenApi = observability.openapi;
-
-// ── Policy ────────────────────────────────────────────────────────
-pub const CspBuilder = policy.CspBuilder;
-pub const SRIHash = policy.SRIHash;
-
-// ── Background ────────────────────────────────────────────────────
-/// 实现 `core.Worker`：`server.setWorker(bg.worker())`
-pub const BackgroundQueue = background.BackgroundQueue;
-
-// ── Pool ──────────────────────────────────────────────────────────
-/// **出站**连接池：给数据库/HTTP 客户端复用长连接用的通用容器。
-///
-/// 和 Server 内部的 `core.ConnStatePool` 是两回事，别搞混：
-/// 后者池化的是「入站连接的读写缓冲 + 每请求 arena」，由 accept 循环
-/// 自动使用，不需要也不应该由调用方管。
-pub const ConnectionPool = pool;
-
-// ── Test ──────────────────────────────────────────────────────────
-pub const IntegrationTest = @import("test/integration_test.zig");
-
 test {
     std.testing.refAllDecls(@This());
 }

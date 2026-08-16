@@ -1,0 +1,142 @@
+//! http_codec — 请求体编解码（依赖 http_app, http_protocol）
+//!
+//! 提供请求体的高级解析能力：
+//! - `parseJson(T, allocator, bytes)`：把 JSON 字节解析成 typed struct
+//! - `JsonBody(T)`：中间件，预解析 JSON body 到 ctx user_data 槽
+//!
+//! 设计原则：
+//! - 不在 http_protocol 层引入 std.json 依赖（protocol 层零依赖）
+//! - 解析结果存入 arena，请求结束自动回收——不调 parsed.deinit()
+//!   （arena allocator 的 free 是 no-op，arena reset 时全部回收）
+
+const std = @import("std");
+const http_app = @import("http_app");
+const http_protocol = @import("http_protocol");
+
+pub const Request = http_protocol.Request;
+pub const Context = http_app.Context;
+pub const AppError = http_app.AppError;
+pub const Response = http_protocol.Response;
+pub const Next = http_app.Next;
+
+/// 从字节切片解析 JSON，返回 arena 分配的 *T。
+///
+/// 用 arena allocator 时不调 parsed.deinit()——arena reset 回收全部。
+/// 返回的 *T 以及其中所有切片都由 allocator 管理。
+pub fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T {
+    const parsed = try std.json.parseFromSlice(T, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    // parsed 的内部分配在 allocator 上。用 arena allocator 时不 deinit，
+    // arena reset 时全部回收。parsed.value 里的切片指向 arena 内存。
+    const result = try allocator.create(T);
+    result.* = parsed.value;
+    return result;
+}
+
+/// JSON Body 中间件：预解析 application/json 请求体为 typed struct，
+/// 存入 `ctx.user_data` 槽。handler 用 `ctx.getUserData(T)` 取出。
+///
+/// 用法：
+/// ```zig
+/// const LoginReq = struct { username: []const u8, password: []const u8 };
+/// var mw = JsonBody(LoginReq).init(1 << 20); // 1MB limit
+/// router.use(Middleware.init(JsonBody(LoginReq), &mw));
+/// ```
+pub fn JsonBody(comptime T: type) type {
+    return struct {
+        limit: u64,
+
+        const Self = @This();
+
+        pub fn init(limit: u64) Self {
+            return .{ .limit = limit };
+        }
+
+        pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
+            const ct = ctx.request.content_type orelse {
+                return next.call(ctx, res);
+            };
+            // 只处理 application/json
+            if (!std.mem.startsWith(u8, ct, "application/json")) {
+                return next.call(ctx, res);
+            }
+            // 只处理有 body 的请求
+            switch (ctx.request.body) {
+                .none => return next.call(ctx, res),
+                else => {},
+            }
+
+            const body = ctx.readBody(ctx.arena, self.limit) catch |err| {
+                if (err == error.BodyTooLarge) {
+                    _ = res.statusCode(.payload_too_large);
+                    try res.text("request body too large");
+                    return;
+                }
+                return err;
+            };
+            if (body.len == 0) return next.call(ctx, res);
+
+            const parsed = parseJson(T, ctx.arena, body) catch {
+                _ = res.statusCode(.bad_request);
+                try res.text("invalid JSON body");
+                return;
+            };
+
+            try ctx.setUserData(T, parsed);
+            return next.call(ctx, res);
+        }
+    };
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "parseJson parses struct from slice" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const Point = struct { x: i32, y: i32 };
+    const p = try parseJson(Point, arena.allocator(), "{\"x\":1,\"y\":2}");
+    try std.testing.expectEqual(@as(i32, 1), p.x);
+    try std.testing.expectEqual(@as(i32, 2), p.y);
+}
+
+test "parseJson handles string fields" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const User = struct { name: []const u8, age: u8 };
+    const u = try parseJson(User, arena.allocator(), "{\"name\":\"alice\",\"age\":30}");
+    try std.testing.expectEqualStrings("alice", u.name);
+    try std.testing.expectEqual(@as(u8, 30), u.age);
+}
+
+test "parseJson ignores unknown fields" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const S = struct { keep: u32 };
+    const s = try parseJson(S, arena.allocator(), "{\"keep\":1,\"extra\":2}");
+    try std.testing.expectEqual(@as(u32, 1), s.keep);
+}
+
+test "parseJson rejects malformed JSON" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const S = struct { x: u32 };
+    // Malformed JSON should produce a parse error
+    _ = parseJson(S, arena.allocator(), "not json") catch return;
+    try std.testing.expect(false); // should have returned above
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

@@ -1,6 +1,0 @@
-[
-  {"id": 1, "name": "机械键盘", "category": "外设", "price": 399, "stock": 120, "description": "RGB 背光青轴机械键盘", "created_at": 0, "updated_at": 0},
-  {"id": 2, "name": "人体工学椅", "category": "家具", "price": 1299, "stock": 40, "description": "可调节腰托办公椅", "created_at": 0, "updated_at": 0},
-  {"id": 3, "name": "4K 显示器", "category": "外设", "price": 1899, "stock": 65, "description": "27 英寸 IPS 显示器", "created_at": 0, "updated_at": 0},
-  {"id": 5, "name": "测试商品", "category": "测试", "price": 9.9, "stock": 3, "description": "冒烟测试", "created_at": 0, "updated_at": 0}
-]

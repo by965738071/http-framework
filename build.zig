@@ -1,94 +1,223 @@
 const std = @import("std");
 
-/// 模块依赖图（由 Zig 的模块系统在编译期强制，不是文档约定）
+/// 新架构模块依赖图（DAG，不是星形）
 ///
-///     core  ← codec, multipart, security, observability, background,
-///             session, static, rate_limit, protocol
-///     (无依赖) policy, template, pool, orm
+///     http_protocol  (零依赖)
+///     http_app       → http_protocol
+///     http_router    → http_app, http_protocol
+///     http_server    → http_router, http_app, http_protocol
 ///
-///     http_framework  → 以上全部（伞形聚合，方便一把梭）
+///     Addons（依赖 http_app / http_protocol，可互相依赖）：
+///       http_security / http_session / http_rate_limit / http_compress /
+///       http_static / http_logging / http_codec / http_multipart / http_orm
 ///
-/// `core` 的 imports 列表是空的。任何人往 core 里 `@import("session")`
-/// 之类的都会直接编译失败——这就是这次重构真正想要的东西：
-/// 依赖方向由构建系统保证，而不是靠自觉。
+///     http_framework  → 以上全部（伞形聚合）
+///
+/// 回应 bug.md §1：core 不再是一个"最小核心"捷 5 层职责。
+/// 回应 bug.md §6：addon 可以互相依赖（DAG），不再是星形。
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── core：最小 HTTP 服务器，零依赖 ────────────────────────────
-    const core = b.addModule("core", .{
-        .root_source_file = b.path("src/core/root.zig"),
+    // ── 新架构：4 层模块 ──────────────────────────────────────
+
+    // Layer 1: http_protocol — 字节 ↔ 报文（零依赖）
+    const http_protocol = b.addModule("http_protocol", .{
+        .root_source_file = b.path("src/http_protocol/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // ── 依赖 core 的 addon ────────────────────────────────────────
-    const AddonSpec = struct { name: []const u8, path: []const u8 };
-    const core_addons = [_]AddonSpec{
-        .{ .name = "codec", .path = "src/codec/root.zig" },
-        .{ .name = "multipart", .path = "src/multipart/multipart.zig" },
-        .{ .name = "security", .path = "src/security/root.zig" },
-        .{ .name = "observability", .path = "src/observability/root.zig" },
-        .{ .name = "background", .path = "src/background/background.zig" },
-        .{ .name = "session", .path = "src/session/session.zig" },
-        .{ .name = "static", .path = "src/static/static.zig" },
-        .{ .name = "rate_limit", .path = "src/rate_limit/root.zig" },
-        .{ .name = "protocol", .path = "src/protocol/root.zig" },
-    };
+    // Layer 2: http_app — 生命周期 + 管道（依赖 http_protocol）
+    const http_app = b.addModule("http_app", .{
+        .root_source_file = b.path("src/http_app/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+        },
+    });
 
-    // ── 不依赖 core 的独立工具模块 ────────────────────────────────
-    const standalone = [_]AddonSpec{
-        .{ .name = "policy", .path = "src/policy/root.zig" },
-        .{ .name = "template", .path = "src/template/root.zig" },
-        .{ .name = "pool", .path = "src/pool/connection_pool.zig" },
-        .{ .name = "orm", .path = "src/orm/root.zig" },
-    };
+    // Layer 3: http_router — radix trie 路由（依赖 http_app, http_protocol）
+    const http_router = b.addModule("http_router", .{
+        .root_source_file = b.path("src/http_router/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
 
-    // 伞形模块的 imports 列表边建边攒
-    var umbrella_imports: std.ArrayList(std.Build.Module.Import) = .empty;
-    defer umbrella_imports.deinit(b.allocator);
-    umbrella_imports.append(b.allocator, .{ .name = "core", .module = core }) catch @panic("OOM");
+    // Layer 4: http_server — 组装（依赖 http_router, http_app, http_protocol）
+    const http_server = b.addModule("http_server", .{
+        .root_source_file = b.path("src/http_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+            .{ .name = "http_router", .module = http_router },
+        },
+    });
 
-    for (core_addons) |spec| {
-        const m = b.addModule(spec.name, .{
-            .root_source_file = b.path(spec.path),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "core", .module = core }},
-        });
-        umbrella_imports.append(b.allocator, .{ .name = spec.name, .module = m }) catch @panic("OOM");
-    }
+    // Addon: http_security — CSRF/Auth/CORS/安全头（依赖 http_app, http_protocol）
+    const http_security = b.addModule("http_security", .{
+        .root_source_file = b.path("src/http_security/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
 
-    for (standalone) |spec| {
-        const m = b.addModule(spec.name, .{
-            .root_source_file = b.path(spec.path),
-            .target = target,
-            .optimize = optimize,
-        });
-        umbrella_imports.append(b.allocator, .{ .name = spec.name, .module = m }) catch @panic("OOM");
-    }
+    // Addon: http_session — 会话管理（依赖 http_app, http_protocol）
+    const http_session = b.addModule("http_session", .{
+        .root_source_file = b.path("src/http_session/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
 
-    // ── 测试 ──────────────────────────────────────────────────────
-    // 每个模块单独编译并测试。
-    //
-    // 这不只是为了跑用例：**编译本身就是依赖方向的回归测试**。
-    // `core` 的测试目标只包含 core 模块，一旦有人往 core 里
-    // `@import("session")` 之类的，这一步会直接编译失败。
+    // Addon: http_rate_limit — 速率限制（依赖 http_app, http_protocol）
+    const http_rate_limit = b.addModule("http_rate_limit", .{
+        .root_source_file = b.path("src/http_rate_limit/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // Addon: http_compress — 响应压缩（依赖 http_app, http_protocol）
+    const http_compress = b.addModule("http_compress", .{
+        .root_source_file = b.path("src/http_compress/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // Addon: http_static — 静态文件服务（依赖 http_app, http_protocol, http_compress）
+    const http_static = b.addModule("http_static", .{
+        .root_source_file = b.path("src/http_static/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+            .{ .name = "http_compress", .module = http_compress },
+        },
+    });
+
+    // Addon: http_logging — 结构化日志（依赖 http_app, http_protocol）
+    const http_logging = b.addModule("http_logging", .{
+        .root_source_file = b.path("src/http_logging/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // Addon: http_codec — JSON body 解析（依赖 http_app, http_protocol）
+    const http_codec = b.addModule("http_codec", .{
+        .root_source_file = b.path("src/http_codec/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // Addon: http_multipart — multipart/form-data 解析（依赖 http_app, http_protocol）
+    const http_multipart = b.addModule("http_multipart", .{
+        .root_source_file = b.path("src/http_multipart/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // Addon: http_orm — JSON 文件存储 ORM（零外部依赖，作为独立 addon 挂在伞形模块下）
+    const http_orm = b.addModule("http_orm", .{
+        .root_source_file = b.path("src/http_orm/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Addon: http_websocket — WebSocket (RFC 6455) 握手 + 帧编解码 + 连接 API
+    // （依赖 http_app 的 Context、http_protocol 的 Response；帧编解码独立于二者）
+    const http_websocket = b.addModule("http_websocket", .{
+        .root_source_file = b.path("src/http_websocket/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
+    // ── 测试 ──────────────────────────────────────────────────
     const test_step = b.step("test", "Run tests");
-    for (umbrella_imports.items) |imp| {
-        const t = b.addTest(.{ .root_module = imp.module });
+
+    for ([_]*std.Build.Module{
+        http_protocol,
+        http_app,
+        http_router,
+        http_server,
+        http_security,
+        http_session,
+        http_rate_limit,
+        http_static,
+        http_codec,
+        http_multipart,
+        http_compress,
+        http_logging,
+        http_orm,
+        http_websocket,
+    }) |mod| {
+        const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // ── http_framework：伞形聚合模块 ──────────────────────────────
+    // ── http_framework：伞形聚合模块 ──────────────────────────
+    const umbrella_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "http_protocol", .module = http_protocol },
+        .{ .name = "http_app", .module = http_app },
+        .{ .name = "http_router", .module = http_router },
+        .{ .name = "http_server", .module = http_server },
+        .{ .name = "http_security", .module = http_security },
+        .{ .name = "http_session", .module = http_session },
+        .{ .name = "http_rate_limit", .module = http_rate_limit },
+        .{ .name = "http_static", .module = http_static },
+        .{ .name = "http_codec", .module = http_codec },
+        .{ .name = "http_multipart", .module = http_multipart },
+        .{ .name = "http_compress", .module = http_compress },
+        .{ .name = "http_logging", .module = http_logging },
+        .{ .name = "http_orm", .module = http_orm },
+        .{ .name = "http_websocket", .module = http_websocket },
+    };
+
     const mod = b.addModule("http_framework", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = umbrella_imports.items,
+        .imports = umbrella_imports,
     });
 
-    // ── 可执行示例 ────────────────────────────────────────────────
+    // ── 可执行入口 ─────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "http_framework",
         .root_module = b.createModule(.{
@@ -108,7 +237,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // 伞形模块（含 src/test 集成测试）与可执行入口
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
 }

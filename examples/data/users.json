@@ -1,5 +1,0 @@
-[
-  {"id": 1, "username": "admin", "email": "admin@example.com", "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9", "full_name": "系统管理员", "role": "admin", "is_active": true, "created_at": 0, "updated_at": 0},
-  {"id": 2, "username": "alice", "email": "alice@example.com", "password_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446", "full_name": "Alice Wang", "role": "user", "is_active": true, "created_at": 0, "updated_at": 0},
-  {"id": 3, "username": "bob", "email": "bob@example.com", "password_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446", "full_name": "Bob Li", "role": "moderator", "is_active": true, "created_at": 0, "updated_at": 0}
-]

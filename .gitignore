@@ -6,3 +6,13 @@ zig-out
 /log
 .test_data/
 .test_model_store_data/
+*.log
+*.png
+zig-out/*
+data/*
+zig-cache/*
+zig-out/
+bug.md
+fix.md
+REDESIGN.md
+STATUS.md

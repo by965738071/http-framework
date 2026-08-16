@@ -1,0 +1,344 @@
+//! Session 管理 addon — 迁移到新架构
+//!
+//! 基于 Cookie 的内存 Session 存储。
+//!
+//! 修复 bug.md Part 2 P0/P1：
+//! - P0：线程不安全 — 加 std.Io.Mutex 保护 sessions map
+//! - P1：setData 内存泄漏（重复 key 时旧 key/value 未释放）— 用 getOrPut + free old
+//! - P1：deleteSession 内存泄漏（data map 的 key/value 未释放）— 遍历释放所有 data
+
+const std = @import("std");
+const http_app = @import("http_app");
+const http_protocol = @import("http_protocol");
+
+const Context = http_app.Context;
+const Response = http_protocol.Response;
+
+/// Session 数据（键值对存储）
+pub const SessionData = std.StringHashMap([]const u8);
+
+/// Session 记录
+const SessionRecord = struct {
+    id: []const u8,
+    data: SessionData,
+    expires: i96, // 过期时间（纳秒，i96 匹配 Timestamp.nanoseconds）
+    created: i96,
+};
+
+pub const SessionConfig = struct {
+    cookie_name: []const u8 = "session_id",
+    session_timeout_sec: u32 = 3600,
+    cleanup_interval_sec: u32 = 300,
+};
+
+pub const SessionManager = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: SessionConfig,
+    sessions: std.StringHashMap(SessionRecord),
+    mutex: std.Io.Mutex = .init,
+    last_cleanup: i96 = 0,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: SessionConfig) Self {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .sessions = std.StringHashMap(SessionRecord).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        // 释放所有 session 记录的 key/value
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var record = entry.value_ptr.*;
+            self.freeSessionData(&record.data);
+            self.allocator.free(record.id);
+        }
+        self.sessions.deinit();
+    }
+
+    /// 获取或创建 Session（线程安全）
+    pub fn getOrCreate(self: *Self, ctx: *Context, res: *Response) ![]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        // 1. 尝试从 Cookie 获取 session_id
+        if (ctx.request.getCookie(self.config.cookie_name)) |session_id| {
+            if (self.sessions.getPtr(session_id)) |record| {
+                const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+                if (now < record.expires) {
+                    // 滑动窗口：更新过期时间
+                    record.expires = now + @as(i96, self.config.session_timeout_sec) * 1_000_000_000;
+                    return session_id;
+                } else {
+                    // 过期，删除
+                    self.deleteSessionLocked(session_id);
+                }
+            }
+        }
+
+        // 2. 创建新 Session
+        return try self.createSessionLocked(res);
+    }
+
+    fn createSessionLocked(self: *Self, res: *Response) ![]const u8 {
+        var random_bytes: [32]u8 = undefined;
+        try std.Io.randomSecure(self.io, &random_bytes);
+
+        const session_id = try std.fmt.allocPrint(self.allocator, "sess{X}", .{&random_bytes});
+        errdefer self.allocator.free(session_id);
+
+        const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const record = SessionRecord{
+            .id = try self.allocator.dupe(u8, session_id),
+            .data = SessionData.init(self.allocator),
+            .expires = now_ns + @as(i96, self.config.session_timeout_sec) * 1_000_000_000,
+            .created = now_ns,
+        };
+        try self.sessions.put(session_id, record);
+
+        _ = try res.setCookieFull(.{
+            .name = self.config.cookie_name,
+            .value = session_id,
+            .http_only = true,
+            .same_site = "Lax",
+        });
+
+        self.maybeCleanupLocked();
+        return session_id;
+    }
+
+    /// 获取 Session 数据（线程安全）
+    pub fn getData(self: *Self, session_id: []const u8) ?SessionData {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.sessions.getPtr(session_id)) |record| {
+            const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+            if (now < record.expires) {
+                return record.data;
+            }
+        }
+        return null;
+    }
+
+    /// 设置 Session 数据（线程安全）
+    /// 修复 P1：重复 key 时释放旧的 key/value，不再泄漏。
+    pub fn setData(self: *Self, session_id: []const u8, key: []const u8, value: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const record = self.sessions.getPtr(session_id) orelse {
+            std.log.warn("Session.setData: session not found: {s}", .{session_id});
+            return;
+        };
+
+        // 修复 P1：用 getOrPut 检查重复 key
+        const gop = try record.data.getOrPut(key);
+        if (gop.found_existing) {
+            // 重复 key：释放旧 key 和旧 value
+            self.allocator.free(gop.key_ptr.*);
+            self.allocator.free(gop.value_ptr.*);
+            gop.key_ptr.* = key; // 将被覆盖
+            gop.value_ptr.* = value; // 将被覆盖
+        }
+
+        // 复制新的 key 和 value（确保所有权独立）
+        const key_dup = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_dup);
+        const val_dup = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(val_dup);
+
+        if (gop.found_existing) {
+            // getOrPut 已经占位，现在替换为我们复制的版本
+            gop.key_ptr.* = key_dup;
+            gop.value_ptr.* = val_dup;
+        } else {
+            // 新增条目
+            gop.key_ptr.* = key_dup;
+            gop.value_ptr.* = val_dup;
+        }
+    }
+
+    /// 删除 Session（线程安全）
+    fn deleteSessionLocked(self: *Self, session_id: []const u8) void {
+        if (self.sessions.fetchRemove(session_id)) |kv| {
+            // fetchRemove 返回 KV 的按值拷贝，捕获 kv 是 const——需要先拷到
+            // 可变局部变量才能拿 *SessionData（与 deinit 里同一模式）。
+            var record = kv.value;
+            // 修复 P1：释放 data map 中的所有 key/value
+            self.freeSessionData(&record.data);
+            self.allocator.free(record.id);
+            // sessions map 的 key 已经在 fetchRemove 时移交了所有权
+            self.allocator.free(kv.key);
+        }
+    }
+
+    /// 释放 SessionData 中所有 key/value（修复 P1）
+    fn freeSessionData(self: *Self, data: *SessionData) void {
+        var it = data.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        data.deinit();
+    }
+
+    fn maybeCleanupLocked(self: *Self) void {
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const interval_ns = @as(i96, self.config.cleanup_interval_sec) * 1_000_000_000;
+        if (now - self.last_cleanup < interval_ns) return;
+        self.last_cleanup = now;
+        self.cleanupExpiredLocked();
+    }
+
+    fn cleanupExpiredLocked(self: *Self) void {
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        var to_remove = std.ArrayList([]const u8).empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (now >= entry.value_ptr.*.expires) {
+                const key_dup = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, key_dup) catch {
+                    self.allocator.free(key_dup);
+                    continue;
+                };
+            }
+        }
+
+        for (to_remove.items) |key| {
+            self.deleteSessionLocked(key);
+            self.allocator.free(key);
+        }
+    }
+
+    pub const Stats = struct {
+        total: u32,
+        active: u32,
+        expired: u32,
+    };
+
+    pub fn getStats(self: *Self) Stats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        var stats = Stats{ .total = 0, .active = 0, .expired = 0 };
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            stats.total += 1;
+            if (now < entry.value_ptr.*.expires) {
+                stats.active += 1;
+            } else {
+                stats.expired += 1;
+            }
+        }
+        return stats;
+    }
+};
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "SessionManager.init creates empty manager" {
+    var sm = SessionManager.init(std.testing.allocator, std.testing.io, .{});
+    defer sm.deinit();
+    try std.testing.expect(sm.sessions.count() == 0);
+}
+
+test "SessionManager.setData/getData round trip" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io, .{});
+    defer sm.deinit();
+
+    // 手动插入一条 session（绕过 createSessionLocked 避免设置 cookie）
+    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const id_dup = try allocator.dupe(u8, "test_session");
+    const record = SessionRecord{
+        .id = try allocator.dupe(u8, "test_session"),
+        .data = SessionData.init(allocator),
+        .expires = now + @as(i96, 3600) * 1_000_000_000,
+        .created = now,
+    };
+    try sm.sessions.put(id_dup, record);
+
+    try sm.setData("test_session", "username", "alice");
+    try sm.setData("test_session", "role", "admin");
+
+    const data = sm.getData("test_session") orelse @panic("data should exist");
+    try std.testing.expectEqualStrings("alice", data.get("username").?);
+    try std.testing.expectEqualStrings("admin", data.get("role").?);
+}
+
+test "SessionManager.setData overwrites without leak" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io, .{});
+    defer sm.deinit();
+
+    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const id_dup = try allocator.dupe(u8, "overwrite_test");
+    const record = SessionRecord{
+        .id = try allocator.dupe(u8, "overwrite_test"),
+        .data = SessionData.init(allocator),
+        .expires = now + @as(i96, 3600) * 1_000_000_000,
+        .created = now,
+    };
+    try sm.sessions.put(id_dup, record);
+
+    // 第一次设置
+    try sm.setData("overwrite_test", "key", "value1");
+    // 覆盖（旧 key/value 应被释放——不泄漏）
+    try sm.setData("overwrite_test", "key", "value2");
+
+    const data = sm.getData("overwrite_test") orelse @panic("data should exist");
+    try std.testing.expectEqualStrings("value2", data.get("key").?);
+}
+
+test "SessionManager.setData on non-existent session does not crash" {
+    var sm = SessionManager.init(std.testing.allocator, std.testing.io, .{});
+    defer sm.deinit();
+    try sm.setData("non_existent", "key", "value");
+}
+
+test "SessionManager.getStats with sessions" {
+    const allocator = std.testing.allocator;
+    var sm = SessionManager.init(allocator, std.testing.io, .{});
+    defer sm.deinit();
+
+    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+
+    // Active
+    const id1 = try allocator.dupe(u8, "active_1");
+    try sm.sessions.put(id1, .{
+        .id = try allocator.dupe(u8, "active_1"),
+        .data = SessionData.init(allocator),
+        .expires = now + @as(i96, 3600) * 1_000_000_000,
+        .created = now,
+    });
+
+    // Expired
+    const id2 = try allocator.dupe(u8, "expired_1");
+    try sm.sessions.put(id2, .{
+        .id = try allocator.dupe(u8, "expired_1"),
+        .data = SessionData.init(allocator),
+        .expires = now - @as(i96, 3600) * 1_000_000_000,
+        .created = now - @as(i96, 7200) * 1_000_000_000,
+    });
+
+    const stats = sm.getStats();
+    try std.testing.expectEqual(@as(u32, 2), stats.total);
+    try std.testing.expectEqual(@as(u32, 1), stats.active);
+    try std.testing.expectEqual(@as(u32, 1), stats.expired);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

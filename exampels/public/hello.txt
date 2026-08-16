@@ -1,0 +1,2 @@
+Hello from http_framework static file server!
+This file is served at /static/hello.txt

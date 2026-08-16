@@ -308,7 +308,7 @@ try router.route(.GET, "/static/*", http_framework.Handler.init(http_framework.S
 基于 JSON 文件持久化，使用编译期反射自动推导表结构：
 
 ```zig
-const orm = @import("orm");
+const orm = @import("http_framework").orm; // 或 @import("http_orm")
 
 const User = struct {
     id: u64 = 0,
