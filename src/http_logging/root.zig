@@ -47,9 +47,9 @@ pub const Middleware = http_app.Middleware;
 pub const Next = http_app.Next;
 pub const RequestId = http_app.RequestId;
 
-// C FFI — Zig 0.17 移除了 std.posix.write，直接用 extern "c"
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn time(tloc: ?*c_long) c_long;
+/// 跨平台实现，不依赖 libc：
+/// - 写 stderr/stdout 走 std.Io.File（std.Io 自带各平台后端）。
+/// - 时间戳用 std.Io.Timestamp.realtime（Unix epoch 纳秒）。
 
 /// 日志级别（有序：debug < info < warn < err < fatal）
 pub const Level = enum(u3) {
@@ -179,8 +179,6 @@ const MAX_LOG_LINE = 8192;
 ///   写入与轮转。
 pub const Logger = struct {
     config: LoggerConfig,
-    /// stderr/stdout 模式下使用的 fd（文件模式忽略）
-    fd: c_int,
     io: std.Io,
     allocator: std.mem.Allocator,
     /// 文件模式写路径串行化（防止轮转与写入并发竞争）
@@ -195,11 +193,6 @@ pub const Logger = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: LoggerConfig) !Logger {
         var self = Logger{
             .config = config,
-            .fd = switch (config.output) {
-                .stderr => 2,
-                .stdout => 1,
-                .file => undefined,
-            },
             .io = io,
             .allocator = allocator,
             .file = .{ .handle = undefined, .flags = .{ .nonblocking = false } },
@@ -212,7 +205,6 @@ pub const Logger = struct {
             self.owned_path = try allocator.dupe(u8, fc.path);
             self.openLogFile() catch {
                 // 打开失败则退回 stderr，避免日志静默丢失
-                self.fd = 2;
                 self.config.output = .stderr;
             };
         }
@@ -237,7 +229,10 @@ pub const Logger = struct {
             if (dir.len > 0) cwd.createDirPath(self.io, dir) catch {};
         }
         self.file = try cwd.createFile(self.io, path, .{ .truncate = false });
-        const st = self.file.stat(self.io) catch {
+        // 用路径 stat 而非已打开的写句柄 stat：Windows 上以写模式打开的
+        // 句柄缺少 FILE_READ_ATTRIBUTES，NtQueryInformationFile 会返回
+        // AccessDenied，导致读不到真实文件大小。
+        const st = cwd.statFile(self.io, path, .{}) catch {
             self.file_offset = 0;
             return;
         };
@@ -251,9 +246,11 @@ pub const Logger = struct {
         var buf: [MAX_LOG_LINE]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buf);
 
+        const ts: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+
         switch (self.config.format) {
-            .json => formatJson(&writer, level, ctx, msg, fields) catch return,
-            .text => formatText(&writer, level, ctx, msg, fields) catch return,
+            .json => formatJson(&writer, ts, level, ctx, msg, fields) catch return,
+            .text => formatText(&writer, ts, level, ctx, msg, fields) catch return,
         }
 
         const written = writer.buffered();
@@ -261,17 +258,25 @@ pub const Logger = struct {
 
         switch (self.config.output) {
             .stderr, .stdout => {
-                _ = write(self.fd, written.ptr, written.len);
+                const out_file = if (self.config.output == .stderr)
+                    std.Io.File.stderr()
+                else
+                    std.Io.File.stdout();
+                out_file.writeStreamingAll(self.io, written) catch {};
             },
             .file => {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
-                // 每次写入前以 fstat 实时校准偏移：若文件被外部进程
-                // 截断/改写，直接追加到真实 EOF，避免陈旧偏移 pwrite
-                // 在文件中间留下 NUL 空洞（Mac 会因此把日志判为二进制）。
-                if (self.file.stat(self.io)) |st| {
-                    self.file_offset = st.size;
-                } else |_| {}
+                // 每次写入前以 stat 实时校准偏移：若文件被外部进程截断/改写，
+                // 直接追加到真实 EOF，避免陈旧偏移 pwrite 在文件中间留下
+                // NUL 空洞（Mac 会因此把日志判为二进制）。
+                // 用路径 stat（而非已打开的写句柄）：Windows 上写句柄缺
+                // FILE_READ_ATTRIBUTES，直连句柄 stat 会返回 AccessDenied。
+                if (self.owned_path) |p| {
+                    if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
+                        self.file_offset = st.size;
+                    } else |_| {}
+                }
                 self.file.writePositionalAll(self.io, written, self.file_offset) catch return;
                 self.file_offset += written.len;
                 self.rotateIfNeeded();
@@ -376,7 +381,6 @@ pub const Logger = struct {
     /// 轮转后重开新的日志文件；失败则退回 stderr。
     fn reopen(self: *Logger) void {
         self.openLogFile() catch {
-            self.fd = 2;
             self.config.output = .stderr;
         };
     }
@@ -400,10 +404,9 @@ pub const Logger = struct {
 
 // ── 格式化 ─────────────────────────────────────────────────────
 
-fn formatJson(writer: *std.Io.Writer, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
+fn formatJson(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
     try writer.writeAll("{");
 
-    const ts = time(null);
     try writer.print("\"ts\":{d}", .{ts});
 
     try writer.print(",\"level\":\"{s}\"", .{level.name()});
@@ -432,8 +435,7 @@ fn formatJson(writer: *std.Io.Writer, level: Level, ctx: ?*const Context, msg: [
     try writer.writeAll("}\n");
 }
 
-fn formatText(writer: *std.Io.Writer, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
-    const ts = time(null);
+fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
     try writer.print("{d} {s} {s}", .{ ts, level.name(), msg });
 
     if (ctx) |c| {
@@ -619,7 +621,7 @@ test "formatJson produces valid JSON" {
         fint("count", 42),
         fbool("ok", true),
     };
-    try formatJson(&writer, .info, null, "test message", &fields);
+    try formatJson(&writer, 1234567890, .info, null, "test message", &fields);
     const out = writer.buffered();
 
     // 验证 JSON 结构
@@ -640,7 +642,7 @@ test "formatText produces readable output" {
         fstr("user", "alice"),
         fint("count", 42),
     };
-    try formatText(&writer, .warn, null, "warning msg", &fields);
+    try formatText(&writer, 1234567890, .warn, null, "warning msg", &fields);
     const out = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "WARN") != null);
@@ -904,7 +906,7 @@ test "formatJson includes request context when ctx provided" {
 
     var buf: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
-    try formatJson(&writer, .info, &ctx, "login attempt", &.{});
+    try formatJson(&writer, 1234567890, .info, &ctx, "login attempt", &.{});
     const out = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\"rid\":\"abcdef0123456789abcdef0123456789\"") != null);

@@ -14,6 +14,7 @@
 //!   ——形成自然的背压。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const http_app = @import("http_app");
 const http_router = @import("http_router");
@@ -22,9 +23,8 @@ const ConnectionRunner = @import("connection.zig").ConnectionRunner;
 const connectionTask = @import("connection.zig").connectionTask;
 const Shutdown = @import("shutdown.zig").Shutdown;
 
-/// libc close——async-signal-safe，用于从信号处理器关闭监听 fd。
-/// std.posix.close 在 Zig 0.17 不存在，直接 extern。
-extern "c" fn close(fd: std.c.fd_t) c_int;
+/// Windows 没有 POSIX 信号（posix.Sigaction 是桩），信号处理逻辑整体跳过。
+const is_windows = builtin.target.os.tag == .windows;
 
 pub const Server = struct {
     io: std.Io,
@@ -54,13 +54,16 @@ pub const Server = struct {
         if (global_instance) |s| {
             s.shutdown.begin();
             // 唤醒可能阻塞在 accept() 的运行循环：close fd 让 accept 返回。
-            _ = close(s.listener.tcp_server.socket.handle);
+            // 用 std.Io 关闭监听 socket（跨平台，无需 libc）。
+            s.listener.tcp_server.socket.close(s.io);
         }
     }
 
     /// 注册为全局实例，并安装 SIGINT/SIGTERM 处理器。
     /// 必须在 run() 之前调用。
+    /// Windows 上无 POSIX 信号，函数直接返回（Ctrl+C 由进程终止处理）。
     pub fn installSignalHandlers(self: *Server) void {
+        if (comptime is_windows) return;
         global_instance = self;
         const act: posix.Sigaction = .{
             .handler = .{ .handler = signalHandler },

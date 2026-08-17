@@ -10,12 +10,28 @@
 //! 不负责 TCP accept（Listener）、信号（Shutdown）、组装（Server）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = std.http;
 const net = std.Io.net;
 const posix = std.posix;
+const windows = std.os.windows;
 const http_protocol = @import("http_protocol");
 const http_app = @import("http_app");
 const http_router = @import("http_router");
+
+/// winsock socket 选项常量（ws2_32.zig 只定义了 timeval，未导出这些）。
+const SOL_SOCKET: c_int = 0xffff;
+const SO_RCVTIMEO: c_int = 4102;
+const SO_SNDTIMEO: c_int = 4101;
+
+/// winsock 的 setsockopt（std 未导出，需自行声明；需在 Windows 链接 ws2_32）。
+extern "ws2_32" fn setsockopt(
+    s: usize,
+    level: c_int,
+    optname: c_int,
+    optval: ?*const anyopaque,
+    optlen: c_int,
+) c_int;
 
 pub const ConnectionRunner = struct {
     stream: net.Stream,
@@ -60,19 +76,35 @@ pub const ConnectionRunner = struct {
 
     /// 设置 SO_RCVTIMEO / SO_SNDTIMEO（fix.md §二.6：防慢攻击）。
     /// 阻塞 read/write 超时后返回错误，conn_loop.next() catch 到后 break。
-    /// 非 macOS/Linux 平台静默跳过（setsockopt 失败不致命）。
+    /// 调用方（run）通过 idle 超时兜底，所以这里 setsockopt 失败不致命。
+    ///
+    /// POSIX 用 std.posix.setsockopt；Windows 的 std.posix.setsockopt 已被
+    /// 移除（"use std.Io instead"），改用 winsock 的 setsockopt，二者语义
+    /// 等价：都用毫秒级超时让阻塞 recv/send 超时。
     fn applySocketTimeouts(self: *ConnectionRunner) void {
-        const fd = self.stream.socket.handle;
-        const read_tv = posix.timeval{
-            .sec = @intCast(self.config.network.read_timeout_ns / 1_000_000_000),
-            .usec = @intCast((self.config.network.read_timeout_ns % 1_000_000_000) / 1_000),
-        };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&read_tv)) catch {};
-        const write_tv = posix.timeval{
-            .sec = @intCast(self.config.network.write_timeout_ns / 1_000_000_000),
-            .usec = @intCast((self.config.network.write_timeout_ns % 1_000_000_000) / 1_000),
-        };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&write_tv)) catch {};
+        const rcv_ns = self.config.network.read_timeout_ns;
+        const snd_ns = self.config.network.write_timeout_ns;
+
+        if (comptime builtin.target.os.tag == .windows) {
+            // winsock 的 SO_RCVTIMEO/SO_SNDTIMEO 接受毫秒 DWORD。
+            var rcv_ms: c_ulong = @intCast(@divTrunc(rcv_ns, 1_000_000));
+            var snd_ms: c_ulong = @intCast(@divTrunc(snd_ns, 1_000_000));
+            const sock: usize = @intFromPtr(self.stream.socket.handle);
+            _ = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_ms, @intCast(@sizeOf(@TypeOf(rcv_ms))));
+            _ = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_ms, @intCast(@sizeOf(@TypeOf(snd_ms))));
+        } else {
+            const fd = self.stream.socket.handle;
+            const read_tv = posix.timeval{
+                .sec = @intCast(rcv_ns / 1_000_000_000),
+                .usec = @intCast((rcv_ns % 1_000_000_000) / 1_000),
+            };
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&read_tv)) catch {};
+            const write_tv = posix.timeval{
+                .sec = @intCast(snd_ns / 1_000_000_000),
+                .usec = @intCast((snd_ns % 1_000_000_000) / 1_000),
+            };
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&write_tv)) catch {};
+        }
     }
 
     pub fn run(self: *ConnectionRunner) void {

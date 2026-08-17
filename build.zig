@@ -19,6 +19,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Windows 上 connection.zig 通过 winsock 的 setsockopt 设置 socket 超时，
+    // 需要显式链接 ws2_32（std.Io.net 走 IOCP，不会自动拉入该库）。
+    const is_windows = target.result.os.tag == .windows;
+
     // ── 新架构：4 层模块 ──────────────────────────────────────
 
     // Layer 1: http_protocol — 字节 ↔ 报文（零依赖）
@@ -60,6 +64,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "http_router", .module = http_router },
         },
     });
+
+    // Windows 上 connection.zig 通过 winsock 的 setsockopt 设置 socket 超时，
+    // 需要链接 ws2_32（std.Io.net 走 IOCP，不会自动拉入该库）。模块级声明会
+    // 传播到所有依赖 http_server 的产物（exe / 测试）。
+    if (is_windows) http_server.linkSystemLibrary("ws2_32", .{});
 
     // Addon: http_security — CSRF/Auth/CORS/安全头（依赖 http_app, http_protocol）
     const http_security = b.addModule("http_security", .{
@@ -126,6 +135,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "http_protocol", .module = http_protocol },
             .{ .name = "http_app", .module = http_app },
         },
+        .link_libc = true,
     });
 
     // Addon: http_codec — JSON body 解析（依赖 http_app, http_protocol）
@@ -237,6 +247,9 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+    const umbrella_test = b.addTest(.{ .root_module = mod });
+    test_step.dependOn(&b.addRunArtifact(umbrella_test).step);
+
+    const exe_test = b.addTest(.{ .root_module = exe.root_module });
+    test_step.dependOn(&b.addRunArtifact(exe_test).step);
 }
