@@ -128,7 +128,7 @@ pub const Server = struct {
                 _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
                 if (self.shutdown.isShuttingDown()) break;
                 // accept 错误：短暂等待后重试
-                try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake);
+                try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .real);
                 std.log.warn("accept error: {s}", .{@errorName(err)});
                 continue;
             };
@@ -136,7 +136,7 @@ pub const Server = struct {
             // 堆分配 runner——任务可能比当前栈帧活得更久
             const runner = self.allocator.create(ConnectionRunner) catch {
                 stream.close(self.io);
-                try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake);
+                try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .real);
                 continue;
             };
             errdefer self.allocator.destroy(runner);

@@ -54,20 +54,18 @@ pub const Request = struct {
         var query = if (query_start) |idx| target[idx + 1 ..] else "";
         var content_type = head.content_type;
 
-        const has_body = head.content_length != null or head.transfer_encoding != .none;
         const original_head = request.head_buffer;
         var head_copy: ?[]const u8 = null;
-        // 带 body 的请求：读 body 会覆盖 head_buffer，所以先复制到 arena。
-        // 不带 body 的请求：直接引用 head_buffer（零拷贝）。
-        const head_bytes: []const u8 = if (has_body) blk: {
-            const copy = try allocator.dupe(u8, original_head);
-            head_copy = copy;
-            path = rebase(path, original_head, copy);
-            query = rebase(query, original_head, copy);
-            if (content_type) |ct| content_type = rebase(ct, original_head, copy);
-            break :blk copy;
-        } else original_head;
+        // 始终复制 head_bytes 到 arena，避免连接缓冲区被后续 receiveHead 覆盖导致悬空指针。
+        // 即使不带 body 的请求也复制，保证 head_bytes 生命周期绑定请求 arena。
+        const copy = try allocator.dupe(u8, original_head);
+        head_copy = copy;
+        path = rebase(path, original_head, copy);
+        query = rebase(query, original_head, copy);
+        if (content_type) |ct| content_type = rebase(ct, original_head, copy);
+        const head_bytes: []const u8 = copy;
 
+        const has_body = head.content_length != null or head.transfer_encoding != .none;
         const body: Body = if (!has_body)
             .none
         else if (head.content_length != null)

@@ -19,11 +19,6 @@ const http_protocol = @import("http_protocol");
 const http_app = @import("http_app");
 const http_router = @import("http_router");
 
-/// winsock socket 选项常量（ws2_32.zig 只定义了 timeval，未导出这些）。
-const SOL_SOCKET: c_int = 0xffff;
-const SO_RCVTIMEO: c_int = 4102;
-const SO_SNDTIMEO: c_int = 4101;
-
 /// winsock 的 setsockopt（std 未导出，需自行声明；需在 Windows 链接 ws2_32）。
 extern "ws2_32" fn setsockopt(
     s: usize,
@@ -86,12 +81,13 @@ pub const ConnectionRunner = struct {
         const snd_ns = self.config.network.write_timeout_ns;
 
         if (comptime builtin.target.os.tag == .windows) {
+            const ws2_32 = @import("std").os.windows.ws2_32;
             // winsock 的 SO_RCVTIMEO/SO_SNDTIMEO 接受毫秒 DWORD。
             var rcv_ms: c_ulong = @intCast(@divTrunc(rcv_ns, 1_000_000));
             var snd_ms: c_ulong = @intCast(@divTrunc(snd_ns, 1_000_000));
             const sock: usize = @intFromPtr(self.stream.socket.handle);
-            _ = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_ms, @intCast(@sizeOf(@TypeOf(rcv_ms))));
-            _ = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_ms, @intCast(@sizeOf(@TypeOf(snd_ms))));
+            _ = setsockopt(sock, @intCast(ws2_32.SOL.SOCKET), @intCast(ws2_32.SO.RCVTIMEO), &rcv_ms, @sizeOf(c_ulong));
+            _ = setsockopt(sock, @intCast(ws2_32.SOL.SOCKET), @intCast(ws2_32.SO.SNDTIMEO), &snd_ms, @sizeOf(c_ulong));
         } else {
             const fd = self.stream.socket.handle;
             const read_tv = posix.timeval{
@@ -140,7 +136,7 @@ pub const ConnectionRunner = struct {
             if (self.stats.shutting_down.load(.monotonic)) break;
 
             // idle timeout：记录等待新请求的开始时间（fix.md §二.6）
-            const idle_start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            const idle_start = std.Io.Timestamp.now(self.io, .real).nanoseconds;
 
             const result = conn_loop.next() catch |err| {
                 // Protocol error → send 400 and close
@@ -152,36 +148,33 @@ pub const ConnectionRunner = struct {
             };
             const next_result = result orelse break; // connection closed
             var request = next_result.parsed;
-            var http_request = next_result.raw;
-
-            // 修正 streaming body 的指针——指向当前作用域的 http_request 副本。
-            // Request.init 在 conn_loop.next() 里存的指针指向 next() 的局部变量，
-            // 返回后已悬空。这里修正为指向当前有效的 http_request。
-            if (request.body == .streaming) {
-                request.body = .{ .streaming = &http_request };
-            }
+            // next_result.raw 已是 arena 分配的指针，生命周期覆盖整个请求，无需修正
+            const http_request = next_result.raw;
 
             _ = self.stats.active_requests.fetchAdd(1, .monotonic);
 
             // request_start 在 processRequest 内部发射——那时 ctx 已创建，
             // LoggingHook 能拿到 rid/method/path（回应 fix.md §三：request_start 无 ctx）
-            self.processRequest(&request, &http_request, &arenas) catch |err| {
+            self.processRequest(&request, http_request, &arenas) catch |err| {
                 std.log.err("processRequest: {s}", .{@errorName(err)});
-            };
+            }; // 注意：processRequest 内部 try dispatch，错误会冒泡到 ErrorRenderer
 
             _ = self.stats.active_requests.fetchSub(1, .monotonic);
+
+            // 先检查 keep-alive（需要 request.head_bytes），再 reset arena
+            const keep_alive = conn_loop.shouldKeepAlive(&request);
 
             // 请求结束：reset request arena
             arenas.endRequest(self.config.pool.request_arena_retain_bytes);
 
             if (recoverable_errors >= max_recoverable) break;
 
-            if (!conn_loop.shouldKeepAlive(&request)) break;
+            if (!keep_alive) break;
 
             // idle timeout 检查：如果处理完一个请求后已超过 idle 超时，关闭连接。
             // 这主要保护 keep-alive 等待期——SO_RCVTIMEO 会在读阶段超时，
             // 这里是处理完成后到下一个读之间的空闲判断。
-            const idle_elapsed = std.Io.Timestamp.now(self.io, .awake).nanoseconds - idle_start;
+            const idle_elapsed = std.Io.Timestamp.now(self.io, .real).nanoseconds - idle_start;
             if (idle_elapsed > @as(i96, @intCast(self.config.network.idle_timeout_ns))) break;
 
             // 响应发送完成后， http_request 的内部状态已经推进到下一个请求位置。
@@ -227,22 +220,10 @@ pub const ConnectionRunner = struct {
             .path = request.path,
         });
 
-        const dispatch_start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const dispatch_start = std.Io.Timestamp.now(self.io, .real).nanoseconds;
 
-        _ = self.router.dispatch(&ctx, &res) catch |err| {
-            self.lifecycle.emit(.request_error, .{ .ctx = &ctx, .err = err });
-            if (!res.sent) {
-                _ = res.statusCode(.internal_server_error);
-                res.text("Internal Server Error") catch {};
-            }
-            res.flush() catch {};
-            return;
-        };
-        // dispatch 内部已处理 404/405（走全局中间件管道），这里只做兜底 flush
-        // 确保缓冲模式的响应被发送（中间件可能忘记 flush）
-        res.flush() catch {};
-
-        const latency = std.Io.Timestamp.now(self.io, .awake).nanoseconds - dispatch_start;
+        _ = try self.router.dispatch(&ctx, &res);
+        const latency = std.Io.Timestamp.now(self.io, .real).nanoseconds - dispatch_start;
 
         self.lifecycle.emit(.request_end, .{
             .ctx = &ctx,
@@ -252,6 +233,9 @@ pub const ConnectionRunner = struct {
             .route_pattern = state.route_pattern,
             .duration_ns = @intCast(latency),
         });
+        // dispatch 内部已处理 404/405（走全局中间件管道），这里只做兜底 flush
+        // 确保缓冲模式的响应被发送（中间件可能忘记 flush）
+        try res.flush();
     }
 };
 

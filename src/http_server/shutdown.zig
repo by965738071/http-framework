@@ -25,13 +25,13 @@ pub const Shutdown = struct {
 
     /// 等待所有活跃连接结束，最多等 drain_timeout_ns。
     pub fn drain(self: *Shutdown, io: std.Io) void {
-        const start = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        const start = std.Io.Timestamp.now(io, .real).nanoseconds;
         while (true) {
             const active = self.stats.active_connections.load(.monotonic);
             if (active == 0) return;
-            const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start;
+            const elapsed = std.Io.Timestamp.now(io, .real).nanoseconds - start;
             if (elapsed >= self.drain_timeout_ns) return;
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .real) catch {};
         }
     }
 };

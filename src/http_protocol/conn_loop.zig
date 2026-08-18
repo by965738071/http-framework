@@ -8,7 +8,6 @@
 //! ConnectionLoop 包装 std.http.Server，每次 `next()` 返回一个
 //! `http_protocol.Request`。连接关闭时返回 null。
 
-const std = @import("std");
 const http = std.http;
 const protocol = @import("request.zig");
 
@@ -27,14 +26,12 @@ pub const ConnectionLoop = struct {
     }
 
     /// next() 的返回值。
-    /// `raw` 是 std.http.Server.Request，ConnectionRunner 用它构建 Sink。
-    ///   - 它的 head_buffer 指向连接读缓冲，在下次 receiveHead 前有效。
-    ///   - protocol.Request.init 已把需要的数据复制到 arena 或引用 head_buffer。
-    ///   - 只有带 body 的请求在 init 时复制了 head（因为读 body 会覆盖）。
+    /// `raw` 是指向 arena 分配的 std.http.Server.Request，ConnectionRunner 用它构建 Sink
+    /// 和读取 streaming body。arena 分配保证其生命周期覆盖整个请求处理过程。
     /// 调用方必须在处理完这个请求（发送完响应）之后才能再次调 next()。
     pub const NextResult = struct {
         parsed: protocol.Request,
-        raw: http.Server.Request,
+        raw: *http.Server.Request,
     };
 
     /// 读取下一个请求。
@@ -45,13 +42,15 @@ pub const ConnectionLoop = struct {
         // 清理上一个请求的 arena
         _ = self.arena.reset(.retain_capacity);
 
-        var http_request = self.server.receiveHead() catch |err| {
+        // 在 arena 上分配 http_request，生命周期绑定请求 arena
+        const http_request = try self.arena.allocator().create(http.Server.Request);
+        http_request.* = self.server.receiveHead() catch |err| {
             if (isConnectionClosed(err)) return null;
             if (isProtocolError(err)) return error.ProtocolError;
             return err;
         };
 
-        const parsed = try protocol.Request.init(self.arena.allocator(), &http_request);
+        const parsed = try protocol.Request.init(self.arena.allocator(), http_request);
         return .{ .parsed = parsed, .raw = http_request };
     }
 
@@ -90,4 +89,9 @@ fn isProtocolError(err: anyerror) bool {
         error.HttpHeadersInvalid, error.HttpRequestHeadTooLarge, error.InvalidCharacter => true,
         else => false,
     };
+}
+
+const std = @import("std");
+test {
+    std.testing.refAllDecls(@This());
 }

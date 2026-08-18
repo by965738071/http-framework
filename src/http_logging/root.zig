@@ -50,7 +50,6 @@ pub const RequestId = http_app.RequestId;
 /// 跨平台实现，不依赖 libc：
 /// - 写 stderr/stdout 走 std.Io.File（std.Io 自带各平台后端）。
 /// - 时间戳用 std.Io.Timestamp.realtime（Unix epoch 纳秒）。
-
 /// 日志级别（有序：debug < info < warn < err < fatal）
 pub const Level = enum(u3) {
     debug = 0,
@@ -495,9 +494,9 @@ pub const LoggingMiddleware = struct {
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
         self.logger.info(ctx, "request_start", &.{});
 
-        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
+        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
         next.call(ctx, res) catch |e| {
-            const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+            const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
             self.logger.err(ctx, "request_error", &.{
                 fstr("error", @errorName(e)),
                 fint("duration_ns", @intCast(elapsed)),
@@ -505,7 +504,7 @@ pub const LoggingMiddleware = struct {
             });
             return e;
         };
-        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
 
         self.logger.info(ctx, "request_end", &.{
             fint("status", @backingInt(res.status)),

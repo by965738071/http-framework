@@ -7,7 +7,7 @@ const std = @import("std");
 const framework = @import("http_framework");
 const builtin = @import("builtin");
 /// Debug 模式下的全局分配器实例（泄漏检测）。
-pub fn main() !void {
+pub fn main(init:std.process.Init) !void {
     // 0. allocator
     // Debug 模式用 DebugAllocator（逐分配追踪 + 退出时泄漏检测）；
     // Release 用全局 Arena（线程安全，进程生命周期内存，退出时一次性释放）。
@@ -31,10 +31,8 @@ pub fn main() !void {
     // concurrent_limit 限制线程池大小，防止压测时无限扩展线程。
     // 默认 = CPU 核心数 - 1。每线程栈 512KB+，1000 并发时线程池不收缩
     // → 内存不回收。显式限制可控制常驻内存上限。
-    var io_state = std.Io.Threaded.init(allocator, .{
-        .concurrent_limit = .limited(128),
-    });
-    const io = io_state.io();
+    
+    const io = init.io;
 
     // 2. 配置
     const config = framework.Config{
@@ -241,15 +239,15 @@ const TimingMiddleware = struct {
         // 不调 flush()：让外层（CompressMiddleware / ErrorRenderer /
         // ConnectionRunner 兜底）负责最终发送。
         res.setBuffered();
-        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
+        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
         // 错误时也要加 timing 头——计时应该包含错误处理时间，
         // 且 ErrorRenderer 在外层兑底时已经能看到这个头（fix.md §三.1）。
         next.call(ctx, res) catch |err| {
-            const elapsed_err = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+            const elapsed_err = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
             _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch "?");
             return err;
         };
-        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
         _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?");
     }
 };

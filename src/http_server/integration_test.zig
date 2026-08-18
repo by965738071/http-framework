@@ -137,15 +137,15 @@ fn boomHandler(ctx: *Context, res: *Response) !void {
 const TimingMiddleware = struct {
     pub fn process(_: *@This(), ctx: *Context, res: *Response, next: http_app.Next) !void {
         res.setBuffered();
-        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
+        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
         // 错误时也要加 timing 头——计时应该包含错误处理时间，
         // 且 ErrorRenderer 在外层兜底时已经能看到这个头（buffered 模式）。
         next.call(ctx, res) catch |err| {
-            const elapsed_err = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+            const elapsed_err = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
             _ = res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch "?") catch {};
             return err;
         };
-        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
         _ = res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?") catch {};
     }
 };
