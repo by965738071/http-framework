@@ -53,9 +53,6 @@ pub const Server = struct {
         _ = sig;
         if (global_instance) |s| {
             s.shutdown.begin();
-            // 唤醒可能阻塞在 accept() 的运行循环：close fd 让 accept 返回。
-            // 用 std.Io 关闭监听 socket（跨平台，无需 libc）。
-            s.listener.tcp_server.socket.close(s.io);
         }
     }
 
@@ -125,10 +122,10 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         while (!self.shutdown.isShuttingDown()) {
             const stream = self.listener.accept() catch |err| {
-                _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
                 if (self.shutdown.isShuttingDown()) break;
+                _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
                 // accept 错误：短暂等待后重试
-                try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .real);
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
                 std.log.warn("accept error: {s}", .{@errorName(err)});
                 continue;
             };

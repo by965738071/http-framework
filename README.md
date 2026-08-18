@@ -53,7 +53,7 @@ zig build run -Doptimize=ReleaseFast
 zig build test
 
 # 运行综合示例
-cd exampels && zig build run
+cd examples && zig build run
 ```
 
 ## 快速开始
@@ -123,7 +123,7 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 }
 ```
 
-接线方式参考 `exampels/build.zig`：`b.dependency("http_framework", .{...}).module("http_framework")`。
+接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_framework")`。
 
 ## 三种 Handler 模式
 
@@ -421,7 +421,7 @@ const matches = try store.findAll(&qb);  // 或 findOne / count / paginate(page,
 
 ## 示例
 
-`exampels/` 目录是一个完整、可运行的服务器，覆盖框架绝大部分功能：
+`examples/` 目录是一个完整、可运行的服务器，覆盖框架绝大部分功能：
 
 | 路由 | 说明 |
 |------|------|
@@ -437,7 +437,7 @@ const matches = try store.findAll(&qb);  // 或 findOne / count / paginate(page,
 | `GET/POST /orm/users` `GET/PUT/DELETE /orm/users/:id` | ORM CRUD（持久化 `./data/users.json`） |
 
 ```bash
-cd exampels
+cd examples
 zig build          # 构建
 zig build run      # 运行（端口 9000）
 zig build test     # 运行测试（含 WebSocket 内存往返测试）
@@ -492,7 +492,7 @@ http-framework/
 │   ├── http_logging/      #    结构化日志（JSON/文本、文件轮转）
 │   ├── http_orm/          #    ORM（编译期反射 + JSON 持久化）
 │   └── http_websocket/    #    WebSocket（RFC 6455）
-├── exampels/              # 综合示例（见上文"示例"）
+├── examples/              # 综合示例（见上文"示例"）
 └── README.md
 ```
 

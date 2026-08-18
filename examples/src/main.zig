@@ -1,4 +1,4 @@
-//! exampels — http_framework 使用示例
+//! examples — http_framework 使用示例
 //!
 //! 一个完整、可直接运行的服务端示例，覆盖 http_framework 的绝大部分功能：
 //!
@@ -18,7 +18,7 @@
 //!                      → SecurityHeaders → CORS → RateLimit → ScopedAuth
 //!
 //! 运行：
-//!   cd exampels && zig build run
+//!   cd examples && zig build run
 //!
 //! 常用 curl 测试（终端里一条条试）：
 //!
@@ -60,7 +60,7 @@
 //!        -d '{"name":"alice2","email":"alice2@example.com"}' http://127.0.0.1:9000/orm/users/1
 //!   curl -X DELETE http://127.0.0.1:9000/orm/users/1
 //!
-//! 日志输出到 ./log/exampels.log（超过 2 MiB 自动轮转 + gzip 归档）。
+//! 日志输出到 ./log/examples.log（超过 2 MiB 自动轮转 + gzip 归档）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -123,7 +123,7 @@ pub fn main() !void {
     // 2. 配置（分层：network / http / body / pool）
     const config = framework.Config{
         .network = .{ .port = 9000 },
-        .http = .{ .server_name = "exampels" },
+        .http = .{ .server_name = "examples" },
         .body = .{ .size_limit = 10 * 1024 * 1024 },
         .pool = .{ .request_arena_retain_bytes = 4 * 1024 },
     };
@@ -134,14 +134,14 @@ pub fn main() !void {
         .format = .json,
         .output = .file,
         .file = .{
-            .path = "log/exampels.log",
+            .path = "log/examples.log",
             .max_size = 2 * 1024 * 1024,
             .max_backups = 1,
             .compress = true,
         },
     });
     defer logger.deinit();
-    logger.info(null, "exampels starting", &.{
+    logger.info(null, "examples starting", &.{
         framework.fstr("addr", config.network.address),
         framework.fint("port", config.network.port),
     });
@@ -301,11 +301,11 @@ pub fn main() !void {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn helloHandler(_: *framework.Context, res: *framework.Response) !void {
-    try res.statusCode(.ok).text("Hello, World! This is the exampels server.");
+    try res.statusCode(.ok).text("Hello, World! This is the examples server.");
 }
 
 fn healthHandler(_: *framework.Context, res: *framework.Response) !void {
-    try res.json(.{ .status = "ok", .service = "exampels" });
+    try res.json(.{ .status = "ok", .service = "examples" });
 }
 
 /// 路径参数示例：GET /users/42
