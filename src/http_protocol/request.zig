@@ -66,12 +66,7 @@ pub const Request = struct {
         const head_bytes: []const u8 = copy;
 
         const has_body = head.content_length != null or head.transfer_encoding != .none;
-        const body: Body = if (!has_body)
-            .none
-        else if (head.content_length != null)
-            .{ .streaming = request }
-        else
-            .{ .streaming = request };
+        const body: Body = if (!has_body) .none else .{ .streaming = request };
 
         return .{
             .method = head.method,

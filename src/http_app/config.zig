@@ -89,3 +89,7 @@ test "Config can be partially overridden (profile diff)" {
     // body/pool still default
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), cfg.body.size_limit);
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}

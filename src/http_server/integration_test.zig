@@ -69,17 +69,18 @@ fn makeCtx(arena: std.mem.Allocator, req: *Request, state: *http_app.RequestStat
 /// `extra_headers` 必须是完整 header 行（含 `\r\n`），如 `"X-Request-Id: abc\r\n"`。
 /// 注意：getHeader 读 head_bytes，所以 extra_headers 要拼进 head_bytes，
 /// 而不是放到 head_copy（head_copy 只在带 body 的请求里用于保存 head 副本）。
-fn makeReq(path: []const u8, extra_headers: []const u8) Request {
-    // 用静态缓冲拼请求行 + extra headers + 空行。路径限长 64 字符。
+fn makeReq(allocator: std.mem.Allocator, path: []const u8, extra_headers: []const u8) !Request {
+    // 在 allocator 上分配 head 字节，保证生命周期覆盖整个测试。
     var buf: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&buf, "GET {s} HTTP/1.1\r\n{s}\r\n", .{ path, extra_headers }) catch unreachable;
+    const head_bytes = try allocator.dupe(u8, head);
     return .{
         .method = .GET,
         .target = path,
         .path = path,
         .query = "",
         .version = .@"HTTP/1.1",
-        .head_bytes = head,
+        .head_bytes = head_bytes,
         .head_copy = null,
         .content_type = null,
         .content_length = null,
@@ -194,7 +195,7 @@ test "命中路由：200 + body + 中间件头齐全" {
     defer arena.deinit();
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
-    var req = makeReq("/", "");
+    var req = try makeReq(arena.allocator(), "/", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
     var buf: [4096]u8 = undefined;
@@ -223,7 +224,7 @@ test "404：经过中间件管道，带 X-Request-Id / timing / tag" {
     defer arena.deinit();
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
-    var req = makeReq("/no-such-path", "");
+    var req = try makeReq(arena.allocator(), "/no-such-path", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
     var buf: [4096]u8 = undefined;
@@ -254,7 +255,7 @@ test "405：经过中间件管道，带 X-Request-Id" {
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
     // /echo 只注册了 POST，用 GET 访问应 405
-    var req = makeReq("/echo", "");
+    var req = try makeReq(arena.allocator(), "/echo", "");
     req.method = .GET;
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
@@ -283,7 +284,7 @@ test "客户端 X-Request-Id 被沿用" {
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
     const hdr = "X-Request-Id: trace-abc-123\r\n";
-    var req = makeReq("/", hdr);
+    var req = try makeReq(arena.allocator(), "/", hdr);
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
     var buf: [4096]u8 = undefined;
@@ -311,7 +312,7 @@ test "handler 抛错：ErrorRenderer 兜底 500，但仍带中间件头" {
     defer arena.deinit();
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
-    var req = makeReq("/boom", "");
+    var req = try makeReq(arena.allocator(), "/boom", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
     var buf: [4096]u8 = undefined;
@@ -346,7 +347,7 @@ test "中间件管道顺序：外层先于内层 setBuffered，handler 后外层
     defer arena.deinit();
     var state = http_app.RequestState{};
     defer state.deinit(arena.allocator());
-    var req = makeReq("/", "");
+    var req = try makeReq(arena.allocator(), "/", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
     var buf: [4096]u8 = undefined;

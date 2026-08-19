@@ -113,3 +113,7 @@ test "SecurityHeaders null values omit headers" {
 
     try std.testing.expectEqual(@as(usize, 0), res.headers.items.len);
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}
