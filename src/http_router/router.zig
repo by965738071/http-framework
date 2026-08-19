@@ -72,7 +72,7 @@ pub const Router = struct {
             break :blk Handler.fromFn(methodNotAllowedHandler);
         } else if (self.not_found) |nf| nf else Handler.fromFn(defaultNotFoundHandler);
 
-        ctx.state.route_pattern = ctx.request.path; // TODO: 记录 pattern 而非原始路径
+        ctx.state.route_pattern = result.pattern;
 
         // 组装管道：全局中间件 + handler
         // 即使是 404/405 也走管道——中间件（request-id/logging/timing）能正常工作
@@ -184,4 +184,54 @@ test "Router returns 404 for unmatched route" {
     try std.testing.expect(matched);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..writer.end], "Not Found") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..writer.end], "404") != null);
+}
+
+test "Router records route pattern instead of raw path (fix TODO)" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const handler = Handler.fromFn(struct {
+        fn h(_: *Context, res: *Response) !void {
+            try res.text("hello");
+        }
+    }.h);
+    try router.route(.GET, "/users/:id", handler);
+
+    var state = http_app.RequestState{};
+    defer state.deinit(allocator);
+    const cfg = http_app.RequestConfig{};
+    var req = @import("http_protocol").Request{
+        .method = .GET,
+        .target = "/users/42",
+        .path = "/users/42",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET /users/42 HTTP/1.1\r\n\r\n",
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = allocator,
+        .io = undefined,
+    };
+
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(allocator, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+
+    const matched = try router.dispatch(&ctx, &res);
+    try std.testing.expect(matched);
+    // 验证 route_pattern 是 pattern 而非原始路径
+    try std.testing.expect(state.route_pattern != null);
+    try std.testing.expectEqualStrings("/users/:id", state.route_pattern.?);
+    // 验证 path_params 正确提取
+    try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
 }

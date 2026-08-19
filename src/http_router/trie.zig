@@ -18,6 +18,8 @@ const Node = struct {
     // 按 method 索引的 handler 映射
     handlers: std.enums.EnumMap(http.Method, Handler) = .{},
     has_any_handler: bool = false,
+    // 完整路由 pattern（插入时记录，匹配时直接复制）
+    pattern: []const u8 = "",
     arena: std.mem.Allocator,
 
     fn init(arena: std.mem.Allocator) !*Node {
@@ -65,6 +67,7 @@ pub const Trie = struct {
         if (node.handlers.get(method) != null) return error.RouteConflict;
         node.handlers.put(method, handler);
         node.has_any_handler = true;
+        node.pattern = try alloc.dupe(u8, pattern);
     }
 
     fn findOrCreateChild(parent: *Node, seg: []const u8, alloc: std.mem.Allocator) !*Node {
@@ -103,6 +106,7 @@ pub const Trie = struct {
     pub const MatchResult = struct {
         handler: ?Handler = null,
         pattern_matched: bool = false,
+        pattern: []const u8 = "",
         allowed_methods: [16]?http.Method = @splat(null),
         allowed_count: u8 = 0,
     };
@@ -126,6 +130,7 @@ pub const Trie = struct {
         if (remaining.len == 0) {
             if (node.has_any_handler) {
                 result.pattern_matched = true;
+                result.pattern = node.pattern;
                 if (node.handlers.get(method)) |h| {
                     result.handler = h;
                 } else {

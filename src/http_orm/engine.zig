@@ -331,7 +331,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         const new_val = query_mod.getFieldValue(T, updated, ufn);
                         const key = try fieldValuesKey(key_alloc, new_val);
                         if (unique_sets.items[ui].contains(key)) {
-                            self.unlock();
+                            // 不显式 unlock——让 errdefer 处理（避免双重解锁）
                             return error.UniqueViolation;
                         }
                         // Add the new value to the set so subsequent matched

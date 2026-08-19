@@ -144,8 +144,6 @@ pub const SessionManager = struct {
             // 重复 key：释放旧 key 和旧 value
             self.allocator.free(gop.key_ptr.*);
             self.allocator.free(gop.value_ptr.*);
-            gop.key_ptr.* = key; // 将被覆盖
-            gop.value_ptr.* = value; // 将被覆盖
         }
 
         // 复制新的 key 和 value（确保所有权独立）
@@ -154,15 +152,9 @@ pub const SessionManager = struct {
         const val_dup = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(val_dup);
 
-        if (gop.found_existing) {
-            // getOrPut 已经占位，现在替换为我们复制的版本
-            gop.key_ptr.* = key_dup;
-            gop.value_ptr.* = val_dup;
-        } else {
-            // 新增条目
-            gop.key_ptr.* = key_dup;
-            gop.value_ptr.* = val_dup;
-        }
+        // 分配成功，接管所有权
+        gop.key_ptr.* = key_dup;
+        gop.value_ptr.* = val_dup;
     }
 
     /// 删除 Session（线程安全）
