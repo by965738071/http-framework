@@ -410,6 +410,11 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
     if (form.getFile("avatar")) |file| {
         const file_name = file.file_name orelse "upload.bin";
+        var target_file = try std.Io.Dir.createFile(.cwd(), ctx.io, file_name, .{});
+        defer target_file.close(ctx.io);
+        var writer = target_file.writer(ctx.io, &.{});
+        const w = &writer.interface;
+        try w.writeAll(file.data);
         const msg = try std.fmt.allocPrint(
             ctx.arena,
             "uploaded \"{s}\" ({d} bytes, {s}) by {s}",

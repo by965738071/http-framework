@@ -22,7 +22,7 @@
     // original project's identity. Thus it is recommended to leave the comment
     // on the following line intact, so that it shows up in code reviews that
     // modify the field.
-    .fingerprint = 0xa5c32d83b339aaad, // Changing this has security and trust implications.
+    .fingerprint = 0x7bd0ad45b26335d6, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
     .minimum_zig_version = "0.17.0-dev.1745+ac8a8d0c5",
