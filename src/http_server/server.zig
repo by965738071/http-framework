@@ -125,14 +125,38 @@ pub const Server = struct {
             try self.runPosix();
         }
 
+        // 收到关闭信号后：取消所有在途连接任务并等待它们结束（优雅关机）。
         self.group.cancel(self.io);
         self.group.await(self.io) catch {};
         self.shutdown.drain(self.io);
     }
 
-    /// POSIX：信号会打断阻塞的 accept()（EINTR），直接阻塞 accept 即可。
+    /// POSIX：阻塞的 accept() 被信号打断后，std.Io 的 Threaded 后端会吞掉
+    /// EINTR 并立即重新阻塞（它的取消机制只认 group.cancel，不认我们自己的
+    /// SIGINT）。因此不能直接 block 在 accept() 上，否则 Ctrl+C 后主循环拿
+    /// 不回控制权、看不到 shutting_down 标志——这正是 macOS 上关不掉的原因。
+    ///
+    /// 解决办法与 Windows 路径一致：用 poll() 带超时地等待监听 fd 可读，每次
+    /// 超时都回到循环顶部检查关闭标志；只有在确有连接就绪时才调用 accept()。
     fn runPosix(self: *Server) !void {
+        const listen_fd = self.listener.tcp_server.socket.handle;
         while (true) {
+            if (self.shutdown.isShuttingDown()) break;
+
+            var fds = [_]posix.pollfd{.{
+                .fd = listen_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            // 200ms 超时：兼顾关闭响应速度与空转开销。poll 被信号打断时
+            // std.posix.poll 内部会重试，但超时会兜底让我们及时检查标志。
+            const ready = posix.poll(&fds, 200) catch |err| {
+                if (self.shutdown.isShuttingDown()) break;
+                _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
+                std.log.warn("poll error: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (ready == 0) continue; // 超时 → 回到顶部重新检查关闭标志
             if (self.shutdown.isShuttingDown()) break;
 
             const stream = self.listener.accept() catch |err| {

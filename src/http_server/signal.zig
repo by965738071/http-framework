@@ -56,8 +56,6 @@ fn triggerShutdown() void {
 
 fn posixSignalHandler(sig: posix.SIG) callconv(.c) void {
     _ = sig;
-    // On POSIX the signal interrupts the blocking accept() syscall (EINTR),
-    // so setting the flag is enough — the run loop observes it and breaks.
     if (global_handle) |h| {
         h.flag.store(true, .monotonic);
     }

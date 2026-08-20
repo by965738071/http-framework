@@ -83,7 +83,10 @@ pub const AuthMiddleware = struct {
 
         // 所有策略都失败 → 401
         _ = res.statusCode(.unauthorized);
-        _ = try res.header("WWW-Authenticate", self.config.realm);
+        // 修复 D3：发合法的挑战头 `Basic realm="..."`（RFC 7235），
+        // 否则浏览器不会弹凭据框。
+        const challenge = try std.fmt.allocPrint(ctx.arena, "Basic realm=\"{s}\"", .{self.config.realm});
+        _ = try res.header("WWW-Authenticate", challenge);
         try res.text("Unauthorized");
     }
 
@@ -118,8 +121,12 @@ pub const AuthMiddleware = struct {
         const u = decoded[0..colon];
         const p = decoded[colon + 1 ..];
 
-        // 常量时间比较——修复 P0 时序侧信道
-        return constantTimeEql(u, username) and constantTimeEql(p, password);
+        // 常量时间比较——修复 P0 时序侧信道。
+        // 修复 D2：先各自求布尔再 AND，避免 `and` 短路在用户名不匹配时
+        // 跳过密码比较、泄露用户名是否正确。
+        const user_ok = constantTimeEql(u, username);
+        const pass_ok = constantTimeEql(p, password);
+        return user_ok and pass_ok;
     }
 
     fn checkApiKey(self: *Self, ctx: *Context, expected: []const u8) !bool {

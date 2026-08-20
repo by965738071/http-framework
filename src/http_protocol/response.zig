@@ -193,8 +193,15 @@ pub const Response = struct {
     /// 非缓冲模式下，如果已经发送，什么都不做。
     pub fn flush(self: *Self) !void {
         if (!self.buffered) return;
-        if (self.pending_body == null) return; // 没有待发送的响应
-        const body = self.pending_body.?;
+        // 修复 F3：缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
+        // == null），只要响应已被标记发送（sent）也应发一个空 body 响应，
+        // 否则 client 永远收不到响应、keep-alive 下挂到超时。
+        const body = self.pending_body orelse {
+            if (!self.sent) return; // 从未产生任何响应，不发
+            self.sent = true;
+            try self.sink.respond(self.status, self.headers.items, "");
+            return;
+        };
         self.pending_body = null;
         try self.sink.respond(self.status, self.headers.items, body);
     }
@@ -233,10 +240,19 @@ pub const Response = struct {
         var c = cookie;
         c.name = owned_name;
         c.value = owned_value;
-        // path/domain/same_site 如果有值，也 copy
-        if (c.path) |p| c.path = try self.dupeOwned(p);
-        if (c.domain) |d| c.domain = try self.dupeOwned(d);
-        if (c.same_site) |ss| c.same_site = try self.dupeOwned(ss);
+        // 修复 F2：path/domain/same_site 也必须校验 CRLF，否则可注入响应头。
+        if (c.path) |p| {
+            try validateHeaderValue(p);
+            c.path = try self.dupeOwned(p);
+        }
+        if (c.domain) |d| {
+            try validateHeaderValue(d);
+            c.domain = try self.dupeOwned(d);
+        }
+        if (c.same_site) |ss| {
+            try validateHeaderValue(ss);
+            c.same_site = try self.dupeOwned(ss);
+        }
         try self.cookies.append(self.allocator, c);
         return self;
     }

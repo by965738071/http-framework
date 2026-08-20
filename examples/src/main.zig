@@ -511,12 +511,13 @@ fn sessionMeHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     };
 
-    const data = sessions.getData(session_id) orelse {
+    const username = sessions.getValue(session_id, "username", ctx.arena) catch {
+        try ctx.failWith(res, framework.AppError.unauthorized("session expired or invalid"));
+        return;
+    } orelse {
         try ctx.failWith(res, framework.AppError.unauthorized("session expired or invalid"));
         return;
     };
-
-    const username = data.get("username") orelse "anonymous";
     try res.json(.{ .ok = true, .username = username });
 }
 
@@ -854,7 +855,7 @@ test "websocket: wsEncodeFrame / wsDecodeFrame roundtrip" {
     try framework.wsEncodeFrame(&w.writer, .text, "hi", true, .{ 0xAA, 0xBB, 0xCC, 0xDD });
 
     var r: std.Io.Reader = .fixed(w.written());
-    const frame = try framework.wsDecodeFrame(&r, allocator);
+    const frame = try framework.wsDecodeFrame(&r, allocator, 16 * 1024 * 1024);
     defer allocator.free(frame.payload);
 
     try std.testing.expect(frame.fin);

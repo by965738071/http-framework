@@ -64,13 +64,16 @@ pub const Request = struct {
         query = rebase(query, original_head, copy);
         if (content_type) |ct| content_type = rebase(ct, original_head, copy);
         const head_bytes: []const u8 = copy;
+        // 修复 F1：target 也必须 rebase 到 arena 副本，否则读 body 或下一个
+        // keep-alive 请求覆盖 head_buffer 后 ctx.request.target 悬空。
+        const target_rebased = rebase(target, original_head, copy);
 
         const has_body = head.content_length != null or head.transfer_encoding != .none;
         const body: Body = if (!has_body) .none else .{ .streaming = request };
 
         return .{
             .method = head.method,
-            .target = target,
+            .target = target_rebased,
             .path = path,
             .query = query,
             .version = head.version,

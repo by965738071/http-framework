@@ -73,6 +73,10 @@ pub const WebSocket = struct {
     is_client: bool = false,
     /// 已发送/收到 close 帧——避免重复发送。
     closed: bool = false,
+    /// 单帧 payload 上限（修复 E1）。
+    max_frame_payload: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
+    /// 分片拼接后的单个 message 总大小上限（修复 E2）。
+    max_message_size: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
 
     const Self = @This();
 
@@ -151,8 +155,17 @@ pub const WebSocket = struct {
         var saw_first_frame: bool = false;
 
         while (true) {
-            var f = try frame_mod.decode(self.reader, self.allocator);
+            var f = try frame_mod.decode(self.reader, self.allocator, self.max_frame_payload);
             defer self.allocator.free(f.payload);
+
+            // 修复 E6：未协商扩展时 RSV 位必须为 0。
+            if (f.rsv1 or f.rsv2 or f.rsv3) return error.ProtocolError;
+
+            // 修复 E4：控制帧不可分片（RFC §5.4，FIN 必须为 1）。
+            if (f.opcode.isControl() and !f.fin) return error.ProtocolError;
+
+            // 修复 E3：服务端必须拒绝未 mask 的客户端帧（RFC §5.1）。
+            if (!self.is_client and !f.mask) return error.ProtocolError;
 
             switch (f.opcode) {
                 .ping => {
@@ -186,12 +199,14 @@ pub const WebSocket = struct {
                 .text, .binary => {
                     // 新 message 的首帧。如果之前有未完成的分片，是协议错误——
                     // RFC §5.4: 不允许在 FIN=0 后开始新 message。
-                    if (saw_first_frame and payload_list.items.len > 0) {
+                    // 修复 E5：用 saw_first_frame 判定（而非 payload_list.len），
+                    // 否则首帧空 payload+FIN=0 时会漏判。
+                    if (saw_first_frame) {
                         return error.ProtocolError;
                     }
                     first_opcode = f.opcode;
                     saw_first_frame = true;
-                    try payload_list.appendSlice(self.allocator, f.payload);
+                    try self.appendBounded(&payload_list, f.payload);
                     if (f.fin) {
                         const owned = try payload_list.toOwnedSlice(self.allocator);
                         return .{
@@ -207,7 +222,7 @@ pub const WebSocket = struct {
                     if (!saw_first_frame) {
                         return error.ProtocolError;
                     }
-                    try payload_list.appendSlice(self.allocator, f.payload);
+                    try self.appendBounded(&payload_list, f.payload);
                     if (f.fin) {
                         const owned = try payload_list.toOwnedSlice(self.allocator);
                         return .{
@@ -223,6 +238,14 @@ pub const WebSocket = struct {
                 },
             }
         }
+    }
+
+    /// 向分片缓冲追加，受 max_message_size 限制（修复 E2：防分片总大小无限增长 OOM）。
+    fn appendBounded(self: *Self, list: *std.ArrayList(u8), data: []const u8) !void {
+        if (list.items.len + data.len > self.max_message_size) {
+            return error.MessageTooBig;
+        }
+        try list.appendSlice(self.allocator, data);
     }
 };
 
@@ -335,7 +358,7 @@ test "receive auto-replies to ping with pong" {
     // 验证服务端发出了 pong（payload 应等于 ping 的 "pingdata"）
     const sent = out_w.written();
     var sent_r: std.Io.Reader = .fixed(sent);
-    const pong_frame = try frame_mod.decode(&sent_r, allocator);
+    const pong_frame = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
     defer allocator.free(pong_frame.payload);
     try testing.expectEqual(OpCode.pong, pong_frame.opcode);
     try testing.expectEqualStrings("pingdata", pong_frame.payload);
@@ -364,7 +387,7 @@ test "receive auto-replies to close and returns ConnectionClosed" {
     // 验证回了一个 close
     const sent = out_w.written();
     var sent_r: std.Io.Reader = .fixed(sent);
-    var reply = try frame_mod.decode(&sent_r, allocator);
+    var reply = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
     defer allocator.free(reply.payload);
     try testing.expectEqual(OpCode.close, reply.opcode);
     try testing.expect(reply.payload.len >= 2);
@@ -411,7 +434,7 @@ test "close method sends close frame and is idempotent" {
 
     const sent = out_w.written();
     var sent_r: std.Io.Reader = .fixed(sent);
-    var f = try frame_mod.decode(&sent_r, allocator);
+    var f = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
     defer allocator.free(f.payload);
     try testing.expectEqual(OpCode.close, f.opcode);
     try testing.expectEqual(@as(usize, 5), f.payload.len);

@@ -113,7 +113,7 @@ pub const StaticFileServer = struct {
         const accept_encoding = ctx.request.getHeader("accept-encoding") orelse "";
         const use_gzip = blk: {
             if (stat.size < 1024) break :blk false; // 太小不值得
-            if (!http_compress.shouldCompressContentType(content_type)) break :blk false;
+            if (!http_compress.shouldCompressContentType(content_type, http_compress.default_skip_types)) break :blk false;
             const enc = http_compress.chooseEncoding(accept_encoding, &.{.gzip}) orelse break :blk false;
             break :blk enc == .gzip;
         };

@@ -32,6 +32,8 @@ pub const RateLimiter = struct {
     io: std.Io,
     records: std.StringHashMapUnmanaged(Record) = .empty,
     mutex: std.Io.Mutex = .init,
+    /// 上次清理过期记录的时间（纳秒）。用于周期性驱逐，防止 map 无限增长（修复 B1）。
+    last_cleanup: i96 = 0,
 
     const Self = @This();
 
@@ -80,8 +82,34 @@ pub const RateLimiter = struct {
         }
 
         try self.updateRecordLocked(identifier, now);
+        self.maybeCleanupLocked(now);
         try self.addRateLimitHeadersLocked(res, identifier, now);
         try next.call(ctx, res);
+    }
+
+    /// 周期性驱逐窗口已过期的记录，防止 records map 无限增长（修复 B1）。
+    /// 攻击者轮换 X-Forwarded-For 可制造无限 key —— 无驱逐会导致内存耗尽。
+    /// 清理间隔取窗口长度（至少 1 秒），在锁内调用。
+    fn maybeCleanupLocked(self: *Self, now: i96) void {
+        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
+        const interval_ns = @max(window_ns, 1_000_000_000);
+        if (now - self.last_cleanup < interval_ns) return;
+        self.last_cleanup = now;
+
+        var to_remove = std.ArrayList([]const u8).empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.records.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.window_start >= window_ns) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+        for (to_remove.items) |key| {
+            if (self.records.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+            }
+        }
     }
 
     fn getIdentifier(self: *const Self, ctx: *Context) ?[]const u8 {

@@ -79,11 +79,22 @@ pub const CorsMiddleware = struct {
 
     fn addCorsHeaders(self: *Self, arena: std.mem.Allocator, res: *Response, origin: []const u8) !void {
         // Allow-Origin
-        _ = try res.header("Access-Control-Allow-Origin", origin);
-
-        // Allow-Credentials
-        if (self.config.allow_credentials) {
-            _ = try res.header("Access-Control-Allow-Credentials", "true");
+        // 修复 D1：禁止“反射任意 Origin + 允许凭据”这个 CORS 规范禁止的组合。
+        // allowed_origins==null（通配）且 allow_credentials 时，不反射具体 Origin，
+        // 改发通配 `*`（浏览器会在带凭据时拒绝 `*`，从而不会泄露）。
+        const wildcard = self.config.allowed_origins == null;
+        if (wildcard and self.config.allow_credentials) {
+            _ = try res.header("Access-Control-Allow-Origin", "*");
+            // 注意：此时不发 Allow-Credentials（`*` 与凭据互斥）。
+        } else if (wildcard) {
+            _ = try res.header("Access-Control-Allow-Origin", "*");
+        } else {
+            // 白名单命中：反射具体 Origin，并补 Vary: Origin防缓存污染（修复 D1 附带）。
+            _ = try res.header("Access-Control-Allow-Origin", origin);
+            _ = try res.header("Vary", "Origin");
+            if (self.config.allow_credentials) {
+                _ = try res.header("Access-Control-Allow-Credentials", "true");
+            }
         }
 
         // Allow-Methods

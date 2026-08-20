@@ -91,17 +91,18 @@ pub const SessionManager = struct {
         try std.Io.randomSecure(self.io, &random_bytes);
 
         const session_id = try std.fmt.allocPrint(self.allocator, "sess{X}", .{&random_bytes});
+        // 只在所有权移交给 map（put）之前有效；put 成功后正常返回不会触发。
         errdefer self.allocator.free(session_id);
 
         const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        const record = SessionRecord{
-            .id = try self.allocator.dupe(u8, session_id),
-            .data = SessionData.init(self.allocator),
-            .expires = now_ns + @as(i96, self.config.session_timeout_sec) * 1_000_000_000,
-            .created = now_ns,
-        };
-        try self.sessions.put(session_id, record);
+        const id_dup = try self.allocator.dupe(u8, session_id);
+        errdefer self.allocator.free(id_dup);
+        var data = SessionData.init(self.allocator);
+        errdefer data.deinit();
 
+        // 修复 A1：先写 Set-Cookie，再插 map。
+        // 若 setCookieFull 失败，上面的 errdefer 会清理 session_id/id_dup/data，
+        // 且此时 map 尚未持有 session_id，不会 double-free / 悬空 key。
         _ = try res.setCookieFull(.{
             .name = self.config.cookie_name,
             .value = session_id,
@@ -109,19 +110,35 @@ pub const SessionManager = struct {
             .same_site = "Lax",
         });
 
+        const record = SessionRecord{
+            .id = id_dup,
+            .data = data,
+            .expires = now_ns + @as(i96, self.config.session_timeout_sec) * 1_000_000_000,
+            .created = now_ns,
+        };
+        // put 成功后 session_id（key）与 record 的所有权移交 map；函数随后正常
+        // 返回，errdefer 不触发。若 put 失败，errdefer 释放全部临时分配。
+        try self.sessions.put(session_id, record);
+
         self.maybeCleanupLocked();
         return session_id;
     }
 
-    /// 获取 Session 数据（线程安全）
-    pub fn getData(self: *Self, session_id: []const u8) ?SessionData {
+    /// 读取 Session 中某个键的值（线程安全）。
+    ///
+    /// 修复 A2：不再把内部 HashMap 结构越过锁返回给调用方（那会在并发
+    /// setData/删除时悬空）。这里在持锁期间把值 dup 到调用方提供的
+    /// allocator（通常是请求 arena），返回独立拷贝。
+    pub fn getValue(self: *Self, session_id: []const u8, key: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         if (self.sessions.getPtr(session_id)) |record| {
             const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
             if (now < record.expires) {
-                return record.data;
+                if (record.data.get(key)) |v| {
+                    return try allocator.dupe(u8, v);
+                }
             }
         }
         return null;
@@ -129,6 +146,8 @@ pub const SessionManager = struct {
 
     /// 设置 Session 数据（线程安全）
     /// 修复 P1：重复 key 时释放旧的 key/value，不再泄漏。
+    /// 修复 A3：先把 key/value dup 成功，再改动 map，避免 OOM 时 map 残留
+    /// undefined value 或悬空 entry。
     pub fn setData(self: *Self, session_id: []const u8, key: []const u8, value: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -138,21 +157,19 @@ pub const SessionManager = struct {
             return;
         };
 
-        // 修复 P1：用 getOrPut 检查重复 key
-        const gop = try record.data.getOrPut(key);
-        if (gop.found_existing) {
-            // 重复 key：释放旧 key 和旧 value
-            self.allocator.free(gop.key_ptr.*);
-            self.allocator.free(gop.value_ptr.*);
-        }
-
-        // 复制新的 key 和 value（确保所有权独立）
+        // 先 dup（可能 OOM），成功后才动 map。
         const key_dup = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_dup);
         const val_dup = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(val_dup);
 
-        // 分配成功，接管所有权
+        const gop = try record.data.getOrPut(key);
+        if (gop.found_existing) {
+            // 重复 key：释放旧 key 和旧 value，复用槽位（key 用新 dup 覆盖）。
+            self.allocator.free(gop.key_ptr.*);
+            self.allocator.free(gop.value_ptr.*);
+        }
+        // 到这里不再有可失败操作，安全接管所有权。
         gop.key_ptr.* = key_dup;
         gop.value_ptr.* = val_dup;
     }
@@ -265,9 +282,12 @@ test "SessionManager.setData/getData round trip" {
     try sm.setData("test_session", "username", "alice");
     try sm.setData("test_session", "role", "admin");
 
-    const data = sm.getData("test_session") orelse @panic("data should exist");
-    try std.testing.expectEqualStrings("alice", data.get("username").?);
-    try std.testing.expectEqualStrings("admin", data.get("role").?);
+    const username = (try sm.getValue("test_session", "username", allocator)) orelse @panic("data should exist");
+    defer allocator.free(username);
+    const role = (try sm.getValue("test_session", "role", allocator)) orelse @panic("data should exist");
+    defer allocator.free(role);
+    try std.testing.expectEqualStrings("alice", username);
+    try std.testing.expectEqualStrings("admin", role);
 }
 
 test "SessionManager.setData overwrites without leak" {
@@ -290,8 +310,9 @@ test "SessionManager.setData overwrites without leak" {
     // 覆盖（旧 key/value 应被释放——不泄漏）
     try sm.setData("overwrite_test", "key", "value2");
 
-    const data = sm.getData("overwrite_test") orelse @panic("data should exist");
-    try std.testing.expectEqualStrings("value2", data.get("key").?);
+    const val = (try sm.getValue("overwrite_test", "key", allocator)) orelse @panic("data should exist");
+    defer allocator.free(val);
+    try std.testing.expectEqualStrings("value2", val);
 }
 
 test "SessionManager.setData on non-existent session does not crash" {

@@ -22,6 +22,9 @@ pub const RequestState = struct {
     path_params: std.StringHashMapUnmanaged([]const u8) = .empty,
     user_data: ?*UserData = null,
     route_pattern: ?[]const u8 = null,
+    /// 405 时的 Allow 头值（逗号分隔的方法名）。由 router 在方法不匹配时填充，
+    /// methodNotAllowedHandler 读取并写入响应头（修复 F4：405 缺 Allow）。
+    allow_header: ?[]const u8 = null,
     poisoned: bool = false,
     /// 已缓冲的请求体（fix.md §四.7：Request 不可变，body 缓存移到 State）。
     /// readBody 首次调用后缓存于此，后续调用直接返回。

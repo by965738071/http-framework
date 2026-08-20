@@ -69,6 +69,20 @@ pub const Router = struct {
 
         // 决定最终要执行的 handler（命中 / 405 兜底 / 404 兜底 / not_found 自定义）
         const handler: Handler = if (result.handler) |h| h else if (result.pattern_matched) blk: {
+            // 修复 F4：把 trie 计算出的 allowed_methods 拼成 Allow 头值，存进 state，
+            // 供 methodNotAllowedHandler 输出（RFC 7231 §6.5.5）。
+            if (result.allowed_count > 0) {
+                var buf = std.ArrayList(u8).empty;
+                errdefer buf.deinit(ctx.arena);
+                var i: u8 = 0;
+                while (i < result.allowed_count) : (i += 1) {
+                    if (result.allowed_methods[i]) |m| {
+                        if (buf.items.len > 0) try buf.appendSlice(ctx.arena, ", ");
+                        try buf.appendSlice(ctx.arena, @tagName(m));
+                    }
+                }
+                ctx.state.allow_header = try buf.toOwnedSlice(ctx.arena);
+            }
             break :blk Handler.fromFn(methodNotAllowedHandler);
         } else if (self.not_found) |nf| nf else Handler.fromFn(defaultNotFoundHandler);
 
@@ -84,8 +98,11 @@ pub const Router = struct {
         return true;
     }
 
-    fn methodNotAllowedHandler(_: *Context, res: *Response) !void {
+    fn methodNotAllowedHandler(ctx: *Context, res: *Response) !void {
         _ = res.statusCode(.method_not_allowed);
+        if (ctx.state.allow_header) |allow| {
+            _ = try res.header("Allow", allow);
+        }
         try res.text("Method Not Allowed");
     }
 

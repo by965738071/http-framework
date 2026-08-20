@@ -138,13 +138,18 @@ pub fn encode(
     }
 }
 
+/// 单帧 payload 的默认上限（字节）。防止客户端用超大长度字段触发 OOM（修复 E1）。
+pub const DEFAULT_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
 /// 从 reader 读一帧并解码。
 ///
 /// `allocator` 用于分配 payload 缓冲——解码后 payload 是独立 owned 内存，
 /// 不依赖 reader 的内部缓冲，调用方负责 free。
 ///
+/// `max_payload` 限制单帧 payload 大小，超过返回 error.FramePayloadTooLong（修复 E1）。
+///
 /// 解码出的 payload 已经 unmask（mask=true 的情况下 XOR 还原）。
-pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Frame {
+pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator, max_payload: usize) !Frame {
     const first = try reader.takeByte();
     const fin = (first & 0x80) != 0;
     const rsv1 = (first & 0x40) != 0;
@@ -165,8 +170,8 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Frame {
         },
         LEN_64_BIT => blk: {
             const v = try reader.takeInt(u64, .big);
-            // RFC §5.5: 控制帧 payload 上限 125，但通用长度字段理论允许更大。
-            // 高 bit 在 64-bit 长度里必须为 0（RFC），这里不校验，留给上层。
+            // RFC §5.5: 64-bit 长度最高位必须为 0（修复 E1：强制校验）。
+            if (v & 0x8000_0000_0000_0000 != 0) return error.InvalidFrameLength;
             break :blk v;
         },
         else => len7,
@@ -177,6 +182,9 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Frame {
         return error.ControlFramePayloadTooLong;
     }
 
+    // 单帧上限校验——在分配之前拦截，防止 OOM（修复 E1）。
+    if (payload_len > max_payload) return error.FramePayloadTooLong;
+
     // mask key
     var masking_key: [4]u8 = .{ 0, 0, 0, 0 };
     if (mask) {
@@ -185,6 +193,7 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Frame {
     }
 
     // 分配 payload 缓冲——独立 owned，不指向 reader 内部缓冲。
+    // payload_len 已 <= max_payload <= usize 上限，@intCast 安全。
     const buf = try allocator.alloc(u8, @intCast(payload_len));
     errdefer allocator.free(buf);
     if (payload_len > 0) {
@@ -233,7 +242,7 @@ test "encode then decode roundtrip — short unmasked text" {
     const written = w.buffered();
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, testing.allocator);
+    const f = try decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD);
     defer testing.allocator.free(f.payload);
 
     try testing.expect(f.fin);
@@ -252,7 +261,7 @@ test "encode then decode roundtrip — masked binary (client→server)" {
     const written = w.buffered();
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, testing.allocator);
+    const f = try decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD);
     defer testing.allocator.free(f.payload);
 
     try testing.expect(f.mask);
@@ -275,7 +284,7 @@ test "encode uses 16-bit length encoding for 126-byte payload" {
     try testing.expectEqual(@as(u8, 126), written[3]);
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, testing.allocator);
+    const f = try decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD);
     defer testing.allocator.free(f.payload);
     try testing.expectEqual(@as(usize, 126), f.payload.len);
 }
@@ -296,7 +305,7 @@ test "encode uses 64-bit length encoding for >65535 byte payload" {
     try testing.expectEqual(@as(u8, 127), written[1]); // 64-bit marker
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, allocator);
+    const f = try decode(&r, allocator, DEFAULT_MAX_PAYLOAD);
     defer allocator.free(f.payload);
     try testing.expectEqual(@as(usize, 70000), f.payload.len);
 }
@@ -308,7 +317,7 @@ test "close frame encodes and decodes" {
     const written = w.buffered();
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, testing.allocator);
+    const f = try decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD);
     defer testing.allocator.free(f.payload);
 
     try testing.expectEqual(OpCode.close, f.opcode);
@@ -350,7 +359,7 @@ test "decode empty payload frame" {
     const written = w.buffered();
 
     var r: std.Io.Reader = .fixed(written);
-    const f = try decode(&r, testing.allocator);
+    const f = try decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD);
     defer testing.allocator.free(f.payload);
     try testing.expectEqual(@as(usize, 0), f.payload.len);
     try testing.expect(f.mask);

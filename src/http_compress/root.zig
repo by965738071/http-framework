@@ -117,7 +117,7 @@ pub const CompressMiddleware = struct {
         }
 
         // 跳过条件：Content-Type 不可压缩
-        if (!shouldCompress(res)) {
+        if (!shouldCompress(res, self.config.skip_content_types)) {
             try res.flush();
             return;
         }
@@ -140,18 +140,45 @@ pub const CompressMiddleware = struct {
 };
 
 /// 根据 Accept-Encoding 头选择编码。
+/// 修复 F7：按 token 解析并尊重 q=0（显式拒绝），避免 `gzip;q=0` 仍选 gzip、
+/// 以及 `x-gzip` 之类子串误匹配。
 pub fn chooseEncoding(accept: []const u8, supported: []const Encoding) ?Encoding {
     for (supported) |enc| {
-        if (std.mem.indexOf(u8, accept, enc.headerValue()) != null) {
-            return enc;
-        }
+        if (acceptsEncoding(accept, enc.headerValue())) return enc;
     }
     return null;
 }
 
-/// 检查 Content-Type 是否可压缩。
-pub fn shouldCompressContentType(content_type: []const u8) bool {
-    for (skip_types) |prefix| {
+/// 在 Accept-Encoding 列表里查找某个 token，返回它是否被接受（q!=0）。
+fn acceptsEncoding(accept: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, accept, ',');
+    while (it.next()) |raw| {
+        var part = std.mem.trim(u8, raw, " \t");
+        // 拆出 coding 与参数（q 值）
+        var q_zero = false;
+        if (std.mem.indexOfScalar(u8, part, ';')) |semi| {
+            const params = part[semi + 1 ..];
+            part = std.mem.trim(u8, part[0..semi], " \t");
+            // 查找 q=0（允许 q=0, q=0.0 等）
+            if (std.mem.indexOf(u8, params, "q=")) |qi| {
+                const qval = std.mem.trim(u8, params[qi + 2 ..], " \t");
+                if (parseQZero(qval)) q_zero = true;
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(part, token)) return !q_zero;
+    }
+    return false;
+}
+
+/// 判断 q 值字符串是否等价于 0（如 "0", "0.0", "0.00"）。
+fn parseQZero(qval: []const u8) bool {
+    const v = std.fmt.parseFloat(f32, qval) catch return false;
+    return v == 0;
+}
+
+/// 检查 Content-Type 是否可压缩（对照给定的 skip 前缀列表）。
+pub fn shouldCompressContentType(content_type: []const u8, skip_list: []const []const u8) bool {
+    for (skip_list) |prefix| {
         if (std.mem.startsWith(u8, content_type, prefix)) return false;
     }
     return true;
@@ -165,8 +192,8 @@ fn hasHeader(res: *const Response, name: []const u8) bool {
     return false;
 }
 
-/// 检查 Content-Type 是否可压缩。
-fn shouldCompress(res: *const Response) bool {
+/// 检查 Response 是否可压缩（修复 F8：使用配置的 skip_content_types 而非模块常量）。
+fn shouldCompress(res: *const Response, skip_list: []const []const u8) bool {
     var ct: ?[]const u8 = null;
     for (res.headers.items) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
@@ -175,10 +202,11 @@ fn shouldCompress(res: *const Response) bool {
         }
     }
     const content_type = ct orelse return true; // 无 CT 默认压缩
-    return shouldCompressContentType(content_type);
+    return shouldCompressContentType(content_type, skip_list);
 }
 
-const skip_types = &[_][]const u8{
+/// 默认不压缩的 Content-Type 前缀列表（供 static 等无自定义配置的调用方使用）。
+pub const default_skip_types = &[_][]const u8{
     "image/",
     "video/",
     "audio/",

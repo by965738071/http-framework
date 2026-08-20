@@ -52,16 +52,23 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         /// 打开（或创建）一个数据表
         pub fn open(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !*Self {
             const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
+            const dir_copy = try allocator.dupe(u8, data_dir);
+            errdefer allocator.free(dir_copy);
             self.* = .{
                 .allocator = allocator,
                 .io = io,
-                .data_dir = try allocator.dupe(u8, data_dir),
+                .data_dir = dir_copy,
                 .table_name = schema.table_name,
                 .next_id = 1,
                 .rows = std.ArrayList(T).empty,
                 .dirty = false,
                 .id_index = std.AutoHashMap(u64, usize).init(allocator),
             };
+            errdefer {
+                self.rows.deinit(allocator);
+                self.id_index.deinit();
+            }
 
             const cwd = std.Io.Dir.cwd();
 
@@ -85,6 +92,10 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             try self.lock();
             errdefer self.unlock();
             try self.flushUnlocked();
+            // 修复 C2：释放所有行的字符串字段。
+            for (self.rows.items) |row| {
+                freeStringFields(T, self.allocator, row);
+            }
             self.rows.deinit(self.allocator);
             self.id_index.deinit();
             self.allocator.free(self.data_dir);
@@ -218,6 +229,10 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // 唯一约束校验（与其它已存在行比较）
             try self.checkUnique(new_row, null);
 
+            // 修复 C1：deep-copy 字符串字段到 self.allocator，与 load 的所有权模型一致。
+            try dupStringFields(T, self.allocator, &new_row);
+            errdefer freeStringFields(T, self.allocator, new_row);
+
             try self.rows.append(self.allocator, new_row);
             try self.id_index.put(id, self.rows.items.len - 1);
             self.dirty = true;
@@ -343,12 +358,18 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 }
                 const orig_id = getFieldId(T, row);
                 setFieldByIdentifier(T, &updated, "id", orig_id);
+                // 修复 C1/C2：调和字符串字段所有权。对每个发生变化的字符串
+                // 字段：释放旧（已 owned）值、dup 新值入 self.allocator，避免旧值泄漏
+                // 与新值指向调用方内存而悬空。
+                try reconcileStringFields(T, self.allocator, row, &updated);
                 self.rows.items[idx] = updated;
                 updated_count += 1;
             }
 
-            self.unlock();
+            // 修复 C3：dirty 必须在锁内写（其他地方都在锁内访问），
+            // 否则与并发 flush 竞态可能丢失一次持久化。
             if (updated_count > 0) self.dirty = true;
+            self.unlock();
             return updated_count;
         }
 
@@ -365,6 +386,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             const deleted_count = to_delete.items.len;
             if (deleted_count == 0) return 0;
+
+            // 修复 C2：释放被删除行的字符串字段。
+            for (to_delete.items) |idx| {
+                freeStringFields(T, self.allocator, self.rows.items[idx]);
+            }
 
             // Second pass: compact-copy all rows that are NOT being deleted.
             // to_delete is in ascending order, so we can walk it with a cursor.
@@ -415,6 +441,10 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             try self.lock();
             defer self.unlock();
 
+            // 修复 C2：释放所有行的字符串字段。
+            for (self.rows.items) |row| {
+                freeStringFields(T, self.allocator, row);
+            }
             self.rows.clearRetainingCapacity();
             self.id_index.clearRetainingCapacity();
             self.next_id = 1;
@@ -763,6 +793,63 @@ fn getFieldId(comptime T: type, value: T) u64 {
         return @intCast(@field(value, "id"));
     }
     @compileError("Type has no 'id' field: " ++ @typeName(T));
+}
+
+/// dup 行中所有 `[]const u8` 字段到 allocator（修复 C1：insert 不能存储
+/// 调用方内存的切片，否则调用方 arena 回收后悬空 / flush 写出损坏 JSON）。
+/// 与 load 的所有权模型（逐字段 dup）一致，便于 delete/truncate/close 统一释放。
+fn dupStringFields(comptime T: type, allocator: std.mem.Allocator, row: *T) !void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime isConstU8Slice(ftype)) {
+            @field(row.*, fname) = try allocator.dupe(u8, @field(row.*, fname));
+        }
+    }
+}
+
+/// 释放行中所有 `[]const u8` 字段（修复 C2：字符串在 delete/truncate/close 时泄漏）。
+fn freeStringFields(comptime T: type, allocator: std.mem.Allocator, row: T) void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime isConstU8Slice(ftype)) {
+            allocator.free(@field(row, fname));
+        }
+    }
+}
+
+fn isConstU8Slice(comptime FT: type) bool {
+    return switch (@typeInfo(FT)) {
+        .pointer => |ptr| ptr.size == .slice and ptr.child == u8,
+        else => false,
+    };
+}
+
+/// 调和 update 时的字符串所有权（修复 C1/C2）。
+/// 对每个字符串字段：若 updated 的指针与 original 不同（即被覆写为
+/// 调用方内存），则释放 original（已 owned）、把新值 dup 入 allocator。
+/// 未变的字段保留 original 的 owned 指针（updated 与 original 共享）。
+fn reconcileStringFields(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T) !void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime isConstU8Slice(ftype)) {
+            const orig_slice = @field(original, fname);
+            const new_slice = @field(updated.*, fname);
+            if (orig_slice.ptr != new_slice.ptr) {
+                const dup = try allocator.dupe(u8, new_slice);
+                allocator.free(orig_slice);
+                @field(updated.*, fname) = dup;
+            }
+        }
+    }
 }
 
 // ── 测试 ──────────────────────────────────────────
