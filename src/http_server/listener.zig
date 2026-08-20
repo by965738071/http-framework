@@ -3,12 +3,11 @@
 //! 只负责 TCP accept 和连接数背压。不负责 HTTP 解析、dispatch、
 //! 信号、worker——那些在 ConnectionRunner / Shutdown / Server 里。
 //!
-//! 接受循环使用 poll() + 短超时：每次超时后检查 shutdown flag。
-//! 信号处理器只需 atomic store，不需要 pipe。
+//! Windows 下阻塞的 accept() 不会被 Ctrl+C 打断，因此 Server.run 用
+//! WaitForMultipleObjects 同时等待“有关可接收连接”和“关闭事件”，
+//! 由关闭事件唤醒主循环，而不是在这里做轮询。
 
 const std = @import("std");
-const posix = std.posix;
-const c = std.c;
 const net = std.Io.net;
 const http_app = @import("http_app");
 
@@ -40,12 +39,13 @@ pub const Listener = struct {
     }
 
     /// 接受新连接。达到 max_connections 时阻塞（背压）。
-    /// 取消（shutdown）时返回 error.Canceled。
-    ///
-    /// 使用 poll() 设置超时，每次超时后检查 shutdown flag。
-    /// 信号处理器只需 atomic store shutdown flag，不需要额外唤醒机制。
+    /// 返回 error.Canceled 时调用方应退出。
     pub fn accept(self: *Listener) !net.Stream {
         try self.semaphore.wait(self.io);
-        return self.tcp_server.accept(self.io);
+        return self.tcp_server.accept(self.io) catch |err| {
+            // accept 失败也要归还信号量许可，避免背压计数器泄漏。
+            self.semaphore.post(self.io);
+            return err;
+        };
     }
 };
