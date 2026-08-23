@@ -44,7 +44,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var static_server = framework.StaticFileServer.init(allocator, io, "./public", "/static");
     try router.route(.GET, "/static/*", framework.Handler.initSingleton(framework.StaticFileServer, &static_server));
 
-    // 3. 日志器
+    // 3. 日志器（文件输出，O_APPEND 内核原子追加，无需每请求 stat）
     var logger = try framework.Logger.init(allocator, io, .{
         .min_level = .info,
         .format = .json,

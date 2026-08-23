@@ -37,6 +37,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http_app = @import("http_app");
 const http_protocol = @import("http_protocol");
 const flate = std.compress.flate;
@@ -188,6 +189,10 @@ pub const Logger = struct {
     file_offset: u64,
     /// init 时 dupe 的文件路径（deinit 释放）
     owned_path: ?[]const u8,
+    /// 是否成功开启 O_APPEND 模式（POSIX）。为 true 时写入走内核原子追加
+    /// （writeStreamingAll，无需每请求 stat 重算偏移），跨进程安全且更快。
+    /// 为 false（Windows / fcntl 失败）时退回 stat+pwrite 兼容路径。
+    append_mode: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: LoggerConfig) !Logger {
         var self = Logger{
@@ -236,6 +241,29 @@ pub const Logger = struct {
             return;
         };
         self.file_offset = st.size;
+
+        // POSIX：给 fd 设置 O_APPEND，之后每次 write 由内核原子追加到 EOF。
+        // 这样写入路径不再需要每请求 statFile 重算偏移（性能瓶颈），也天然
+        // 跨进程/多线程安全（多个 writer 各自的 write 不会互相覆盖）。
+        // 失败（或非 POSIX）时保持 append_mode=false，退回 stat+pwrite 路径。
+        self.append_mode = enableAppendMode(self.file.handle);
+    }
+
+    /// 给已打开的文件描述符设置 O_APPEND（POSIX）。成功返回 true。
+    /// 非 POSIX 平台或 fcntl 失败返回 false（调用方退回 pwrite 路径）。
+    fn enableAppendMode(handle: std.posix.fd_t) bool {
+        switch (builtin.os.tag) {
+            .windows, .wasi => return false,
+            else => {
+                const F = std.posix.F;
+                const cur = std.c.fcntl(handle, F.GETFL, @as(usize, 0));
+                if (cur < 0) return false;
+                const append_bit: usize = @as(u32, @bitCast(std.posix.O{ .APPEND = true }));
+                const new_flags: usize = @as(usize, @intCast(cur)) | append_bit;
+                if (std.c.fcntl(handle, F.SETFL, new_flags) < 0) return false;
+                return true;
+            },
+        }
     }
 
     /// 主日志方法。ctx 可为 null（启动/关闭阶段无请求上下文）。
@@ -270,18 +298,23 @@ pub const Logger = struct {
             .file => {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
-                // 每次写入前以 stat 实时校准偏移：若文件被外部进程截断/改写，
-                // 直接追加到真实 EOF，避免陈旧偏移 pwrite 在文件中间留下
-                // NUL 空洞（Mac 会因此把日志判为二进制）。
-                // 用路径 stat（而非已打开的写句柄）：Windows 上写句柄缺
-                // FILE_READ_ATTRIBUTES，直连句柄 stat 会返回 AccessDenied。
-                if (self.owned_path) |p| {
-                    if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
-                        self.file_offset = st.size;
-                    } else |_| {}
+                if (self.append_mode) {
+                    // O_APPEND 快路径：内核保证每次 write 原子追加到 EOF，
+                    // 无需 stat 重算偏移，也不会留下 NUL 空洞。file_offset 仅
+                    // 增量维护用于轮转判断。
+                    self.file.writeStreamingAll(self.io, written) catch return;
+                    self.file_offset += written.len;
+                } else {
+                    // 兼容路径（Windows / fcntl 失败）：每次写入前以 stat 实时
+                    // 校准偏移，避免陈旧偏移 pwrite 在文件中间留下 NUL 空洞。
+                    if (self.owned_path) |p| {
+                        if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
+                            self.file_offset = st.size;
+                        } else |_| {}
+                    }
+                    self.file.writePositionalAll(self.io, written, self.file_offset) catch return;
+                    self.file_offset += written.len;
                 }
-                self.file.writePositionalAll(self.io, written, self.file_offset) catch return;
-                self.file_offset += written.len;
                 self.rotateIfNeeded();
             },
         }
