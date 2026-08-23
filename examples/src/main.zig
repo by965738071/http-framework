@@ -14,6 +14,8 @@
 //!   ├─ 鉴权            GET /admin/secret（Bearer Token，仅 /admin 前缀受保护）
 //!   ├─ 限流            GET /rate-limit（60 秒窗口，全局 30 次）
 //!   ├─ ORM            GET/POST /orm/users   GET/PUT/DELETE /orm/users/:id
+//!   ├─ Admin 后台      GET/POST /admin/*（登录 + 用户管理 + 仪表盘 + 日志）
+//!   ├─ WebSocket      GET /ws（echo）      GET /admin/ws（实时通知）
 //!   └─ 中间件管道       ErrorRenderer → RequestId → Compress → Timing
 //!                      → SecurityHeaders → CORS → RateLimit（全局）
 //!                      /admin/* 额外叠加组级 Auth 中间件（router.group）
@@ -21,7 +23,8 @@
 //! 运行：
 //!   cd examples && zig build run
 //!
-//! 常用 curl 测试（终端里一条条试）：
+//! 访问 Admin 后台：http://127.0.0.1:9000/admin
+//! Demo 账号：admin / admin123  editor / editor123  viewer / viewer123
 //!
 //!   # 基础
 //!   curl http://127.0.0.1:9000/
@@ -67,6 +70,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const framework = @import("http_framework");
 const zio = @import("zio");
+const admin = @import("admin");
 
 // ────────────────────────────────────────────────────────────────────────────
 // 全局状态
@@ -96,10 +100,8 @@ const UserStore = UserModel.Store;
 // ────────────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
-    const rt = try zio.Runtime.init(init.gpa, .{});
-    defer rt.deinit();
-    var handle = try zio.spawn(appMain, .{ rt.io(), init.gpa });
-    handle.join() catch |err| std.log.err("appMain: {s}", .{@errorName(err)});
+    // 使用框架的 runZio 启动 zio 运行时
+    try framework.runZio(init.gpa, appMain);
 }
 
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
@@ -111,17 +113,11 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         .pool = .{ .request_arena_retain_bytes = 4 * 1024 },
     };
 
-    // 3. 结构化日志器（文件输出，2 MiB 轮转 + gzip 归档 1 个）
+    // 3. 结构化日志器（同时输出到终端和文件）
     var logger = try framework.Logger.init(allocator, io, .{
         .min_level = .info,
-        .format = .json,
-        .output = .file,
-        .file = .{
-            .path = "log/examples.log",
-            .max_size = 2 * 1024 * 1024,
-            .max_backups = 1,
-            .compress = true,
-        },
+        .format = .text, // 使用文本格式便于终端阅读
+        .output = .stderr, // 输出到 stderr（终端）
     });
     defer logger.deinit();
     logger.info(null, "examples starting", &.{
@@ -140,6 +136,27 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     const store = try UserStore.open(allocator, io, "./data");
     defer store.close() catch {};
 
+    // 5b. Admin ORM stores
+    const admin_users = try admin.UserModel.Store.open(allocator, io, "./data/admin");
+    defer admin_users.close() catch {};
+    const admin_logs = try admin.LogStore.open(allocator, io, "./data/admin");
+    defer admin_logs.close() catch {};
+
+    // 5c. Admin notifications broadcaster
+    var notifications = admin.Notifications.init(allocator);
+    defer notifications.deinit();
+
+    // 5d. Admin static file server
+    var admin_static = framework.StaticFileServer.init(allocator, io, "./public/admin", "/admin");
+
+    var admin_services = admin.AdminServices{
+        .allocator = allocator,
+        .io = io,
+        .users = admin_users,
+        .logs = admin_logs,
+        .notifications = notifications,
+    };
+
     // 5b. 应用级服务容器（修复 #2）：把进程级单例注册进去，
     //     handler 通过 ctx.service(T) 取回，不再依赖全局变量。
     var services = framework.Services.init(allocator);
@@ -147,6 +164,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try services.register(framework.Logger, &logger);
     try services.register(framework.SessionManager, &sessions);
     try services.register(UserStore, store);
+    try services.register(admin.AdminServices, &admin_services);
 
     // 6. 路由器
     var router = try framework.Router.init(allocator);
@@ -170,8 +188,14 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var timing_mw = TimingMiddleware{};
     try router.use(framework.Middleware.init(TimingMiddleware, &timing_mw));
 
-    // 安全响应头（X-Content-Type-Options 等）
-    var security_mw = framework.SecurityHeaders{ .config = .{} };
+    // 安全响应头（X-Content-Type-Options 等）。
+    // 框架默认 CSP 是 `default-src 'self'`（不允许任何内联）。但本示例的
+    // admin 页面（public/admin/index.html）是单文件 demo，内联了 <style>/<script>/
+    // style=/onclick=，所以放宽 CSP 允许 inline，否则浏览器会拒绝样式与脚本。
+    // 生产环境应把样式/脚本拆到外部文件，保持默认的严格 CSP。
+    var security_mw = framework.SecurityHeaders{ .config = .{
+        .content_security_policy = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:",
+    } };
     try router.use(framework.Middleware.init(framework.SecurityHeaders, &security_mw));
 
     // CORS（通配允许所有源，预检请求自动处理）
@@ -242,16 +266,70 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
 
     try router.route(.GET, "/rate-limit", framework.Handler.fromFn(rateLimitDemoHandler));
 
-    // ── 鉴权演示：用路由分组把 Bearer Token 鉴权只施加于 /admin/* ────
-    // 修复 #4：不再需要自写前缀判断的 ScopedAuth，直接用 router.group。
-    // 组级中间件只对本组下注册的路由执行，其他路由不受影响。
-    var admin_auth = framework.AuthMiddleware{ .config = .{
-        .bearer_token = "demo-secret-token",
-        .realm = "Protected",
-    } };
-    var admin = router.group("/admin");
-    try admin.use(framework.Middleware.init(framework.AuthMiddleware, &admin_auth));
-    try admin.route(.GET, "/secret", framework.Handler.fromFn(adminSecretHandler));
+    // 5d. Handler instances (必须在 admin_services 之后声明)
+    var login_page_handler = admin.LoginPageHandler{ .services = &admin_services };
+    var login_api_handler = admin.LoginApiHandler{ .services = &admin_services };
+    var logout_handler = admin.LogoutHandler{ .services = &admin_services };
+    var me_handler = admin.MeHandler{ .services = &admin_services };
+    var dashboard_handler = admin.DashboardHandler{ .services = &admin_services };
+    var user_list_handler = admin.UserListHandler{ .services = &admin_services };
+    var user_create_handler = admin.UserCreateHandler{ .services = &admin_services };
+    var user_get_handler = admin.UserGetHandler{ .services = &admin_services };
+    var user_update_handler = admin.UserUpdateHandler{ .services = &admin_services };
+    var user_delete_handler = admin.UserDeleteHandler{ .services = &admin_services };
+    var log_list_handler = admin.LogListHandler{ .services = &admin_services };
+    var log_clear_handler = admin.LogClearHandler{ .services = &admin_services };
+    var settings_handler = admin.SettingsHandler{ .services = &admin_services };
+    var ws_notifications_handler = admin.WsNotificationsHandler{ .services = &admin_services };
+
+    // ── Admin 后台管理 ────────────────────────────────────────
+    {
+        // 创建 admin 路由组
+        var admin_routes = router.group("/admin");
+        std.log.info("Registering admin routes...", .{});
+
+        // 登录/登出（无需认证）
+        try admin_routes.route(.GET, "/", framework.Handler.initSingleton(admin.LoginPageHandler, &login_page_handler));
+        try admin_routes.route(.GET, "/login", framework.Handler.initSingleton(admin.LoginPageHandler, &login_page_handler));
+        try admin_routes.route(.POST, "/login", framework.Handler.initSingleton(admin.LoginApiHandler, &login_api_handler));
+        try admin_routes.route(.POST, "/logout", framework.Handler.initSingleton(admin.LogoutHandler, &logout_handler));
+
+        // Bearer Token 演示：/admin/secret 用 AuthMiddleware（Authorization: Bearer ...）保护，
+        // 与后台 UI 的 session 鉴权互不相关，仅作为 Bearer 认证示例。
+        {
+            var admin_bearer_routes = try admin_routes.group("");
+            var admin_auth = framework.AuthMiddleware{ .config = .{
+                .bearer_token = "demo-secret-token",
+                .realm = "Protected",
+            } };
+            try admin_bearer_routes.use(framework.Middleware.init(framework.AuthMiddleware, &admin_auth));
+            try admin_bearer_routes.route(.GET, "/secret", framework.Handler.fromFn(adminSecretHandler));
+        }
+
+        // 后台 UI 的受保护路由：用 session 鉴权（admin.requireAuth）。
+        // 后台前端（public/admin/index.html）通过登录设置的 `sid` cookie 访问这些接口，
+        // 因此必须用 session 中间件而非 Bearer Token，否则浏览器登录后仍会 401。
+        {
+            var admin_session_routes = try admin_routes.group("");
+            try admin_session_routes.use(admin.requireAuth(&admin_services));
+
+            try admin_session_routes.route(.GET, "/me", framework.Handler.initSingleton(admin.MeHandler, &me_handler));
+            try admin_session_routes.route(.GET, "/dashboard", framework.Handler.initSingleton(admin.DashboardHandler, &dashboard_handler));
+            try admin_session_routes.route(.GET, "/users", framework.Handler.initSingleton(admin.UserListHandler, &user_list_handler));
+            try admin_session_routes.route(.POST, "/users", framework.Handler.initSingleton(admin.UserCreateHandler, &user_create_handler));
+            try admin_session_routes.route(.GET, "/users/:id", framework.Handler.initSingleton(admin.UserGetHandler, &user_get_handler));
+            try admin_session_routes.route(.PUT, "/users/:id", framework.Handler.initSingleton(admin.UserUpdateHandler, &user_update_handler));
+            try admin_session_routes.route(.DELETE, "/users/:id", framework.Handler.initSingleton(admin.UserDeleteHandler, &user_delete_handler));
+            try admin_session_routes.route(.GET, "/logs", framework.Handler.initSingleton(admin.LogListHandler, &log_list_handler));
+            try admin_session_routes.route(.POST, "/logs/clear", framework.Handler.initSingleton(admin.LogClearHandler, &log_clear_handler));
+            try admin_session_routes.route(.GET, "/settings", framework.Handler.initSingleton(admin.SettingsHandler, &settings_handler));
+            try admin_session_routes.route(.GET, "/ws", framework.Handler.initSingleton(admin.WsNotificationsHandler, &ws_notifications_handler));
+        }
+
+        // 静态文件（Admin UI）- 使用 /* 来捕获所有其他路径
+        try admin_routes.route(.GET, "/*", framework.Handler.initSingleton(framework.StaticFileServer, &admin_static));
+        std.log.info("Admin routes registered successfully", .{});
+    }
 
     // ── ORM CRUD ───────────────────────────────────────────────
 
@@ -283,8 +361,10 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     server.setServices(&services);
 
     std.log.info("Server starting on {s}:{d}", .{ config.network.address, config.network.port });
+    std.log.info("Admin routes registered, trying to start...", .{});
 
     try server.run();
+    std.log.info("Server run() returned", .{});
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -338,12 +418,11 @@ fn redirectHandler(_: *framework.Context, res: *framework.Response) !void {
 /// 表单提交回显（application/x-www-form-urlencoded）：
 /// curl -X POST -d 'name=Jane+Doe&city=%E5%8C%97%E4%BA%AC' http://127.0.0.1:9000/form
 fn formHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    _ = ctx.readBody(ctx.arena, 1 << 20) catch {
+    const name = (ctx.formDecoded("name", 1 << 20) catch {
         try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
         return;
-    };
-    const name = (try ctx.request.getFormDecoded(ctx.arena, "name")) orelse "anonymous";
-    const city = (try ctx.request.getFormDecoded(ctx.arena, "city")) orelse "unknown";
+    }) orelse "anonymous";
+    const city = (try ctx.formDecoded("city", 1 << 20)) orelse "unknown";
     try res.json(.{ .name = name, .city = city });
 }
 
@@ -764,16 +843,16 @@ const TimingMiddleware = struct {
         // 启用缓冲模式——保证 next() 返回后还能修改响应头。
         // 不调 flush()：让外层（Compress / ErrorRenderer / ConnectionRunner）负责最终发送。
         res.setBuffered();
-        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
+        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
 
         // 错误时也要加计时头——计时应该包含错误处理时间。
         next.call(ctx, res) catch |err| {
-            const elapsed_err = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+            const elapsed_err = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
             _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch "?");
             return err;
         };
 
-        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
         _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?");
     }
 };

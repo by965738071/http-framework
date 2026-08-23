@@ -19,10 +19,21 @@ pub const Services = struct {
     allocator: std.mem.Allocator,
 
     const Entry = struct {
-        /// @typeName(T) —— 编译期字符串，稳定且唯一，作为类型键。
-        key: []const u8,
+        /// 类型响应的编译期唯一哨兵指针地址（比指针相等即可，免字符串比较）。
+        key: *const anyopaque,
         ptr: *anyopaque,
     };
+
+    /// 为类型 T 生成编译期唯一的哨兵指针（每个 T 对应一个独立的静态地址）。
+    /// 用作类型键比 @typeName 字符串更快（指针相等而非逐字节比较）且无碰撞风险。
+    fn typeKey(comptime T: type) *const anyopaque {
+        // 把 T 嵌入 Tag 使每个 T 得到独立的静态 sentinel（防止编译器合并实例）。
+        const Tag = struct {
+            const _t = T;
+            var sentinel: u8 = 0;
+        };
+        return &Tag.sentinel;
+    }
 
     pub fn init(allocator: std.mem.Allocator) Services {
         return .{ .allocator = allocator };
@@ -36,9 +47,9 @@ pub const Services = struct {
     /// 只存指针，不接管所有权——服务的生命周期由调用方负责。
     /// 应在启动阶段（开始服务前）调用，不要在并发 dispatch 中调用。
     pub fn register(self: *Services, comptime T: type, ptr: *T) !void {
-        const key = @typeName(T);
+        const key = typeKey(T);
         for (self.entries.items) |*e| {
-            if (std.mem.eql(u8, e.key, key)) {
+            if (e.key == key) {
                 e.ptr = @ptrCast(ptr);
                 return;
             }
@@ -48,9 +59,9 @@ pub const Services = struct {
 
     /// 取回某类型的服务指针，未注册返回 null。
     pub fn get(self: *const Services, comptime T: type) ?*T {
-        const key = @typeName(T);
+        const key = typeKey(T);
         for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.key, key)) {
+            if (e.key == key) {
                 return @ptrCast(@alignCast(e.ptr));
             }
         }

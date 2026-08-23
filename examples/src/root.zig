@@ -1,18 +1,33 @@
-//! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
-const Io = std.Io;
+const admin = @import("admin.zig");
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+// Re-export admin declarations for testing
+pub const Role = admin.Role;
+pub const AdminUser = admin.AdminUser;
+pub const SystemLog = admin.SystemLog;
+pub const AdminServices = admin.AdminServices;
+pub const Notifications = admin.Notifications;
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+// Middleware and handler types
+pub const RequireAuthMiddleware = admin.RequireAuthMiddleware;
+pub const RequireRoleMiddleware = admin.RequireRoleMiddleware;
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+// Handler structs
+pub const LoginPageHandler = admin.LoginPageHandler;
+pub const LoginApiHandler = admin.LoginApiHandler;
+pub const LogoutHandler = admin.LogoutHandler;
+pub const DashboardHandler = admin.DashboardHandler;
+pub const UserListHandler = admin.UserListHandler;
+pub const UserCreateHandler = admin.UserCreateHandler;
+pub const UserGetHandler = admin.UserGetHandler;
+pub const UserUpdateHandler = admin.UserUpdateHandler;
+pub const UserDeleteHandler = admin.UserDeleteHandler;
+pub const LogListHandler = admin.LogListHandler;
+pub const LogClearHandler = admin.LogClearHandler;
+pub const SettingsHandler = admin.SettingsHandler;
+pub const MeHandler = admin.MeHandler;
+pub const WsNotificationsHandler = admin.WsNotificationsHandler;
+
+test {
+    std.testing.refAllDecls(@This());
 }

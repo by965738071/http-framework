@@ -208,10 +208,14 @@ pub const StaticFileServer = struct {
                     .content_type = content_type,
                 });
 
-                var hist_buf: [std.compress.flate.max_window_len]u8 = undefined;
-                var encoder = http_compress.initStreamingEncoder(
+                // flate.Compress 是 ~224KB 的巨型 struct，hist_buf 64KB，都必须堆分配：
+                // 放在 zio 协程栈上会溢出 guard page 崩溃（与 compress() 同根因）。
+                const hist_buf = try ctx.arena.alloc(u8, std.compress.flate.max_window_len);
+                const encoder = try ctx.arena.create(std.compress.flate.Compress);
+                http_compress.initStreamingEncoder(
+                    encoder,
                     stream.writer(),
-                    &hist_buf,
+                    hist_buf,
                     .gzip,
                     .default,
                 ) catch {

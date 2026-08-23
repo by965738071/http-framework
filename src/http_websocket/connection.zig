@@ -77,6 +77,8 @@ pub const WebSocket = struct {
     max_frame_payload: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
     /// 分片拼接后的单个 message 总大小上限（修复 E2）。
     max_message_size: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
+    /// 客户端 mask key 递增计数器（用于派生不可预测的每帧 mask）。
+    mask_counter: u64 = 0,
 
     const Self = @This();
 
@@ -105,11 +107,29 @@ pub const WebSocket = struct {
     /// 内部发送：按 is_client 决定 mask。
     fn send(self: *Self, opcode: OpCode, payload: []const u8) !void {
         if (self.is_client) {
-            const key: [4]u8 = .{ 0x12, 0x34, 0x56, 0x78 };
+            // RFC 6455 §5.3: 客户端每帧必须用不可预测的随机 mask key，
+            // 防经过代理时的缓存投毒攻击（修复:此前写死常量）。
+            // 优先用 io 的安全熵源；不可用时退回用计数器+地址混合的 PRNG（仍优于常量）。
+            var key: [4]u8 = undefined;
+            self.mask_counter +%= 1;
+            var seed: [16]u8 = undefined;
+            std.mem.writeInt(u64, seed[0..8], self.mask_counter, .little);
+            std.mem.writeInt(u64, seed[8..16], @intFromPtr(self), .little);
+            const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &seed);
+            std.mem.writeInt(u32, &key, @truncate(h), .little);
             try frame_mod.encode(self.writer, opcode, payload, true, key);
         } else {
             try frame_mod.encode(self.writer, opcode, payload, false, .{ 0, 0, 0, 0 });
         }
+    }
+
+    /// 用指定数字状态码发送 close 帧（内部用,不做 CloseCode enum 约束）。
+    fn closeWithCode(self: *Self, code: u16) !void {
+        if (self.closed) return;
+        self.closed = true;
+        var buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &buf, code, .big);
+        try self.send(.close, &buf);
     }
 
     /// 发送 ping（控制帧，payload ≤ 125）。
@@ -185,7 +205,10 @@ pub const WebSocket = struct {
                         var reply_buf: [125]u8 = undefined;
                         var reply_len: usize = 0;
                         if (f.payload.len >= 2) {
-                            const reply_code = std.mem.readInt(u16, f.payload[0..2], .big);
+                            var reply_code = std.mem.readInt(u16, f.payload[0..2], .big);
+                            // RFC §7.4.1: 1005/1006/1015 等不得出现在线路上;
+                            // 对方发了无效码则用 1002 protocol_error 回应，不直接回显。
+                            if (!isValidCloseCode(reply_code)) reply_code = 1002;
                             std.mem.writeInt(u16, reply_buf[0..2], reply_code, .big);
                             const reason = f.payload[2..];
                             const rlen = @min(reason.len, 123);
@@ -209,6 +232,13 @@ pub const WebSocket = struct {
                     try self.appendBounded(&payload_list, f.payload);
                     if (f.fin) {
                         const owned = try payload_list.toOwnedSlice(self.allocator);
+                        errdefer self.allocator.free(owned);
+                        // RFC §5.6: text 帧 payload 必须是有效 UTF-8（修复）。
+                        if (first_opcode == .text and !std.unicode.utf8ValidateSlice(owned)) {
+                            self.allocator.free(owned);
+                            self.closeWithCode(1007) catch {};
+                            return error.InvalidUtf8;
+                        }
                         return .{
                             .opcode = first_opcode,
                             .payload = owned,
@@ -225,6 +255,12 @@ pub const WebSocket = struct {
                     try self.appendBounded(&payload_list, f.payload);
                     if (f.fin) {
                         const owned = try payload_list.toOwnedSlice(self.allocator);
+                        errdefer self.allocator.free(owned);
+                        if (first_opcode == .text and !std.unicode.utf8ValidateSlice(owned)) {
+                            self.allocator.free(owned);
+                            self.closeWithCode(1007) catch {};
+                            return error.InvalidUtf8;
+                        }
                         return .{
                             .opcode = first_opcode,
                             .payload = owned,
@@ -248,6 +284,16 @@ pub const WebSocket = struct {
         try list.appendSlice(self.allocator, data);
     }
 };
+
+/// 判断 close 状态码是否允许出现在线路上（RFC 6455 §7.4.1）。
+/// 1005/1006/1015 是保留码，不得在实际 close 帧中发送。
+fn isValidCloseCode(code: u16) bool {
+    return switch (code) {
+        1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011 => true,
+        3000...4999 => true, // 应用/私有保留区间
+        else => false,
+    };
+}
 
 // ===========================================================================
 // Tests

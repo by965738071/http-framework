@@ -10,8 +10,8 @@ const framework = @import("http_framework");
 pub fn main(init: std.process.Init) !void {
     _ = init;
     var debug_allocator = std.heap.DebugAllocator(.{}){};
-    defer{
-        if(debug_allocator.deinit() == .leak) {
+    defer {
+        if (debug_allocator.deinit() == .leak) {
             std.debug.panic("memory leak", .{});
         }
     }
@@ -182,15 +182,15 @@ const TimingMiddleware = struct {
         // 不调 flush()：让外层（CompressMiddleware / ErrorRenderer /
         // ConnectionRunner 兜底）负责最终发送。
         res.setBuffered();
-        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
+        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
         // 错误时也要加 timing 头——计时应该包含错误处理时间，
-        // 且 ErrorRenderer 在外层兑底时已经能看到这个头（fix.md §三.1）。
+        // 且 ErrorRenderer 在外层兌底时已经能看到这个头（fix.md §三.1）。
         next.call(ctx, res) catch |err| {
-            const elapsed_err = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+            const elapsed_err = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
             _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch "?");
             return err;
         };
-        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
         _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?");
     }
 };

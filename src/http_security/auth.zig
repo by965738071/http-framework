@@ -101,9 +101,11 @@ pub const AuthMiddleware = struct {
 
     fn checkBearer(self: *Self, ctx: *Context, expected: []const u8) !bool {
         _ = self;
+        // 空凭据不应放行（否则 constantTimeEql("","")==true 会误放行）。
+        if (expected.len == 0) return false;
         const header = ctx.request.getHeader("Authorization") orelse return false;
-        if (!std.mem.startsWith(u8, header, "Bearer ")) return false;
-        const token = header["Bearer ".len..];
+        // RFC 7235：auth-scheme 大小写不敏感。
+        const token = stripSchemePrefix(header, "Bearer ") orelse return false;
         // 常量时间比较——修复 P0 时序侧信道
         return constantTimeEql(token, expected);
     }
@@ -111,9 +113,7 @@ pub const AuthMiddleware = struct {
     fn checkBasic(self: *Self, ctx: *Context, username: []const u8, password: []const u8) !bool {
         _ = self;
         const header = ctx.request.getHeader("Authorization") orelse return false;
-        if (!std.mem.startsWith(u8, header, "Basic ")) return false;
-
-        const encoded = header["Basic ".len..];
+        const encoded = stripSchemePrefix(header, "Basic ") orelse return false;
 
         // 计算 base64 解码后的长度
         const dec_len = base64DecodedLen(encoded);
@@ -137,6 +137,8 @@ pub const AuthMiddleware = struct {
     }
 
     fn checkApiKey(self: *Self, ctx: *Context, expected: []const u8) !bool {
+        // 空凭据不放行。
+        if (expected.len == 0) return false;
         if (ctx.request.getHeader(self.config.api_key_header)) |key| {
             return constantTimeEql(key, expected);
         }
@@ -148,6 +150,14 @@ pub const AuthMiddleware = struct {
         return false;
     }
 
+    /// 大小写不敏感地剔除 auth-scheme 前缀（如 "Bearer "），返回剩余部分。
+    /// 不匹配返回 null。RFC 7235 规定 scheme 大小写不敏感。
+    fn stripSchemePrefix(header: []const u8, prefix: []const u8) ?[]const u8 {
+        if (header.len < prefix.len) return null;
+        if (!std.ascii.eqlIgnoreCase(header[0..prefix.len], prefix)) return null;
+        return header[prefix.len..];
+    }
+
     fn authOk(self: *Self, ctx: *Context, strategy: AuthStrategy) !void {
         const info_ptr = try ctx.arena.create(AuthInfo);
         info_ptr.* = .{ .strategy = strategy };
@@ -155,15 +165,16 @@ pub const AuthMiddleware = struct {
         switch (strategy) {
             .bearer => {
                 const header = ctx.request.getHeader("Authorization").?;
-                info_ptr.token = try ctx.arena.dupe(u8, header["Bearer ".len..]);
+                const token = stripSchemePrefix(header, "Bearer ") orelse "";
+                info_ptr.token = try ctx.arena.dupe(u8, token);
             },
             .basic => {
                 const header = ctx.request.getHeader("Authorization").?;
-                const encoded = header["Basic ".len..];
+                const encoded = stripSchemePrefix(header, "Basic ") orelse "";
                 const dec_len = base64DecodedLen(encoded);
                 if (dec_len > 0) {
                     const dec_buf = try ctx.arena.alloc(u8, dec_len);
-                    std.base64.standard.Decoder.decode(dec_buf, encoded) catch {};
+                    std.base64.standard.Decoder.decode(dec_buf, encoded) catch return error.InvalidBase64;
                     const colon = std.mem.indexOfScalar(u8, dec_buf, ':') orelse 0;
                     info_ptr.username = try ctx.arena.dupe(u8, dec_buf[0..colon]);
                 }

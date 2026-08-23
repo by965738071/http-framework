@@ -31,6 +31,9 @@ pub const SessionConfig = struct {
     cleanup_interval_sec: u32 = 300,
     /// 是否给 session cookie 加 Secure 属性（生产 HTTPS 下应为 true）。
     secure: bool = false,
+    /// session 数量上限，防止匿名高频请求堆积 session 耗尽内存（DoS）。
+    /// 达上限时先触发一次过期清理，仍满则拒绝创建。
+    max_sessions: usize = 100_000,
 };
 
 pub const SessionManager = struct {
@@ -64,7 +67,9 @@ pub const SessionManager = struct {
         self.sessions.deinit();
     }
 
-    /// 获取或创建 Session（线程安全）
+    /// 获取或创建 Session（线程安全）。
+    /// 返回的 session_id 拷贝到 ctx.arena，生命周期随请求，不会在锁外悬空
+    /// （回应审查发现 #4：不把 map 内部 key 越过锁交给调用方）。
     pub fn getOrCreate(self: *Self, ctx: *Context, res: *Response) ![]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -76,7 +81,9 @@ pub const SessionManager = struct {
                 if (now < record.expires) {
                     // 滑动窗口：更新过期时间
                     record.expires = now + @as(i96, self.config.session_timeout_sec) * 1_000_000_000;
-                    return session_id;
+                    // Cookie 里的 session_id 生命周期随请求（head arena），本身安全，
+                    // 但为统一语义也拷到 ctx.arena 返回。
+                    return try ctx.arena.dupe(u8, session_id);
                 } else {
                     // 过期，删除
                     self.deleteSessionLocked(session_id);
@@ -85,10 +92,19 @@ pub const SessionManager = struct {
         }
 
         // 2. 创建新 Session
-        return try self.createSessionLocked(res);
+        const new_id = try self.createSessionLocked(res);
+        return try ctx.arena.dupe(u8, new_id);
     }
 
     fn createSessionLocked(self: *Self, res: *Response) ![]const u8 {
+        // 先尝试清理过期项，再判上限，避免匿名高频请求堆积 session 耗尽内存。
+        if (self.sessions.count() >= self.config.max_sessions) {
+            self.cleanupExpiredLocked();
+            if (self.sessions.count() >= self.config.max_sessions) {
+                return error.TooManySessions;
+            }
+        }
+
         var random_bytes: [32]u8 = undefined;
         try std.Io.randomSecure(self.io, &random_bytes);
 
@@ -231,6 +247,21 @@ pub const SessionManager = struct {
         for (to_remove.items) |key| {
             self.deleteSessionLocked(key);
             self.allocator.free(key);
+        }
+    }
+
+    /// 公开销毁指定 session（登出）。线程安全。找不到则静默返回。
+    /// 修复：原先只有私有 deleteSessionLocked，应用层无法真正登出。
+    pub fn invalidate(self: *Self, session_id: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.deleteSessionLocked(session_id);
+    }
+
+    /// 从 Cookie 读取 session 并销毁（登出便捷方法）。线程安全。
+    pub fn destroyFromRequest(self: *Self, ctx: *Context) void {
+        if (ctx.request.getCookie(self.config.cookie_name)) |sid| {
+            self.invalidate(sid);
         }
     }
 

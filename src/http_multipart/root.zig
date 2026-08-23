@@ -28,10 +28,32 @@ pub const Context = http_app.Context;
 /// 解析后的文件字段。
 pub const FileField = struct {
     name: []const u8, // field name (e.g. "avatar")
-    file_name: ?[]const u8, // filename from Content-Disposition
+    file_name: ?[]const u8, // filename from Content-Disposition（原始，未清洗）
     content_type: ?[]const u8, // Content-Type of this part
     data: []const u8, // file content
+
+    /// 返回可安全用于文件系统的基名：剥掉任何路径成分（`/`、`\`），
+    /// 拒绝 `.`/`..`。防止调用方直接用 file_name 拼盘造成路径穿越/覆盖。
+    /// 无有效基名时返回 null——调用方应改用自己生成的名字。
+    pub fn safeBaseName(self: FileField) ?[]const u8 {
+        const raw = self.file_name orelse return null;
+        if (raw.len == 0) return null;
+        // 取最后一个 `/` 或 `\` 之后的部分。
+        var start: usize = 0;
+        for (raw, 0..) |c, i| {
+            if (c == '/' or c == '\\') start = i + 1;
+        }
+        const base = raw[start..];
+        if (base.len == 0) return null;
+        if (std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
+        // 含 NUL 的名字拒绝（防止截断攻击）。
+        if (std.mem.indexOfScalar(u8, base, 0) != null) return null;
+        return base;
+    }
 };
+
+/// 单个 multipart 请求允许的最大 part 数，防止构造海量极小 part 放大内存/CPU。
+pub const MAX_PARTS = 1024;
 
 /// 解析后的 multipart 表单。
 /// 所有字段切片都指向 arena 分配的内存。
@@ -106,6 +128,11 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
     const first_delim = std.mem.indexOf(u8, body, delimiter) orelse return form;
     pos = first_delim + delimiter.len;
 
+    // 修复 M3：next_delim_search 在循环外分配一次复用（而非每轮 allocPrint），
+    // 并限制 part 数上限，防止海量极小 part 放大内存/CPU。
+    const next_delim_search = try std.fmt.allocPrint(allocator, "\r\n{s}", .{delimiter});
+    var part_count: usize = 0;
+
     while (pos < body.len) {
         // 检查是否是结束标记 --\r\n
         if (pos + 2 <= body.len and body[pos] == '-' and body[pos + 1] == '-') {
@@ -116,8 +143,10 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
             pos += 2;
         }
 
+        part_count += 1;
+        if (part_count > MAX_PARTS) return error.TooManyParts;
+
         // 找下一个 delimiter（以 \r\n 开头）
-        const next_delim_search = try std.fmt.allocPrint(allocator, "\r\n{s}", .{delimiter});
         const part_end = std.mem.indexOfPos(u8, body, pos, next_delim_search) orelse break;
         const part_data = body[pos..part_end];
 

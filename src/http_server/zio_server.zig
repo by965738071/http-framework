@@ -22,10 +22,24 @@ pub fn run(
     allocator: std.mem.Allocator,
     comptime appFn: fn (std.Io, std.mem.Allocator) anyerror!void,
 ) !void {
-    const rt = try zio.Runtime.init(allocator, .{});
+    // zio 协程默认只提交 256KB 栈。某些 handler/中间件路径会产生较大的栈临时量，
+    // 典型如响应压缩：`flate.Compress` 是 ~224KB 的巨型 struct（std 源码注释：
+    // "Allocates statically ~224K"），`try flate.Compress.init(...)` 会在栈上
+    // 生成该体积的临时值。叠加其它帧后溢出 256KB 提交栈、踩到 guard page，
+    // 在 macOS/kqueue 的栈增长 fault 路径上表现为请求挂起 + WriteFailed/EFAULT。
+    // 把提交栈提到 1MB，给这类大栈帧留足空间（虚拟保留上限仍是默认 8MB）。
+    const rt = try zio.Runtime.init(allocator, .{
+        .stack_pool = .{
+            .maximum_size = 8 * 1024 * 1024,
+            .committed_size = 1024 * 1024,
+        },
+    });
     defer rt.deinit();
     var handle = try zio.spawn(appFn, .{ rt.io(), allocator });
-    handle.join() catch |err| std.log.err("zio app failed: {s}", .{@errorName(err)});
+    handle.join() catch |err| {
+        std.log.err("zio app failed: {s}", .{@errorName(err)});
+        return err;
+    };
 }
 
 /// TCP 监听器 + 并发连接背压（zio.net.Server + zio.Semaphore）。

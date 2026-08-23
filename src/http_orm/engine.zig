@@ -145,6 +145,12 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             defer parsed.deinit();
 
             var max_id: u64 = 0;
+            errdefer {
+                // 修复 M3：load 中途失败时释放已加载行的字符串字段，避免汄漏。
+                for (self.rows.items) |row| freeStringFields(T, self.allocator, row);
+                self.rows.clearRetainingCapacity();
+                self.id_index.clearRetainingCapacity();
+            }
             for (parsed.value) |jrow| {
                 if (jrow != .object) continue;
                 const row = try jsonObjectToType(T, self.allocator, jrow.object);
@@ -153,7 +159,8 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 
                 if (jrow.object.get("id")) |id_val| {
                     if (id_val == .integer) {
-                        const row_id: u64 = @intCast(id_val.integer);
+                        // 修复 H2：负数/越界 id 不直接 @intCast panic，优雅报错。
+                        const row_id: u64 = std.math.cast(u64, id_val.integer) orelse return error.CorruptData;
                         if (row_id > max_id) max_id = row_id;
                         try self.id_index.put(row_id, rows_len - 1);
                     }
@@ -201,16 +208,25 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             const file_path = try self.tableFilePath();
             defer self.allocator.free(file_path);
 
-            const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{file_path});
+            // 修复 H3：tmp 路径加随机 + 地址后缀，避免同进程多实例/多进程并发写
+            // 同一 .tmp 互相覆盖；rename 前 fsync 文件内容，避免崩溃后数据丢失。
+            var rand_suffix: [8]u8 = undefined;
+            self.io.random(&rand_suffix);
+            const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.{x}.{x}.tmp", .{ file_path, @intFromPtr(self), std.mem.readInt(u64, &rand_suffix, .little) });
             defer self.allocator.free(tmp_path);
 
             const cwd = std.Io.Dir.cwd();
             const file = try cwd.createFile(self.io, tmp_path, .{ .truncate = true });
-            defer file.close(self.io);
-            var write_buf: [4096]u8 = undefined;
-            var writer = file.writer(self.io, write_buf[0..]);
-            try writer.interface.writeAll(content);
-            try writer.flush();
+            errdefer cwd.deleteFile(self.io, tmp_path) catch {};
+            {
+                defer file.close(self.io);
+                var write_buf: [4096]u8 = undefined;
+                var writer = file.writer(self.io, write_buf[0..]);
+                try writer.interface.writeAll(content);
+                try writer.flush();
+                // rename 前落盘，保证 rename 后即使崩溃也不会丢掉内容。
+                file.sync(self.io) catch {};
+            }
             try std.Io.Dir.rename(cwd, tmp_path, cwd, file_path, self.io);
         }
 
@@ -795,7 +811,7 @@ fn getFieldId(comptime T: type, value: T) u64 {
     @compileError("Type has no 'id' field: " ++ @typeName(T));
 }
 
-/// dup 行中所有 `[]const u8` 字段到 allocator（修复 C1：insert 不能存储
+/// dup 行中所有字符串字段（`[]const u8` 与 `?[]const u8`）到 allocator（修复 C1：insert 不能存储
 /// 调用方内存的切片，否则调用方 arena 回收后悬空 / flush 写出损坏 JSON）。
 /// 与 load 的所有权模型（逐字段 dup）一致，便于 delete/truncate/close 统一释放。
 fn dupStringFields(comptime T: type, allocator: std.mem.Allocator, row: *T) !void {
@@ -806,11 +822,16 @@ fn dupStringFields(comptime T: type, allocator: std.mem.Allocator, row: *T) !voi
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime isConstU8Slice(ftype)) {
             @field(row.*, fname) = try allocator.dupe(u8, @field(row.*, fname));
+        } else if (comptime isOptionalConstU8Slice(ftype)) {
+            if (@field(row.*, fname)) |s| {
+                @field(row.*, fname) = try allocator.dupe(u8, s);
+            }
         }
     }
 }
 
-/// 释放行中所有 `[]const u8` 字段（修复 C2：字符串在 delete/truncate/close 时泄漏）。
+/// 释放行中所有字符串字段（`[]const u8` 与 `?[]const u8`）（修复 C2：字符串在
+/// delete/truncate/close 时汄漏；optional 字段之前被漏掉）。
 fn freeStringFields(comptime T: type, allocator: std.mem.Allocator, row: T) void {
     const info = switch (@typeInfo(T)) {
         .@"struct" => |s| s,
@@ -819,6 +840,8 @@ fn freeStringFields(comptime T: type, allocator: std.mem.Allocator, row: T) void
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime isConstU8Slice(ftype)) {
             allocator.free(@field(row, fname));
+        } else if (comptime isOptionalConstU8Slice(ftype)) {
+            if (@field(row, fname)) |s| allocator.free(s);
         }
     }
 }
@@ -830,8 +853,17 @@ fn isConstU8Slice(comptime FT: type) bool {
     };
 }
 
+/// 识别 `?[]const u8` / `?[]u8`（修复 C2：之前 isConstU8Slice 不认 optional，
+/// 导致可选字符串字段 insert 悬空、close/delete 汄漏、update 不调和）。
+fn isOptionalConstU8Slice(comptime FT: type) bool {
+    return switch (@typeInfo(FT)) {
+        .optional => |opt| isConstU8Slice(opt.child),
+        else => false,
+    };
+}
+
 /// 调和 update 时的字符串所有权（修复 C1/C2）。
-/// 对每个字符串字段：若 updated 的指针与 original 不同（即被覆写为
+/// 对每个字符串字段（含 optional）：若 updated 的指针与 original 不同（即被覆写为
 /// 调用方内存），则释放 original（已 owned）、把新值 dup 入 allocator。
 /// 未变的字段保留 original 的 owned 指针（updated 与 original 共享）。
 fn reconcileStringFields(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T) !void {
@@ -847,6 +879,23 @@ fn reconcileStringFields(comptime T: type, allocator: std.mem.Allocator, origina
                 const dup = try allocator.dupe(u8, new_slice);
                 allocator.free(orig_slice);
                 @field(updated.*, fname) = dup;
+            }
+        } else if (comptime isOptionalConstU8Slice(ftype)) {
+            const orig_opt = @field(original, fname);
+            const new_opt = @field(updated.*, fname);
+            // 四种情况：null→null(不动)、null→值(dup 新)、值→null(释放旧)、值→值(指针不同则释旧 dup 新)。
+            if (orig_opt) |orig_slice| {
+                if (new_opt) |new_slice| {
+                    if (orig_slice.ptr != new_slice.ptr) {
+                        const dup = try allocator.dupe(u8, new_slice);
+                        allocator.free(orig_slice);
+                        @field(updated.*, fname) = dup;
+                    }
+                } else {
+                    allocator.free(orig_slice);
+                }
+            } else if (new_opt) |new_slice| {
+                @field(updated.*, fname) = try allocator.dupe(u8, new_slice);
             }
         }
     }

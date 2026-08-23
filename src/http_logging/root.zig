@@ -261,6 +261,10 @@ pub const Logger = struct {
                     std.Io.File.stderr()
                 else
                     std.Io.File.stdout();
+                // 修复 H4：stderr/stdout 也加锁，避免多线程并发日志行交错（单条
+                // 日志可能超 PIPE_BUF，且 writeStreamingAll 可能拆成多次 write）。
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 out_file.writeStreamingAll(self.io, written) catch {};
             },
             .file => {
@@ -450,7 +454,8 @@ fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
 
     for (fields) |f| {
         try writer.writeAll(" ");
-        try writer.writeAll(f.key);
+        // 修复 M6：key 也要转义（与 value/msg 一致），否则动态 key 含换行可伪造日志行。
+        try writeTextEscaped(writer, f.key);
         try writer.writeAll("=");
         try f.value.writeText(writer);
     }

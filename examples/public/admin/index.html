@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Panel</title>
+  <style>
+    :root {
+      --primary: #4f46e5;
+      --primary-light: #818cf8;
+      --bg: #0f172a;
+      --bg-card: #1e293b;
+      --bg-sidebar: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: #334155;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --info: #3b82f6;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+    /* Login */
+    .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .login-box { background: var(--bg-card); padding: 2rem; border-radius: 12px; width: 100%; max-width: 400px; border: 1px solid var(--border); }
+    .login-box h1 { text-align: center; margin-bottom: 1.5rem; font-size: 1.5rem; }
+    .form-group { margin-bottom: 1rem; }
+    .form-group label { display: block; margin-bottom: 0.5rem; color: var(--text-muted); font-size: 0.875rem; }
+    .form-group input { width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 1rem; }
+    .form-group input:focus { outline: none; border-color: var(--primary); }
+    .btn { padding: 0.75rem 1.5rem; border-radius: 8px; border: none; cursor: pointer; font-size: 1rem; font-weight: 500; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.9; }
+    .btn-primary { background: var(--primary); color: white; width: 100%; }
+    .btn-danger { background: var(--danger); color: white; }
+    .btn-success { background: var(--success); color: white; }
+    .btn-sm { padding: 0.5rem 1rem; font-size: 0.875rem; }
+    .error-msg { color: var(--danger); font-size: 0.875rem; margin-top: 0.5rem; display: none; }
+    .error-msg.show { display: block; }
+
+    /* Layout */
+    .app-layout { display: flex; min-height: 100vh; }
+    .sidebar { width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border); padding: 1.5rem; position: fixed; height: 100vh; overflow-y: auto; }
+    .sidebar h2 { margin-bottom: 2rem; font-size: 1.25rem; color: var(--primary-light); }
+    .nav-item { display: block; padding: 0.75rem 1rem; border-radius: 8px; color: var(--text-muted); text-decoration: none; margin-bottom: 0.25rem; cursor: pointer; transition: all 0.2s; }
+    .nav-item:hover, .nav-item.active { background: var(--primary); color: white; }
+    .nav-item .badge { float: right; background: var(--danger); color: white; font-size: 0.75rem; padding: 0.125rem 0.5rem; border-radius: 10px; }
+    .main-content { margin-left: 260px; flex: 1; padding: 2rem; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+    .header h1 { font-size: 1.5rem; }
+    .user-info { display: flex; align-items: center; gap: 1rem; color: var(--text-muted); }
+
+    /* Cards */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+    .stat-card { background: var(--bg-card); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); }
+    .stat-card .label { color: var(--text-muted); font-size: 0.875rem; margin-bottom: 0.5rem; }
+    .stat-card .value { font-size: 2rem; font-weight: 600; }
+    .stat-card.primary .value { color: var(--primary-light); }
+    .stat-card.success .value { color: var(--success); }
+    .stat-card.warning .value { color: var(--warning); }
+    .stat-card.danger .value { color: var(--danger); }
+
+    /* Table */
+    .table-container { background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border); overflow: hidden; }
+    .table-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 1rem 1.5rem; text-align: left; border-bottom: 1px solid var(--border); }
+    th { background: rgba(0,0,0,0.2); color: var(--text-muted); font-weight: 500; font-size: 0.875rem; }
+    td { font-size: 0.9375rem; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    .role-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.75rem; font-weight: 500; }
+    .role-admin { background: var(--primary); color: white; }
+    .role-editor { background: var(--info); color: white; }
+    .role-viewer { background: var(--text-muted); color: white; }
+    .actions { display: flex; gap: 0.5rem; }
+
+    /* Modal */
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
+    .modal { background: var(--bg-card); padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; border: 1px solid var(--border); }
+    .modal h2 { margin-bottom: 1.5rem; }
+    .modal-actions { display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1.5rem; }
+
+    /* Toast */
+    .toast-container { position: fixed; top: 1rem; right: 1rem; z-index: 200; }
+    .toast { background: var(--bg-card); padding: 1rem 1.5rem; border-radius: 8px; margin-bottom: 0.5rem; border-left: 4px solid var(--primary); animation: slideIn 0.3s ease; }
+    .toast.success { border-left-color: var(--success); }
+    .toast.error { border-left-color: var(--danger); }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    /* Page sections */
+    .page { display: none; }
+    .page.active { display: block; }
+
+    /* Logs */
+    .log-entry { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); font-family: monospace; font-size: 0.875rem; }
+    .log-entry:last-child { border-bottom: none; }
+    .log-level { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 4px; font-size: 0.75rem; margin-right: 0.5rem; }
+    .log-info { background: var(--info); color: white; }
+    .log-warn { background: var(--warning); color: white; }
+    .log-error { background: var(--danger); color: white; }
+    .log-debug { background: var(--text-muted); color: white; }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .sidebar { width: 100%; height: auto; position: relative; }
+      .main-content { margin-left: 0; }
+      .app-layout { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Login Page -->
+  <div id="login-page" class="login-container">
+    <div class="login-box">
+      <h1>🔐 Admin Panel</h1>
+      <form id="login-form">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="username" name="username" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="password" name="password" required autocomplete="current-password">
+        </div>
+        <div id="login-error" class="error-msg">Invalid credentials</div>
+        <button type="submit" class="btn btn-primary">Sign In</button>
+      </form>
+      <p style="margin-top: 1rem; text-align: center; color: var(--text-muted); font-size: 0.875rem;">
+        Demo: admin / admin123
+      </p>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="app-page" class="app-layout" style="display: none;">
+    <aside class="sidebar">
+      <h2>📊 Admin Panel</h2>
+      <nav>
+        <a class="nav-item active" data-page="dashboard">Dashboard</a>
+        <a class="nav-item" data-page="users">Users <span class="badge" id="user-count">0</span></a>
+        <a class="nav-item" data-page="logs">Logs</a>
+        <a class="nav-item" data-page="settings">Settings</a>
+      </nav>
+      <div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+        <div class="user-info">
+          <span id="sidebar-username">admin</span>
+          <span class="role-badge role-admin" id="sidebar-role">admin</span>
+        </div>
+        <button class="btn btn-danger btn-sm" style="margin-top: 1rem; width: 100%;" onclick="logout()">Logout</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <!-- Dashboard -->
+      <div id="dashboard-page" class="page active">
+        <div class="header">
+          <h1>Dashboard</h1>
+          <div class="user-info">
+            <span id="ws-status">🔴 Disconnected</span>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card primary">
+            <div class="label">Total Users</div>
+            <div class="value" id="stat-users">0</div>
+          </div>
+          <div class="stat-card success">
+            <div class="label">Admins</div>
+            <div class="value" id="stat-admins">0</div>
+          </div>
+          <div class="stat-card warning">
+            <div class="label">Editors</div>
+            <div class="value" id="stat-editors">0</div>
+          </div>
+          <div class="stat-card danger">
+            <div class="label">Logs</div>
+            <div class="value" id="stat-logs">0</div>
+          </div>
+        </div>
+        <div class="table-container">
+          <div class="table-header">
+            <h3>Recent Activity</h3>
+          </div>
+          <div id="activity-log" style="padding: 1rem;">
+            <p style="color: var(--text-muted);">No recent activity</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Users -->
+      <div id="users-page" class="page">
+        <div class="header">
+          <h1>User Management</h1>
+          <button class="btn btn-success btn-sm" onclick="showAddUser()">+ Add User</button>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Username</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="users-table"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Logs -->
+      <div id="logs-page" class="page">
+        <div class="header">
+          <h1>System Logs</h1>
+          <button class="btn btn-danger btn-sm" onclick="clearLogs()">Clear Logs</button>
+        </div>
+        <div class="table-container">
+          <div id="logs-container"></div>
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div id="settings-page" class="page">
+        <div class="header">
+          <h1>Settings</h1>
+        </div>
+        <div class="table-container" style="padding: 2rem;">
+          <div id="settings-content"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Add/Edit User Modal -->
+  <div id="user-modal" class="modal-overlay" style="display: none;">
+    <div class="modal">
+      <h2 id="modal-title">Add User</h2>
+      <form id="user-form">
+        <input type="hidden" id="user-id">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="form-username" required>
+        </div>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="form-email" required>
+        </div>
+        <div class="form-group" id="password-group">
+          <label>Password</label>
+          <input type="password" id="form-password">
+        </div>
+        <div class="form-group">
+          <label>Role</label>
+          <select id="form-role" style="width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
+            <option value="admin">Admin</option>
+            <option value="editor">Editor</option>
+            <option value="viewer" selected>Viewer</option>
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-sm" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary btn-sm">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toasts"></div>
+
+  <script>
+    let currentUser = null;
+    let ws = null;
+
+    // ── Auth ──────────────────────────────────────────────────────
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      
+      try {
+        const resp = await fetch('/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
+        });
+        
+        if (resp.ok) {
+          const data = await resp.json();
+          currentUser = data;
+          showApp();
+          initWebSocket();
+        } else {
+          document.getElementById('login-error').textContent = 'Invalid credentials';
+          document.getElementById('login-error').classList.add('show');
+        }
+      } catch (err) {
+        showToast('Connection error', 'error');
+      }
+    });
+
+    function showApp() {
+      document.getElementById('login-page').style.display = 'none';
+      document.getElementById('app-page').style.display = 'flex';
+      document.getElementById('sidebar-username').textContent = currentUser.username;
+      document.getElementById('sidebar-role').textContent = currentUser.role;
+      document.getElementById('sidebar-role').className = 'role-badge role-' + currentUser.role;
+      loadDashboard();
+    }
+
+    async function logout() {
+      await fetch('/admin/logout', { method: 'POST' });
+      location.reload();
+    }
+
+    // ── Navigation ────────────────────────────────────────────────
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.addEventListener('click', () => {
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        item.classList.add('active');
+        const page = item.dataset.page;
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        document.getElementById(page + '-page').classList.add('active');
+        
+        if (page === 'dashboard') loadDashboard();
+        if (page === 'users') loadUsers();
+        if (page === 'logs') loadLogs();
+        if (page === 'settings') loadSettings();
+      });
+    });
+
+    // ── Dashboard ─────────────────────────────────────────────────
+    async function loadDashboard() {
+      try {
+        const resp = await fetch('/admin/dashboard');
+        const data = await resp.json();
+        document.getElementById('stat-users').textContent = data.total_users;
+        document.getElementById('stat-admins').textContent = data.admins;
+        document.getElementById('stat-editors').textContent = data.editors;
+        document.getElementById('stat-logs').textContent = data.total_logs;
+        document.getElementById('user-count').textContent = data.total_users;
+      } catch (err) {
+        showToast('Failed to load dashboard', 'error');
+      }
+    }
+
+    // ── Users ─────────────────────────────────────────────────────
+    async function loadUsers() {
+      try {
+        const resp = await fetch('/admin/users');
+        const data = await resp.json();
+        const tbody = document.getElementById('users-table');
+        tbody.innerHTML = data.users.map(u => `
+          <tr>
+            <td>${u.id}</td>
+            <td>${escapeHtml(u.username)}</td>
+            <td>${escapeHtml(u.email)}</td>
+            <td><span class="role-badge role-${u.role}">${u.role}</span></td>
+            <td>${new Date(u.created_at).toLocaleString()}</td>
+            <td class="actions">
+              <button class="btn btn-sm" style="background: var(--info); color: white;" onclick="editUser(${u.id})">Edit</button>
+              <button class="btn btn-sm" style="background: var(--danger); color: white;" onclick="deleteUser(${u.id})">Delete</button>
+            </td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        showToast('Failed to load users', 'error');
+      }
+    }
+
+    function showAddUser() {
+      document.getElementById('modal-title').textContent = 'Add User';
+      document.getElementById('user-id').value = '';
+      document.getElementById('form-username').value = '';
+      document.getElementById('form-email').value = '';
+      document.getElementById('form-password').value = '';
+      document.getElementById('form-role').value = 'viewer';
+      document.getElementById('password-group').style.display = 'block';
+      document.getElementById('user-modal').style.display = 'flex';
+    }
+
+    async function editUser(id) {
+      try {
+        const resp = await fetch('/admin/users/' + id);
+        const user = await resp.json();
+        document.getElementById('modal-title').textContent = 'Edit User';
+        document.getElementById('user-id').value = user.id;
+        document.getElementById('form-username').value = user.username;
+        document.getElementById('form-email').value = user.email;
+        document.getElementById('form-password').value = '';
+        document.getElementById('form-role').value = user.role;
+        document.getElementById('password-group').style.display = 'none';
+        document.getElementById('user-modal').style.display = 'flex';
+      } catch (err) {
+        showToast('Failed to load user', 'error');
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('user-modal').style.display = 'none';
+    }
+
+    document.getElementById('user-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const id = document.getElementById('user-id').value;
+      const username = document.getElementById('form-username').value;
+      const email = document.getElementById('form-email').value;
+      const password = document.getElementById('form-password').value;
+      const role = document.getElementById('form-role').value;
+
+      const body = new URLSearchParams({ username, email, role });
+      if (password) body.append('password', password);
+
+      const method = id ? 'PUT' : 'POST';
+      const url = id ? `/admin/users/${id}` : '/admin/users';
+
+      try {
+        const resp = await fetch(url, { method, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+        if (resp.ok) {
+          showToast(id ? 'User updated' : 'User created', 'success');
+          closeModal();
+          loadUsers();
+          loadDashboard();
+        } else {
+          showToast('Failed to save user', 'error');
+        }
+      } catch (err) {
+        showToast('Connection error', 'error');
+      }
+    });
+
+    async function deleteUser(id) {
+      if (!confirm('Delete this user?')) return;
+      try {
+        const resp = await fetch('/admin/users/' + id, { method: 'DELETE' });
+        if (resp.ok) {
+          showToast('User deleted', 'success');
+          loadUsers();
+          loadDashboard();
+        }
+      } catch (err) {
+        showToast('Connection error', 'error');
+      }
+    }
+
+    // ── Logs ──────────────────────────────────────────────────────
+    async function loadLogs() {
+      try {
+        const resp = await fetch('/admin/logs?limit=100');
+        const data = await resp.json();
+        const container = document.getElementById('logs-container');
+        container.innerHTML = data.logs.map(l => `
+          <div class="log-entry">
+            <span class="log-level log-${l.level || 'info'}">${(l.level || 'info').toUpperCase()}</span>
+            <span style="color: var(--text-muted)">${new Date(l.created_at).toLocaleString()}</span>
+            ${escapeHtml(l.message)}
+          </div>
+        `).join('');
+      } catch (err) {
+        showToast('Failed to load logs', 'error');
+      }
+    }
+
+    async function clearLogs() {
+      if (!confirm('Clear all logs?')) return;
+      try {
+        await fetch('/admin/logs/clear', { method: 'POST' });
+        loadLogs();
+        showToast('Logs cleared', 'success');
+      } catch (err) {
+        showToast('Failed to clear logs', 'error');
+      }
+    }
+
+    // ── Settings ──────────────────────────────────────────────────
+    async function loadSettings() {
+      try {
+        const resp = await fetch('/admin/settings');
+        const data = await resp.json();
+        document.getElementById('settings-content').innerHTML = `
+          <dl style="display: grid; gap: 1rem;">
+            <div><dt style="color: var(--text-muted);">Site Name</dt><dd>${escapeHtml(data.site_name)}</dd></div>
+            <div><dt style="color: var(--text-muted);">Site URL</dt><dd>${escapeHtml(data.site_url)}</dd></div>
+            <div><dt style="color: var(--text-muted);">Version</dt><dd>${escapeHtml(data.version)}</dd></div>
+            <div><dt style="color: var(--text-muted);">Maintenance Mode</dt><dd>${data.maintenance_mode ? 'Enabled' : 'Disabled'}</dd></div>
+          </dl>
+        `;
+      } catch (err) {
+        showToast('Failed to load settings', 'error');
+      }
+    }
+
+    // ── WebSocket ─────────────────────────────────────────────────
+    function initWebSocket() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/admin/ws`);
+      
+      ws.onopen = () => {
+        document.getElementById('ws-status').textContent = '🟢 Connected';
+      };
+      
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'notification') {
+          showToast(data.message, 'success');
+        }
+      };
+      
+      ws.onclose = () => {
+        document.getElementById('ws-status').textContent = '🔴 Disconnected';
+        setTimeout(initWebSocket, 5000);
+      };
+      
+      // Keep alive
+      setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 30000);
+    }
+
+    // ── Utils ─────────────────────────────────────────────────────
+    function showToast(msg, type = 'info') {
+      const container = document.getElementById('toasts');
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      toast.textContent = msg;
+      container.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Check session on load
+    fetch('/admin/me').then(r => r.json()).then(data => {
+      if (data.username) {
+        currentUser = data;
+        showApp();
+        initWebSocket();
+      }
+    }).catch(() => {});
+  </script>
+</body>
+</html>

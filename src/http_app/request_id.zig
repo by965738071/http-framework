@@ -44,21 +44,18 @@ pub const RequestIdMiddleware = struct {
         // 在请求 arena 上分配 RequestId 槽
         const rid = try ctx.arena.create(RequestId);
 
-        // 沿用客户端传入的 X-Request-Id（信任模式，便于跨服务串联）
+        // 沿用客户端传入的 X-Request-Id（信任模式，便于跨服务串联）。
+        // 但必须校验字符：直接回显到响应头会造成响应头注入 / 响应拆分
+        // （回应审查发现 C4）。只接受安全字符，否则自生成新 ID。
         if (ctx.request.getHeader("x-request-id")) |client_rid| {
-            const copy_len = @min(client_rid.len, rid.value.len);
-            @memcpy(rid.value[0..copy_len], client_rid[0..copy_len]);
-            rid.len = @intCast(copy_len);
-        } else {
-            // 生成 16 字节随机 ID，hex 编码成 32 字符
-            var rand_bytes: [16]u8 = undefined;
-            ctx.io.random(&rand_bytes);
-            const hex_chars = "0123456789abcdef";
-            for (rand_bytes, 0..) |b, i| {
-                rid.value[i * 2] = hex_chars[b >> 4];
-                rid.value[i * 2 + 1] = hex_chars[b & 0xf];
+            if (client_rid.len > 0 and client_rid.len <= rid.value.len and isSafeRequestId(client_rid)) {
+                @memcpy(rid.value[0..client_rid.len], client_rid);
+                rid.len = @intCast(client_rid.len);
+            } else {
+                generateRandomId(ctx, rid);
             }
-            rid.len = 32;
+        } else {
+            generateRandomId(ctx, rid);
         }
 
         // 存进 ctx.state，供下游中间件/handler/日志取用
@@ -68,6 +65,29 @@ pub const RequestIdMiddleware = struct {
         _ = res.header(REQUEST_ID_HEADER, rid.slice()) catch {};
 
         try next.call(ctx, res);
+    }
+
+    /// 只允许可安全放进响应头的字符：字母数字与 `.` `-` `_`。
+    /// 拒绝 CR/LF/控制字符/空格等，杜绝响应头注入。
+    fn isSafeRequestId(s: []const u8) bool {
+        for (s) |c| {
+            const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '.' or c == '-' or c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    fn generateRandomId(ctx: *Context, rid: *RequestId) void {
+        // 生成 16 字节随机 ID，hex 编码成 32 字符
+        var rand_bytes: [16]u8 = undefined;
+        ctx.io.random(&rand_bytes);
+        const hex_chars = "0123456789abcdef";
+        for (rand_bytes, 0..) |b, i| {
+            rid.value[i * 2] = hex_chars[b >> 4];
+            rid.value[i * 2 + 1] = hex_chars[b & 0xf];
+        }
+        rid.len = 32;
     }
 };
 

@@ -226,8 +226,18 @@ fn compress(allocator: std.mem.Allocator, body: []const u8, encoding: Encoding, 
     var out: std.Io.Writer.Allocating = try .initCapacity(allocator, body.len + 64);
     defer out.deinit();
 
-    var hist_buf: [flate.max_window_len]u8 = undefined;
-    var encoder = try flate.Compress.init(&out.writer, &hist_buf, encoding.toContainer(), level);
+    // history window 必须 ≥ max_window_len (64KB)。堆分配，避开大栈帧。
+    const hist_buf = try allocator.alloc(u8, flate.max_window_len);
+    defer allocator.free(hist_buf);
+
+    // flate.Compress 本体是 ~224KB 的巨型 struct（128K lookup + 96K tokens）。
+    // 若用 `var encoder = try Compress.init(...)` 放栈上，在 zio 协程（约
+    // 256KB 提交栈）里会直接溢出到 guard page，触发 zio 栈增长 fault
+    // 处理路径崩溃/死循环（表现为请求挂起、WriteFailed/EFAULT）。
+    // 改为堆分配，避开超大栈帧。
+    const encoder = try allocator.create(flate.Compress);
+    defer allocator.destroy(encoder);
+    encoder.* = try flate.Compress.init(&out.writer, hist_buf, encoding.toContainer(), level);
     try encoder.writer.writeAll(body);
     try encoder.finish();
 
@@ -235,28 +245,33 @@ fn compress(allocator: std.mem.Allocator, body: []const u8, encoding: Encoding, 
     return try allocator.dupe(u8, out.written());
 }
 
-/// 初始化流式 gzip/deflate 编码器，包装一个 writer。
-/// 用于流式响应（res.stream()）场景，弥补缓冲中间件模型的缺陷
-/// （回应 fix.md 架构缺陷 #2：流式响应绕过缓冲模式 → 压缩失效）。
+/// 初始化流式 gzip/deflate 编码器,写入 `encoder`(由调用方堆分配)。
+/// 用于流式响应(res.stream())场景,弥补缓冲中间件模型的缺陷
+/// (回应 fix.md 架构缺陷 #2:流式响应绕过缓冲模式 → 压缩失效)。
 ///
-/// `hist_buf` 必须由调用方提供（栈数组），生命周期需覆盖编码器使用期。
+/// **重要**:`flate.Compress` 是 ~224KB 的巨型 struct。必须由调用方
+/// `allocator.create(flate.Compress)` 堆分配后把指针传进来,**不能**放在
+/// zio 协程栈上(会溢出 guard page 崩溃——见 compress() 的注释)。
+/// `hist_buf` 长度必须 ≥ flate.max_window_len,同样建议堆分配。
 ///
-/// 使用方式：
+/// 使用方式:
 /// ```zig
-/// var hist_buf: [flate.max_window_len]u8 = undefined;
-/// var encoder = try http_compress.initStreamingEncoder(
-///     stream.writer(), &hist_buf, .gzip, .default,
-/// );
+/// const hist_buf = try allocator.alloc(u8, flate.max_window_len);
+/// defer allocator.free(hist_buf);
+/// const encoder = try allocator.create(flate.Compress);
+/// defer allocator.destroy(encoder);
+/// try http_compress.initStreamingEncoder(encoder, stream.writer(), hist_buf, .gzip, .default);
 /// try encoder.writer.writeAll(file_data);
 /// try encoder.finish();
 /// ```
 pub fn initStreamingEncoder(
+    encoder: *flate.Compress,
     out: *std.Io.Writer,
-    hist_buf: *[flate.max_window_len]u8,
+    hist_buf: []u8,
     encoding: Encoding,
     level: flate.Compress.Options,
-) !flate.Compress {
-    return try flate.Compress.init(out, hist_buf, encoding.toContainer(), level);
+) !void {
+    encoder.* = try flate.Compress.init(out, hist_buf, encoding.toContainer(), level);
 }
 
 // ===========================================================================

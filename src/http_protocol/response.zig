@@ -376,8 +376,14 @@ pub const Response = struct {
         try self.appendHeaderIfAbsent("Content-Type", content_type);
         self.sent = true;
         if (self.buffered) {
-            // 缓冲模式：只存不发送，等 flush() 再写入 sink
-            self.pending_body = content;
+            // 缓冲模式：只存不发送，等 flush() 再写入 sink。
+            // 必须拷贝 body——handler 常在返回时释放自己的 body 缓冲区
+            // （如 `defer allocator.free(html)`），而 flush() 发生在外层中间件、
+            // 晚于 handler 栈帧。若只存借用切片，flush 时就是 use-after-free
+            // （小 body 侥幸读到陈旧内存，大 body 页已归还内核 → EFAULT/WriteFailed）。
+            // owned_strings 由 response.allocator（请求 arena）持有，flush 之后、
+            // deinit 之时释放，生命周期正确。
+            self.pending_body = try self.dupeOwned(content);
             return;
         }
         try self.sink.respond(self.status, self.headers.items, content);

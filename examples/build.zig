@@ -53,6 +53,20 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // root.zig re-exports admin.zig declarations for testing; admin.zig
+        // depends on http_framework, so the examples module needs it too.
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+        },
+    });
+
+    // Admin module - backend admin management system
+    const admin_mod = b.addModule("admin", .{
+        .root_source_file = b.path("src/admin.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -88,6 +102,7 @@ pub fn build(b: *std.Build) void {
             // root module.
             .imports = &.{
                 .{ .name = "examples", .module = mod },
+                .{ .name = "admin", .module = admin_mod },
                 .{ .name = "http_framework", .module = http_framework_mod },
                 .{ .name = "zio", .module = zio_mod },
             },

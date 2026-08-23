@@ -40,9 +40,65 @@ pub const Hijack = struct {
     ) anyerror!void,
 };
 
+/// 路径参数存储 —— 小型内联数组（性能优化）。
+///
+/// REST 路由参数通常 0-2 个，极少超过几个。HashMap 的哈希+桶分配在这个
+/// 绝对热路径上得不偿失，改用固定容量内联数组：get/put 就是几次 eql 比较，
+/// 零分配（key/value 切片指向 trie/arena，本结构只存指针）。
+/// 容量 16 足够——router 已限制路径段数 ≤64，参数数 ≤ 段数，实际远小于 16。
+pub const PathParams = struct {
+    pub const CAP = 16;
+    keys: [CAP][]const u8 = undefined,
+    values: [CAP][]const u8 = undefined,
+    len: usize = 0,
+
+    /// allocator 参数保留是为了与旧 HashMap 调用点签名兼容（本实现不分配）。
+    pub fn put(self: *PathParams, _: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (std.mem.eql(u8, self.keys[i], key)) {
+                self.values[i] = value;
+                return;
+            }
+        }
+        if (self.len >= CAP) return error.TooManyPathParams;
+        self.keys[self.len] = key;
+        self.values[self.len] = value;
+        self.len += 1;
+    }
+
+    pub fn get(self: *const PathParams, key: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (std.mem.eql(u8, self.keys[i], key)) return self.values[i];
+        }
+        return null;
+    }
+
+    /// 移除某个 key（swap-remove，顺序无关）。返回是否移除到。
+    /// 供 trie 匹配回溯时撤销 param 绑定。
+    pub fn remove(self: *PathParams, key: []const u8) bool {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (std.mem.eql(u8, self.keys[i], key)) {
+                self.len -= 1;
+                self.keys[i] = self.keys[self.len];
+                self.values[i] = self.values[self.len];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 与旧 HashMap 签名兼容；内联数组无需释放。
+    pub fn deinit(self: *PathParams, _: std.mem.Allocator) void {
+        self.len = 0;
+    }
+};
+
 /// 请求级可变状态（每个请求一个实例）。
 pub const RequestState = struct {
-    path_params: std.StringHashMapUnmanaged([]const u8) = .empty,
+    path_params: PathParams = .{},
     user_data: ?*UserData = null,
     route_pattern: ?[]const u8 = null,
     /// 405 时的 Allow 头值（逗号分隔的方法名）。由 router 在方法不匹配时填充，
@@ -57,8 +113,7 @@ pub const RequestState = struct {
     hijack: ?Hijack = null,
 
     pub fn deinit(self: *RequestState, allocator: std.mem.Allocator) void {
-        // path_params: key 和 value 都在 request arena 上，arena reset 时自动回收。
-        // 但 HashMap 的内部桶需要释放。
+        // path_params: 内联数组，key/value 切片指向 trie/arena，无需释放内存。
         self.path_params.deinit(allocator);
 
         // user_data: 链表节点由 arena 分配，arena reset 时回收。
@@ -167,10 +222,17 @@ pub const Context = struct {
         return self.request.getQueryDecoded(self.arena, key);
     }
 
+    /// 便捷方法：读 body 后获取表单字段（原始，未解码）。
+    /// 读取的 body 缓冲在 state.body_buffer（streaming body 经 readBody 缓冲）。
+    pub fn form(self: *Context, key: []const u8, limit: u64) !?[]const u8 {
+        const body = try self.readBody(self.arena, limit);
+        return Request.getFormFrom(body, key);
+    }
+
     /// 便捷方法：读 body 后获取表单字段并解码（urlencoded）。
     pub fn formDecoded(self: *Context, key: []const u8, limit: u64) !?[]const u8 {
-        _ = try self.readBody(self.arena, limit);
-        return self.request.getFormDecoded(self.arena, key);
+        const body = try self.readBody(self.arena, limit);
+        return Request.getFormDecodedFrom(self.arena, body, key);
     }
 
     /// 便捷方法：中间件通讯槽

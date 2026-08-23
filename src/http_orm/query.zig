@@ -203,14 +203,27 @@ pub fn QueryBuilder(comptime T: type) type {
             return self.conditions.items.len == 0;
         }
 
-        /// 判断给定行是否匹配当前查询条件
+        /// 判断给定行是否匹配当前查询条件。
+        /// 字段名不存在时该条件视为不匹配（而非 panic）——where 字段名可能来自外部。
         pub fn matches(self: *const Self, row: T) bool {
             if (self.conditions.items.len == 0) return true;
 
             var result: ?bool = null;
 
             for (self.conditions.items) |cond| {
-                const field_value = getFieldValue(T, row, cond.field);
+                const field_value = getFieldValueOpt(T, row, cond.field) orelse {
+                    // 未知字段：该条件不匹配。
+                    const matches_cond = false;
+                    if (result == null) {
+                        result = matches_cond;
+                    } else {
+                        result = switch (cond.logic) {
+                            .And => result.? and matches_cond,
+                            .Or => result.? or matches_cond,
+                        };
+                    }
+                    continue;
+                };
                 const matches_cond = evaluateCondition(cond, field_value);
 
                 if (result == null) {
@@ -236,8 +249,9 @@ pub fn QueryBuilder(comptime T: type) type {
             std.sort.insertion(T, items, clauses, struct {
                 fn compare(ctx: []const OrderClause, a: T, b: T) bool {
                     for (ctx) |clause| {
-                        const va = getFieldValue(T, a, clause.field);
-                        const vb = getFieldValue(T, b, clause.field);
+                        // 未知字段：跳过该排序子句（不 panic）。
+                        const va = getFieldValueOpt(T, a, clause.field) orelse continue;
+                        const vb = getFieldValueOpt(T, b, clause.field) orelse continue;
                         const cmp = compareValues(va, vb);
                         if (cmp == .lt) return clause.direction == .Asc;
                         if (cmp == .gt) return clause.direction == .Desc;
@@ -447,8 +461,17 @@ fn compareBool(op: Operator, a: bool, b: bool) bool {
     };
 }
 
-/// 从结构体实例中获取字段值（编译期反射）
+/// 从结构体实例中获取字段值（编译期反射）。找不到字段时 @panic。
+/// 仅用于字段名编译期/schema 保证存在的内部调用（checkUnique/applyDefaults）。
+/// 对运行时、可能拼错的字段名（where/orderBy）用 getFieldValueOpt。
 pub fn getFieldValue(comptime T: type, instance: T, field_name: []const u8) FieldValue {
+    return getFieldValueOpt(T, instance, field_name) orelse
+        @panic("Field not found in " ++ @typeName(T));
+}
+
+/// 从结构体实例中获取字段值，找不到返回 null（不 panic）。
+/// 用于字段名来自运行时/外部输入的场景，避免拼错一个字段名就崩溃整个进程。
+pub fn getFieldValueOpt(comptime T: type, instance: T, field_name: []const u8) ?FieldValue {
     const struct_info = switch (@typeInfo(T)) {
         .@"struct" => |s| s,
         else => @compileError("expected struct"),
@@ -460,7 +483,7 @@ pub fn getFieldValue(comptime T: type, instance: T, field_name: []const u8) Fiel
             return toFieldValue(val);
         }
     }
-    @panic("Field not found in " ++ @typeName(T));
+    return null;
 }
 
 /// 将任意值转换为 FieldValue

@@ -52,6 +52,29 @@ pub const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Accept-Key 输出长度：20 字节 SHA-1 → base64 编码 = 28 字符（含 1 个 '=' 填充）。
 pub const ACCEPT_KEY_LEN = 28;
 
+/// 获取进程级 Origin 白名单（由 setAllowedOrigins 设置）。null = 不校验（向后兼容）。
+/// 浏览器发起的跨源 WebSocket 不受同源策略/CORS 约束，不校验 Origin 会造成
+/// CSWSH（跨站 WebSocket 劫持）。生产中应显式设置白名单。
+var allowed_origins: ?[]const []const u8 = null;
+
+/// 设置 WebSocket 握手的 Origin 白名单（全局，启动期调用一次）。
+/// 传入的切片必须在进程存活期内有效（通常是编译期常量）。
+/// 传 null / 不调用 = 不校验（适用于非浏览器客户端 / 内网）。
+pub fn setAllowedOrigins(origins: ?[]const []const u8) void {
+    allowed_origins = origins;
+}
+
+/// 校验请求 Origin 是否在白名单内。未配白名单时总是通过（向后兼容）。
+/// 配了白名单但请求无 Origin 头（非浏览器客户端）也通过。
+fn isOriginAllowed(ctx: *Context) bool {
+    const allowed = allowed_origins orelse return true;
+    const origin = ctx.header("origin") orelse return true; // 非浏览器客户端无 Origin
+    for (allowed) |o| {
+        if (std.mem.eql(u8, o, origin)) return true;
+    }
+    return false;
+}
+
 /// 校验 WebSocket 握手请求并设置 101 响应头。
 ///
 /// 成功时：
@@ -75,6 +98,12 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
 
     // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。这里只校验存在。
     const key = ctx.header("sec-websocket-key") orelse return false;
+
+    // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
+    if (!isOriginAllowed(ctx)) {
+        _ = res.statusCode(.forbidden);
+        return false;
+    }
 
     // 校验 Sec-WebSocket-Version（RFC 6455 §4.2.1）：本实现仅支持版本 13。
     // 缺失或不支持时按 RFC 回 426 Upgrade Required + Sec-WebSocket-Version: 13，
@@ -160,6 +189,12 @@ pub fn upgrade(
     if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
 
     const key = ctx.header("sec-websocket-key") orelse return false;
+
+    // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
+    if (!isOriginAllowed(ctx)) {
+        _ = res.statusCode(.forbidden);
+        return false;
+    }
 
     const version = ctx.header("sec-websocket-version") orelse {
         setUnsupportedVersion(res) catch {};

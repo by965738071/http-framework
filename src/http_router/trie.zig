@@ -64,12 +64,17 @@ pub const Trie = struct {
         var node = self.root;
         var it = std.mem.splitScalar(u8, pattern, '/');
         var first = true;
+        var saw_catch_all = false;
         while (it.next()) |seg| {
             if (first) {
                 first = false;
                 if (seg.len == 0) continue; // leading /
             }
             if (seg.len == 0) continue;
+
+            // catch-all 必须是最后一段，否则后续段永远不可达（回应审查 H3）。
+            if (saw_catch_all) return error.InvalidRoute;
+            if (seg[0] == '*') saw_catch_all = true;
 
             const child = try Trie.findOrCreateChild(node, seg, alloc);
             node = child;
@@ -91,16 +96,32 @@ pub const Trie = struct {
             if (seg.len > 0 and seg[0] == ':') {
                 if (child.param_name != null) {
                     if (std.mem.eql(u8, child.param_name.?, seg[1..])) return child;
+                    // 同层已有不同名的 :param → 路由歧义，匹配结果依赖注册顺序（回应审查 H2）。
+                    return error.RouteConflict;
                 }
                 continue;
             }
             if (seg.len > 0 and seg[0] == '*') {
                 if (child.catch_all_name != null) {
                     if (std.mem.eql(u8, child.catch_all_name.?, seg[1..])) return child;
+                    // 同层已有不同名的 *catch_all → 歧义。
+                    return error.RouteConflict;
                 }
                 continue;
             }
             if (std.mem.eql(u8, child.segment, seg)) return child;
+        }
+
+        // 若要新建 param/catch-all，但同层已存在另一个（不同名，上面已返回冲突的除外），
+        // 也要拒绝：同层至多一个 param、至多一个 catch-all。
+        if (seg.len > 0 and seg[0] == ':') {
+            for (parent.children.items) |child| {
+                if (child.param_name != null) return error.RouteConflict;
+            }
+        } else if (seg.len > 0 and seg[0] == '*') {
+            for (parent.children.items) |child| {
+                if (child.catch_all_name != null) return error.RouteConflict;
+            }
         }
 
         // 创建新子节点

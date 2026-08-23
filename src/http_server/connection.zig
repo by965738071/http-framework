@@ -48,8 +48,6 @@ pub const ConnectionRunner = struct {
         while (true) {
             if (self.stats.shutting_down.load(.monotonic)) break;
 
-            const idle_start = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-
             const result = conn_loop.next() catch |err| {
                 writeError(self.writer, .bad_request, "Bad Request");
                 if (err != error.HttpConnectionClosing) {
@@ -62,8 +60,10 @@ pub const ConnectionRunner = struct {
             const http_request = next_result.raw;
 
             _ = self.stats.active_requests.fetchAdd(1, .monotonic);
+            var request_failed = false;
             const hijack = self.processRequest(&request, http_request, &arenas) catch |err| blk: {
                 std.log.err("processRequest: {s}", .{@errorName(err)});
+                request_failed = true;
                 break :blk null;
             };
             _ = self.stats.active_requests.fetchSub(1, .monotonic);
@@ -81,10 +81,13 @@ pub const ConnectionRunner = struct {
 
             const keep_alive = conn_loop.shouldKeepAlive(&request);
             arenas.endRequest(self.config.pool.request_arena_retain_bytes);
-            if (!keep_alive) break;
-
-            const idle_elapsed = std.Io.Timestamp.now(self.io, .real).nanoseconds - idle_start;
-            if (idle_elapsed > @as(i96, @intCast(self.config.network.idle_timeout_ns))) break;
+            // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
+            // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
+            if (request_failed or !keep_alive) break;
+            // 真正的空闲等待发生在下一次 conn_loop.next() 的阻塞读里，
+            // 由 reader 的 read_timeout_ns 约束。旧代码在 next() 前采样 idle_start、
+            // 在处理完后算差，实际测的是“读+处理”总耗时，既无法在真正空闲时
+            // 关连接，又可能因慢请求误关（回应审查发现 #5），故移除。
         }
 
         self.lifecycle.emit(.connection_close, .{});
@@ -125,7 +128,7 @@ pub const ConnectionRunner = struct {
             .path = request.path,
         });
 
-        const dispatch_start = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const dispatch_start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         _ = self.router.dispatch(&ctx, &res) catch |err| {
             self.lifecycle.emit(.request_error, .{
                 .ctx = &ctx,
@@ -140,9 +143,13 @@ pub const ConnectionRunner = struct {
                 _ = res.statusCode(.internal_server_error);
                 res.text("Internal Server Error") catch {};
             }
+            // 缓冲模式下（压缩/计时中间件会开启）res.text 只存入 pending_body，
+            // 必须 flush 才会真正写出。不在这里 flush 会导致 client 永远收不到响应
+            // → 连接死锁到超时（回应审查发现 #2）。
+            res.flush() catch {};
             return err;
         };
-        const latency = std.Io.Timestamp.now(self.io, .real).nanoseconds - dispatch_start;
+        const latency = std.Io.Timestamp.now(self.io, .awake).nanoseconds - dispatch_start;
 
         self.lifecycle.emit(.request_end, .{
             .ctx = &ctx,
@@ -180,10 +187,18 @@ pub const ConnectionRunner = struct {
 };
 
 fn writeError(writer: *std.Io.Writer, status: http.Status, msg: []const u8) void {
-    _ = writer.print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{
+    _ = writer.print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
         @backingInt(status),
-        @tagName(status),
+        reasonPhrase(status),
         msg.len,
         msg,
-    }) catch {};
+    }) catch return;
+    // 写入的是带缓冲 writer，必须 flush，否则紧接着的连接关闭会丢弃缓冲
+    // 区内容，client 收不到 400 → 挂到超时（回应审查发现 #4）。
+    writer.flush() catch {};
+}
+
+/// HTTP reason phrase（标准描述短语）。@tagName 会得到 "bad_request" 而非 "Bad Request"。
+fn reasonPhrase(status: http.Status) []const u8 {
+    return status.phrase() orelse "Error";
 }

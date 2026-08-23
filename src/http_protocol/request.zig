@@ -17,6 +17,10 @@ const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 
+/// limit==0（“无限”）时 body 读取的硬上限，防止伪造巨大 Content-Length 的
+/// 放大型内存 DoS。256MB 对正常上传足够大，同时避免无上限分配。
+const HARD_BODY_CAP: u64 = 256 * 1024 * 1024;
+
 pub const Request = struct {
     method: http.Method,
     target: []const u8,
@@ -154,6 +158,13 @@ pub const Request = struct {
             .buffered => |data| data,
             else => return null,
         };
+        return getFormFrom(body, key);
+    }
+
+    /// 从给定的表单体字节里提取字段值（原始，未解码）。
+    /// streaming body 经 Context.readBody 缓冲后，用它解析（body 存于
+    /// RequestState.body_buffer，Request.body 仍是 .streaming）。
+    pub fn getFormFrom(body: []const u8, key: []const u8) ?[]const u8 {
         if (body.len == 0) return null;
         var it = mem.splitScalar(u8, body, '&');
         while (it.next()) |pair| {
@@ -175,6 +186,12 @@ pub const Request = struct {
             .buffered => |data| data,
             else => return null,
         };
+        return getFormDecodedFrom(allocator, body, key);
+    }
+
+    /// 从给定的表单体字节里提取字段并解码。streaming body 经 Context.readBody
+    /// 缓冲后用它解析（Context.formDecoded 会传入缓冲结果）。
+    pub fn getFormDecodedFrom(allocator: mem.Allocator, body: []const u8, key: []const u8) !?[]const u8 {
         if (body.len == 0) return null;
         var it = mem.splitScalar(u8, body, '&');
         while (it.next()) |pair| {
@@ -203,8 +220,12 @@ pub const Request = struct {
 
                 if (self.content_length) |len| {
                     // Content-Length 已知：预分配、读足。
-                    if (limit > 0 and len > limit) return error.BodyTooLarge;
-                    const buf = try allocator.alloc(u8, @intCast(len));
+                    // 即使 limit==0（“无限”）也先卡一个硬上限，防止客户端伪造
+                    // 巨大 Content-Length（例如 10GB）不发 body，诱导服务端一次性分配
+                    // 巨额内存 → 放大型 DoS（回应审查发现 #4）。
+                    const effective_limit: u64 = if (limit > 0) limit else HARD_BODY_CAP;
+                    if (len > effective_limit) return error.BodyTooLarge;
+                    const buf = try allocator.alloc(u8, std.math.cast(usize, len) orelse return error.BodyTooLarge);
                     errdefer allocator.free(buf);
                     var read: usize = 0;
                     while (read < buf.len) {
@@ -218,13 +239,18 @@ pub const Request = struct {
                 }
 
                 // chunked（无 Content-Length）：读到 EOF 到可增长缓冲，受 limit 限制。
+                // 注意：read_buf 必须与 reader 内部缓冲（work_buf）分开，否则
+                // readSliceShort 会把 work_buf 里的数据 memcpy 回 work_buf 自身
+                // （源目标重叠 = UB），且 reader 随后继续写 work_buf 破坏刚读到的数据
+                // → chunked body 静默损坏（回应审查发现 #3）。
+                var read_buf: [4096]u8 = undefined;
                 var list = std.ArrayList(u8).empty;
                 errdefer list.deinit(allocator);
                 while (true) {
-                    const n = try reader.readSliceShort(&work_buf);
+                    const n = try reader.readSliceShort(&read_buf);
                     if (n == 0) break; // EOF
                     if (limit > 0 and list.items.len + n > limit) return error.BodyTooLarge;
-                    try list.appendSlice(allocator, work_buf[0..n]);
+                    try list.appendSlice(allocator, read_buf[0..n]);
                 }
                 return list.toOwnedSlice(allocator);
             },

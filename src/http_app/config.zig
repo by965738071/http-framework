@@ -46,7 +46,7 @@ pub const BodyConfig = struct {
 };
 
 pub const PoolConfig = struct {
-    conn_pool_size: u32 = 256,
+    /// 请求 arena 在请求结束后保留的容量（>0 则 keep-alive 下复用内存、不归还 OS）。
     request_arena_retain_bytes: usize = 16 * 1024,
 };
 

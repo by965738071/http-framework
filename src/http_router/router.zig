@@ -61,6 +61,22 @@ pub const RouteGroup = struct {
     }
 };
 
+/// 路径段数硬上限。trie 按段递归，段数过多会击穿协程栈。
+/// 正常 REST 路径极少超过几十段，64 留足余量。
+const MAX_PATH_SEGMENTS = 64;
+
+/// 判断路径段数是否超限（连续 `/` 也计入，与 trie 递归行为一致）。
+fn tooManyPathSegments(path: []const u8) bool {
+    var count: usize = 0;
+    for (path) |c| {
+        if (c == '/') {
+            count += 1;
+            if (count > MAX_PATH_SEGMENTS) return true;
+        }
+    }
+    return false;
+}
+
 /// 拼接前缀与子路径，规范化斜杠（避免 `//` 与缺失 `/`）。
 fn joinPath(alloc: std.mem.Allocator, prefix: []const u8, sub: []const u8) ![]const u8 {
     const p = std.mem.trimEnd(u8, prefix, "/");
@@ -120,6 +136,16 @@ pub const Router = struct {
     /// 日志上下文、计时头等（回应 fix.md §三：404 不走中间件）。
     pub fn dispatch(self: *const Router, ctx: *Context, res: *Response) !bool {
         const method = @as(http.Method, ctx.request.method);
+
+        // 路径段数上限：matchNode 按段递归（非尾递归），超长路径（如 /a/a/.../a
+        // 或 //////...）会击穿协程栈 → 远程 DoS。命中上限时按 404 处理（回应审查 C1）。
+        if (tooManyPathSegments(ctx.request.path)) {
+            const nf = self.not_found orelse Handler.fromFn(defaultNotFoundHandler);
+            const next = http_app.Next.root(self.global_middleware.items, nf);
+            try next.call(ctx, res);
+            return true;
+        }
+
         var result = self.trie.match(method, ctx.request.path, ctx.state, ctx.arena);
 
         // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
