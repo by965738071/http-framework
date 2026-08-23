@@ -138,15 +138,15 @@ pub const Server = struct {
             return;
         };
         defer sig.deinit();
-        sig.wait() catch {};
+        try sig.wait();
         std.log.info("shutdown signal received", .{});
 
         self.runtime.shutting_down.store(true, .monotonic);
         accept_group.cancel();
-        accept_group.wait() catch {};
+        try accept_group.wait();
 
         self.group.cancel();
-        self.group.wait() catch {};
+        try self.group.wait();
         self.drain();
     }
 
@@ -166,7 +166,7 @@ pub const Server = struct {
         while (true) {
             if (self.isShuttingDown()) break;
 
-            self.listener.semaphore.wait() catch break; // 背压 + Canceled 退出
+            try  self.listener.semaphore.wait(); // 背压 + Canceled 退出
 
             const stream = self.listener.server.accept(.{}) catch |err| {
                 self.listener.semaphore.post();
