@@ -38,6 +38,7 @@
 const std = @import("std");
 const http_app = @import("http_app");
 const http_protocol = @import("http_protocol");
+const connection = @import("connection.zig");
 
 pub const Context = http_app.Context;
 pub const Response = http_protocol.Response;
@@ -64,16 +65,28 @@ pub const ACCEPT_KEY_LEN = 28;
 /// `res.flush()` 或直接走框架的发送路径）并在发送后"劫持"底层 stream。
 pub fn handshake(ctx: *Context, res: *Response) !bool {
     // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
-    const upgrade = ctx.header("upgrade") orelse return false;
-    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return false;
+    const upgrade_hdr = ctx.header("upgrade") orelse return false;
+    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
 
     // 校验 Connection 头包含 "upgrade" token。
     // Connection 头可能是 "keep-alive, Upgrade" 形式，所以用 contains 而非 eql。
-    const connection = ctx.header("connection") orelse return false;
-    if (!containsTokenIgnoreCase(connection, "upgrade")) return false;
+    const connection_hdr = ctx.header("connection") orelse return false;
+    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
 
     // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。这里只校验存在。
     const key = ctx.header("sec-websocket-key") orelse return false;
+
+    // 校验 Sec-WebSocket-Version（RFC 6455 §4.2.1）：本实现仅支持版本 13。
+    // 缺失或不支持时按 RFC 回 426 Upgrade Required + Sec-WebSocket-Version: 13，
+    // 让客户端知道服务端期望的版本。
+    const version = ctx.header("sec-websocket-version") orelse {
+        setUnsupportedVersion(res) catch {};
+        return false;
+    };
+    if (!containsTokenIgnoreCase(version, "13")) {
+        try setUnsupportedVersion(res);
+        return false;
+    }
 
     // 计算 Accept-Key 并设置响应
     var accept_buf: [ACCEPT_KEY_LEN]u8 = undefined;
@@ -85,6 +98,12 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
     _ = try res.header("Sec-WebSocket-Accept", accept_value);
 
     return true;
+}
+
+/// 设置 426 Upgrade Required 响应，并带上服务端支持的版本号（RFC 6455 §4.4）。
+fn setUnsupportedVersion(res: *Response) !void {
+    _ = res.statusCode(.upgrade_required);
+    _ = try res.header("Sec-WebSocket-Version", "13");
 }
 
 /// 计算 `Sec-WebSocket-Accept` = base64(SHA1(key + GUID))。
@@ -103,7 +122,7 @@ pub fn computeAcceptKey(client_key: []const u8, out: *[@This().ACCEPT_KEY_LEN]u8
     return std.base64.standard.Encoder.encode(out, &digest);
 }
 
-/// 在逗号分隔的 header 值里查找某个 token（大小写不敏感）。
+/// 在逐字分隔的 header 值里查找某个 token（大小写不敏感）。
 /// 用于 "Connection: keep-alive, Upgrade" 这种多值场景。
 /// 简单实现：split by ',' 并 trim 空白后比对。
 fn containsTokenIgnoreCase(header_value: []const u8, token: []const u8) bool {
@@ -113,6 +132,86 @@ fn containsTokenIgnoreCase(header_value: []const u8, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
     }
     return false;
+}
+
+/// WebSocket 升级（高级 API）——把“校验握手 + 注册连接劫持回调”一步完成。
+///
+/// 返回 `true`：握手合法，已通过 `ctx.hijack` 注册回调。handler 应**直接 return**，
+/// 不要再写任何响应。ConnectionRunner 在 dispatch 结束后会：
+///   1. 向裸 writer 写 101 Switching Protocols + Sec-WebSocket-Accept；
+///   2. 构造 `WebSocket.initServer` 并调用你的 `handlerFn(ws, hijack_ctx)`。
+///
+/// 返回 `false`：非合法升级请求（缺头/版本不支持），已写好错误响应（426 等），
+/// handler 直接 return 即可。
+///
+/// `hijack_ctx` 是用户上下文指针（必须在连接存活期内有效，如 singleton handler
+/// 实例）；`handlerFn` 拿到已建好的 `*WebSocket` 和该上下文。
+pub fn upgrade(
+    ctx: *Context,
+    res: *Response,
+    hijack_ctx: *anyopaque,
+    comptime handlerFn: fn (ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void,
+) !bool {
+    // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
+    const upgrade_hdr = ctx.header("upgrade") orelse return false;
+    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
+
+    const connection_hdr = ctx.header("connection") orelse return false;
+    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
+
+    const key = ctx.header("sec-websocket-key") orelse return false;
+
+    const version = ctx.header("sec-websocket-version") orelse {
+        setUnsupportedVersion(res) catch {};
+        return false;
+    };
+    if (!containsTokenIgnoreCase(version, "13")) {
+        try setUnsupportedVersion(res);
+        return false;
+    }
+
+    // 把 client key 拷到请求 arena（handshake 响应写阶段在 dispatch 后，target/head 可能失效）。
+    const key_owned = try ctx.arena.dupe(u8, key);
+
+    // 封装“写 101 + 跑帧循环”的劫持回调。因为 Hijack.run 签名固定，
+    // 需要把 client key 和用户回调 handlerFn 一起带到回调里——用一个请求 arena
+    // 上的 UpgradeCtx 打包（arena 在 hijack.run 执行前不会被 reset，因为 run 在
+    // 本请求的 keep-alive 循环迭代内、endRequest 之前就被调用）。
+    const UpgradeCtx = struct { key: []const u8, user_ctx: *anyopaque };
+    const uc = try ctx.arena.create(UpgradeCtx);
+    uc.* = .{ .key = key_owned, .user_ctx = hijack_ctx };
+
+    const runFn = struct {
+        fn run(
+            hctx: *anyopaque,
+            io: std.Io,
+            reader: *std.Io.Reader,
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) anyerror!void {
+            _ = io;
+            const u: *UpgradeCtx = @ptrCast(@alignCast(hctx));
+
+            // 1. 写 101 Switching Protocols 握手响应（直写裸 writer，不经 Sink）。
+            var accept_buf: [ACCEPT_KEY_LEN]u8 = undefined;
+            const accept_value = try computeAcceptKey(u.key, &accept_buf);
+            try writer.print(
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                    "Upgrade: websocket\r\n" ++
+                    "Connection: Upgrade\r\n" ++
+                    "Sec-WebSocket-Accept: {s}\r\n\r\n",
+                .{accept_value},
+            );
+            try writer.flush();
+
+            // 2. 构造 WebSocket 连接对象，交给用户回调。
+            var ws = connection.WebSocket.initServer(reader, writer, allocator);
+            try handlerFn(&ws, u.user_ctx);
+        }
+    }.run;
+
+    ctx.hijack(@ptrCast(uc), runFn);
+    return true;
 }
 
 // ===========================================================================
@@ -251,6 +350,155 @@ test "handshake accepts valid upgrade request" {
         }
     }
     try testing.expect(found_accept);
+}
+
+test "handshake rejects unsupported Sec-WebSocket-Version with 426" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = http_app.RequestState{};
+    defer state.deinit(arena.allocator());
+
+    // Sec-WebSocket-Version: 8（不支持）
+    const head =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 8\r\n" ++
+        "\r\n";
+    var req = http_app.Request{
+        .method = .GET,
+        .target = "/ws",
+        .path = "/ws",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head,
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = http_app.RequestConfig{};
+    var ctx = http_app.Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    var out_buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    var res = Response.init(arena.allocator(), Sink.testSink(&w));
+    defer res.deinit();
+
+    try testing.expectEqual(false, try handshake(&ctx, &res));
+    try testing.expectEqual(std.http.Status.upgrade_required, res.status);
+
+    var found_version = false;
+    for (res.headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Sec-WebSocket-Version")) {
+            try testing.expectEqualStrings("13", h.value);
+            found_version = true;
+        }
+    }
+    try testing.expect(found_version);
+}
+
+test "upgrade registers hijack and writes 101 + runs handler" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = http_app.RequestState{};
+    defer state.deinit(arena.allocator());
+
+    const head =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    var req = http_app.Request{
+        .method = .GET,
+        .target = "/ws",
+        .path = "/ws",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head,
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = http_app.RequestConfig{};
+    var ctx = http_app.Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    var out_buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    var res = Response.init(arena.allocator(), Sink.testSink(&w));
+    defer res.deinit();
+
+    // 用户上下文：记录回调是否被调用 + 收到的消息。
+    const H = struct {
+        var called: bool = false;
+        var got: [64]u8 = undefined;
+        var got_len: usize = 0;
+        fn onWs(ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
+            _ = hijack_ctx;
+            called = true;
+            var msg = try ws.receive();
+            defer msg.deinit();
+            @memcpy(got[0..msg.payload.len], msg.payload);
+            got_len = msg.payload.len;
+            try ws.sendText("pong");
+        }
+    };
+    H.called = false;
+
+    var dummy: u8 = 0;
+    const ok = try upgrade(&ctx, &res, @ptrCast(&dummy), H.onWs);
+    try testing.expect(ok);
+    // upgrade 不直接写响应，而是注册 hijack。
+    try testing.expect(state.hijack != null);
+    try testing.expect(!res.sent);
+
+    // 模拟 ConnectionRunner 执行 hijack：客户端先发一个 masked text 帧。
+    var client_send: std.Io.Writer.Allocating = .init(allocator);
+    defer client_send.deinit();
+    {
+        var cw: std.Io.Reader = .fixed("");
+        var cli = connection.WebSocket.initClient(&cw, &client_send.writer, allocator);
+        try cli.sendText("hi-server");
+    }
+
+    var server_in: std.Io.Reader = .fixed(client_send.written());
+    var server_out: std.Io.Writer.Allocating = .init(allocator);
+    defer server_out.deinit();
+
+    const h = state.hijack.?;
+    try h.run(h.ctx, undefined, &server_in, &server_out.writer, allocator);
+
+    // 回调被调用、收到客户端消息。
+    try testing.expect(H.called);
+    try testing.expectEqualStrings("hi-server", H.got[0..H.got_len]);
+    // server_out 应包含 101 握手行 + Sec-WebSocket-Accept。
+    const server_written = server_out.written();
+    try testing.expect(std.mem.indexOf(u8, server_written, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, server_written, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }
 
 test {

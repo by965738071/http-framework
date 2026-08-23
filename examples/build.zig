@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
     });
     const http_framework_mod = http_framework_dep.module("http_framework");
 
+    const zio_mod = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zio");
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -82,15 +87,9 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "examples" is the name you will use in your source code to
-                // import this module (e.g. `@import("examples")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
                 .{ .name = "examples", .module = mod },
-                // The framework umbrella module. Use `@import("http_framework")`
-                // in src/main.zig.
                 .{ .name = "http_framework", .module = http_framework_mod },
+                .{ .name = "zio", .module = zio_mod },
             },
         }),
     });

@@ -8,15 +8,24 @@
 const std = @import("std");
 const http = std.http;
 const Handler = @import("http_app").Handler;
+const Middleware = @import("http_app").Middleware;
 const RequestState = @import("http_app").RequestState;
+
+/// 一条已注册的路由：handler + 该路由专属的中间件切片（来自 RouteGroup）。
+/// middleware 切片在注册时拷贝到 trie arena，生命周期与 trie 绑定，dispatch
+/// 只读，无需每请求重建。
+pub const Route = struct {
+    handler: Handler,
+    middleware: []const Middleware = &.{},
+};
 
 const Node = struct {
     segment: []const u8 = "",
     param_name: ?[]const u8 = null,
     catch_all_name: ?[]const u8 = null,
     children: std.ArrayList(*Node) = .empty,
-    // 按 method 索引的 handler 映射
-    handlers: std.enums.EnumMap(http.Method, Handler) = .{},
+    // 按 method 索引的 route 映射
+    handlers: std.enums.EnumMap(http.Method, Route) = .{},
     has_any_handler: bool = false,
     // 完整路由 pattern（插入时记录，匹配时直接复制）
     pattern: []const u8 = "",
@@ -49,7 +58,8 @@ pub const Trie = struct {
     }
 
     /// 注册路由。pattern 用 `:param` / `*catch_all` 语法。
-    pub fn insert(self: *Trie, method: http.Method, pattern: []const u8, handler: Handler) !void {
+    /// route.middleware 会被拷贝到 trie arena（生命周期与 trie 绑定）。
+    pub fn insert(self: *Trie, method: http.Method, pattern: []const u8, route: Route) !void {
         const alloc = self.arena.allocator();
         var node = self.root;
         var it = std.mem.splitScalar(u8, pattern, '/');
@@ -65,7 +75,12 @@ pub const Trie = struct {
             node = child;
         }
         if (node.handlers.get(method) != null) return error.RouteConflict;
-        node.handlers.put(method, handler);
+        // 拷贝中间件切片到 trie arena，避免悬空（调用方的切片可能是栈上临时的）。
+        const mw_copy = if (route.middleware.len > 0)
+            try alloc.dupe(Middleware, route.middleware)
+        else
+            &[_]Middleware{};
+        node.handlers.put(method, .{ .handler = route.handler, .middleware = mw_copy });
         node.has_any_handler = true;
         node.pattern = try alloc.dupe(u8, pattern);
     }
@@ -101,10 +116,9 @@ pub const Trie = struct {
         return child;
     }
 
-    /// 匹配路径。命中时提取 path_params 到 state，返回 handler。
-    /// 返回 null 表示无匹配。
+    /// 匹配路径。命中时提取 path_params 到 state，返回 route（handler + 中间件）。
     pub const MatchResult = struct {
-        handler: ?Handler = null,
+        route: ?Route = null,
         pattern_matched: bool = false,
         pattern: []const u8 = "",
         allowed_methods: [16]?http.Method = @splat(null),
@@ -131,8 +145,8 @@ pub const Trie = struct {
             if (node.has_any_handler) {
                 result.pattern_matched = true;
                 result.pattern = node.pattern;
-                if (node.handlers.get(method)) |h| {
-                    result.handler = h;
+                if (node.handlers.get(method)) |r| {
+                    result.route = r;
                 } else {
                     // 收集 Allow 头
                     self.collectAllowed(node, result);
@@ -157,7 +171,7 @@ pub const Trie = struct {
             if (child.param_name == null and child.catch_all_name == null) {
                 if (std.mem.eql(u8, child.segment, seg)) {
                     self.matchNode(child, path[seg_end..], method, state, alloc, result);
-                    if (result.handler != null) return;
+                    if (result.route != null) return;
                 }
             }
         }
@@ -167,7 +181,7 @@ pub const Trie = struct {
             if (child.param_name != null) {
                 state.path_params.put(alloc, child.param_name.?, seg) catch {};
                 self.matchNode(child, path[seg_end..], method, state, alloc, result);
-                if (result.handler != null) return;
+                if (result.route != null) return;
                 _ = state.path_params.remove(child.param_name.?);
             }
         }
@@ -177,7 +191,8 @@ pub const Trie = struct {
             if (child.catch_all_name != null) {
                 state.path_params.put(alloc, child.catch_all_name.?, path) catch {};
                 self.matchNode(child, "", method, state, alloc, result);
-                if (result.handler != null) return;
+                if (result.route != null) return;
+                _ = state.path_params.remove(child.catch_all_name.?);
             }
         }
     }
@@ -206,12 +221,12 @@ test "Trie matches static route" {
     const handler = Handler.fromFn(struct {
         fn h(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
     }.h);
-    try trie.insert(.GET, "/hello", handler);
+    try trie.insert(.GET, "/hello", .{ .handler = handler });
 
     var state = RequestState{};
     defer state.deinit(allocator);
     const result = trie.match(.GET, "/hello", &state, allocator);
-    try std.testing.expect(result.handler != null);
+    try std.testing.expect(result.route != null);
 }
 
 test "Trie extracts path params" {
@@ -222,12 +237,12 @@ test "Trie extracts path params" {
     const handler = Handler.fromFn(struct {
         fn h(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
     }.h);
-    try trie.insert(.GET, "/users/:id", handler);
+    try trie.insert(.GET, "/users/:id", .{ .handler = handler });
 
     var state = RequestState{};
     defer state.deinit(allocator);
     const result = trie.match(.GET, "/users/42", &state, allocator);
-    try std.testing.expect(result.handler != null);
+    try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
 }
 
@@ -239,13 +254,13 @@ test "Trie returns 405 when pattern matches but method doesn't" {
     const handler = Handler.fromFn(struct {
         fn h(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
     }.h);
-    try trie.insert(.GET, "/items", handler);
+    try trie.insert(.GET, "/items", .{ .handler = handler });
 
     var state = RequestState{};
     defer state.deinit(allocator);
     const result = trie.match(.POST, "/items", &state, allocator);
     try std.testing.expect(result.pattern_matched);
-    try std.testing.expect(result.handler == null);
+    try std.testing.expect(result.route == null);
     try std.testing.expect(result.allowed_count > 0);
     try std.testing.expectEqual(http.Method.GET, result.allowed_methods[0].?);
 }
@@ -258,12 +273,12 @@ test "Trie catch_all matches remaining path" {
     const handler = Handler.fromFn(struct {
         fn h(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
     }.h);
-    try trie.insert(.GET, "/static/*filepath", handler);
+    try trie.insert(.GET, "/static/*filepath", .{ .handler = handler });
 
     var state = RequestState{};
     defer state.deinit(allocator);
     const result = trie.match(.GET, "/static/css/app.css", &state, allocator);
-    try std.testing.expect(result.handler != null);
+    try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("filepath").?);
 }
 
@@ -275,6 +290,6 @@ test "Trie detects route conflicts" {
     const handler = Handler.fromFn(struct {
         fn h(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
     }.h);
-    try trie.insert(.GET, "/users/:id", handler);
-    try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/users/:id", handler));
+    try trie.insert(.GET, "/users/:id", .{ .handler = handler });
+    try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/users/:id", .{ .handler = handler }));
 }

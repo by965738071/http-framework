@@ -96,8 +96,8 @@ pub const Request = struct {
         return null;
     }
 
-    /// 获取单个 query 参数值（零分配线性扫描，不缓存）。
-    /// 需要缓存的批量查询由 http_app 层的 codec 负责。
+    /// 获取单个 query 参数值（原始，未解码）。零分配线性扫描。
+    /// 需要百分号/加号解码时用 getQueryDecoded。
     pub fn getQuery(self: *const Request, key: []const u8) ?[]const u8 {
         if (self.query.len == 0) return null;
         var it = mem.splitScalar(u8, self.query, '&');
@@ -109,6 +109,25 @@ pub const Request = struct {
             };
             const k = pair[0..eq_idx];
             if (std.mem.eql(u8, k, key)) return pair[eq_idx + 1 ..];
+        }
+        return null;
+    }
+
+    /// 获取 query 参数并做 application/x-www-form-urlencoded 解码
+    /// （`+`→空格、`%XX`→字节）。用调用方 allocator（通常 ctx.arena）分配结果。
+    /// key 本身也按同规则解码后再比较。
+    pub fn getQueryDecoded(self: *const Request, allocator: mem.Allocator, key: []const u8) !?[]const u8 {
+        if (self.query.len == 0) return null;
+        var it = mem.splitScalar(u8, self.query, '&');
+        while (it.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq_idx = mem.indexOfScalar(u8, pair, '=');
+            const raw_k = if (eq_idx) |i| pair[0..i] else pair;
+            const dk = try urlDecode(allocator, raw_k);
+            defer allocator.free(dk);
+            if (!std.mem.eql(u8, dk, key)) continue;
+            const raw_v = if (eq_idx) |i| pair[i + 1 ..] else "";
+            return try urlDecode(allocator, raw_v);
         }
         return null;
     }
@@ -128,8 +147,8 @@ pub const Request = struct {
         return null;
     }
 
-    /// 从已读取的表单体中提取字段值（application/x-www-form-urlencoded）。
-    /// body 必须已通过 readBody 读入。零分配线性扫描。
+    /// 从已读取的表单体中提取字段值（原始，未解码）。
+    /// 需要 `+`/`%XX` 解码时用 getFormDecoded。
     pub fn getForm(self: *const Request, key: []const u8) ?[]const u8 {
         const body = switch (self.body) {
             .buffered => |data| data,
@@ -149,26 +168,65 @@ pub const Request = struct {
         return null;
     }
 
+    /// 从已读取的表单体提取字段并解码（`+`→空格、`%XX`→字节，WHATWG urlencoded 规则）。
+    /// body 必须已 buffered。用调用方 allocator 分配结果。
+    pub fn getFormDecoded(self: *const Request, allocator: mem.Allocator, key: []const u8) !?[]const u8 {
+        const body = switch (self.body) {
+            .buffered => |data| data,
+            else => return null,
+        };
+        if (body.len == 0) return null;
+        var it = mem.splitScalar(u8, body, '&');
+        while (it.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq_idx = mem.indexOfScalar(u8, pair, '=');
+            const raw_k = if (eq_idx) |i| pair[0..i] else pair;
+            const dk = try urlDecode(allocator, raw_k);
+            defer allocator.free(dk);
+            if (!std.mem.eql(u8, dk, key)) continue;
+            const raw_v = if (eq_idx) |i| pair[i + 1 ..] else "";
+            return try urlDecode(allocator, raw_v);
+        }
+        return null;
+    }
+
     /// 从 streaming body 读取到新分配的 buffer。不修改 self（fix.md §四.7）。
     /// 调用方负责缓存（Context.readBody 会存入 RequestState.body_buffer）。
+    /// 支持 Content-Length 与 chunked（Transfer-Encoding）两种。limit==0 表示无限。
     pub fn readBodyInto(self: *const Request, allocator: mem.Allocator, limit: u64) ![]const u8 {
         return switch (self.body) {
             .none => "",
             .buffered => |data| data,
             .streaming => |req| {
-                const len = self.content_length orelse return error.BodyLengthUnknown;
-                if (limit > 0 and len > limit) return error.BodyTooLarge;
-                const buf = try allocator.alloc(u8, @intCast(len));
-                errdefer allocator.free(buf);
                 var work_buf: [4096]u8 = undefined;
                 var reader = req.readerExpectNone(&work_buf);
-                var read: usize = 0;
-                while (read < buf.len) {
-                    const chunk = reader.readSliceShort(buf[read..]) catch break;
-                    if (chunk == 0) break;
-                    read += chunk;
+
+                if (self.content_length) |len| {
+                    // Content-Length 已知：预分配、读足。
+                    if (limit > 0 and len > limit) return error.BodyTooLarge;
+                    const buf = try allocator.alloc(u8, @intCast(len));
+                    errdefer allocator.free(buf);
+                    var read: usize = 0;
+                    while (read < buf.len) {
+                        const chunk = try reader.readSliceShort(buf[read..]);
+                        if (chunk == 0) break; // EOF
+                        read += chunk;
+                    }
+                    // 读不足声明长度 → 连接被提前切断，报错而非静默返回短体。
+                    if (read < buf.len) return error.UnexpectedEof;
+                    return buf;
                 }
-                return buf[0..read];
+
+                // chunked（无 Content-Length）：读到 EOF 到可增长缓冲，受 limit 限制。
+                var list = std.ArrayList(u8).empty;
+                errdefer list.deinit(allocator);
+                while (true) {
+                    const n = try reader.readSliceShort(&work_buf);
+                    if (n == 0) break; // EOF
+                    if (limit > 0 and list.items.len + n > limit) return error.BodyTooLarge;
+                    try list.appendSlice(allocator, work_buf[0..n]);
+                }
+                return list.toOwnedSlice(allocator);
             },
         };
     }
@@ -213,6 +271,38 @@ fn rebase(slice: []const u8, old: []const u8, new: []const u8) []const u8 {
     const base = @intFromPtr(old.ptr);
     if (s < base or s + slice.len > base + old.len) return slice;
     return new[s - base ..][0..slice.len];
+}
+
+/// application/x-www-form-urlencoded 解码：`+`→空格，`%XX`→字节。
+/// 非法 `%` 序列原样保留。结果由 allocator 分配。
+fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '+') {
+            try out.append(allocator, ' ');
+            i += 1;
+        } else if (c == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                try out.append(allocator, c);
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                try out.append(allocator, c);
+                i += 1;
+                continue;
+            };
+            try out.append(allocator, @as(u8, hi) * 16 + lo);
+            i += 3;
+        } else {
+            try out.append(allocator, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 // ===========================================================================
@@ -327,4 +417,49 @@ test "rebase shifts slice from old buffer to new" {
     @memcpy(&new, old);
     const rebased = rebase(old[6..11], old, &new);
     try std.testing.expectEqualStrings("world", rebased);
+}
+
+test "getQueryDecoded decodes percent and plus" {
+    const head_bytes = "GET / HTTP/1.1\r\n\r\n";
+    const req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "q=hello+world&name=caf%C3%A9",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head_bytes,
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const a = std.testing.allocator;
+    const q = (try req.getQueryDecoded(a, "q")).?;
+    defer a.free(q);
+    try std.testing.expectEqualStrings("hello world", q);
+    const name = (try req.getQueryDecoded(a, "name")).?;
+    defer a.free(name);
+    try std.testing.expectEqualStrings("caf\xc3\xa9", name);
+}
+
+test "getFormDecoded decodes urlencoded body" {
+    const head_bytes = "POST / HTTP/1.1\r\n\r\n";
+    const req = Request{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head_bytes,
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .{ .buffered = "msg=a%20b%26c&x=1" },
+    };
+    const a = std.testing.allocator;
+    const msg = (try req.getFormDecoded(a, "msg")).?;
+    defer a.free(msg);
+    try std.testing.expectEqualStrings("a b&c", msg);
 }

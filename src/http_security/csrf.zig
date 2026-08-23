@@ -36,6 +36,14 @@ pub const CsrfMiddleware = struct {
     /// 验证失败时直接写 403 响应并 short-circuit（不调 next）。
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
         if (self.isMethodIgnored(ctx.request.method)) {
+            // 安全方法：若尚无 CSRF cookie，生成并下发一个（双提交模式需先有 cookie）。
+            if (ctx.request.getCookie(self.config.cookie_name) == null) {
+                const token = self.generateToken(ctx.arena) catch {
+                    try next.call(ctx, res);
+                    return;
+                };
+                self.setCookie(res, token) catch {};
+            }
             try next.call(ctx, res);
             return;
         }
@@ -48,6 +56,13 @@ pub const CsrfMiddleware = struct {
             _ = res.statusCode(.forbidden);
             try res.text("CSRF token missing");
             return; // short-circuit，不调 next
+        }
+
+        // 拒绝空 token（否则 constantTimeEql("","") == true 会误放行）。
+        if (cookie_token.?.len == 0 or submitted.?.len == 0) {
+            _ = res.statusCode(.forbidden);
+            try res.text("CSRF token empty");
+            return;
         }
 
         // 常量时间比较——修复 P0 时序侧信道
@@ -79,14 +94,16 @@ pub const CsrfMiddleware = struct {
         return hex;
     }
 
-    /// 在响应中设置 CSRF Cookie（带安全属性）。
+    /// 在响应中设置 CSRF Cookie。
+    /// 注意：双提交模式要求客户端 JS 能读到该 cookie 并回填到请求头，
+    /// 所以**不能**设 HttpOnly（否则 SPA/AJAX 永远读不到 token）。
     pub fn setCookie(self: *const Self, res: *Response, token: []const u8) !void {
         _ = try res.setCookieFull(.{
             .name = self.config.cookie_name,
             .value = token,
             .path = self.config.cookie_path,
             .secure = self.config.secure,
-            .http_only = true,
+            .http_only = false,
             .same_site = "Strict",
         });
     }

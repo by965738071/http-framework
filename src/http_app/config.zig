@@ -20,13 +20,14 @@ pub const NetworkConfig = struct {
     port: u16 = 9000,
     tcp_backlog: u31 = 4096,
     reuse_address: bool = false,
-    max_connections: u32 = 10000,
+    /// 同时存活的连接上限（背压）。达到后新连接在 accept 前挂起，
+    /// 直到有连接结束释放名额。zio 下一个连接只占一个轻量协程，可设很高。
+    max_connections: u32 = 1024,
     /// keep-alive 空闲超时（纳秒）。超过此时间无新请求则关闭连接。
-    /// 防止 Slowloris 慢攻击耗尽连接（fix.md §二.6）。
     idle_timeout_ns: u64 = 60_000_000_000,
-    /// 单次读超时（纳秒）。setsockopt SO_RCVTIMEO。
+    /// 单次读超时（纳秒）。zio 原生 per-operation timeout（防慢攻击）。
     read_timeout_ns: u64 = 30_000_000_000,
-    /// 单次写超时（纳秒）。setsockopt SO_SNDTIMEO。
+    /// 单次写超时（纳秒）。zio 原生 per-operation timeout。
     write_timeout_ns: u64 = 30_000_000_000,
 };
 

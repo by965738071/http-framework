@@ -1,6 +1,6 @@
 //! 集成测试 — 中间件管道 + 路由 端到端（回应 fix.md §四：无集成测试）
 //!
-//! 用真实的 Router + DynPipeline + 中间件堆栈，验证：
+//! 用真实的 Router + 中间件堆栈（通过 Next 直接驱动），验证：
 //! - 命中路由经过完整中间件管道
 //! - 404 也经过中间件管道（X-Request-Id / timing 头都在）
 //! - 405 也经过中间件管道
@@ -155,6 +155,24 @@ const TagMiddleware = struct {
     pub fn process(_: *@This(), ctx: *Context, res: *Response, next: http_app.Next) !void {
         _ = res.header("X-Tag", "tag-value") catch {};
         try next.call(ctx, res);
+    }
+};
+
+// 记录生命周期事件的 Hook，用于验证 request_error 确实被触发。
+const EventRecorder = struct {
+    request_errors: u32 = 0,
+    request_ends: u32 = 0,
+    last_error_status: ?std.http.Status = null,
+
+    pub fn onEvent(self: *@This(), event: http_app.Event, data: *const http_app.EventData) void {
+        switch (event) {
+            .request_error => {
+                self.request_errors += 1;
+                self.last_error_status = data.status;
+            },
+            .request_end => self.request_ends += 1,
+            else => {},
+        }
     }
 };
 
@@ -362,4 +380,110 @@ test "中间件管道顺序：外层先于内层 setBuffered，handler 后外层
     try std.testing.expectEqual(@as(u16, 200), extractStatus(written));
     try std.testing.expect(std.mem.indexOf(u8, written, "Hello, World!") != null);
     try std.testing.expectEqualStrings("tag-value", extractHeader(written, "x-tag").?);
+}
+
+test "request_error 事件：5xx 响应触发 Hook（修复 #1）" {
+    // 验证 lifecycle.emit(.request_error) 能被 Hook 收到。这里直接驱动
+    // Lifecycle（connection.zig 的实际触发代码与此同形：状态码 >= 500 则 emit）。
+    var recorder = EventRecorder{};
+    const hooks = [_]http_app.Hook{http_app.Hook.init(EventRecorder, &recorder)};
+    const lifecycle = http_app.Lifecycle{ .hooks = &hooks };
+
+    // 成功请求：只发 request_end，不发 request_error。
+    lifecycle.emit(.request_end, .{ .status = .ok });
+    try std.testing.expectEqual(@as(u32, 1), recorder.request_ends);
+    try std.testing.expectEqual(@as(u32, 0), recorder.request_errors);
+
+    // 5xx：补发 request_error。
+    lifecycle.emit(.request_error, .{ .status = .internal_server_error });
+    try std.testing.expectEqual(@as(u32, 1), recorder.request_errors);
+    try std.testing.expectEqual(std.http.Status.internal_server_error, recorder.last_error_status.?);
+}
+
+test "HEAD 自动回退到 GET 路由" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var router = try buildRouter(allocator, io);
+    defer router.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var state = http_app.RequestState{};
+    defer state.deinit(arena.allocator());
+    // 只注册了 GET /，用 HEAD 访问应命中 GET handler（而非 405）。
+    var req = try makeReq(arena.allocator(), "/", "");
+    req.method = .HEAD;
+    var ctx = makeCtx(arena.allocator(), &req, &state, io);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(allocator, capturingSink(&writer));
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    try res.flush();
+    const written = buf[0..writer.end];
+    try std.testing.expectEqual(@as(u16, 200), extractStatus(written));
+}
+
+test "405 Allow 头无重复方法" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    // 重叠路由 /a/b 与 /a/:x，都只 GET——POST 时回溯可能重复收集 GET。
+    try router.route(.GET, "/a/b", Handler.fromFn(helloHandler));
+    try router.route(.GET, "/a/:x", Handler.fromFn(helloHandler));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var state = http_app.RequestState{};
+    defer state.deinit(arena.allocator());
+    var req = try makeReq(arena.allocator(), "/a/b", "");
+    req.method = .POST;
+    var ctx = makeCtx(arena.allocator(), &req, &state, io);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(allocator, capturingSink(&writer));
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    try res.flush();
+    const written = buf[0..writer.end];
+    try std.testing.expectEqual(@as(u16, 405), extractStatus(written));
+    const allow = extractHeader(written, "allow").?;
+    // "GET" 只应出现一次
+    try std.testing.expect(std.mem.indexOf(u8, allow, "GET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow[3..], "GET") == null);
+}
+
+test "缓冲模式 flush 幂等：中间件 flush 后 ConnectionRunner 再 flush 不双发" {
+    const allocator = std.testing.allocator;
+
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(allocator, capturingSink(&writer));
+    defer res.deinit();
+
+    res.setBuffered();
+    _ = res.statusCode(.ok);
+    try res.text("body");
+    try res.flush(); // 中间件的 flush
+    const after_first = writer.end;
+    try res.flush(); // ConnectionRunner 的兜底 flush——应为 no-op
+    try std.testing.expectEqual(after_first, writer.end); // 没有第二次写入
+}
+
+test "Cookie 值含分号被拒绝（属性注入防护）" {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(allocator, capturingSink(&writer));
+    defer res.deinit();
+
+    try std.testing.expectError(
+        error.InvalidCookieValue,
+        res.setCookie("sid", "abc; Domain=evil.example"),
+    );
 }

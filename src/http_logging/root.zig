@@ -95,7 +95,7 @@ pub const Value = union(enum) {
 
     fn writeText(self: Value, writer: *std.Io.Writer) !void {
         switch (self) {
-            .string => |s| try writer.writeAll(s),
+            .string => |s| try writeTextEscaped(writer, s),
             .int => |n| try writer.print("{d}", .{n}),
             .uint => |n| try writer.print("{d}", .{n}),
             .float => |n| try writer.print("{d}", .{n}),
@@ -435,13 +435,17 @@ fn formatJson(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
 }
 
 fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
-    try writer.print("{d} {s} {s}", .{ ts, level.name(), msg });
+    // 转义控制字符（防日志注入）：msg/path 等用户可控字段可能含 \r\n，
+    // 未转义会伪造日志行。
+    try writer.print("{d} {s} ", .{ ts, level.name() });
+    try writeTextEscaped(writer, msg);
 
     if (ctx) |c| {
         if (c.state.getUserData(RequestId)) |rid| {
             try writer.print(" rid={s}", .{rid.slice()});
         }
-        try writer.print(" method={s} path={s}", .{ @tagName(c.request.method), c.request.path });
+        try writer.print(" method={s} path=", .{@tagName(c.request.method)});
+        try writeTextEscaped(writer, c.request.path);
     }
 
     for (fields) |f| {
@@ -452,6 +456,27 @@ fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
     }
 
     try writer.writeAll("\n");
+}
+
+/// text 日志值转义：将控制字符（含 CR/LF/TAB）转成可见的反斜杠转义，
+/// 防止用户可控内容注入伪造日志行。
+fn writeTextEscaped(writer: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            '\\' => try writer.writeAll("\\\\"),
+            0...8, 11, 12, 14...31, 127 => {
+                const hex = "0123456789abcdef";
+                var esc: [4]u8 = .{ '\\', 'x', '0', '0' };
+                esc[2] = hex[c >> 4];
+                esc[3] = hex[c & 0xf];
+                try writer.writeAll(&esc);
+            },
+            else => try writer.writeAll(&[1]u8{c}),
+        }
+    }
 }
 
 /// JSON 字符串转义（RFC 8259）

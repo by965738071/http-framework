@@ -13,7 +13,9 @@ pub const SecurityHeadersConfig = struct {
     x_frame_options: ?[]const u8 = "DENY",
     content_security_policy: ?[]const u8 = "default-src 'self'",
     strict_transport_security: ?[]const u8 = null,
-    x_xss_protection: ?[]const u8 = "1; mode=block",
+    /// X-XSS-Protection 已被主流浏览器弃用，`1; mode=block` 有已知 XS-leak 风险，
+    /// 现代指导是置 0 或省略。默认 null（不发），依靠 CSP 防 XSS。
+    x_xss_protection: ?[]const u8 = null,
     referrer_policy: ?[]const u8 = "strict-origin-when-cross-origin",
     permissions_policy: ?[]const u8 = null,
     server: ?[]const u8 = null,

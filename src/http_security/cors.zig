@@ -38,6 +38,9 @@ pub const CorsMiddleware = struct {
     /// - OPTIONS 预检（带 Access-Control-Request-Method）→ 添加 CORS 头并直接响应
     /// - 简单请求 → 添加 CORS 头后调 next
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
+        const is_preflight = ctx.request.method == .OPTIONS and
+            ctx.request.getHeader("Access-Control-Request-Method") != null;
+
         const origin = ctx.request.getHeader("Origin") orelse {
             try next.call(ctx, res);
             return;
@@ -49,21 +52,21 @@ pub const CorsMiddleware = struct {
                 try res.text("CORS: origin not allowed");
                 return; // short-circuit
             }
-            // 不 block 但也不加 CORS 头——浏览器会自己拒绝
+            // 不 block 但也不加 CORS 头——浏览器会自己拒绝。
+            // 配了白名单时响应随 Origin 而变，补 Vary: Origin 防缓存污染。
+            if (self.config.allowed_origins != null) _ = res.header("Vary", "Origin") catch {};
             try next.call(ctx, res);
             return;
         }
 
         // 添加 CORS 头（用请求级 arena，连接结束自动回收）
-        try self.addCorsHeaders(ctx.arena, res, origin);
+        try self.addCorsHeaders(ctx.arena, res, origin, is_preflight);
 
         // OPTIONS 预检请求：直接响应
-        if (ctx.request.method == .OPTIONS) {
-            if (ctx.request.getHeader("Access-Control-Request-Method") != null) {
-                _ = res.statusCode(.no_content);
-                try res.text("");
-                return; // short-circuit，不调 next
-            }
+        if (is_preflight) {
+            _ = res.statusCode(.no_content);
+            try res.text("");
+            return; // short-circuit，不调 next
         }
 
         try next.call(ctx, res);
@@ -77,19 +80,17 @@ pub const CorsMiddleware = struct {
         return false;
     }
 
-    fn addCorsHeaders(self: *Self, arena: std.mem.Allocator, res: *Response, origin: []const u8) !void {
+    fn addCorsHeaders(self: *Self, arena: std.mem.Allocator, res: *Response, origin: []const u8, is_preflight: bool) !void {
         // Allow-Origin
         // 修复 D1：禁止“反射任意 Origin + 允许凭据”这个 CORS 规范禁止的组合。
-        // allowed_origins==null（通配）且 allow_credentials 时，不反射具体 Origin，
-        // 改发通配 `*`（浏览器会在带凭据时拒绝 `*`，从而不会泄露）。
         const wildcard = self.config.allowed_origins == null;
         if (wildcard and self.config.allow_credentials) {
             _ = try res.header("Access-Control-Allow-Origin", "*");
-            // 注意：此时不发 Allow-Credentials（`*` 与凭据互斥）。
+            // 此时不发 Allow-Credentials（`*` 与凭据互斥）。
         } else if (wildcard) {
             _ = try res.header("Access-Control-Allow-Origin", "*");
         } else {
-            // 白名单命中：反射具体 Origin，并补 Vary: Origin防缓存污染（修复 D1 附带）。
+            // 白名单命中：反射具体 Origin，补 Vary: Origin 防缓存污染。
             _ = try res.header("Access-Control-Allow-Origin", origin);
             _ = try res.header("Vary", "Origin");
             if (self.config.allow_credentials) {
@@ -97,32 +98,31 @@ pub const CorsMiddleware = struct {
             }
         }
 
-        // Allow-Methods
-        if (self.config.allowed_methods.len > 0) {
-            const methods_str = try joinMethods(arena, self.config.allowed_methods);
-            _ = try res.header("Access-Control-Allow-Methods", methods_str);
-        }
-
-        // Allow-Headers
-        if (self.config.allowed_headers) |headers| {
-            if (headers.len > 0) {
-                const headers_str = try joinStrings(arena, headers, ", ");
-                _ = try res.header("Access-Control-Allow-Headers", headers_str);
+        // 以下头仅在预检（OPTIONS + Access-Control-Request-Method）时才有意义，
+        // 简单请求不应携带（避免每个响应冗余头）。
+        if (is_preflight) {
+            if (self.config.allowed_methods.len > 0) {
+                const methods_str = try joinMethods(arena, self.config.allowed_methods);
+                _ = try res.header("Access-Control-Allow-Methods", methods_str);
+            }
+            if (self.config.allowed_headers) |headers| {
+                if (headers.len > 0) {
+                    const headers_str = try joinStrings(arena, headers, ", ");
+                    _ = try res.header("Access-Control-Allow-Headers", headers_str);
+                }
+            }
+            if (self.config.max_age) |age| {
+                const age_str = try std.fmt.allocPrint(arena, "{d}", .{age});
+                _ = try res.header("Access-Control-Max-Age", age_str);
             }
         }
 
-        // Expose-Headers
+        // Expose-Headers 对实际响应（非预检）有意义。
         if (self.config.exposed_headers) |headers| {
             if (headers.len > 0) {
                 const exposed_str = try joinStrings(arena, headers, ", ");
                 _ = try res.header("Access-Control-Expose-Headers", exposed_str);
             }
-        }
-
-        // Max-Age（仅预检响应）
-        if (self.config.max_age) |age| {
-            const age_str = try std.fmt.allocPrint(arena, "{d}", .{age});
-            _ = try res.header("Access-Control-Max-Age", age_str);
         }
     }
 };

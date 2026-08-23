@@ -12,7 +12,6 @@ zig-out/*
 data/*
 zig-cache/*
 zig-out/
+zig-pkg/
 bug.md
-fix.md
-REDESIGN.md
-STATUS.md
+log/

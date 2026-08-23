@@ -1,78 +1,50 @@
 //! http_framework — 入口示例
 //!
-//! 展示完整架构的使用方式：4 层模块 + 中间件管道 + 生命周期钩子。
-//! 包含 JSON body 解析、multipart 文件上传、响应压缩等完整功能。
+//! 入口只做两件事：
+//!   1. 通过 framework.runZio 启动运行时（封装了 zio 初始化，入口不直接依赖 zio）；
+//!   2. 在 appMain(io, allocator) 里做 http_framework 的初始化（路由/中间件/Server）。
 
 const std = @import("std");
 const framework = @import("http_framework");
-const builtin = @import("builtin");
-/// Debug 模式下的全局分配器实例（泄漏检测）。
-pub fn main(init:std.process.Init) !void {
-    // 0. allocator
-    // Debug 模式用 DebugAllocator（逐分配追踪 + 退出时泄漏检测）；
-    // Release 用全局 Arena（线程安全，进程生命周期内存，退出时一次性释放）。
-    // DebugAllocator(.{ .safety = false }) 关闭逐分配跟踪，减少元数据开销。
-    var release_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
-    var debug_allocator_instance = std.heap.DebugAllocator(.{ .safety = false }){};
 
-    const allocator: std.mem.Allocator = if (builtin.mode == .debug) blk: {
-        break :blk debug_allocator_instance.allocator();
-    } else release_arena.allocator();
-    defer {
-        if (builtin.mode == .debug) {
-            if (debug_allocator_instance.deinit() == .leak) {
-                std.debug.panic("memory leak {}", .{@src()});
-            }
-        } else {
-            release_arena.deinit();
+pub fn main(init: std.process.Init) !void {
+    _ = init;
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    defer{
+        if(debug_allocator.deinit() == .leak) {
+            std.debug.panic("memory leak", .{});
         }
     }
-    // 1. 初始化 Io
-    // concurrent_limit 限制线程池大小，防止压测时无限扩展线程。
-    // 默认 = CPU 核心数 - 1。每线程栈 512KB+，1000 并发时线程池不收缩
-    // → 内存不回收。显式限制可控制常驻内存上限。
-    
-    const io = init.io;
+    const allocator = debug_allocator.allocator();
+    try framework.runZio(allocator, appMain);
+}
 
-    // 2. 配置
+fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
+    // 1. 配置
     const config = framework.Config{
         .network = .{ .port = 9000 },
         .http = .{ .access_log_enabled = true },
         .body = .{ .size_limit = 10 * 1024 * 1024 },
-        // 降低 arena 保留容量：16KB → 4KB，1000 并发时减少 12MB 常驻内存
         .pool = .{ .request_arena_retain_bytes = 4 * 1024 },
     };
 
-    // 3. 路由
+    // 2. 路由
     var router = try framework.Router.init(allocator);
     defer router.deinit();
 
-    // ── 基础路由 ──────────────────────────────────────────────
     try router.route(.GET, "/", framework.Handler.fromFn(helloHandler));
     try router.route(.GET, "/users/:id", framework.Handler.fromFn(userHandler));
     try router.route(.GET, "/health", framework.Handler.fromFn(healthHandler));
 
-    // 单例 handler
     var api_handler = ApiHandler{ .request_count = 0 };
     try router.route(.GET, "/api", framework.Handler.initSingleton(ApiHandler, &api_handler));
-
-    // ── JSON body 解析示例 ────────────────────────────────────
     try router.route(.POST, "/login", framework.Handler.fromFn(loginHandler));
-
-    // ── Multipart 文件上传示例 ───────────────────────────────
     try router.route(.POST, "/upload", framework.Handler.fromFn(uploadHandler));
 
-    // 静态文件服务
-    var static_server = framework.StaticFileServer.init(
-        allocator,
-        io,
-        "./public",
-        "/static",
-    );
+    var static_server = framework.StaticFileServer.init(allocator, io, "./public", "/static");
     try router.route(.GET, "/static/*", framework.Handler.initSingleton(framework.StaticFileServer, &static_server));
 
-    // ── 结构化日志器（全局单例）────────────────────────────────
-    // 文件输出：超过 16 MiB 自动轮转，归档文件 gzip 压缩，最多保留 5 个备份。
+    // 3. 日志器
     var logger = try framework.Logger.init(allocator, io, .{
         .min_level = .info,
         .format = .json,
@@ -80,61 +52,32 @@ pub fn main(init:std.process.Init) !void {
         .file = .{ .path = "log/zighttp.log", .max_size = 2 * 1024 * 1024, .max_backups = 1, .compress = true },
     });
     defer logger.deinit();
-    logger.info(null, "server starting", &.{
-        framework.fstr("addr", config.network.address),
-        framework.fint("port", config.network.port),
-    });
 
-    // ── 中间件管道 ────────────────────────────────────────────
-
-    // 错误渲染（应放最外层，兜底所有错误）
+    // 4. 中间件管道
     var error_renderer = framework.ErrorRenderer{};
     try router.use(framework.Middleware.init(framework.ErrorRenderer, &error_renderer));
-
-    // Request ID（紧跟 ErrorRenderer，让下游所有中间件/handler 都能取到 ID）
     var rid_mw = framework.RequestIdMiddleware{};
     try router.use(framework.Middleware.init(framework.RequestIdMiddleware, &rid_mw));
-
-    // 响应压缩
     var compress_mw = framework.CompressMiddleware{ .config = .{} };
     try router.use(framework.Middleware.init(framework.CompressMiddleware, &compress_mw));
-
-    // 计时中间件
     var timing_mw = TimingMiddleware{};
     try router.use(framework.Middleware.init(TimingMiddleware, &timing_mw));
-
-    // 安全头
     var security_mw = framework.SecurityHeaders{ .config = .{} };
     try router.use(framework.Middleware.init(framework.SecurityHeaders, &security_mw));
-
-    // CORS（不再持有 arena 字段——CORS 头用请求级 ctx.arena 分配）
     var cors_mw = framework.CorsMiddleware{ .config = .{} };
     try router.use(framework.Middleware.init(framework.CorsMiddleware, &cors_mw));
 
-    // 速率限制（全局 100 req/分钟）
-    // var rate_mw = framework.RateLimiter.init(allocator, io, .{
-    //     .window_seconds = 60,
-    //     .max_requests = 100,
-    //     .per_ip = false,
-    // });
-    // try router.use(framework.Middleware.init(framework.RateLimiter, &rate_mw));
-
-    // 4. 生命周期钩子（结构化日志 Hook——利用 server 计算的 duration/status）
+    // 5. 生命周期钩子
     var log_hook = framework.LoggingHook{ .logger = &logger };
-    const hooks = [_]framework.Hook{
-        framework.Hook.init(framework.LoggingHook, &log_hook),
-    };
+    const hooks = [_]framework.Hook{framework.Hook.init(framework.LoggingHook, &log_hook)};
 
-    // 5. 组装 Server
+    // 6. 组装并运行 Server
     var server = try framework.Server.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
     server.setLifecycle(.{ .hooks = &hooks });
-    // 6. 注册信号处理器（SIGINT/SIGTERM → server.beginShutdown）
-    server.installSignalHandlers();
 
     std.log.info("Server starting on {s}:{d}", .{ config.network.address, config.network.port });
-
     try server.run();
 }
 

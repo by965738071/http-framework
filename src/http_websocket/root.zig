@@ -55,6 +55,7 @@ pub const decode = frame.decode;
 pub const applyMask = frame.applyMask;
 
 pub const handshake = handshake_mod.handshake;
+pub const upgrade = handshake_mod.upgrade;
 pub const computeAcceptKey = handshake_mod.computeAcceptKey;
 pub const WS_GUID = handshake_mod.WS_GUID;
 pub const ACCEPT_KEY_LEN = handshake_mod.ACCEPT_KEY_LEN;

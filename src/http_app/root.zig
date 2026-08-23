@@ -14,6 +14,7 @@ pub const RequestState = @import("context.zig").RequestState;
 pub const RequestConfig = @import("context.zig").RequestConfig;
 pub const UserData = @import("context.zig").UserData;
 pub const Context = @import("context.zig").Context;
+pub const Hijack = @import("context.zig").Hijack;
 
 pub const Handler = @import("handler.zig").Handler;
 pub const Middleware = @import("middleware.zig").Middleware;
@@ -42,6 +43,8 @@ pub const Hook = @import("lifecycle.zig").Hook;
 pub const Lifecycle = @import("lifecycle.zig").Lifecycle;
 
 pub const Arenas = @import("arena.zig").Arenas;
+
+pub const Services = @import("services.zig").Services;
 
 const std = @import("std");
 test {

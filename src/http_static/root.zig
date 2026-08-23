@@ -8,6 +8,7 @@ const http_protocol = @import("http_protocol");
 
 pub const static = @import("static.zig");
 pub const StaticFileServer = static.StaticFileServer;
+pub const formatHttpDateForTest = static.formatHttpDateForTest;
 
 test {
     std.testing.refAllDecls(@This());

@@ -13,9 +13,32 @@
 const std = @import("std");
 const http_protocol = @import("http_protocol");
 const error_mod = @import("error.zig");
+const Services = @import("services.zig").Services;
 
 pub const Request = http_protocol.Request;
 pub const AppError = error_mod.AppError;
+
+/// 连接劫持钩子（如 WebSocket 升级）。
+///
+/// handler 通过 `ctx.hijack(...)` 注册后，ConnectionRunner 在 dispatch 结束、
+/// **不发送常规响应**的前提下，把裸 `*std.Io.Reader` / `*std.Io.Writer`
+/// 交给 `run` 回调；回调负责写协议切换响应并接管连接（跑帧循环等）。
+/// 回调返回即视为连接结束，keep-alive 循环随之退出。
+///
+/// 这是**协议无关**的原语：http_app 不依赖 http_websocket（避免循环依赖），
+/// WebSocket 只是它的一个使用者。
+pub const Hijack = struct {
+    /// 用户上下文（回调实现自行 @ptrCast 回具体类型）。
+    ctx: *anyopaque,
+    /// 接管裸连接。allocator 是连接级 gpa（非 arena），回调内分配需自行释放。
+    run: *const fn (
+        ctx: *anyopaque,
+        io: std.Io,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) anyerror!void,
+};
 
 /// 请求级可变状态（每个请求一个实例）。
 pub const RequestState = struct {
@@ -29,6 +52,9 @@ pub const RequestState = struct {
     /// 已缓冲的请求体（fix.md §四.7：Request 不可变，body 缓存移到 State）。
     /// readBody 首次调用后缓存于此，后续调用直接返回。
     body_buffer: ?[]const u8 = null,
+    /// 连接劫持钩子（WebSocket 升级等）。handler 设置后 ConnectionRunner
+    /// 跳过常规响应并把裸连接交给 hijack.run。
+    hijack: ?Hijack = null,
 
     pub fn deinit(self: *RequestState, allocator: std.mem.Allocator) void {
         // path_params: key 和 value 都在 request arena 上，arena reset 时自动回收。
@@ -99,6 +125,17 @@ pub const Context = struct {
     config: *const RequestConfig,
     arena: std.mem.Allocator,
     io: std.Io,
+    /// 应用级服务容器（进程级单例，如 SessionManager/Logger/ORM Store）。
+    /// 由 Server 注入；handler 通过 ctx.service(T) 取回，脱离全局变量。
+    /// 可能为 null（未注入服务时，如部分单元测试）。
+    services: ?*const Services = null,
+
+    /// 取回某类型的应用级服务，未注册或未注入服务容器时返回 null。
+    /// 用法：`const sm = ctx.service(SessionManager) orelse return error...;`
+    pub fn service(self: *const Context, comptime T: type) ?*T {
+        const svc = self.services orelse return null;
+        return svc.get(T);
+    }
 
     /// 读取请求体。首次调用从 streaming body 读取并存入 state.body_buffer；
     /// 后续调用直接返回缓存的 buffer。handler/中间件应通过此方法读 body，
@@ -120,9 +157,20 @@ pub const Context = struct {
         return self.request.getHeader(name);
     }
 
-    /// 便捷方法：获取 query 参数
+    /// 便捷方法：获取 query 参数（原始，未解码）
     pub fn query(self: *const Context, key: []const u8) ?[]const u8 {
         return self.request.getQuery(key);
+    }
+
+    /// 便捷方法：获取 query 参数并解码（`+`→空格、`%XX`→字节，用 ctx.arena）。
+    pub fn queryDecoded(self: *const Context, key: []const u8) !?[]const u8 {
+        return self.request.getQueryDecoded(self.arena, key);
+    }
+
+    /// 便捷方法：读 body 后获取表单字段并解码（urlencoded）。
+    pub fn formDecoded(self: *Context, key: []const u8, limit: u64) !?[]const u8 {
+        _ = try self.readBody(self.arena, limit);
+        return self.request.getFormDecoded(self.arena, key);
     }
 
     /// 便捷方法：中间件通讯槽
@@ -132,6 +180,20 @@ pub const Context = struct {
 
     pub fn setUserData(self: *Context, comptime T: type, ptr: *T) !void {
         try self.state.setUserData(T, ptr, self.arena);
+    }
+
+    /// 注册连接劫持钩子（WebSocket 升级等）。
+    /// handler 调用后应直接 return：ConnectionRunner 会跳过常规响应，
+    /// 在 dispatch 结束后把裸 reader/writer 交给 `run` 回调。
+    /// 注意：劫持后该请求不再经过 Response，不要再写响应体。
+    pub fn hijack(self: *Context, hijack_ctx: *anyopaque, run: *const fn (
+        ctx: *anyopaque,
+        io: std.Io,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) anyerror!void) void {
+        self.state.hijack = .{ .ctx = hijack_ctx, .run = run };
     }
 
     /// 便捷方法：发送错误响应（状态码 + 消息文本）。

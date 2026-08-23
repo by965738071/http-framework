@@ -19,9 +19,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Windows 上 connection.zig 通过 winsock 的 setsockopt 设置 socket 超时，
-    // 需要显式链接 ws2_32（std.Io.net 走 IOCP，不会自动拉入该库）。
-    const is_windows = target.result.os.tag == .windows;
+    // zio 异步运行时（io_uring/kqueue/iocp + 协程）。http_server 全面基于 zio
+    // 实现，统一跨平台 API，不再有 std.Io.Threaded 的 poll/信号平台分支。
+    const zio = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zio");
 
     // ── 新架构：4 层模块 ──────────────────────────────────────
 
@@ -53,7 +56,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Layer 4: http_server — 组装（依赖 http_router, http_app, http_protocol）
+    // Layer 4: http_server — 组装（依赖 http_router, http_app, http_protocol, zio）
     const http_server = b.addModule("http_server", .{
         .root_source_file = b.path("src/http_server/root.zig"),
         .target = target,
@@ -62,13 +65,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "http_protocol", .module = http_protocol },
             .{ .name = "http_app", .module = http_app },
             .{ .name = "http_router", .module = http_router },
+            .{ .name = "zio", .module = zio },
         },
     });
-
-    // Windows 上 connection.zig 通过 winsock 的 setsockopt 设置 socket 超时，
-    // 需要链接 ws2_32（std.Io.net 走 IOCP，不会自动拉入该库）。模块级声明会
-    // 传播到所有依赖 http_server 的产物（exe / 测试）。
-    if (is_windows) http_server.linkSystemLibrary("ws2_32", .{});
 
     // Addon: http_security — CSRF/Auth/CORS/安全头（依赖 http_app, http_protocol）
     const http_security = b.addModule("http_security", .{
@@ -252,4 +251,21 @@ pub fn build(b: *std.Build) void {
 
     const exe_test = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_test).step);
+
+    // ── 性能基准（内存内 Router.dispatch 热路径）────────────
+    // 用法：zig build bench -Doptimize=ReleaseFast
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "http_framework", .module = mod },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Run performance micro-benchmarks");
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_run.step);
 }

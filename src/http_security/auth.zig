@@ -66,10 +66,13 @@ pub const AuthMiddleware = struct {
         }
 
         if (self.config.basic_username) |user| {
-            if (try self.checkBasic(ctx, user, self.config.basic_password.?)) {
-                try self.authOk(ctx, .basic);
-                try next.call(ctx, res);
-                return;
+            // 防御性：basic_username 设了但 basic_password 为 null 时不 unwrap panic。
+            if (self.config.basic_password) |pass| {
+                if (try self.checkBasic(ctx, user, pass)) {
+                    try self.authOk(ctx, .basic);
+                    try next.call(ctx, res);
+                    return;
+                }
             }
         }
 
@@ -83,9 +86,13 @@ pub const AuthMiddleware = struct {
 
         // 所有策略都失败 → 401
         _ = res.statusCode(.unauthorized);
-        // 修复 D3：发合法的挑战头 `Basic realm="..."`（RFC 7235），
-        // 否则浏览器不会弹凭据框。
-        const challenge = try std.fmt.allocPrint(ctx.arena, "Basic realm=\"{s}\"", .{self.config.realm});
+        // 修复 D3：根据已启用的策略发合适的挑战头（RFC 7235/6750）。
+        // bearer-only API 不应发 Basic（否则浏览器弹 Basic 登录框）。
+        const scheme: []const u8 = if (self.config.bearer_token != null and self.config.basic_username == null)
+            "Bearer"
+        else
+            "Basic";
+        const challenge = try std.fmt.allocPrint(ctx.arena, "{s} realm=\"{s}\"", .{ scheme, self.config.realm });
         _ = try res.header("WWW-Authenticate", challenge);
         try res.text("Unauthorized");
     }

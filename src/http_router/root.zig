@@ -4,7 +4,9 @@
 //! O(路径段数) 匹配、前缀共享、注册时静态冲突检测。
 
 pub const Trie = @import("trie.zig").Trie;
+pub const Route = @import("trie.zig").Route;
 pub const Router = @import("router.zig").Router;
+pub const RouteGroup = @import("router.zig").RouteGroup;
 
 const std = @import("std");
 test {

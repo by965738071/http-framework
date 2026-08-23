@@ -24,14 +24,14 @@ pub const Next = http_app.Next;
 /// 用 arena allocator 时不调 parsed.deinit()——arena reset 回收全部。
 /// 返回的 *T 以及其中所有切片都由 allocator 管理。
 pub fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T {
-    const parsed = try std.json.parseFromSlice(T, allocator, bytes, .{
+    // 用 parseFromSliceLeaky 明确 arena 契约：所有内部分配直接落在 allocator
+    // 上，不产生需要 deinit 的 Parsed(T) 句柄，避免传非 arena 分配器时泄漏。
+    // 调用方应传 arena（如 ctx.arena），请求结束时统一回收。
+    const result = try allocator.create(T);
+    result.* = try std.json.parseFromSliceLeaky(T, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
-    // parsed 的内部分配在 allocator 上。用 arena allocator 时不 deinit，
-    // arena reset 时全部回收。parsed.value 里的切片指向 arena 内存。
-    const result = try allocator.create(T);
-    result.* = parsed.value;
     return result;
 }
 

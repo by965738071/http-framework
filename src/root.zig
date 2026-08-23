@@ -8,10 +8,13 @@
 //! http_protocol   字节 ↔ 报文（Request/Response/ConnectionLoop）
 //! http_app        生命周期 + 管道（Context/Handler/Middleware/AppError/Config/Lifecycle）
 //! http_router     radix trie 路由（Router/Trie）
-//! http_server     组装（Listener/ConnectionRunner/Shutdown/Server）
+//! http_framework   字节 ↔ 报文（Request/Response/ConnectionLoop）
+//! http_app        生命周期 + 管道（Context/Handler/Middleware/AppError/Config/Lifecycle）
+//! http_router     radix trie 路由（Router/Trie）
+//! http_server     组装（zio_server + 后端无关的 ConnectionRunner）
 //! ```
 //!
-//! 回应 bug.md §1：core 不再是一个"最小核心"扛 5 层职责。
+//! 回应 bug.md §1：core 不再是一个"最小核心"扴 5 层职责。
 //! 回应 bug.md §6：模块图是 DAG，不是星形。
 
 pub const http_protocol = @import("http_protocol");
@@ -63,16 +66,19 @@ pub const EventData = http_app.EventData;
 pub const Hook = http_app.Hook;
 pub const Lifecycle = http_app.Lifecycle;
 pub const Arenas = http_app.Arenas;
+pub const Services = http_app.Services;
 
 // ── http_router ──────────────────────────────────────────────
 pub const Router = http_router.Router;
 pub const Trie = http_router.Trie;
+pub const RouteGroup = http_router.RouteGroup;
 
 // ── http_server ──────────────────────────────────────────────
+// ── http_server（默认 zio 后端）────────────────────────
 pub const Server = http_server.Server;
-pub const Listener = http_server.Listener;
 pub const ConnectionRunner = http_server.ConnectionRunner;
-pub const Shutdown = http_server.Shutdown;
+/// 启动 zio 运行时并在其协程上下文中运行 app（io, allocator）。
+pub const runZio = http_server.runZio;
 
 // ── http_security ─────────────────────────────────────────────
 pub const CsrfMiddleware = http_security.csrf.CsrfMiddleware;
@@ -156,6 +162,7 @@ pub const WsFrame = http_websocket.Frame;
 pub const OpCode = http_websocket.OpCode;
 pub const CloseCode = http_websocket.CloseCode;
 pub const wsHandshake = http_websocket.handshake;
+pub const wsUpgrade = http_websocket.upgrade;
 pub const wsComputeAcceptKey = http_websocket.computeAcceptKey;
 pub const wsEncodeFrame = http_websocket.encode;
 pub const wsDecodeFrame = http_websocket.decode;

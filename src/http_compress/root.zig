@@ -220,21 +220,19 @@ pub const default_skip_types = &[_][]const u8{
 
 /// 压缩 body，返回 arena 分配的压缩字节。
 fn compress(allocator: std.mem.Allocator, body: []const u8, encoding: Encoding, level: flate.Compress.Options) ![]const u8 {
-    // 用 ArrayList 做输出缓冲——Compress.init 要求 output.buffer.len > 8
-    var out_list = std.ArrayList(u8).empty;
-    defer out_list.deinit(allocator);
-    // 预分配足够容量
-    try out_list.ensureTotalCapacity(allocator, body.len + 64);
-    var out_writer = std.Io.Writer.fixed(out_list.allocatedSlice());
+    // 修复 F12：用会动态增长的 Allocating writer 作为输出缓冲，避免旧的
+    // 固定 `body.len + 64` 缓冲在不可压缩输入膨胀超 64 字节时写失败。
+    // 预分配 body.len + 64 作为常见情况的初始容量，超出时自动 grow。
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, body.len + 64);
+    defer out.deinit();
 
     var hist_buf: [flate.max_window_len]u8 = undefined;
-    var encoder = try flate.Compress.init(&out_writer, &hist_buf, encoding.toContainer(), level);
+    var encoder = try flate.Compress.init(&out.writer, &hist_buf, encoding.toContainer(), level);
     try encoder.writer.writeAll(body);
     try encoder.finish();
 
-    // 复制实际写入的字节到 arena
-    const written = out_writer.buffered();
-    return try allocator.dupe(u8, written);
+    // 复制实际写入的字节到 arena（out 的 buffer 由 defer 释放）。
+    return try allocator.dupe(u8, out.written());
 }
 
 /// 初始化流式 gzip/deflate 编码器，包装一个 writer。

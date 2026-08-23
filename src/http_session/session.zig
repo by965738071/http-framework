@@ -29,6 +29,8 @@ pub const SessionConfig = struct {
     cookie_name: []const u8 = "session_id",
     session_timeout_sec: u32 = 3600,
     cleanup_interval_sec: u32 = 300,
+    /// 是否给 session cookie 加 Secure 属性（生产 HTTPS 下应为 true）。
+    secure: bool = false,
 };
 
 pub const SessionManager = struct {
@@ -103,10 +105,14 @@ pub const SessionManager = struct {
         // 修复 A1：先写 Set-Cookie，再插 map。
         // 若 setCookieFull 失败，上面的 errdefer 会清理 session_id/id_dup/data，
         // 且此时 map 尚未持有 session_id，不会 double-free / 悬空 key。
+        // Path=/ ：默认 default-path 会取请求 URI 目录，导致在 login 之外的路径丢失
+        // session（RFC 6265 §5.1.4），所以显式设 Path=/。
         _ = try res.setCookieFull(.{
             .name = self.config.cookie_name,
             .value = session_id,
+            .path = "/",
             .http_only = true,
+            .secure = self.config.secure,
             .same_site = "Lax",
         });
 

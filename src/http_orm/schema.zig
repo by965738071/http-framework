@@ -118,15 +118,17 @@ pub const MigrationOp = union(enum) {
     },
     raw_sql: []const u8,
 
-    /// 获取迁移的描述标签
-    pub fn label(self: MigrationOp) []const u8 {
+    /// 获取迁移的描述标签。
+    /// 写入调用方提供的 buf（建议 ≥128 字节），避免旧实现用
+    /// page_allocator 的每次调用泄漏。buf 不够时 fallback 到静态标签。
+    pub fn label(self: MigrationOp, buf: []u8) []const u8 {
         return switch (self) {
-            .create_table => |s| std.fmt.allocPrintSentinel(std.heap.page_allocator, "create_table_{s}", .{s.table_name}, 0) catch "create_table",
-            .add_column => |a| std.fmt.allocPrintSentinel(std.heap.page_allocator, "add_column_{s}_{s}", .{ a.table, a.field.name }, 0) catch "add_column",
-            .drop_column => |d| std.fmt.allocPrintSentinel(std.heap.page_allocator, "drop_column_{s}_{s}", .{ d.table, d.column_name }, 0) catch "drop_column",
-            .create_index => |c| std.fmt.allocPrintSentinel(std.heap.page_allocator, "create_index_{s}_{s}", .{ c.table, c.index.name }, 0) catch "create_index",
-            .drop_index => |d| std.fmt.allocPrintSentinel(std.heap.page_allocator, "drop_index_{s}_{s}", .{ d.table, d.index_name }, 0) catch "drop_index",
-            .rename_table => |r| std.fmt.allocPrintSentinel(std.heap.page_allocator, "rename_table_{s}_to_{s}", .{ r.old_name, r.new_name }, 0) catch "rename_table",
+            .create_table => |s| std.fmt.bufPrint(buf, "create_table_{s}", .{s.table_name}) catch "create_table",
+            .add_column => |a| std.fmt.bufPrint(buf, "add_column_{s}_{s}", .{ a.table, a.field.name }) catch "add_column",
+            .drop_column => |d| std.fmt.bufPrint(buf, "drop_column_{s}_{s}", .{ d.table, d.column_name }) catch "drop_column",
+            .create_index => |c| std.fmt.bufPrint(buf, "create_index_{s}_{s}", .{ c.table, c.index.name }) catch "create_index",
+            .drop_index => |d| std.fmt.bufPrint(buf, "drop_index_{s}_{s}", .{ d.table, d.index_name }) catch "drop_index",
+            .rename_table => |r| std.fmt.bufPrint(buf, "rename_table_{s}_to_{s}", .{ r.old_name, r.new_name }) catch "rename_table",
             .raw_sql => "raw_sql",
         };
     }
@@ -345,6 +347,7 @@ test "TableSchema with empty indexes defaults" {
 }
 
 test "MigrationOp.label for create_table" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .create_table = .{
             .table_name = "users",
@@ -353,62 +356,68 @@ test "MigrationOp.label for create_table" {
             },
         },
     };
-    try std.testing.expectEqualStrings("create_table_users", op.label());
+    try std.testing.expectEqualStrings("create_table_users", op.label(&buf));
 }
 
 test "MigrationOp.label for add_column" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .add_column = .{
             .table = "users",
             .field = .{ .name = "email", .field_type = .string },
         },
     };
-    try std.testing.expectEqualStrings("add_column_users_email", op.label());
+    try std.testing.expectEqualStrings("add_column_users_email", op.label(&buf));
 }
 
 test "MigrationOp.label for drop_column" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .drop_column = .{
             .table = "users",
             .column_name = "legacy_col",
         },
     };
-    try std.testing.expectEqualStrings("drop_column_users_legacy_col", op.label());
+    try std.testing.expectEqualStrings("drop_column_users_legacy_col", op.label(&buf));
 }
 
 test "MigrationOp.label for create_index" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .create_index = .{
             .table = "orders",
             .index = .{ .name = "idx_status", .fields = &.{"status"} },
         },
     };
-    try std.testing.expectEqualStrings("create_index_orders_idx_status", op.label());
+    try std.testing.expectEqualStrings("create_index_orders_idx_status", op.label(&buf));
 }
 
 test "MigrationOp.label for drop_index" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .drop_index = .{
             .table = "orders",
             .index_name = "idx_old",
         },
     };
-    try std.testing.expectEqualStrings("drop_index_orders_idx_old", op.label());
+    try std.testing.expectEqualStrings("drop_index_orders_idx_old", op.label(&buf));
 }
 
 test "MigrationOp.label for rename_table" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{
         .rename_table = .{
             .old_name = "users",
             .new_name = "accounts",
         },
     };
-    try std.testing.expectEqualStrings("rename_table_users_to_accounts", op.label());
+    try std.testing.expectEqualStrings("rename_table_users_to_accounts", op.label(&buf));
 }
 
 test "MigrationOp.label for raw_sql" {
+    var buf: [128]u8 = undefined;
     const op = MigrationOp{ .raw_sql = "ALTER TABLE x DROP COLUMN y" };
-    try std.testing.expectEqualStrings("raw_sql", op.label());
+    try std.testing.expectEqualStrings("raw_sql", op.label(&buf));
 }
 
 test "MigrationOp.deinit does not panic" {
@@ -451,8 +460,9 @@ test "Migration with multiple operations" {
     };
     try std.testing.expectEqual(@as(u32, 2), m.version);
     try std.testing.expectEqual(@as(usize, 2), m.operations.len);
-    try std.testing.expectEqualStrings("create_table_users", m.operations[0].label());
-    try std.testing.expectEqualStrings("create_index_users_idx_name", m.operations[1].label());
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("create_table_users", m.operations[0].label(&buf));
+    try std.testing.expectEqualStrings("create_index_users_idx_name", m.operations[1].label(&buf));
 }
 
 test "FieldType enum ordinal values" {

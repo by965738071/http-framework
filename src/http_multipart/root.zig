@@ -67,7 +67,12 @@ pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
     if (boundary.len > 0 and boundary[0] == '"') {
         boundary = boundary[1..];
         const end = std.mem.indexOfScalar(u8, boundary, '"') orelse return null;
-        boundary = boundary[0..end];
+        return boundary[0..end];
+    }
+    // 无引号：在第一个 `;` 或空白处截断（否则 `boundary=xyz; charset=..` 会把
+    // 后面的参数当成分隔符的一部分，导致解析不出 parts）。
+    for (boundary, 0..) |c, i| {
+        if (c == ';' or c == ' ' or c == '\t') return boundary[0..i];
     }
     return boundary;
 }
@@ -76,7 +81,8 @@ pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
 /// `limit` 是 body 最大字节数。
 pub fn from(ctx: *Context, limit: u64) !FormData {
     const ct = ctx.request.content_type orelse return error.NotMultipart;
-    if (!std.mem.startsWith(u8, ct, "multipart/form-data")) {
+    // 媒体类型大小写不敏感（RFC 9110 §8.3.1）。
+    if (!std.ascii.startsWithIgnoreCase(ct, "multipart/form-data")) {
         return error.NotMultipart;
     }
     const boundary_raw = extractBoundary(ct) orelse return error.MissingBoundary;
@@ -145,8 +151,10 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
     var header_it = std.mem.splitSequence(u8, header_block, "\r\n");
     while (header_it.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "Content-Disposition:")) {
-            field_name = extractParam(line, "name");
+            // 先取 filename（包含 `name=` 子串），再取 name——避免 name= 误匹配
+            // filename= 里的 name= 子串。extractParam 按分隔 token 匹配 key。
             file_name = extractParam(line, "filename");
+            field_name = extractParam(line, "name");
         } else if (std.ascii.startsWithIgnoreCase(line, "Content-Type:")) {
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
             content_type = std.mem.trim(u8, line[colon + 1 ..], " \t");
@@ -169,15 +177,31 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
     }
 }
 
-/// 从 `key="value"` 格式提取 value。
+/// 从 Content-Disposition 行里提取 `key="value"` 的 value。
+/// 按分隔 token 匹配（前面是行首、`;` 或空白），避免 `name` 误匹配 `filename`。
+/// 零分配（不再用 page_allocator 拼 search 串）。
 fn extractParam(line: []const u8, key: []const u8) ?[]const u8 {
-    // 找 key=
-    const search = std.fmt.allocPrint(std.heap.page_allocator, "{s}=\"", .{key}) catch return null;
-    defer std.heap.page_allocator.free(search);
-    const idx = std.mem.indexOf(u8, line, search) orelse return null;
-    const start = idx + search.len;
-    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
-    return line[start..end];
+    var i: usize = 0;
+    while (i < line.len) {
+        // 定位下一个 key
+        const found = std.mem.indexOfPos(u8, line, i, key) orelse return null;
+        // key 前一字符必须是分隔符（行首 / `;` / 空白），否则是子串误匹配。
+        const boundary_ok = found == 0 or line[found - 1] == ';' or line[found - 1] == ' ' or line[found - 1] == '\t';
+        const after = found + key.len;
+        if (boundary_ok and after < line.len and line[after] == '=') {
+            var v = line[after + 1 ..];
+            if (v.len > 0 and v[0] == '"') {
+                v = v[1..];
+                const end = std.mem.indexOfScalar(u8, v, '"') orelse return null;
+                return v[0..end];
+            }
+            // 无引号：到 `;` 或行尾
+            const end = std.mem.indexOfScalar(u8, v, ';') orelse v.len;
+            return std.mem.trim(u8, v[0..end], " \t");
+        }
+        i = found + key.len;
+    }
+    return null;
 }
 
 // ===========================================================================

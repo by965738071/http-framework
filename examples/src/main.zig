@@ -15,7 +15,8 @@
 //!   ├─ 限流            GET /rate-limit（60 秒窗口，全局 30 次）
 //!   ├─ ORM            GET/POST /orm/users   GET/PUT/DELETE /orm/users/:id
 //!   └─ 中间件管道       ErrorRenderer → RequestId → Compress → Timing
-//!                      → SecurityHeaders → CORS → RateLimit → ScopedAuth
+//!                      → SecurityHeaders → CORS → RateLimit（全局）
+//!                      /admin/* 额外叠加组级 Auth 中间件（router.group）
 //!
 //! 运行：
 //!   cd examples && zig build run
@@ -65,6 +66,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const framework = @import("http_framework");
+const zio = @import("zio");
 
 // ────────────────────────────────────────────────────────────────────────────
 // 全局状态
@@ -72,9 +74,9 @@ const framework = @import("http_framework");
 // 单例（SessionManager / ORM Store / Logger）用模块级 var 持有。
 // ────────────────────────────────────────────────────────────────────────────
 
-var logger: framework.Logger = undefined;
-var sessions: framework.SessionManager = undefined;
-var user_store: ?*UserStore = null;
+// 全局变量已移除（架构缺陷 #2 修复）：SessionManager / Logger / ORM Store
+// 现在通过 framework.Services 服务容器注入，handler 用 ctx.service(T) 取回。
+// 这些实例在 main 的栈上创建，生命周期由 main 的 defer 管理。
 
 // ── ORM 模型 ────────────────────────────────────────────────────────────────
 // Model(T, "表名") 会在编译期反射出表结构（id 字段自动成为主键并自增），
@@ -93,33 +95,14 @@ const UserStore = UserModel.Store;
 // 入口
 // ────────────────────────────────────────────────────────────────────────────
 
-pub fn main() !void {
-    // 0. allocator（与框架示例一致）
-    //    Debug 模式用 DebugAllocator：退出时泄漏检测。
-    //    Release 用全局 Arena：进程生命周期内存，退出一次性释放。
-    var release_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
-    var debug_allocator_instance = std.heap.DebugAllocator(.{ .safety = false }){};
+pub fn main(init: std.process.Init) !void {
+    const rt = try zio.Runtime.init(init.gpa, .{});
+    defer rt.deinit();
+    var handle = try zio.spawn(appMain, .{ rt.io(), init.gpa });
+    handle.join() catch |err| std.log.err("appMain: {s}", .{@errorName(err)});
+}
 
-    const allocator: std.mem.Allocator = if (builtin.mode == .debug)
-        debug_allocator_instance.allocator()
-    else
-        release_arena.allocator();
-    defer {
-        if (builtin.mode == .debug) {
-            if (debug_allocator_instance.deinit() == .leak) {
-                std.debug.panic("memory leak {}", .{@src()});
-            }
-        } else {
-            release_arena.deinit();
-        }
-    }
-
-    // 1. Io（线程池）。concurrent_limit 限制线程数上限，防止压测时无限扩张。
-    var io_state = std.Io.Threaded.init(allocator, .{
-        .concurrent_limit = .limited(128),
-    });
-    const io = io_state.io();
-
+fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // 2. 配置（分层：network / http / body / pool）
     const config = framework.Config{
         .network = .{ .port = 9000 },
@@ -129,7 +112,7 @@ pub fn main() !void {
     };
 
     // 3. 结构化日志器（文件输出，2 MiB 轮转 + gzip 归档 1 个）
-    logger = try framework.Logger.init(allocator, io, .{
+    var logger = try framework.Logger.init(allocator, io, .{
         .min_level = .info,
         .format = .json,
         .output = .file,
@@ -147,7 +130,7 @@ pub fn main() !void {
     });
 
     // 4. 会话管理器（内存 Session，cookie 名 "sid"）
-    sessions = framework.SessionManager.init(allocator, io, .{
+    var sessions = framework.SessionManager.init(allocator, io, .{
         .cookie_name = "sid",
         .session_timeout_sec = 3600,
     });
@@ -155,8 +138,15 @@ pub fn main() !void {
 
     // 5. ORM store（打开/创建表 ./data/users.json）
     const store = try UserStore.open(allocator, io, "./data");
-    user_store = store;
     defer store.close() catch {};
+
+    // 5b. 应用级服务容器（修复 #2）：把进程级单例注册进去，
+    //     handler 通过 ctx.service(T) 取回，不再依赖全局变量。
+    var services = framework.Services.init(allocator);
+    defer services.deinit();
+    try services.register(framework.Logger, &logger);
+    try services.register(framework.SessionManager, &sessions);
+    try services.register(UserStore, store);
 
     // 6. 路由器
     var router = try framework.Router.init(allocator);
@@ -198,17 +188,6 @@ pub fn main() !void {
     });
     try router.use(framework.Middleware.init(framework.RateLimiter, &rate_mw));
 
-    // 自定义中间件：路径作用域鉴权（只有 /admin 前缀需要 Bearer Token，
-    // 内部委托给框架内置的 AuthMiddleware 做实际校验）。
-    var scoped_auth = ScopedAuth{
-        .auth = .{ .config = .{
-            .bearer_token = "demo-secret-token",
-            .realm = "Protected",
-        } },
-        .prefix = "/admin",
-    };
-    try router.use(framework.Middleware.init(ScopedAuth, &scoped_auth));
-
     // ── 基础路由 ──────────────────────────────────────────────
 
     try router.route(.GET, "/", framework.Handler.fromFn(helloHandler));
@@ -218,6 +197,7 @@ pub fn main() !void {
     // 路径参数（:id）+ query 参数
     try router.route(.GET, "/users/:id", framework.Handler.fromFn(userHandler));
     try router.route(.GET, "/echo", framework.Handler.fromFn(echoHandler));
+    try router.route(.POST, "/form", framework.Handler.fromFn(formHandler));
 
     // 重定向
     try router.route(.GET, "/redirect", framework.Handler.fromFn(redirectHandler));
@@ -262,9 +242,16 @@ pub fn main() !void {
 
     try router.route(.GET, "/rate-limit", framework.Handler.fromFn(rateLimitDemoHandler));
 
-    // ── 鉴权演示（/admin 前缀已被 scoped_auth 保护）────────────
-
-    try router.route(.GET, "/admin/secret", framework.Handler.fromFn(adminSecretHandler));
+    // ── 鉴权演示：用路由分组把 Bearer Token 鉴权只施加于 /admin/* ────
+    // 修复 #4：不再需要自写前缀判断的 ScopedAuth，直接用 router.group。
+    // 组级中间件只对本组下注册的路由执行，其他路由不受影响。
+    var admin_auth = framework.AuthMiddleware{ .config = .{
+        .bearer_token = "demo-secret-token",
+        .realm = "Protected",
+    } };
+    var admin = router.group("/admin");
+    try admin.use(framework.Middleware.init(framework.AuthMiddleware, &admin_auth));
+    try admin.route(.GET, "/secret", framework.Handler.fromFn(adminSecretHandler));
 
     // ── ORM CRUD ───────────────────────────────────────────────
 
@@ -273,6 +260,10 @@ pub fn main() !void {
     try router.route(.GET, "/orm/users/:id", framework.Handler.fromFn(ormGetHandler));
     try router.route(.PUT, "/orm/users/:id", framework.Handler.fromFn(ormUpdateHandler));
     try router.route(.DELETE, "/orm/users/:id", framework.Handler.fromFn(ormDeleteHandler));
+
+    // ── WebSocket（RFC 6455）──────────────────────────────────
+    // /ws 路由：升级为 WebSocket，回显收到的每个消息（echo）。
+    try router.route(.GET, "/ws", framework.Handler.fromFn(wsEchoHandler));
 
     // ── 自定义 404 ─────────────────────────────────────────────
 
@@ -289,7 +280,7 @@ pub fn main() !void {
     defer server.deinit();
     try server.setup();
     server.setLifecycle(.{ .hooks = &hooks });
-    server.installSignalHandlers();
+    server.setServices(&services);
 
     std.log.info("Server starting on {s}:{d}", .{ config.network.address, config.network.port });
 
@@ -332,14 +323,28 @@ fn greetHandler(ctx: *framework.Context, res: *framework.Response) !void {
     try res.text(msg);
 }
 
-/// query 参数回显：GET /echo?a=1&b=2
+/// query 参数回显（解码）：GET /echo?msg=hello+world
 fn echoHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    try res.json(.{ .query = ctx.request.query });
+    // getQueryDecoded：`+`→空格、`%XX`→字节（用请求 arena 分配）。
+    const msg = (try ctx.request.getQueryDecoded(ctx.arena, "msg")) orelse "(none)";
+    try res.json(.{ .raw_query = ctx.request.query, .decoded_msg = msg });
 }
 
-/// 重定向：GET /redirect → /users/42
+/// 重定向：GET /redirect → /users/42（303 See Other，POST-后重定向到 GET 的常见模式）
 fn redirectHandler(_: *framework.Context, res: *framework.Response) !void {
-    try res.redirect("/users/42", false);
+    try res.redirectStatus("/users/42", .see_other);
+}
+
+/// 表单提交回显（application/x-www-form-urlencoded）：
+/// curl -X POST -d 'name=Jane+Doe&city=%E5%8C%97%E4%BA%AC' http://127.0.0.1:9000/form
+fn formHandler(ctx: *framework.Context, res: *framework.Response) !void {
+    _ = ctx.readBody(ctx.arena, 1 << 20) catch {
+        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        return;
+    };
+    const name = (try ctx.request.getFormDecoded(ctx.arena, "name")) orelse "anonymous";
+    const city = (try ctx.request.getFormDecoded(ctx.arena, "city")) orelse "unknown";
+    try res.json(.{ .name = name, .city = city });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -382,10 +387,12 @@ fn createItemHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     };
 
-    logger.info(ctx, "item created", &.{
-        framework.fstr("name", body.name),
-        framework.ffloat("price", body.price),
-    });
+    if (ctx.service(framework.Logger)) |logger| {
+        logger.info(ctx, "item created", &.{
+            framework.fstr("name", body.name),
+            framework.ffloat("price", body.price),
+        });
+    }
 
     // 201 Created + 回显创建的对象
     try res.statusCode(.created).json(.{
@@ -496,16 +503,26 @@ fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void 
     }
 
     // getOrCreate：没有 cookie 就新建 session 并写 Set-Cookie
+    const sessions = ctx.service(framework.SessionManager) orelse {
+        try ctx.failWith(res, framework.AppError.internal("session service not available"));
+        return;
+    };
     const session_id = try sessions.getOrCreate(ctx, res);
     try sessions.setData(session_id, "username", body.username);
 
-    logger.info(ctx, "user logged in", &.{framework.fstr("user", body.username)});
+    if (ctx.service(framework.Logger)) |logger| {
+        logger.info(ctx, "user logged in", &.{framework.fstr("user", body.username)});
+    }
 
     try res.json(.{ .ok = true, .session = session_id });
 }
 
 /// GET /session/me （带 cookie）→ 返回当前登录用户
 fn sessionMeHandler(ctx: *framework.Context, res: *framework.Response) !void {
+    const sessions = ctx.service(framework.SessionManager) orelse {
+        try ctx.failWith(res, framework.AppError.internal("session service not available"));
+        return;
+    };
     const session_id = ctx.request.getCookie("sid") orelse {
         try ctx.failWith(res, framework.AppError.unauthorized("no session cookie"));
         return;
@@ -568,7 +585,7 @@ const NewUserBody = struct {
 };
 
 fn ormListHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const store = user_store orelse {
+    const store = ctx.service(UserStore) orelse {
         try ctx.failWith(res, framework.AppError.internal("store not initialized"));
         return;
     };
@@ -581,7 +598,7 @@ fn ormListHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const store = user_store orelse {
+    const store = ctx.service(UserStore) orelse {
         try ctx.failWith(res, framework.AppError.internal("store not initialized"));
         return;
     };
@@ -610,13 +627,15 @@ fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // 失败会向上传播，由调用方决定如何处理（这里直接 500）。
     try store.flush();
 
-    logger.info(ctx, "user created", &.{framework.fint("id", @intCast(id))});
+    if (ctx.service(framework.Logger)) |logger| {
+        logger.info(ctx, "user created", &.{framework.fint("id", @intCast(id))});
+    }
 
     try res.statusCode(.created).json(.{ .id = id, .name = body.name, .email = body.email });
 }
 
 fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const store = user_store orelse {
+    const store = ctx.service(UserStore) orelse {
         try ctx.failWith(res, framework.AppError.internal("store not initialized"));
         return;
     };
@@ -630,7 +649,7 @@ fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const store = user_store orelse {
+    const store = ctx.service(UserStore) orelse {
         try ctx.failWith(res, framework.AppError.internal("store not initialized"));
         return;
     };
@@ -654,7 +673,7 @@ fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 fn ormDeleteHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const store = user_store orelse {
+    const store = ctx.service(UserStore) orelse {
         try ctx.failWith(res, framework.AppError.internal("store not initialized"));
         return;
     };
@@ -759,41 +778,54 @@ const TimingMiddleware = struct {
     }
 };
 
-/// 路径作用域鉴权中间件：只有 prefix 前缀的请求才校验身份。
-/// 这是"如何用框架组件拼自定义逻辑"的示例——校验部分直接委托
-/// 给内置 AuthMiddleware（支持 bearer / basic / api_key 多种策略）。
-const ScopedAuth = struct {
-    auth: framework.AuthMiddleware,
-    prefix: []const u8,
+// ──────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────
+// WebSocket 示例（可运行的 /ws echo 路由）
+//
+// 流程：
+//   1. handler 调用 framework.wsUpgrade(ctx, res, user_ctx, onWs)；
+//   2. 合法升级请求返回 true，handler 直接 return；
+//   3. ConnectionRunner 写 101 握手、构造 WebSocket，回调 onWs(ws, user_ctx)；
+//   4. onWs 跑自己的 receive/send 循环，返回即关连接。
+//
+// 用 websocat 测试：  websocat ws://127.0.0.1:9000/ws
+// 或浏览器：         new WebSocket("ws://127.0.0.1:9000/ws")
+// ───────────────────────────────────────────────────────
 
-    pub fn process(self: *@This(), ctx: *framework.Context, res: *framework.Response, next: framework.Next) !void {
-        // 不在受保护前缀内 → 直接放行
-        if (!std.mem.startsWith(u8, ctx.request.path, self.prefix)) {
-            return next.call(ctx, res);
-        }
-        // 前缀内 → 走 AuthMiddleware 的校验逻辑（失败会 short-circuit 401）
-        return self.auth.process(ctx, res, next);
+fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
+    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), wsEcho) catch {
+        try ctx.failWith(res, .{ .status = .bad_request, .message = "websocket upgrade failed" });
+        return;
+    };
+    if (!upgraded) {
+        // 非合法升级请求（普通 HTTP GET 或版本不支持）。wsUpgrade 已写好错误响应。
+        if (!res.sent) try res.statusCode(.bad_request).text("expected a WebSocket upgrade request");
+        return;
     }
-};
+    // 升级成功：直接 return，后续由 wsEcho 回调接管连接。
+}
 
-// ────────────────────────────────────────────────────────────────────────────
-// WebSocket 示例
-//
-// 注意：http_server 层目前还没有实现连接劫持（ConnectionRunner 不处理
-// 101 升级后的裸帧读写），所以这里不做可运行的服务端 /ws 路由。
-//
-// 现在可用的 API（本项目测试已覆盖，直接 `zig build test` 即可验证）：
-//   - wsHandshake(ctx, res)  校验升级请求，设置 101 + Sec-WebSocket-Accept 头
-//   - wsComputeAcceptKey(...) 计算 Sec-WebSocket-Accept 值
-//   - wsEncodeFrame / wsDecodeFrame  单帧编解码（RFC 6455 §5）
-//   - WebSocket.initServer/initClient  连接级读写（分片拼合、自动回 pong、关闭）
-//
-// 将来 ConnectionRunner 支持劫持后，一个 /ws 路由大致长这样：
-//   const upgraded = try framework.wsHandshake(ctx, res);
-//   if (!upgraded) return;          // 不是合法升级请求，已写好响应
-//   // 这里接管底层 TCP 连接，构造 WebSocket.initServer(reader, writer, allocator)
-//   // 然后 while (true) { const msg = try ws.receive(); ... }
-// ────────────────────────────────────────────────────────────────────────────
+/// WebSocket 连接回调：echo 每个收到的消息，直到对方关闭。
+fn wsEcho(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
+    _ = hijack_ctx;
+    while (true) {
+        var msg = ws.receive() catch |err| {
+            // 对方关闭 / 连接断开 → 正常结束。
+            if (err == error.ConnectionClosed or err == error.EndOfStream) return;
+            return err;
+        };
+        defer msg.deinit();
+        switch (msg.opcode) {
+            .text => try ws.sendText(msg.payload),
+            .binary => try ws.sendBinary(msg.payload),
+            else => {},
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────
+// WebSocket 帧编解码 in-memory 测试（不依赖真实 TCP）
+// ───────────────────────────────────────────────────────
 
 test "websocket: client → server text roundtrip (in-memory)" {
     const allocator = std.testing.allocator;

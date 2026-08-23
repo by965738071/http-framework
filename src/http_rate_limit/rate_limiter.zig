@@ -76,7 +76,10 @@ pub const RateLimiter = struct {
         if (self.isRateLimitedLocked(identifier, now)) {
             _ = res.statusCode(.too_many_requests);
             try self.addRateLimitHeadersLocked(res, identifier, now);
-            _ = try res.header("Retry-After", "1");
+            // Retry-After = 距当前窗口重置还剩多少秒（RFC 9110 §10.2.3）。
+            const retry_after = self.secondsUntilResetLocked(identifier, now);
+            const retry_str = try std.fmt.allocPrint(res.allocator, "{d}", .{retry_after});
+            _ = try res.header("Retry-After", retry_str);
             try res.text(self.config.limit_message);
             return; // short-circuit
         }
@@ -163,19 +166,32 @@ pub const RateLimiter = struct {
         }
     }
 
+    /// 距当前窗口重置还剩多少秒（向上取整，至少 1）。
+    fn secondsUntilResetLocked(self: *Self, identifier: []const u8, now: i96) u64 {
+        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
+        if (self.records.get(identifier)) |record| {
+            const elapsed = now - record.window_start;
+            const remaining_ns = window_ns - elapsed;
+            if (remaining_ns <= 0) return 1;
+            return @intCast(@divTrunc(remaining_ns + 999_999_999, 1_000_000_000));
+        }
+        return self.config.window_seconds;
+    }
+
     fn addRateLimitHeadersLocked(self: *Self, res: *Response, identifier: []const u8, now: i96) !void {
         const record = self.records.get(identifier) orelse return;
         const limit = self.config.max_requests;
         const remaining = if (limit > record.count) limit - record.count else 0;
-        const reset_time = now + @as(i96, self.config.window_seconds) * 1_000_000_000;
+        // X-RateLimit-Reset：窗口重置的 Unix 时间戳（秒），从 window_start 算起。
+        const reset_unix_sec = @divTrunc(record.window_start, 1_000_000_000) + self.config.window_seconds;
 
-        // 用 arena 分配头值字符串
         const limit_str = try std.fmt.allocPrint(res.allocator, "{d}", .{limit});
         _ = try res.header("X-RateLimit-Limit", limit_str);
         const remain_str = try std.fmt.allocPrint(res.allocator, "{d}", .{remaining});
         _ = try res.header("X-RateLimit-Remaining", remain_str);
-        const reset_str = try std.fmt.allocPrint(res.allocator, "{d}", .{reset_time});
+        const reset_str = try std.fmt.allocPrint(res.allocator, "{d}", .{reset_unix_sec});
         _ = try res.header("X-RateLimit-Reset", reset_str);
+        _ = now;
     }
 };
 

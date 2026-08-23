@@ -57,17 +57,14 @@ pub const ConnectionLoop = struct {
     /// 检查请求是否可以继续复用连接（keep-alive）。
     pub fn shouldKeepAlive(self: *const Self, req: *const protocol.Request) bool {
         _ = self;
-        // HTTP/1.1 默认 keep-alive，除非显式 Connection: close
-        if (req.getHeader("Connection")) |conn| {
-            if (std.ascii.eqlIgnoreCase(conn, "close")) return false;
-        }
+        // Connection 头是逗号分隔的 token 列表（RFC 9110 §7.6.1）。
+        const conn_close = if (req.getHeader("Connection")) |conn| hasToken(conn, "close") else false;
+        const conn_keepalive = if (req.getHeader("Connection")) |conn| hasToken(conn, "keep-alive") else false;
+
+        if (conn_close) return false;
         // HTTP/1.0 默认 close，除非显式 Connection: keep-alive
-        if (req.version == .@"HTTP/1.0") {
-            if (req.getHeader("Connection")) |conn| {
-                if (std.ascii.eqlIgnoreCase(conn, "keep-alive")) return true;
-            }
-            return false;
-        }
+        if (req.version == .@"HTTP/1.0") return conn_keepalive;
+        // HTTP/1.1 默认 keep-alive
         return true;
     }
 
@@ -83,12 +80,21 @@ fn isConnectionClosed(err: anyerror) bool {
         else => false,
     };
 }
-
 fn isProtocolError(err: anyerror) bool {
     return switch (err) {
         error.HttpHeadersInvalid, error.HttpRequestHeadTooLarge, error.InvalidCharacter => true,
         else => false,
     };
+}
+
+/// 在逗号分隔的 header 值（如 Connection）里查找某个 token（大小写不敏感）。
+fn hasToken(header_value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, header_value, ',');
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(t, token)) return true;
+    }
+    return false;
 }
 
 const std = @import("std");

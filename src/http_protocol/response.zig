@@ -142,6 +142,9 @@ pub const Response = struct {
     headers: std.ArrayList(http.Header) = .empty,
     cookies: std.ArrayList(Cookie) = .empty,
     sent: bool = false,
+    /// 是否已真正写入 sink（flush 或直接 send 之后置位）。防止缓冲模式下
+    /// 中间件 flush 一次、ConnectionRunner 再 flush 一次导致 double-send（wire 错帧）。
+    flushed: bool = false,
     stream_open: bool = false,
     owned_strings: std.ArrayList([]u8) = .empty,
     /// 缓冲模式：sendResponse 只存不发送，flush() 才真正写入 sink。
@@ -193,16 +196,17 @@ pub const Response = struct {
     /// 非缓冲模式下，如果已经发送，什么都不做。
     pub fn flush(self: *Self) !void {
         if (!self.buffered) return;
-        // 修复 F3：缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
-        // == null），只要响应已被标记发送（sent）也应发一个空 body 响应，
-        // 否则 client 永远收不到响应、keep-alive 下挂到超时。
+        if (self.flushed) return; // 已发送过，幂等（防 double-send）
+        // 缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
+        // == null），只要响应已被标记发送（sent）也应发一个空 body 响应。
         const body = self.pending_body orelse {
             if (!self.sent) return; // 从未产生任何响应，不发
-            self.sent = true;
+            self.flushed = true;
             try self.sink.respond(self.status, self.headers.items, "");
             return;
         };
         self.pending_body = null;
+        self.flushed = true;
         try self.sink.respond(self.status, self.headers.items, body);
     }
 
@@ -223,8 +227,8 @@ pub const Response = struct {
     }
 
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !*Self {
-        try validateHeaderValue(name);
-        try validateHeaderValue(value);
+        try validateCookieToken(name);
+        try validateCookieToken(value);
         const owned_name = try self.dupeOwned(name);
         const owned_value = try self.dupeOwned(value);
         try self.cookies.append(self.allocator, .{ .name = owned_name, .value = owned_value });
@@ -233,14 +237,14 @@ pub const Response = struct {
 
     /// 设置完整 Cookie（带属性）。
     pub fn setCookieFull(self: *Self, cookie: Cookie) !*Self {
-        try validateHeaderValue(cookie.name);
-        try validateHeaderValue(cookie.value);
+        try validateCookieToken(cookie.name);
+        try validateCookieToken(cookie.value);
         const owned_name = try self.dupeOwned(cookie.name);
         const owned_value = try self.dupeOwned(cookie.value);
         var c = cookie;
         c.name = owned_name;
         c.value = owned_value;
-        // 修复 F2：path/domain/same_site 也必须校验 CRLF，否则可注入响应头。
+        // path/domain/same_site 也必须校验 CRLF，否则可注入响应头。
         if (c.path) |p| {
             try validateHeaderValue(p);
             c.path = try self.dupeOwned(p);
@@ -283,11 +287,12 @@ pub const Response = struct {
         try self.sendResponse(out.written(), "application/json");
     }
 
-    pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
+    /// 重定向。status 可为 301/302/303/307/308（默认 302 found）。
+    /// 303 用于 POST 后重定向到 GET；307/308 保留方法。
+    pub fn redirectStatus(self: *Self, location: []const u8, status: http.Status) !void {
         if (self.sent) return error.AlreadyResponded;
         try self.addCookiesToHeaders();
         _ = try self.header("Location", location);
-        const status = if (permanent) http.Status.moved_permanently else http.Status.found;
         self.sent = true;
         if (self.buffered) {
             self.status = status;
@@ -295,6 +300,11 @@ pub const Response = struct {
             return;
         }
         try self.sink.respond(status, self.headers.items, "");
+    }
+
+    /// 便捷：permanent=true → 301，false → 302。
+    pub fn redirect(self: *Self, location: []const u8, permanent: bool) !void {
+        return self.redirectStatus(location, if (permanent) .moved_permanently else .found);
     }
 
     /// 开始流式响应。
@@ -438,6 +448,15 @@ pub const Response = struct {
 fn validateHeaderValue(s: []const u8) !void {
     for (s) |c| {
         if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
+    }
+}
+
+/// 校验 cookie name/value：除 CRLF/NUL 外，还禁止 `;` `,` 空白（RFC 6265 §4.1.1），
+/// 防止通过值里的 `;` 注入 Domain/Path/Secure 等属性（cookie 属性注入）。
+fn validateCookieToken(s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
+        if (c == ';' or c == ',' or c == ' ' or c == '\t') return error.InvalidCookieValue;
     }
 }
 
