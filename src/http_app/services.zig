@@ -111,3 +111,7 @@ test "Services register overwrites same type" {
     try std.testing.expectEqual(@as(u32, 2), svc.get(Counter).?.v);
     try std.testing.expectEqual(@as(usize, 1), svc.entries.items.len);
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}

@@ -314,3 +314,6 @@ test "Trie detects route conflicts" {
     try trie.insert(.GET, "/users/:id", .{ .handler = handler });
     try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/users/:id", .{ .handler = handler }));
 }
+test {
+    std.testing.refAllDecls(@This());
+}

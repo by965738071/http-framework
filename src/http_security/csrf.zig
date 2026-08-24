@@ -158,3 +158,6 @@ test "CsrfMiddleware.generateToken produces different tokens" {
     defer allocator.free(t2);
     try std.testing.expect(!std.mem.eql(u8, t1, t2));
 }
+test {
+    std.testing.refAllDecls(@This());
+}

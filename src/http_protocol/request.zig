@@ -489,3 +489,7 @@ test "getFormDecoded decodes urlencoded body" {
     defer a.free(msg);
     try std.testing.expectEqualStrings("a b&c", msg);
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}

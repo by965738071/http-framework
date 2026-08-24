@@ -5,7 +5,10 @@
     .fingerprint = 0x7bd0ad45b26335d6,
     .dependencies = .{
         .http_framework = .{ .path = "../" },
-        .zio = .{ .path = "../../../zio" },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#zig-0.17",
+            .hash = "zio-0.17.0-xHbVVJhmJgDCkSLd-chGMOmcpcOlUTTnpNt2_zJJhZVZ",
+        },
     },
     .minimum_zig_version = "0.17.0-dev.889+e6be5cfe3",
     .paths = .{

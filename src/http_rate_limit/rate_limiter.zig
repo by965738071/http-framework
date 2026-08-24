@@ -354,3 +354,6 @@ test "per_ip=false: 返回 global 标识" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("global", id.?);
 }
+test {
+    std.testing.refAllDecls(@This());
+}

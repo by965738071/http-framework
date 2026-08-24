@@ -565,3 +565,6 @@ test "Response buffered mode delays send until flush" {
     const written = buf[0..writer.end];
     try std.testing.expect(std.mem.indexOf(u8, written, "hello") != null);
 }
+test {
+    std.testing.refAllDecls(@This());
+}

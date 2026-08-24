@@ -69,6 +69,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const devices_mod = b.addModule("devices", .{
+        .root_source_file = b.path("src/devices.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+        },
+    });
+
+    const register_mod = b.addModule("register", .{
+        .root_source_file = b.path("src/register.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+            .{ .name = "admin", .module = admin_mod },
+        },
+    });
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -103,6 +120,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "examples", .module = mod },
                 .{ .name = "admin", .module = admin_mod },
+                .{ .name = "devices", .module = devices_mod },
+                .{ .name = "register", .module = register_mod },
                 .{ .name = "http_framework", .module = http_framework_mod },
                 .{ .name = "zio", .module = zio_mod },
             },

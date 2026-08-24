@@ -1,5 +1,7 @@
 const std = @import("std");
-const admin = @import("admin.zig");
+const admin = @import("admin");
+const devices = @import("devices");
+const register = @import("register");
 
 // Re-export admin declarations for testing
 pub const Role = admin.Role;
@@ -27,6 +29,18 @@ pub const LogClearHandler = admin.LogClearHandler;
 pub const SettingsHandler = admin.SettingsHandler;
 pub const MeHandler = admin.MeHandler;
 pub const WsNotificationsHandler = admin.WsNotificationsHandler;
+
+// Device management exports
+pub const DeviceModel = devices.DeviceModel;
+pub const DeviceStore = devices.DeviceStore;
+pub const DeviceListHandler = devices.DeviceListHandler;
+pub const DeviceCreateHandler = devices.DeviceCreateHandler;
+pub const DeviceGetHandler = devices.DeviceGetHandler;
+pub const DeviceUpdateHandler = devices.DeviceUpdateHandler;
+pub const DeviceDeleteHandler = devices.DeviceDeleteHandler;
+
+// User registration exports
+pub const RegisterHandler = register.RegisterHandler;
 
 test {
     std.testing.refAllDecls(@This());

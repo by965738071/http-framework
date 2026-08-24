@@ -146,7 +146,7 @@ pub const ConnectionRunner = struct {
             // 缓冲模式下（压缩/计时中间件会开启）res.text 只存入 pending_body，
             // 必须 flush 才会真正写出。不在这里 flush 会导致 client 永远收不到响应
             // → 连接死锁到超时（回应审查发现 #2）。
-            res.flush() catch {};
+            try res.flush();
             return err;
         };
         const latency = std.Io.Timestamp.now(self.io, .awake).nanoseconds - dispatch_start;
@@ -179,7 +179,7 @@ pub const ConnectionRunner = struct {
         // 兵底：非缓冲模式下 handler 若只设了 status 而从未写 body，补发一个空响应，
         // 避免 client 挂到超时（缓冲模式由 res.flush 处理）。
         if (!res.buffered and !res.sent) {
-            res.text("") catch {};
+            try res.text("");
         }
         try res.flush();
         return null;

@@ -346,3 +346,7 @@ test "Context.param delegates to state.path_params" {
 
     try std.testing.expectEqualStrings("123", ctx.param("id").?);
 }
+
+test{
+    std.testing.refAllDecls(@This());
+}

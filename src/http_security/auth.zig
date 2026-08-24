@@ -263,3 +263,6 @@ test "checkBasic logic with base64 decode" {
     try std.testing.expect(constantTimeEql(p, "secret123"));
     try std.testing.expect(!constantTimeEql(p, "wrong"));
 }
+test {
+    std.testing.refAllDecls(@This());
+}

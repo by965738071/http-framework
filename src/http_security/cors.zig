@@ -173,3 +173,6 @@ test "CorsMiddleware isOriginAllowed - exact match" {
     try std.testing.expect(cors.isOriginAllowed("https://api.example.com"));
     try std.testing.expect(!cors.isOriginAllowed("https://evil.com"));
 }
+test {
+    std.testing.refAllDecls(@This());
+}

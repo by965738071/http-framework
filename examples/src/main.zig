@@ -71,6 +71,8 @@ const builtin = @import("builtin");
 const framework = @import("http_framework");
 const zio = @import("zio");
 const admin = @import("admin");
+const devices = @import("devices");
+const register = @import("register");
 
 // ────────────────────────────────────────────────────────────────────────────
 // 全局状态
@@ -157,6 +159,10 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         .notifications = notifications,
     };
 
+    // 5e. Device store
+    const device_store = try devices.DeviceStore.open(allocator, io, "./data/devices");
+    defer device_store.close() catch {};
+
     // 5b. 应用级服务容器（修复 #2）：把进程级单例注册进去，
     //     handler 通过 ctx.service(T) 取回，不再依赖全局变量。
     var services = framework.Services.init(allocator);
@@ -194,7 +200,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // style=/onclick=，所以放宽 CSP 允许 inline，否则浏览器会拒绝样式与脚本。
     // 生产环境应把样式/脚本拆到外部文件，保持默认的严格 CSP。
     var security_mw = framework.SecurityHeaders{ .config = .{
-        .content_security_policy = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:",
+        .content_security_policy = "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss: http://127.0.0.1:9000;",
     } };
     try router.use(framework.Middleware.init(framework.SecurityHeaders, &security_mw));
 
@@ -282,6 +288,14 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var settings_handler = admin.SettingsHandler{ .services = &admin_services };
     var ws_notifications_handler = admin.WsNotificationsHandler{ .services = &admin_services };
 
+    // 5f. Device & Register handler instances
+    var register_handler = register.RegisterHandler{ .io = io, .users = admin_users };
+    var device_list_handler = devices.DeviceListHandler{ .store = device_store };
+    var device_create_handler = devices.DeviceCreateHandler{ .store = device_store, .io = io };
+    var device_get_handler = devices.DeviceGetHandler{ .store = device_store };
+    var device_update_handler = devices.DeviceUpdateHandler{ .store = device_store };
+    var device_delete_handler = devices.DeviceDeleteHandler{ .store = device_store };
+
     // ── Admin 后台管理 ────────────────────────────────────────
     {
         // 创建 admin 路由组
@@ -330,6 +344,28 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         try admin_routes.route(.GET, "/*", framework.Handler.initSingleton(framework.StaticFileServer, &admin_static));
         std.log.info("Admin routes registered successfully", .{});
     }
+
+    // ── 用户注册（无需认证）─────────────────────────────────────
+
+    try router.route(.POST, "/api/register", framework.Handler.initSingleton(register.RegisterHandler, &register_handler));
+
+    // ── 设备管理 API（需要认证）─────────────────────────────────
+    // 使用 admin 的 session 鉴权（复用 admin_services 的 RequireAuthMiddleware）
+    {
+        var api_device_routes = try router.group("/api/devices");
+        try api_device_routes.use(admin.requireAuth(&admin_services));
+
+        try api_device_routes.route(.GET, "", framework.Handler.initSingleton(devices.DeviceListHandler, &device_list_handler));
+        try api_device_routes.route(.POST, "", framework.Handler.initSingleton(devices.DeviceCreateHandler, &device_create_handler));
+        try api_device_routes.route(.GET, "/:id", framework.Handler.initSingleton(devices.DeviceGetHandler, &device_get_handler));
+        try api_device_routes.route(.PUT, "/:id", framework.Handler.initSingleton(devices.DeviceUpdateHandler, &device_update_handler));
+        try api_device_routes.route(.DELETE, "/:id", framework.Handler.initSingleton(devices.DeviceDeleteHandler, &device_delete_handler));
+    }
+
+    // ── 前端 SPA 静态文件服务 ────────────────────────────────────
+
+    var app_static = framework.StaticFileServer.init(allocator, io, "./public/app", "/app");
+    try router.route(.GET, "/app/*", framework.Handler.initSingleton(framework.StaticFileServer, &app_static));
 
     // ── ORM CRUD ───────────────────────────────────────────────
 

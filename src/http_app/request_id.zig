@@ -150,3 +150,7 @@ test "RequestIdMiddleware reuses client-provided X-Request-Id" {
     try std.testing.expect(stored != null);
     try std.testing.expectEqualStrings("abc-123", stored.?.slice());
 }
+
+test{
+    std.testing.refAllDecls(@This());
+}

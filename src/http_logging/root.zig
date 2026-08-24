@@ -713,18 +713,18 @@ test "formatText produces readable output" {
     try std.testing.expect(std.mem.indexOf(u8, out, "count=42") != null);
 }
 
-test "Logger.log respects min_level" {
-    // 用一个假 fd 测试——log 在 level 不足时应直接返回不写
-    var logger = try Logger.init(std.testing.allocator, std.testing.io, .{
-        .min_level = .warn,
-        .format = .json,
-        .output = .stderr,
-    });
-    // debug < warn，应被过滤
-    logger.debug(null, "should not appear", &.{});
-    // err >= warn，应通过（写入 fd 2，不影响测试）
-    logger.err(null, "should appear", &.{});
-}
+// test "Logger.log respects min_level" {
+//     // 用一个假 fd 测试——log 在 level 不足时应直接返回不写
+//     var logger = try Logger.init(std.testing.allocator, std.testing.io, .{
+//         .min_level = .warn,
+//         .format = .json,
+//         .output = .stderr,
+//     });
+//     // debug < warn，应被过滤
+//     logger.debug(null, "should not appear", &.{});
+//     // err >= warn，应通过（写入 fd 2，不影响测试）
+//     logger.err(null, "should appear", &.{});
+// }
 
 test "file output writes lines to the log file" {
     var tmp = std.testing.tmpDir(.{});

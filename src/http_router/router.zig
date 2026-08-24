@@ -479,3 +479,6 @@ test "RouteGroup: 嵌套子组继承前缀与中间件" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "outer") != null);
 }
+test {
+    std.testing.refAllDecls(@This());
+}
