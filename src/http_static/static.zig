@@ -152,13 +152,21 @@ pub const StaticFileServer = struct {
         _ = try res.header("Accept-Ranges", "bytes");
 
         // HEAD：只发头，不发 body（RFC 9110 §9.3.2）。
+        //
+        // 不能手写 Content-Length 再 res.text("")：std 的 respond() 会按 body.len
+        // 另写一个 `content-length: 0`，wire 上出现两个不一致的 Content-Length。
+        // RFC 9110 §8.6 要求接收方视为不可恢复错误，放在反代/CDN 后面就是请求走私原语
+        // （已实测：HEAD /static/test.html 同时返回 content-length: 0 与 Content-Length: 34）。
+        // 走 stream + 声明长度：std 对 HEAD 请求自动设 elide 标志，只发头不发 body，
+        // 而 Stream.end() 已经处理了 eliding 下把 content_length 归零的情况。
         if (ctx.request.method == .HEAD) {
-            _ = try res.header("Content-Type", content_type);
-            var clen_buf: [24]u8 = undefined;
-            const clen = std.fmt.bufPrint(&clen_buf, "{d}", .{stat.size}) catch "0";
-            _ = try res.header("Content-Length", clen);
             _ = res.statusCode(.ok);
-            try res.text("");
+            var head_buf: [64]u8 = undefined;
+            var head_stream = try res.stream(&head_buf, .{
+                .content_length = stat.size,
+                .content_type = content_type,
+            });
+            try head_stream.end();
             return;
         }
 
@@ -331,7 +339,11 @@ pub const StaticFileServer = struct {
             const to_read = @min(file_read_buf.len, remaining);
             const bufs: []const []u8 = &.{file_read_buf[0..to_read]};
             const n = try file.readPositional(ctx.io, bufs, offset);
-            if (n == 0) break;
+            // 这里已经声明了 content_length = len。少写字节会撞上 std
+            // BodyWriter.endUnflushed 的 `assert(len == 0)` → 进程级 panic。
+            // 文件在 stat 之后被并发截断（日志轮转、部署替换）即触发。
+            // 必须以错误终止（连接会被关闭），不能像旧代码那样 break。
+            if (n == 0) return error.UnexpectedEof;
             try stream.writeAll(file_read_buf[0..n]);
             offset += n;
             remaining -= n;

@@ -195,8 +195,17 @@ pub const Response = struct {
     /// 在缓冲模式下，把暂存的响应真正写入 sink。
     /// 非缓冲模式下，如果已经发送，什么都不做。
     pub fn flush(self: *Self) !void {
+        // `flushed` 检查必须在最前面。它覆盖三种「已经上过 wire」的情况：
+        //   1. 缓冲模式下已 flush 过（幂等）；
+        //   2. 直发模式（sendResponse 已写 sink）；
+        //   3. **流式响应**（stream() 已把状态行+头写进 sink）。
+        // 第 3 种是关键：旧代码只在 !buffered 时提前返回，而 stream() 只置 sent
+        // 不置 flushed。于是「缓冲中间件（compress/timing 会 setBuffered）+ 流式
+        // handler（静态大文件 / Range）」的组合会走到下面的 `pending_body == null`
+        // 分支，看到 sent==true 就再发一个空响应 —— 同一个请求两个 HTTP 响应，
+        // keep-alive 客户端/反代会把第二个当成下一个请求的响应（响应队列投毒）。
+        if (self.flushed) return;
         if (!self.buffered) return;
-        if (self.flushed) return; // 已发送过，幂等（防 double-send）
         // 缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
         // == null），只要响应已被标记发送（sent）也应发一个空 body 响应。
         const body = self.pending_body orelse {
@@ -316,6 +325,12 @@ pub const Response = struct {
 
         self.sent = true;
         self.stream_open = true;
+        // 流式响应已经把状态行 + 头直接交给 sink（startStream）。此后任何 flush()
+        // 都必须是 no-op：缓冲中间件（CompressMiddleware / TimingMiddleware 会
+        // setBuffered）在 next() 返回后会调 flush()，而 ConnectionRunner 结尾还会
+        // 再调一次。不置位 flushed 的话它们会补发一个完整的空响应
+        // → 同一请求两个 HTTP 响应 → keep-alive 响应队列投毒。
+        self.flushed = true;
 
         const body = try self.sink.startStream(
             self.status,
@@ -564,6 +579,85 @@ test "Response buffered mode delays send until flush" {
     // 现在写入了 body
     const written = buf[0..writer.end];
     try std.testing.expect(std.mem.indexOf(u8, written, "hello") != null);
+}
+
+// ── 回归测试：缓冲模式 + 流式响应不得双发（P0-2）──────────────────────────
+//
+// 这是本轮最严重的 wire 层缺陷：`stream()` 只置 sent 不置 flushed，缓冲中间件
+// （CompressMiddleware / TimingMiddleware 都会 setBuffered）在 next() 之后调
+// flush()，会看到 `pending_body == null && sent == true` 而补发一个完整的空响应
+// → 同一个请求两个 HTTP 响应 → keep-alive 客户端/反代把第二个当成下一个请求的
+// 响应（响应队列投毒 / 缓存投毒）。
+//
+// 用一个会统计 respond/startStream 调用次数的 Sink 来断言"提交只能发生一次"。
+const CountingSink = struct {
+    respond_calls: usize = 0,
+    stream_calls: usize = 0,
+
+    fn respondImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: []const u8) anyerror!void {
+        const self: *CountingSink = @ptrCast(@alignCast(ptr));
+        self.respond_calls += 1;
+    }
+    fn startStreamImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: ?u64, _: []u8) anyerror!http.BodyWriter {
+        const self: *CountingSink = @ptrCast(@alignCast(ptr));
+        self.stream_calls += 1;
+        // 不需要真的写 wire：本测试只关心"提交次数"。
+        return error.StreamNotNeededInTest;
+    }
+    fn sink(self: *CountingSink) Sink {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &.{ .respond = respondImpl, .startStream = startStreamImpl },
+        };
+    }
+};
+
+test "缓冲模式下 stream() 之后 flush() 不再补发第二个响应（P0-2 回归）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    // 模拟 CompressMiddleware / TimingMiddleware
+    res.setBuffered();
+
+    // handler 走流式响应（静态大文件 / Range 请求）。
+    // 本测试的 sink 在 startStream 里返回错误，但 stream() 在调用 startStream 之前
+    // 就已经把 sent/flushed 置好了 —— 这正是我们要断言的状态。
+    var stream_buf: [64]u8 = undefined;
+    _ = res.stream(&stream_buf, .{ .content_length = 100 }) catch {};
+
+    try std.testing.expectEqual(@as(usize, 1), counter.stream_calls);
+    try std.testing.expect(res.sent);
+    try std.testing.expect(res.flushed); // ← 修复的核心：stream() 必须置位 flushed
+
+    // 中间件收尾 flush + ConnectionRunner 兜底 flush：都必须是 no-op。
+    try res.flush();
+    try res.flush();
+    try std.testing.expectEqual(@as(usize, 0), counter.respond_calls);
+}
+
+test "非缓冲模式下 stream() 之后 flush() 也不补发（P0-2 回归）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    var stream_buf: [64]u8 = undefined;
+    _ = res.stream(&stream_buf, .{}) catch {};
+    try res.flush();
+    try std.testing.expectEqual(@as(usize, 0), counter.respond_calls);
+}
+
+test "缓冲模式 flush 幂等：只 respond 一次（P0-2 回归）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    res.setBuffered();
+    try res.text("hello");
+    try res.flush();
+    try res.flush();
+    try res.flush();
+    try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
 }
 test {
     std.testing.refAllDecls(@This());

@@ -31,13 +31,19 @@ pub const Arenas = struct {
         return self.connection.allocator();
     }
 
-    /// 请求结束后调用：reset request arena，保留热身容量。
+    /// 请求结束后调用：reset request arena，保留至多 `retain_bytes` 的热身容量。
+    ///
+    /// 旧实现把 `retain_bytes` 当布尔用（`> 0` 就 `.retain_capacity`），而
+    /// `.retain_capacity` 的语义是「按历史峰值预热」——预算完全不起作用。
+    /// 后果：一个 10MB body 的请求让这条 keep-alive 连接**永久**占住 10MB；
+    /// `max_connections` 默认 1024 → 最坏 10GB 常驻，且攻击者只需在每条连接上
+    /// 打一次大请求然后保持空闲即可。
+    /// `.retain_with_limit` 才是「保留至多 N 字节，超出的归还给上游」。
     pub fn endRequest(self: *Arenas, retain_bytes: usize) void {
-        if (retain_bytes > 0) {
-            _ = self.request.reset(.retain_capacity);
-        } else {
-            _ = self.request.reset(.free_all);
-        }
+        _ = self.request.reset(if (retain_bytes > 0)
+            .{ .retain_with_limit = retain_bytes }
+        else
+            .free_all);
     }
 
     /// 连接结束后调用：释放两个 arena。

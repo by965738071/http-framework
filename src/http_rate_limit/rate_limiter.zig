@@ -58,36 +58,82 @@ pub const RateLimiter = struct {
         self.records.deinit(self.allocator);
     }
 
+    /// 一次限流判定的结果快照。在锁内填好，锁外用于写响应头 —— 这样
+    /// `next.call` 就不必在持锁状态下执行。
+    const Snapshot = struct {
+        limit: u32,
+        remaining: u32,
+        reset_unix_sec: i64,
+        retry_after_s: u64,
+    };
+
     /// 中间件入口：检查速率限制
     /// - 超限 → 写 429 响应，short-circuit
     /// - 未超限 → 更新记录，调 next
+    ///
+    /// **临界区绝不能包住 `next.call`**：旧实现是
+    /// `lockUncancelable(); defer unlock(); ...; try next.call(ctx, res);`，
+    /// 意味着整条下游管道（后续中间件、handler、DB IO、socket 写出）都在这一把
+    /// 全局互斥锁里跑 —— 服务器并发度被压成 1，一个慢读客户端就能让全服停摆；
+    /// handler 里再进一次限流器（嵌套 dispatch / 重试）会直接自死锁。
+    /// 一个为了防 DoS 而存在的中间件，反而制造了一个更好的 DoS。
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
         const identifier = self.getIdentifier(ctx) orelse {
             try next.call(ctx, res);
             return;
         };
 
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        // 单调时钟：墙钟（.real）被 NTP 校正/手工改时间会重置或冻结限流窗口。
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
 
-        // 加锁检查 + 更新（修复 P0 线程不安全）
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        // 临界区：只做「判定 + 计数 + 驱逐 + 取快照」，全部是纯内存操作。
+        var snap: Snapshot = undefined;
+        var limited: bool = undefined;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
-        if (self.isRateLimitedLocked(identifier, now)) {
-            _ = res.statusCode(.too_many_requests);
-            try self.addRateLimitHeadersLocked(res, identifier, now);
-            // Retry-After = 距当前窗口重置还剩多少秒（RFC 9110 §10.2.3）。
-            const retry_after = self.secondsUntilResetLocked(identifier, now);
-            const retry_str = try std.fmt.allocPrint(res.allocator, "{d}", .{retry_after});
-            _ = try res.header("Retry-After", retry_str);
-            try res.text(self.config.limit_message);
-            return; // short-circuit
+            limited = self.isRateLimitedLocked(identifier, now);
+            if (!limited) try self.updateRecordLocked(identifier, now);
+            self.maybeCleanupLocked(now);
+            snap = self.snapshotLocked(identifier, now);
         }
 
-        try self.updateRecordLocked(identifier, now);
-        self.maybeCleanupLocked(now);
-        try self.addRateLimitHeadersLocked(res, identifier, now);
-        try next.call(ctx, res);
+        // 锁已释放，下面全部是锁外操作。
+        try writeRateLimitHeaders(res, snap);
+
+        if (!limited) {
+            try next.call(ctx, res);
+            return;
+        }
+
+        _ = res.statusCode(.too_many_requests);
+        // Retry-After = 距当前窗口重置还剩多少秒（RFC 9110 §10.2.3）。
+        const retry_str = try std.fmt.allocPrint(ctx.arena, "{d}", .{snap.retry_after_s});
+        _ = try res.header("Retry-After", retry_str);
+        try res.text(self.config.limit_message);
+    }
+
+    /// 在锁内取一份限流状态快照（调用方必须已持锁）。
+    fn snapshotLocked(self: *Self, identifier: []const u8, now: i96) Snapshot {
+        const limit = self.config.max_requests;
+        const record = self.records.get(identifier) orelse return .{
+            .limit = limit,
+            .remaining = limit,
+            .reset_unix_sec = @intCast(@divTrunc(now, 1_000_000_000) + @as(i96, self.config.window_seconds)),
+            .retry_after_s = self.config.window_seconds,
+        };
+        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
+        const remaining_ns = window_ns - (now - record.window_start);
+        return .{
+            .limit = limit,
+            .remaining = if (limit > record.count) limit - record.count else 0,
+            .reset_unix_sec = @intCast(@divTrunc(record.window_start, 1_000_000_000) + @as(i96, self.config.window_seconds)),
+            .retry_after_s = if (remaining_ns <= 0)
+                1
+            else
+                @intCast(@divTrunc(remaining_ns + 999_999_999, 1_000_000_000)),
+        };
     }
 
     /// 周期性驱逐窗口已过期的记录，防止 records map 无限增长（修复 B1）。
@@ -177,23 +223,17 @@ pub const RateLimiter = struct {
         }
         return self.config.window_seconds;
     }
-
-    fn addRateLimitHeadersLocked(self: *Self, res: *Response, identifier: []const u8, now: i96) !void {
-        const record = self.records.get(identifier) orelse return;
-        const limit = self.config.max_requests;
-        const remaining = if (limit > record.count) limit - record.count else 0;
-        // X-RateLimit-Reset：窗口重置的 Unix 时间戳（秒），从 window_start 算起。
-        const reset_unix_sec = @divTrunc(record.window_start, 1_000_000_000) + self.config.window_seconds;
-
-        const limit_str = try std.fmt.allocPrint(res.allocator, "{d}", .{limit});
-        _ = try res.header("X-RateLimit-Limit", limit_str);
-        const remain_str = try std.fmt.allocPrint(res.allocator, "{d}", .{remaining});
-        _ = try res.header("X-RateLimit-Remaining", remain_str);
-        const reset_str = try std.fmt.allocPrint(res.allocator, "{d}", .{reset_unix_sec});
-        _ = try res.header("X-RateLimit-Reset", reset_str);
-        _ = now;
-    }
 };
+
+/// 写 X-RateLimit-* 响应头。**锁外**调用（入参是锁内取好的快照）。
+fn writeRateLimitHeaders(res: *Response, snap: RateLimiter.Snapshot) !void {
+    var buf: [24]u8 = undefined;
+    _ = try res.header("X-RateLimit-Limit", std.fmt.bufPrint(&buf, "{d}", .{snap.limit}) catch "0");
+    var buf2: [24]u8 = undefined;
+    _ = try res.header("X-RateLimit-Remaining", std.fmt.bufPrint(&buf2, "{d}", .{snap.remaining}) catch "0");
+    var buf3: [24]u8 = undefined;
+    _ = try res.header("X-RateLimit-Reset", std.fmt.bufPrint(&buf3, "{d}", .{snap.reset_unix_sec}) catch "0");
+}
 
 // ===========================================================================
 // Tests

@@ -49,9 +49,21 @@ pub const ConnectionRunner = struct {
             if (self.stats.shutting_down.load(.monotonic)) break;
 
             const result = conn_loop.next() catch |err| {
-                writeError(self.writer, .bad_request, "Bad Request");
-                if (err != error.HttpConnectionClosing) {
-                    std.log.warn("conn_loop: {s}", .{@errorName(err)});
+                // 只有真正的客户端协议错误才写响应。
+                // 旧代码在判断错误类型「之前」就无条件写了 400，于是每一个正常关闭
+                // 的 keep-alive 连接、每一次读超时都会往（多半已关闭的）连接里塞一个
+                // 伪造的 400 Bad Request。conn_loop 现在把三类情况分开：
+                //   - 返回 null      → 连接正常结束（EOF / HttpConnectionClosing / 读超时）
+                //   - ProtocolError  → 400
+                //   - HeadTooLarge   → 431（RFC 6585 §5）
+                switch (err) {
+                    error.ProtocolError => writeError(self.writer, .bad_request, "Bad Request"),
+                    error.HeadTooLarge => writeError(
+                        self.writer,
+                        .request_header_fields_too_large,
+                        "Request Header Fields Too Large",
+                    ),
+                    else => std.log.warn("conn_loop: {s}", .{@errorName(err)}),
                 }
                 break;
             };

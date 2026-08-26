@@ -15,7 +15,6 @@ pub const ConnectionLoop = struct {
     server: *http.Server,
     arena: *std.heap.ArenaAllocator,
     io: std.Io,
-    recoverable_errors: u32 = 0,
 
     const Self = @This();
 
@@ -36,16 +35,20 @@ pub const ConnectionLoop = struct {
 
     /// 读取下一个请求。
     ///
-    /// 返回 `null` 表示连接已关闭（正常 EOF 或关服取消）。
+    /// 返回 `null` 表示连接已结束（正常 EOF / keep-alive 正常关闭 / 读超时 /
+    /// 关服取消）—— 这些情况下**不要**向连接写任何响应。
     /// 返回 `error.ProtocolError` 表示客户端发了坏请求，应当回 400 并关连接。
+    /// 返回 `error.HeadTooLarge` 表示请求头超出读缓冲，应当回 431 并关连接。
     pub fn next(self: *Self) !?NextResult {
-        // 清理上一个请求的 arena
-        _ = self.arena.reset(.retain_capacity);
-
+        // 不在这里 reset arena：ConnectionRunner 的 arenas.endRequest() 已经按
+        // request_arena_retain_bytes 做了带上限的 reset。这里再来一次
+        // `.retain_capacity`（按历史峰值预热、无上限）会把那个上限重新破坏掉。
+        //
         // 在 arena 上分配 http_request，生命周期绑定请求 arena
         const http_request = try self.arena.allocator().create(http.Server.Request);
         http_request.* = self.server.receiveHead() catch |err| {
             if (isConnectionClosed(err)) return null;
+            if (isHeadTooLarge(err)) return error.HeadTooLarge;
             if (isProtocolError(err)) return error.ProtocolError;
             return err;
         };
@@ -74,17 +77,53 @@ pub const ConnectionLoop = struct {
     }
 };
 
+/// 「连接正常结束」：不是错误，**绝不能**向连接写响应。
+///
+/// `error.HttpConnectionClosing` 是 std 明确定义的「客户端在请求边界正常关闭
+/// keep-alive 连接」（std/http.zig: "The client sent 0 bytes of headers before
+/// closing the stream. This happens when a keep-alive connection is finally
+/// closed."）。旧代码没把它列进来，导致每一个正常关闭的连接都会收到一个伪造的
+/// 400 Bad Request（已实测：client shutdown(SHUT_WR) 后仍收到 78 字节的 400）。
+///
+/// `HttpRequestTruncated` / `ReadFailed` 是传输层断开或读超时，对端多半已经走了，
+/// 写响应没有意义（只会污染 wire、刷日志）。
 fn isConnectionClosed(err: anyerror) bool {
     return switch (err) {
-        error.EndOfStream, error.ConnectionClosed, error.Canceled => true,
+        error.EndOfStream,
+        error.ConnectionClosed,
+        error.Canceled,
+        error.HttpConnectionClosing,
+        error.HttpRequestTruncated,
+        error.ReadFailed,
+        => true,
         else => false,
     };
 }
+
+/// 真正的客户端协议错误 → 400。
+///
+/// 注意：旧代码这里写的是 `error.HttpRequestHeadTooLarge`，本 std 版本已改名为
+/// `HttpHeadersOversize`（`switch (anyerror)` 对不存在的错误名不会报编译错误，
+/// 所以这个分支一直是死的）。头过大现在由 `isHeadTooLarge` 单独映射为 431。
 fn isProtocolError(err: anyerror) bool {
     return switch (err) {
-        error.HttpHeadersInvalid, error.HttpRequestHeadTooLarge, error.InvalidCharacter => true,
+        error.HttpHeadersInvalid,
+        error.UnknownHttpMethod,
+        error.HttpHeaderContinuationsUnsupported,
+        error.HttpTransferEncodingUnsupported,
+        error.HttpConnectionHeaderUnsupported,
+        error.InvalidContentLength,
+        error.CompressionUnsupported,
+        error.MissingFinalNewline,
+        error.InvalidCharacter,
+        => true,
         else => false,
     };
+}
+
+/// 请求头超出读缓冲 → 431 Request Header Fields Too Large（RFC 6585 §5）。
+fn isHeadTooLarge(err: anyerror) bool {
+    return err == error.HttpHeadersOversize;
 }
 
 /// 在逗号分隔的 header 值（如 Connection）里查找某个 token（大小写不敏感）。

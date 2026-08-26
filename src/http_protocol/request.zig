@@ -210,21 +210,42 @@ pub const Request = struct {
     /// 从 streaming body 读取到新分配的 buffer。不修改 self（fix.md §四.7）。
     /// 调用方负责缓存（Context.readBody 会存入 RequestState.body_buffer）。
     /// 支持 Content-Length 与 chunked（Transfer-Encoding）两种。limit==0 表示无限。
+    ///
+    /// 可能返回 `error.HttpExpectationFailed`（客户端发了无法满足的 Expect 值），
+    /// 调用方应映射为 417 Expectation Failed。
     pub fn readBodyInto(self: *const Request, allocator: mem.Allocator, limit: u64) ![]const u8 {
         return switch (self.body) {
             .none => "",
             .buffered => |data| data,
             .streaming => |req| {
-                var work_buf: [4096]u8 = undefined;
-                var reader = req.readerExpectNone(&work_buf);
+                // ── limit 校验必须在建 reader 之前 ────────────────────────────
+                // 一旦调用 readerExpectContinue，std 就把 reader 状态切到
+                // body_remaining_content_length；此后 std 的 discardBody() 对该状态
+                // 直接 return true（不排空，见 std/http/Server.zig:640）。
+                // 如果我们在建了 reader 之后才返回 error.BodyTooLarge，而调用方
+                // catch 掉它并正常回 413（http_codec.JsonBody 就是这么写的），
+                // 连接会被复用，残留的 body 字节会被当成下一个请求行解析
+                // → HTTP 请求走私。所以先判长度，再建 reader。
+                const effective_limit: u64 = if (limit > 0) limit else HARD_BODY_CAP;
+                if (self.content_length) |len| {
+                    if (len > effective_limit) return error.BodyTooLarge;
+                }
+
+                // transfer buffer 必须由 allocator（请求 arena）分配，不能用栈数组：
+                // bodyReader 会把它挂到 server.reader.interface.buffer，
+                // 其生命周期长于本函数，栈数组返回后即悬空。
+                const work_buf = try allocator.alloc(u8, 4096);
+
+                // 必须用 readerExpectContinue 而非 readerExpectNone：
+                // 后者第一行就是 assert(head.expect == null)，任何带
+                // `Expect: 100-continue` 的请求都会直接 panic 打死整个进程
+                // （curl 对 >1KB body 自动加这个头）。readerExpectContinue 会先写
+                // "100 Continue" + flush，再把 head.expect 置 null；无法满足的
+                // Expect 值返回 error.HttpExpectationFailed。
+                const reader = try req.readerExpectContinue(work_buf);
 
                 if (self.content_length) |len| {
                     // Content-Length 已知：预分配、读足。
-                    // 即使 limit==0（“无限”）也先卡一个硬上限，防止客户端伪造
-                    // 巨大 Content-Length（例如 10GB）不发 body，诱导服务端一次性分配
-                    // 巨额内存 → 放大型 DoS（回应审查发现 #4）。
-                    const effective_limit: u64 = if (limit > 0) limit else HARD_BODY_CAP;
-                    if (len > effective_limit) return error.BodyTooLarge;
                     const buf = try allocator.alloc(u8, std.math.cast(usize, len) orelse return error.BodyTooLarge);
                     errdefer allocator.free(buf);
                     var read: usize = 0;
@@ -249,7 +270,7 @@ pub const Request = struct {
                 while (true) {
                     const n = try reader.readSliceShort(&read_buf);
                     if (n == 0) break; // EOF
-                    if (limit > 0 and list.items.len + n > limit) return error.BodyTooLarge;
+                    if (list.items.len + n > effective_limit) return error.BodyTooLarge;
                     try list.appendSlice(allocator, read_buf[0..n]);
                 }
                 return list.toOwnedSlice(allocator);
@@ -258,22 +279,29 @@ pub const Request = struct {
     }
 
     /// 流式 body 的 Reader 接口（不整体缓冲）。
-    pub fn bodyReader(self: *const Request) ?BodyReader {
+    ///
+    /// `transfer_buf` 由调用方提供，必须活到读完 body 为止（std 会把它挂到
+    /// `server.reader.interface`）。streaming 变体只能构造一次（std 内部有 assert）。
+    pub fn bodyReader(self: *const Request, transfer_buf: []u8) !?BodyReader {
         return switch (self.body) {
             .none => null,
             .buffered => |data| .{ .internal = .{ .buffered = .{ .data = data, .pos = 0 } } },
-            .streaming => |req| .{ .internal = .{ .streaming = .{ .req = req } } },
+            .streaming => |req| .{ .internal = .{
+                // 与 readBodyInto 同理：必须用 readerExpectContinue，
+                // readerExpectNone 会对带 Expect: 100-continue 的请求 assert 崩溃。
+                .streaming = .{ .reader = try req.readerExpectContinue(transfer_buf) },
+            } },
         };
     }
 
     pub const BodyReader = struct {
         internal: union(enum) {
             buffered: struct { data: []const u8, pos: usize },
-            streaming: struct { req: *http.Server.Request },
+            streaming: struct { reader: *std.Io.Reader },
         },
 
         pub fn read(self: *BodyReader, buf: []u8) !usize {
-            return switch (self.internal) {
+            switch (self.internal) {
                 .buffered => |*b| {
                     const remaining = b.data.len - b.pos;
                     const n = @min(buf.len, remaining);
@@ -282,11 +310,12 @@ pub const Request = struct {
                     b.pos += n;
                     return n;
                 },
-                .streaming => |*s| {
-                    const reader = s.req.reader();
-                    return reader.read(buf);
-                },
-            };
+                // 旧实现写的是 `s.req.reader()` —— 这个方法在本 std 版本不存在
+                // （只有 readerExpectNone / readerExpectContinue）。因为该函数
+                // 从未被语义分析（refAllDecls 不递归到嵌套类型的方法），编译期
+                // 没报错，但任何真实调用都会让构建失败。
+                .streaming => |*s| return s.reader.readSliceShort(buf),
+            }
         }
     };
 };

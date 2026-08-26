@@ -32,9 +32,15 @@ pub fn modelSchema(comptime T: type, comptime table_name: []const u8) TableSchem
     };
     const field_names = struct_info.field_names;
     const field_types = struct_info.field_types;
-    const fields = blk: {
+    // 必须 `comptime blk:`。函数局部 `const` 在 Zig 里**不是** comptime 变量：
+    // `std.mem.eql` 不是 inline fn，整个 block 不会被常量折叠，`arr` 就是栈数组，
+    // `return .{ .fields = &fields }` 交出的是指向已销毁栈帧的指针（use-after-return）。
+    // 实测 fields.ptr 落在栈上，clobber 栈帧后 fields[0].name 变成垃圾。
+    // 同文件的 Model() 用的是容器级 `const _fields`（天然 comptime），那才是对的。
+    // 文件内所有测试都写了 `comptime modelSchema(...)`，恰好掩盖了这个 bug。
+    const fields = comptime blk: {
         var arr: [field_names.len]FieldDef = undefined;
-        inline for (field_names, field_types, 0..) |name, typ, i| {
+        for (field_names, field_types, 0..) |name, typ, i| {
             const is_id = std.mem.eql(u8, name, "id");
             arr[i] = .{
                 .name = name,

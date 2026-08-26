@@ -732,9 +732,15 @@ fn appendEscapedJson(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: [
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
-            0...7, 11, 14...31 => {
+            // 其余**全部**控制字符必须转成 \u00XX（0x09/0x0a/0x0d 已在上面单独处理）。
+            // 旧代码写的是 `0...7, 11, 14...31`，漏掉了 0x08 (\b) 和 0x0c (\f)：
+            // 它们会落到 else 分支被原样写出 → 非法 JSON → 下次 load() 的
+            // parseFromSlice 直接失败 → **整张表打不开**（且失败点在 open()，
+            // 通常导致进程起不来）。这是不可逆的数据损坏，用户只要提交一个
+            // 含退格/换页符的字符串就能触发。
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
                 var hex_buf: [8]u8 = undefined;
-                const hex = try std.fmt.bufPrint(&hex_buf, "\\u00{X:0>2}", .{c});
+                const hex = try std.fmt.bufPrint(&hex_buf, "\\u{X:0>4}", .{c});
                 try buf.appendSlice(allocator, hex);
             },
             else => try buf.append(allocator, c),

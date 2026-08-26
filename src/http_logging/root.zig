@@ -598,12 +598,23 @@ pub const LoggingHook = struct {
 
         switch (event) {
             .request_start => {
-                const method_str = if (data.method) |m| @tagName(m) else "?";
-                const path_str = if (data.path) |p| p else "?";
-                self.logger.info(ctx, "request_start", &.{
-                    fstr("method", method_str),
-                    fstr("path", path_str),
-                });
+                // 不要把 method/path 再当 field 传一遍：formatJson/formatText 已经
+                // 从 ctx 输出了这两个字段（见 formatJson 里的 ",\"method\":" / ",\"path\":"）。
+                // 重复传会产出重复 JSON key
+                // （实测：{"msg":"request_start","method":"GET","path":"/x","method":"GET","path":"/x"}），
+                // 重复 key 的 JSON 行为未定义，Loki/ES/jq 处理各异，最坏整行被拒收 ——
+                // 也就是出事时最需要的那条日志没了。
+                // ctx 为 null（无请求上下文）时才补上，保证信息不丢。
+                if (ctx != null) {
+                    self.logger.info(ctx, "request_start", &.{});
+                } else {
+                    const method_str = if (data.method) |m| @tagName(m) else "?";
+                    const path_str = if (data.path) |p| p else "?";
+                    self.logger.info(null, "request_start", &.{
+                        fstr("method", method_str),
+                        fstr("path", path_str),
+                    });
+                }
             },
             .request_end => {
                 const status_val: i64 = if (data.status) |s| @backingInt(s) else 0;

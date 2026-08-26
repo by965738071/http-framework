@@ -170,14 +170,17 @@ pub const SessionManager = struct {
     /// 修复 P1：重复 key 时释放旧的 key/value，不再泄漏。
     /// 修复 A3：先把 key/value dup 成功，再改动 map，避免 OOM 时 map 残留
     /// undefined value 或悬空 entry。
+    ///
+    /// session 不存在时返回 `error.SessionNotFound`。旧实现只 `std.log.warn`
+    /// 然后静默返回 —— 调用方无法得知写入是否落地。这不是理论问题：
+    /// `examples/src/admin.zig` 登录成功后写 username/role，若 session 在
+    /// getOrCreate 与 setData 之间过期，写入被静默丢弃，用户会以「已登录但无角色」
+    /// 的状态继续，是一个鉴权缺陷。
     pub fn setData(self: *Self, session_id: []const u8, key: []const u8, value: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const record = self.sessions.getPtr(session_id) orelse {
-            std.log.warn("Session.setData: session not found: {s}", .{session_id});
-            return;
-        };
+        const record = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
 
         // 先 dup（可能 OOM），成功后才动 map。
         const key_dup = try self.allocator.dupe(u8, key);
@@ -352,10 +355,12 @@ test "SessionManager.setData overwrites without leak" {
     try std.testing.expectEqualStrings("value2", val);
 }
 
-test "SessionManager.setData on non-existent session does not crash" {
+test "SessionManager.setData on non-existent session reports SessionNotFound" {
     var sm = SessionManager.init(std.testing.allocator, std.testing.io, .{});
     defer sm.deinit();
-    try sm.setData("non_existent", "key", "value");
+    // 旧行为是 std.log.warn + 静默返回（调用方无法得知写入丢了，
+    // 且在 build runner 的 --listen 协议下这条 stderr 输出会让测试步骤间歇性失败）。
+    try std.testing.expectError(error.SessionNotFound, sm.setData("non_existent", "key", "value"));
 }
 
 test "SessionManager.getStats with sessions" {

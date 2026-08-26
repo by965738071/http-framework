@@ -77,8 +77,12 @@ pub const WebSocket = struct {
     max_frame_payload: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
     /// 分片拼接后的单个 message 总大小上限（修复 E2）。
     max_message_size: usize = frame_mod.DEFAULT_MAX_PAYLOAD,
-    /// 客户端 mask key 递增计数器（用于派生不可预测的每帧 mask）。
+    /// 客户端 mask key 递增计数器（无 io 时的退化派生用）。
     mask_counter: u64 = 0,
+    /// 密码学熵源。客户端模式下 RFC 6455 §5.3 要求每帧 mask key **不可预测**
+    /// （否则经过代理时可做缓存投毒）。设了 io 就用 `std.Io.randomSecure`。
+    /// 为 null 时退化成计数器派生 —— 仅可用于单元测试，不要用于真实客户端。
+    io: ?std.Io = null,
 
     const Self = @This();
 
@@ -88,10 +92,28 @@ pub const WebSocket = struct {
     }
 
     /// 客户端模式构造（发送时 mask）。
-    /// mask key 用固定值——生产应随机生成以防 cache poisoning，
-    /// 这里简化为常量，让单元测试可重现。
+    ///
+    /// **注意**：没有 io 就没有密码学熵源，mask key 退化成计数器派生（可预测）。
+    /// RFC 6455 §5.3 要求客户端每帧用不可预测的 mask key（防代理缓存投毒），
+    /// 真实客户端请用 `initClientSecure`。本构造函数保留给单元测试（可重现）。
     pub fn initClient(reader: *std.Io.Reader, writer: *std.Io.Writer, allocator: std.mem.Allocator) Self {
         return .{ .reader = reader, .writer = writer, .allocator = allocator, .is_client = true };
+    }
+
+    /// 客户端模式构造（带密码学熵源）。mask key 用 `std.Io.randomSecure` 生成。
+    pub fn initClientSecure(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) Self {
+        return .{
+            .reader = reader,
+            .writer = writer,
+            .allocator = allocator,
+            .is_client = true,
+            .io = io,
+        };
     }
 
     /// 发送一个 text message（完整帧，FIN=1）。
@@ -104,23 +126,32 @@ pub const WebSocket = struct {
         try self.send(.binary, message);
     }
 
-    /// 内部发送：按 is_client 决定 mask。
+    /// 内部发送：按 is_client 决定 mask，写完立即 flush。
+    ///
+    /// **flush 不是可选的**：self.writer 是带缓冲的 socket writer（生产里是 zio
+    /// stream writer，默认 8KB 缓冲）。只 encode 不 flush 的话帧会一直卡在缓冲区，
+    /// 对端在缓冲填满前收不到任何东西 —— echo/推送场景表现为「WebSocket 毫无反应」。
     fn send(self: *Self, opcode: OpCode, payload: []const u8) !void {
         if (self.is_client) {
             // RFC 6455 §5.3: 客户端每帧必须用不可预测的随机 mask key，
-            // 防经过代理时的缓存投毒攻击（修复:此前写死常量）。
-            // 优先用 io 的安全熵源；不可用时退回用计数器+地址混合的 PRNG（仍优于常量）。
+            // 防经过代理时的缓存投毒攻击。
             var key: [4]u8 = undefined;
-            self.mask_counter +%= 1;
-            var seed: [16]u8 = undefined;
-            std.mem.writeInt(u64, seed[0..8], self.mask_counter, .little);
-            std.mem.writeInt(u64, seed[8..16], @intFromPtr(self), .little);
-            const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &seed);
-            std.mem.writeInt(u32, &key, @truncate(h), .little);
+            if (self.io) |io| {
+                try std.Io.randomSecure(io, &key);
+            } else {
+                // 无熵源的退化路径（仅单元测试会走到，initClientSecure 才是生产用法）。
+                self.mask_counter +%= 1;
+                var seed: [16]u8 = undefined;
+                std.mem.writeInt(u64, seed[0..8], self.mask_counter, .little);
+                std.mem.writeInt(u64, seed[8..16], @intFromPtr(self), .little);
+                const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &seed);
+                std.mem.writeInt(u32, &key, @truncate(h), .little);
+            }
             try frame_mod.encode(self.writer, opcode, payload, true, key);
         } else {
             try frame_mod.encode(self.writer, opcode, payload, false, .{ 0, 0, 0, 0 });
         }
+        try self.writer.flush();
     }
 
     /// 用指定数字状态码发送 close 帧（内部用,不做 CloseCode enum 约束）。
@@ -230,21 +261,7 @@ pub const WebSocket = struct {
                     first_opcode = f.opcode;
                     saw_first_frame = true;
                     try self.appendBounded(&payload_list, f.payload);
-                    if (f.fin) {
-                        const owned = try payload_list.toOwnedSlice(self.allocator);
-                        errdefer self.allocator.free(owned);
-                        // RFC §5.6: text 帧 payload 必须是有效 UTF-8（修复）。
-                        if (first_opcode == .text and !std.unicode.utf8ValidateSlice(owned)) {
-                            self.allocator.free(owned);
-                            self.closeWithCode(1007) catch {};
-                            return error.InvalidUtf8;
-                        }
-                        return .{
-                            .opcode = first_opcode,
-                            .payload = owned,
-                            .allocator = self.allocator,
-                        };
-                    }
+                    if (f.fin) return self.finishMessage(&payload_list, first_opcode);
                     // FIN=0: 等待 continuation 帧
                 },
                 .continuation => {
@@ -253,20 +270,7 @@ pub const WebSocket = struct {
                         return error.ProtocolError;
                     }
                     try self.appendBounded(&payload_list, f.payload);
-                    if (f.fin) {
-                        const owned = try payload_list.toOwnedSlice(self.allocator);
-                        errdefer self.allocator.free(owned);
-                        if (first_opcode == .text and !std.unicode.utf8ValidateSlice(owned)) {
-                            self.allocator.free(owned);
-                            self.closeWithCode(1007) catch {};
-                            return error.InvalidUtf8;
-                        }
-                        return .{
-                            .opcode = first_opcode,
-                            .payload = owned,
-                            .allocator = self.allocator,
-                        };
-                    }
+                    if (f.fin) return self.finishMessage(&payload_list, first_opcode);
                 },
                 else => {
                     // 保留 opcode（0x3-0x7, 0xB-0xF）——未知帧，协议错误。
@@ -274,6 +278,22 @@ pub const WebSocket = struct {
                 },
             }
         }
+    }
+
+    /// 收尾一个完整 message：取走 payload 所有权、校验 text 的 UTF-8（RFC §5.6）。
+    ///
+    /// **释放路径只有这一条**：失败时本函数自己 free。调用点绝对不能再写
+    /// `errdefer allocator.free(owned)` 或额外的显式 free —— 旧实现两者共存，
+    /// `return error.InvalidUtf8` 会先执行分支内的 free 再触发 errdefer 的 free
+    /// → double free（远程可触发：一个 payload=`\xff` 的 text 帧即可）。
+    fn finishMessage(self: *Self, list: *std.ArrayList(u8), opcode: OpCode) !Message {
+        const owned = try list.toOwnedSlice(self.allocator);
+        if (opcode == .text and !std.unicode.utf8ValidateSlice(owned)) {
+            self.allocator.free(owned);
+            self.closeWithCode(1007) catch {};
+            return error.InvalidUtf8;
+        }
+        return .{ .opcode = opcode, .payload = owned, .allocator = self.allocator };
     }
 
     /// 向分片缓冲追加，受 max_message_size 限制（修复 E2：防分片总大小无限增长 OOM）。

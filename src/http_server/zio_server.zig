@@ -66,7 +66,11 @@ pub const Server = struct {
     io: std.Io,
     config: http_app.Config,
     runtime: http_app.RuntimeState,
-    listener: Listener,
+    /// 监听器在 `setup()` 里创建。用 optional 而不是 `undefined`：
+    /// 标准用法是 `init` → `defer deinit()` → `setup()`，若 setup 失败
+    /// （端口占用是最常见的启动失败），deinit 会对 undefined 的 fd 调 close()
+    /// —— 关掉进程里任意一个句柄，或直接 UB。
+    listener: ?Listener = null,
     router: *const http_router.Router,
     lifecycle: http_app.Lifecycle,
     group: zio.Group,
@@ -84,7 +88,7 @@ pub const Server = struct {
             .io = io,
             .config = config,
             .runtime = .{},
-            .listener = undefined,
+            .listener = null,
             .router = router,
             .lifecycle = .{},
             .group = .init,
@@ -97,7 +101,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.listener.deinit();
+        if (self.listener) |*l| l.deinit();
+        self.listener = null;
     }
 
     pub fn setLifecycle(self: *Server, lifecycle: http_app.Lifecycle) void {
@@ -125,21 +130,23 @@ pub const Server = struct {
 
     /// 主运行循环。在 zio 协程里跑：
     /// 1. 把 accept 循环 spawn 为可取消的 group 任务；
-    /// 2. 当前协程阻塞等 SIGINT；
+    /// 2. 当前协程阻塞等 SIGINT **或 SIGTERM**；
     /// 3. 收到信号：置关机标志、cancel accept（accept 返回 Canceled）；
     /// 4. 取消并等待在途连接任务，drain 兜底。
     pub fn run(self: *Server) !void {
         var accept_group: zio.Group = .init;
         try accept_group.spawn(acceptLoop, .{self});
-
-        var sig = zio.Signal.init(.interrupt) catch |err| {
-            std.log.warn("signal init failed: {s}", .{@errorName(err)});
+        // 无论从哪条路径退出（信号等待失败、wait 报错），在途任务都必须被取消并回收，
+        // 否则协程在 Server 析构后仍持有 self/listener 指针。
+        errdefer {
+            self.runtime.shutting_down.store(true, .monotonic);
+            accept_group.cancel();
             accept_group.wait() catch {};
-            return;
-        };
-        defer sig.deinit();
-        try sig.wait();
-        std.log.info("shutdown signal received", .{});
+            self.group.cancel();
+            self.group.wait() catch {};
+        }
+
+        try waitForShutdownSignal(&accept_group);
 
         self.runtime.shutting_down.store(true, .monotonic);
         accept_group.cancel();
@@ -150,15 +157,50 @@ pub const Server = struct {
         self.drain();
     }
 
+    /// 等待 SIGINT 或 SIGTERM 之一。
+    ///
+    /// 必须同时监听 SIGTERM：容器（docker stop）、systemd、k8s 发的都是 SIGTERM，
+    /// 只监听 SIGINT 等于「优雅关机在生产环境不生效」——进程被 SIGKILL 强杀，
+    /// 在途请求直接断、drain 逻辑白写。
+    fn waitForShutdownSignal(accept_group: *zio.Group) !void {
+        var sigint = zio.Signal.init(.interrupt) catch |err| {
+            std.log.warn("signal init (SIGINT) failed: {s}", .{@errorName(err)});
+            accept_group.wait() catch {};
+            return;
+        };
+        defer sigint.deinit();
+
+        var sigterm = zio.Signal.init(.terminate) catch |err| {
+            // SIGTERM 注册失败不致命，退化成只等 SIGINT。
+            std.log.warn("signal init (SIGTERM) failed: {s}", .{@errorName(err)});
+            try sigint.wait();
+            std.log.info("shutdown signal received (SIGINT)", .{});
+            return;
+        };
+        defer sigterm.deinit();
+
+        switch (try zio.select(.{ .int = &sigint, .term = &sigterm })) {
+            .int => std.log.info("shutdown signal received (SIGINT)", .{}),
+            .term => std.log.info("shutdown signal received (SIGTERM)", .{}),
+        }
+    }
+
     /// 等所有活跃连接结束，最多等 drain_timeout_ns（兜底）。
     fn drain(self: *Server) void {
         const drain_timeout_ns: u64 = 30 * std.time.ns_per_s;
-        const start = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        // 用单调时钟（.awake）而不是墙钟（.real）：NTP 校正/手工改时间会让
+        // 墙钟差值变成负数或巨大值 —— 前者让 drain 卡满 30s，后者让它立刻放弃。
+        const start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         while (true) {
             if (self.runtime.active_connections.load(.monotonic) == 0) return;
-            const elapsed = std.Io.Timestamp.now(self.io, .real).nanoseconds - start;
-            if (elapsed >= drain_timeout_ns) return;
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .real) catch {};
+            const elapsed = std.Io.Timestamp.now(self.io, .awake).nanoseconds - start;
+            if (elapsed >= drain_timeout_ns) {
+                std.log.warn("drain timed out with {d} connections still active", .{
+                    self.runtime.active_connections.load(.monotonic),
+                });
+                return;
+            }
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
         }
     }
 
@@ -166,10 +208,10 @@ pub const Server = struct {
         while (true) {
             if (self.isShuttingDown()) break;
 
-            try  self.listener.semaphore.wait(); // 背压 + Canceled 退出
+            try self.listener.?.semaphore.wait(); // 背压 + Canceled 退出
 
-            const stream = self.listener.server.accept(.{}) catch |err| {
-                self.listener.semaphore.post();
+            const stream = self.listener.?.server.accept(.{}) catch |err| {
+                self.listener.?.semaphore.post();
                 if (err == error.Canceled) break;
                 if (self.isShuttingDown()) break;
                 _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
@@ -184,7 +226,7 @@ pub const Server = struct {
     fn spawnConnection(self: *Server, stream: zio.net.Stream) void {
         const conn = self.allocator.create(Conn) catch {
             stream.close();
-            self.listener.semaphore.post();
+            self.listener.?.semaphore.post();
             return;
         };
         conn.* = .{
@@ -193,14 +235,14 @@ pub const Server = struct {
             .read_buf = self.allocator.alloc(u8, @max(self.config.http.read_buffer_size, MIN_READ_BUF)) catch {
                 self.allocator.destroy(conn);
                 stream.close();
-                self.listener.semaphore.post();
+                self.listener.?.semaphore.post();
                 return;
             },
             .write_buf = self.allocator.alloc(u8, @max(self.config.http.write_buffer_size, MIN_WRITE_BUF)) catch {
                 self.allocator.free(conn.read_buf);
                 self.allocator.destroy(conn);
                 stream.close();
-                self.listener.semaphore.post();
+                self.listener.?.semaphore.post();
                 return;
             },
         };
@@ -248,7 +290,7 @@ pub const Server = struct {
             server.allocator.free(self.read_buf);
             server.allocator.free(self.write_buf);
             server.allocator.destroy(self);
-            server.listener.semaphore.post(); // 归还背压名额
+            server.listener.?.semaphore.post(); // 归还背压名额
         }
     };
 

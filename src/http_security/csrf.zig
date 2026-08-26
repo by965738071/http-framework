@@ -16,6 +16,11 @@ const constantTimeEql = root.constantTimeEql;
 
 const http = std.http;
 
+/// 为了从表单体里取 CSRF token 而允许缓冲的最大 body 字节数。
+/// token 本身只有几十字节，但表单里还有其它字段；64KB 对普通表单足够，
+/// 又不会让 CSRF 中间件变成一个内存放大面。
+const MAX_FORM_TOKEN_BODY: u64 = 64 * 1024;
+
 pub const CsrfConfig = struct {
     cookie_name: []const u8 = "csrf_token",
     header_name: []const u8 = "X-CSRF-Token",
@@ -49,8 +54,14 @@ pub const CsrfMiddleware = struct {
         }
 
         const cookie_token = ctx.request.getCookie(self.config.cookie_name);
+        // 表单字段回退必须走 ctx.formDecoded（它会 readBody 并缓存）。
+        // 旧代码用的是 ctx.request.getForm —— 而 getForm 只处理 `.buffered` body，
+        // 而 Request.init 对任何带 body 的请求都只产生 `.streaming`
+        // （request.zig: `if (!has_body) .none else .{ .streaming = request }`），
+        // 所以那条回退**恒为 null**：纯 HTML `<form method="post">` 一律 403，
+        // 只有能读 cookie 并设 X-CSRF-Token 的 JS 客户端能通过。
         const submitted = ctx.request.getHeader(self.config.header_name) orelse
-            ctx.request.getForm(self.config.form_field_name);
+            (ctx.formDecoded(self.config.form_field_name, MAX_FORM_TOKEN_BODY) catch null);
 
         if (cookie_token == null or submitted == null) {
             _ = res.statusCode(.forbidden);
