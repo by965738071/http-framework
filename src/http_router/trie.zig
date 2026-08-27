@@ -42,6 +42,10 @@ pub const Trie = struct {
     root: *Node,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
+    /// 所有已注册 route handler，按注册顺序记录。
+    /// deinit 时逐个 `h.deinit()`：factory handler 的 FactoryCtx 由 GPA 分配，
+    /// 不随 trie arena 释放，漏掉会永久泄漏（bug.md §5 router.zig:104-110）。
+    registered: std.ArrayList(Handler) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !Trie {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -54,6 +58,8 @@ pub const Trie = struct {
     }
 
     pub fn deinit(self: *Trie) void {
+        for (self.registered.items) |h| h.deinit();
+        self.registered.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -80,6 +86,21 @@ pub const Trie = struct {
             node = child;
         }
         if (node.handlers.get(method) != null) return error.RouteConflict;
+        // 先登记到 deinit 列表，再写入 node：登记失败时 insert 返回错误，
+        // 而 node.has_any_handler 仍为 false，路由表现为「未注册」，不会出现
+        // 「可派发但从不释放」的半注册态。
+        // 同一 Handler 值多次注册（如同一 factory handler 挂多个 method/路径）只
+        // 登记一次，deinit 时只释放一次，避免 double-free。
+        var already_registered = false;
+        for (self.registered.items) |r| {
+            if (std.meta.eql(r, route.handler)) {
+                already_registered = true;
+                break;
+            }
+        }
+        if (!already_registered) {
+            try self.registered.append(self.allocator, route.handler);
+        }
         // 拷贝中间件切片到 trie arena，避免悬空（调用方的切片可能是栈上临时的）。
         const mw_copy = if (route.middleware.len > 0)
             try alloc.dupe(Middleware, route.middleware)
@@ -87,7 +108,12 @@ pub const Trie = struct {
             &[_]Middleware{};
         node.handlers.put(method, .{ .handler = route.handler, .middleware = mw_copy });
         node.has_any_handler = true;
-        node.pattern = try alloc.dupe(u8, pattern);
+        // P2-3：只在首次记录 pattern。同一节点上不同方法共享相同路径结构，
+        // 但 :param 命名可能写法不同（/users/:id vs /users/:uid）。固定用首次，
+        // 避免后续 insert 覆盖导致日志/指标聚合的 route_pattern 串台，并省一次 dupe。
+        if (node.pattern.len == 0) {
+            node.pattern = try alloc.dupe(u8, pattern);
+        }
     }
 
     fn findOrCreateChild(parent: *Node, seg: []const u8, alloc: std.mem.Allocator) !*Node {
@@ -221,9 +247,27 @@ pub const Trie = struct {
     fn collectAllowed(self: *const Trie, node: *Node, result: *MatchResult) void {
         _ = self;
         var it = node.handlers.iterator();
+        var has_get = false;
         while (it.next()) |entry| {
+            if (entry.key == .GET) has_get = true;
             if (result.allowed_count < 16) {
                 result.allowed_methods[result.allowed_count] = entry.key;
+                result.allowed_count += 1;
+            }
+        }
+        // P2-5：dispatch 实现了 HEAD→GET 回退，所以只要有 GET 就支持 HEAD。
+        // 不把 HEAD 算进 Allow 会让 Allow 头与实际行为矛盾（RFC 9110 §10.2.1）。
+        if (has_get and result.allowed_count < 16) {
+            var already = false;
+            var i: u8 = 0;
+            while (i < result.allowed_count) : (i += 1) {
+                if (result.allowed_methods[i] == .HEAD) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                result.allowed_methods[result.allowed_count] = .HEAD;
                 result.allowed_count += 1;
             }
         }
@@ -313,6 +357,36 @@ test "Trie detects route conflicts" {
     }.h);
     try trie.insert(.GET, "/users/:id", .{ .handler = handler });
     try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/users/:id", .{ .handler = handler }));
+}
+
+test "Trie deinit frees registered factory handler ctx (bug.md §5)" {
+    const allocator = std.testing.allocator;
+    const T = struct {
+        tag: usize,
+        pub fn init(a: std.mem.Allocator) !*@This() {
+            const s = try a.create(@This());
+            s.* = .{ .tag = 0 };
+            return s;
+        }
+        pub fn handle(_: *@This(), _: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+        pub fn deinit(_: *@This()) void {}
+    };
+
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    // 同一 factory handler 挂多个方法：trie.deinit 应只释放一次 FactoryCtx
+    //（去重）。重复释放会 double-free。
+    const h = try Handler.initFactory(T, allocator);
+    try trie.insert(.GET, "/factory", .{ .handler = h });
+    try trie.insert(.POST, "/factory", .{ .handler = h });
+
+    // 另一个独立 factory handler，一并由 trie 托管。
+    const h2 = try Handler.initFactory(T, allocator);
+    try trie.insert(.GET, "/other", .{ .handler = h2 });
+
+    // 这里不手动调用 h.deinit()：FactoryCtx 由 std.testing.allocator 分配，
+    // 若 trie.deinit 漏释放（或释放两次），泄漏/双重释放检测会失败。
 }
 test {
     std.testing.refAllDecls(@This());

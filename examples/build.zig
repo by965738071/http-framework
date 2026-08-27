@@ -35,31 +35,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zio");
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
-    const mod = b.addModule("examples", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
-        .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
-        .target = target,
-        // root.zig re-exports admin.zig declarations for testing; admin.zig
-        // depends on http_framework, so the examples module needs it too.
-        .imports = &.{
-            .{ .name = "http_framework", .module = http_framework_mod },
-        },
-    });
-
     // Admin module - backend admin management system
     const admin_mod = b.addModule("admin", .{
         .root_source_file = b.path("src/admin.zig"),
@@ -83,6 +58,34 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "http_framework", .module = http_framework_mod },
             .{ .name = "admin", .module = admin_mod },
+        },
+    });
+
+    // This creates a module, which represents a collection of source files alongside
+    // some compilation options, such as optimization mode and linked system libraries.
+    // Zig modules are the preferred way of making Zig code available to consumers.
+    // addModule defines a module that we intend to make available for importing
+    // to our consumers. We must give it a name because a Zig package can expose
+    // multiple modules and consumers will need to be able to specify which
+    // module they want to access.
+    const mod = b.addModule("examples", .{
+        // The root source file is the "entry point" of this module. Users of
+        // this module will only be able to access public declarations contained
+        // in this file, which means that if you have declarations that you
+        // intend to expose to consumers that were defined in other files part
+        // of this module, you will have to make sure to re-export them from
+        // the root file.
+        .root_source_file = b.path("src/root.zig"),
+        // Later on we'll use this module as the root module of a test executable
+        // which requires us to specify a target.
+        .target = target,
+        // root.zig re-exports admin.zig declarations for testing; admin.zig
+        // depends on http_framework, so the examples module needs it too.
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+            .{ .name = "admin", .module = admin_mod },
+            .{ .name = "devices", .module = devices_mod },
+            .{ .name = "register", .module = register_mod },
         },
     });
 

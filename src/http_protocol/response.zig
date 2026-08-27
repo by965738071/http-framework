@@ -23,11 +23,13 @@ pub const Sink = struct {
 
     pub const VTable = struct {
         /// 发送完整响应（状态行 + 头 + body）。
+        /// keep_alive=false 时底层应写 `Connection: close`（HTTP/1.1）。
         respond: *const fn (
             ptr: *anyopaque,
             status: http.Status,
             headers: []const http.Header,
             body: []const u8,
+            keep_alive: bool,
         ) anyerror!void,
 
         /// 开始流式响应，返回 body writer。
@@ -37,20 +39,22 @@ pub const Sink = struct {
             headers: []const http.Header,
             content_length: ?u64,
             buffer: []u8,
+            keep_alive: bool,
         ) anyerror!http.BodyWriter,
     };
 
     pub fn fromHttp(request: *http.Server.Request) Sink {
         const ctx = struct {
-            fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8) anyerror!void {
+            fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) anyerror!void {
                 const req: *http.Server.Request = @ptrCast(@alignCast(ptr));
                 prepareBodyNone(req);
                 try req.respond(body, .{
                     .status = status,
                     .extra_headers = headers,
+                    .keep_alive = keep_alive,
                 });
             }
-            fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8) anyerror!http.BodyWriter {
+            fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8, keep_alive: bool) anyerror!http.BodyWriter {
                 const req: *http.Server.Request = @ptrCast(@alignCast(ptr));
                 prepareBodyNone(req);
                 return req.respondStreaming(buffer, .{
@@ -58,6 +62,7 @@ pub const Sink = struct {
                     .respond_options = .{
                         .status = status,
                         .extra_headers = headers,
+                        .keep_alive = keep_alive,
                     },
                 });
             }
@@ -90,19 +95,21 @@ pub const Sink = struct {
     /// 回应 bug.md §8：Response 不需要 http.Server harness 就能测试。
     pub fn testSink(writer: *std.Io.Writer) Sink {
         const ctx = struct {
-            fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8) anyerror!void {
+            fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) anyerror!void {
                 _ = headers;
+                _ = keep_alive;
                 const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
                 // 简化：只写状态行 + body，不做 HTTP 编码
                 try w.print("{s} {d}\r\n", .{ @tagName(status), @backingInt(status) });
                 try w.writeAll(body);
             }
-            fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8) anyerror!http.BodyWriter {
+            fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8, keep_alive: bool) anyerror!http.BodyWriter {
                 _ = ptr;
                 _ = status;
                 _ = headers;
                 _ = content_length;
                 _ = buffer;
+                _ = keep_alive;
                 return error.NotSupportedInTestSink;
             }
         };
@@ -115,12 +122,12 @@ pub const Sink = struct {
         };
     }
 
-    pub fn respond(self: Sink, status: http.Status, headers: []const http.Header, body: []const u8) !void {
-        return self.vtable.respond(self.ptr, status, headers, body);
+    pub fn respond(self: Sink, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) !void {
+        return self.vtable.respond(self.ptr, status, headers, body, keep_alive);
     }
 
-    pub fn startStream(self: Sink, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8) !http.BodyWriter {
-        return self.vtable.startStream(self.ptr, status, headers, content_length, buffer);
+    pub fn startStream(self: Sink, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8, keep_alive: bool) !http.BodyWriter {
+        return self.vtable.startStream(self.ptr, status, headers, content_length, buffer, keep_alive);
     }
 };
 
@@ -151,6 +158,11 @@ pub const Response = struct {
     /// 中间件在 next() 之后添加的头能进入最终响应。
     buffered: bool = false,
     pending_body: ?[]const u8 = null,
+    /// 是否保持 keep-alive。由 ConnectionRunner（唯一的 keep-alive 决策者）
+    /// 在提交前设置。为 false 时底层 std 会写 `Connection: close`（P1-3）：
+    /// 服务端主动断连（handler 报错 / 优雅关机）时不告知客户端，连接池
+    /// 会把死连接当可复用 → 下一个请求 ECONNRESET。
+    keep_alive: bool = true,
 
     const Self = @This();
 
@@ -206,17 +218,23 @@ pub const Response = struct {
         // keep-alive 客户端/反代会把第二个当成下一个请求的响应（响应队列投毒）。
         if (self.flushed) return;
         if (!self.buffered) return;
+        // P2-7：缓冲模式下，中间件在 next() 之后调用 setCookie 设的 cookie 也要
+        // 进入最终响应。sendResponse/redirect/stream 各自只在提交那一刻 addCookies
+        // 一次，晚于它们的 setCookie（典型是外层中间件在 next() 返回后）会被静默丢弃。
+        // flush 是缓冲响应真正上 wire 的唯一出口，在此补一次即可（addCookiesToHeaders
+        // 会 clear cookies，幂等安全）。
+        try self.addCookiesToHeaders();
         // 缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
         // == null），只要响应已被标记发送（sent）也应发一个空 body 响应。
         const body = self.pending_body orelse {
             if (!self.sent) return; // 从未产生任何响应，不发
             self.flushed = true;
-            try self.sink.respond(self.status, self.headers.items, "");
+            try self.sink.respond(self.status, self.headers.items, "", self.keep_alive);
             return;
         };
         self.pending_body = null;
         self.flushed = true;
-        try self.sink.respond(self.status, self.headers.items, body);
+        try self.sink.respond(self.status, self.headers.items, body, self.keep_alive);
     }
 
     // ── 链式构建 ──────────────────────────────────────────────
@@ -233,6 +251,25 @@ pub const Response = struct {
         const owned_value = try self.dupeOwned(value);
         try self.headers.append(self.allocator, .{ .name = owned_name, .value = owned_value });
         return self;
+    }
+
+    /// 设置响应头（去重替换，bug.md §6 security_headers.zig:58-60）。
+    /// 与 `header()`（追加）不同：同名头（大小写不敏感）已存在时覆盖其值，
+    /// 而不是追加成一堆重复行。CSP 等多行叠加是「交集」语义，重复行会意外收紧
+    /// 策略；`Server` 头重复会漏出后端实现。
+    ///
+    /// 所有权说明：新值用 `dupeOwned`（计入 owned_strings，deinit 统一释放）；
+    /// 旧值指针替换后仍留在 owned_strings 中，deinit 时会一并释放，无 double-free。
+    pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !*Self {
+        try validateHeaderValue(name);
+        try validateHeaderValue(value);
+        for (self.headers.items) |*h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) {
+                h.value = try self.dupeOwned(value);
+                return self;
+            }
+        }
+        return self.header(name, value);
     }
 
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !*Self {
@@ -308,7 +345,7 @@ pub const Response = struct {
             self.pending_body = "";
             return;
         }
-        try self.sink.respond(status, self.headers.items, "");
+        try self.sink.respond(status, self.headers.items, "", self.keep_alive);
     }
 
     /// 便捷：permanent=true → 301，false → 302。
@@ -320,6 +357,14 @@ pub const Response = struct {
     /// `buffer` 由调用方提供（通常栈数组），框架不分配。
     pub fn stream(self: *Self, buffer: []u8, options: StreamOptions) !Stream {
         if (self.sent) return error.AlreadyResponded;
+        // 缓冲中间件（Compress/Timing 会 setBuffered）假设能在 next() 返回后再改头，
+        // 但流式响应会把状态行+头立即写进 sink —— 此后追加的头（如 Timing 的
+        // X-Response-Time-ns）永远上不了 wire（P1-7）。安全头（CSP/HSTS）不受影响，
+        // 因为 SecurityHeaders 在 next() 之前加头（已在 self.headers 里）。这里记一条 warn
+        // 方便定位“流式响应丢了 handler 之后追加的头”这类可观测性问题。
+        if (self.buffered) {
+            std.log.warn("Response.stream() called in buffered mode: headers added after the handler (e.g. timing) will not reach the wire (bug.md P1-7)", .{});
+        }
         try self.addCookiesToHeaders();
         try self.appendHeaderIfAbsent("Content-Type", options.content_type);
 
@@ -337,6 +382,7 @@ pub const Response = struct {
             self.headers.items,
             options.content_length,
             buffer,
+            self.keep_alive,
         );
         return .{ .body = body, .response = self };
     }
@@ -401,7 +447,7 @@ pub const Response = struct {
             self.pending_body = try self.dupeOwned(content);
             return;
         }
-        try self.sink.respond(self.status, self.headers.items, content);
+        try self.sink.respond(self.status, self.headers.items, content, self.keep_alive);
     }
 
     fn dupeOwned(self: *Self, s: []const u8) ![]const u8 {
@@ -594,11 +640,11 @@ const CountingSink = struct {
     respond_calls: usize = 0,
     stream_calls: usize = 0,
 
-    fn respondImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: []const u8) anyerror!void {
+    fn respondImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: []const u8, _: bool) anyerror!void {
         const self: *CountingSink = @ptrCast(@alignCast(ptr));
         self.respond_calls += 1;
     }
-    fn startStreamImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: ?u64, _: []u8) anyerror!http.BodyWriter {
+    fn startStreamImpl(ptr: *anyopaque, _: http.Status, _: []const http.Header, _: ?u64, _: []u8, _: bool) anyerror!http.BodyWriter {
         const self: *CountingSink = @ptrCast(@alignCast(ptr));
         self.stream_calls += 1;
         // 不需要真的写 wire：本测试只关心"提交次数"。

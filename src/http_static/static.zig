@@ -54,10 +54,21 @@ pub const StaticFileServer = struct {
             return;
         });
 
-        const target = if (relative_path.len == 0) "index.html" else relative_path;
+        const raw_target = if (relative_path.len == 0) "index.html" else relative_path;
 
-        // 基本检查：禁止 ".."
-        if (std.mem.indexOf(u8, target, "..") != null) {
+        // P2-9：先做 percent-decode，让带空格 / 中文 / 任意 %xx 的文件名可访问。
+        // 顺序至关重要——必须「先 decode 再做 .. 与前缀校验」，反了 `%2e%2e`
+        // 就能绕过 ".." 检查造成路径穿越。
+        const target = percentDecode(ctx.arena, raw_target) catch {
+            _ = res.statusCode(.bad_request);
+            try res.text("Invalid static path");
+            return;
+        };
+
+        // P2-10：按「路径段」判断 ".."，而不是整串 indexOf("..")。
+        // 后者会误杀 my..file.txt / v1..2.tar.gz 这类合法文件名。
+        // 顺带拒绝内嵌 NUL（%00）——部分平台会在 NUL 处截断路径造成穿越。
+        if (hasDotDotSegment(target) or std.mem.indexOfScalar(u8, target, 0) != null) {
             _ = res.statusCode(.forbidden);
             try res.text("Access denied");
             return;
@@ -87,17 +98,26 @@ pub const StaticFileServer = struct {
                     try res.text("Access denied");
                 },
                 else => {
+                    // 修复低优先级表：不把实现细节（错误名）泄露给客户端，进日志。
+                    std.log.err("static: statFile failed for '{s}': {s}", .{ full_path, @errorName(err) });
                     _ = res.statusCode(.internal_server_error);
-                    try res.text(@errorName(err));
+                    try res.text("internal error");
                 },
             }
             return;
         };
 
-        // 目录请求：重定向到其下的 index.html。
+        // 目录请求：无尾斜杠 → 重定向补 "/"，有尾斜杠 → 直接 serve index.html。
+        // （修复低优先级表：直接 serve index.html 会让 /dir/index.html 里的相对链接
+        // 相对根解析而非相对 /dir/ 解析，基准错位；先重定向到带尾斜杠的位置。）
         var resolved_path = full_path;
         var resolved_ct = getContentType(full_path);
         if (stat.kind == .directory) {
+            if (!std.mem.endsWith(u8, ctx.request.path, "/")) {
+                const loc = try std.fs.path.join(ctx.arena, &.{ ctx.request.path, "/" });
+                _ = try res.redirect(loc, false);
+                return;
+            }
             resolved_path = try std.fs.path.join(ctx.arena, &.{ full_path, "index.html" });
             resolved_ct = getContentType(resolved_path);
             stat = std.Io.Dir.cwd().statFile(ctx.io, resolved_path, .{}) catch {
@@ -131,8 +151,15 @@ pub const StaticFileServer = struct {
 
         // 条件请求：If-None-Match 优先于 If-Modified-Since。
         const inm_match = if (ctx.request.getHeader("If-None-Match")) |inm| ifNoneMatch(inm, etag) else false;
+        // P2-12：If-Modified-Since 按语义（时间点）比较，而非字符串精确相等。
+        // 客户端可能发送与我们生成格式不同、但语义上 >= mtime 的日期（如带前导零
+        // 差异、或复用其它来源的 Last-Modified），字符串比较会漏掉合法 304。
+        // 解析失败时回退到原字符串比较，保证不会误判为已修改。
         const ims_match = if (!inm_match)
-            (if (ctx.request.getHeader("If-Modified-Since")) |ims| (last_modified != null and std.mem.eql(u8, ims, last_modified.?)) else false)
+            (if (ctx.request.getHeader("If-Modified-Since")) |ims|
+                ifModifiedSinceMatch(ims, stat.mtime.nanoseconds, last_modified)
+            else
+                false)
         else
             false;
 
@@ -151,6 +178,23 @@ pub const StaticFileServer = struct {
         _ = try res.header("Cache-Control", "public, max-age=3600");
         _ = try res.header("Accept-Ranges", "bytes");
 
+        // P2-11：SVG 可含脚本，内联访问用户上传目录下的 SVG 就是存储型 XSS
+        // （nosniff 挡不住 image/svg+xml）。强制 attachment 下载，避免浏览器内联渲染执行脚本。
+        if (std.mem.startsWith(u8, content_type, "image/svg+xml")) {
+            _ = try res.header("Content-Disposition", "attachment");
+            _ = try res.header("X-Content-Type-Options", "nosniff");
+        }
+
+        // 协商是否 gzip 压缩（仅大文件 >MAX_BUFFERED_SIZE）。HEAD 分支也共用此逻辑，
+        // 保证 HEAD 与同 URL 的压缩 GET 的 Vary / Content-Length 语义一致，避免污染共享缓存。
+        // Range 与 gzip 不同时做（范围针对 identity 表示），因此 use_gzip 仅用于非 Range 分支。
+        const accept_encoding = ctx.request.getHeader("accept-encoding") orelse "";
+        const can_compress = stat.size > MAX_BUFFERED_SIZE and
+            http_compress.shouldCompressContentType(content_type, http_compress.default_skip_types);
+        const use_gzip = can_compress and
+            http_compress.chooseEncoding(accept_encoding, &.{.gzip}) == .gzip;
+        if (can_compress) _ = try res.header("Vary", "Accept-Encoding");
+
         // HEAD：只发头，不发 body（RFC 9110 §9.3.2）。
         //
         // 不能手写 Content-Length 再 res.text("")：std 的 respond() 会按 body.len
@@ -159,11 +203,12 @@ pub const StaticFileServer = struct {
         // （已实测：HEAD /static/test.html 同时返回 content-length: 0 与 Content-Length: 34）。
         // 走 stream + 声明长度：std 对 HEAD 请求自动设 elide 标志，只发头不发 body，
         // 而 Stream.end() 已经处理了 eliding 下把 content_length 归零的情况。
+        // 压缩命中时与 GET 一致走 content_length=null（压缩后长度未知）；否则声明 stat.size。
         if (ctx.request.method == .HEAD) {
             _ = res.statusCode(.ok);
             var head_buf: [64]u8 = undefined;
             var head_stream = try res.stream(&head_buf, .{
-                .content_length = stat.size,
+                .content_length = if (use_gzip) null else stat.size,
                 .content_type = content_type,
             });
             try head_stream.end();
@@ -171,37 +216,36 @@ pub const StaticFileServer = struct {
         }
 
         // Range 请求（RFC 9110 §14.2）：仅支持单一 `bytes=a-b` 区间。
-        // Range 与 gzip 不同时做（范围针对 identity 表示）。
         if (ctx.request.getHeader("Range")) |range_hdr| {
-            if (parseByteRange(range_hdr, stat.size)) |rng| {
-                return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng);
-            } else {
-                // 不可满足的范围 → 416 + Content-Range: bytes */size
-                var cr_buf: [48]u8 = undefined;
-                const cr = std.fmt.bufPrint(&cr_buf, "bytes */{d}", .{stat.size}) catch "bytes */0";
-                _ = try res.header("Content-Range", cr);
-                _ = res.statusCode(.range_not_satisfiable);
-                try res.text("Range Not Satisfiable");
-                return;
+            switch (parseByteRange(range_hdr, stat.size)) {
+                .range => |rng| return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng),
+                .unsatisfiable => {
+                    // 不可满足的范围 → 416 + Content-Range: bytes */size
+                    var cr_buf: [48]u8 = undefined;
+                    const cr = std.fmt.bufPrint(&cr_buf, "bytes */{d}", .{stat.size}) catch "bytes */0";
+                    _ = try res.header("Content-Range", cr);
+                    _ = res.statusCode(.range_not_satisfiable);
+                    try res.text("Range Not Satisfiable");
+                    return;
+                },
+                // 多区间 / 不可识别 unit：RFC 9110 §14.2 要求忽略该 Range，回 200 全量。
+                .ignore => {},
             }
         }
 
         // 修复 fix.md 架构缺陷 #2：流式响应绕过缓冲中间件 → 压缩失效。
         // 在 StaticFileServer 内部检测 Accept-Encoding，对可压缩的大文件
-        // 直接用 gzip 流式编码。
-        const accept_encoding = ctx.request.getHeader("accept-encoding") orelse "";
-        const use_gzip = blk: {
-            if (stat.size < 1024) break :blk false; // 太小不值得
-            if (!http_compress.shouldCompressContentType(content_type, http_compress.default_skip_types)) break :blk false;
-            const enc = http_compress.chooseEncoding(accept_encoding, &.{.gzip}) orelse break :blk false;
-            break :blk enc == .gzip;
-        };
-
+        // 直接用 gzip 流式编码。P2-13：仅在大文件分支（>MAX_BUFFERED_SIZE）需要，
+        // 小文件不走 gzip（旧代码在每个小文件请求都白跑一次 chooseEncoding），
+        // 因此把协商推迟到这里；use_gzip 已在上方与 HEAD 分支共享计算。
         // 大文件流式响应
         if (stat.size > MAX_BUFFERED_SIZE) {
+            // 大文件流式响应。use_gzip / can_compress / accept_encoding 已在上方
+            // （HEAD 分支之前）协商并共享计算，这里直接复用。
             const file = std.Io.Dir.cwd().openFile(ctx.io, resolved_path, .{}) catch |err| {
+                std.log.err("static: openFile failed for '{s}': {s}", .{ resolved_path, @errorName(err) });
                 _ = res.statusCode(.internal_server_error);
-                try res.text(@errorName(err));
+                try res.text("internal error");
                 return;
             };
             defer file.close(ctx.io);
@@ -220,16 +264,16 @@ pub const StaticFileServer = struct {
                 // 放在 zio 协程栈上会溢出 guard page 崩溃（与 compress() 同根因）。
                 const hist_buf = try ctx.arena.alloc(u8, std.compress.flate.max_window_len);
                 const encoder = try ctx.arena.create(std.compress.flate.Compress);
-                http_compress.initStreamingEncoder(
+                // 修复低优先级表：编码器 init 失败绝不能以 `Content-Encoding: gzip` + 空/残缺
+                // body 结束响应（那会被当成一个看似完整实则非法的 gzip 流）。init 失败直接
+                // 向上抛错 → 连接被关闭，客户端不会把残缺响应当作完整 gzip 解析。
+                try http_compress.initStreamingEncoder(
                     encoder,
                     stream.writer(),
                     hist_buf,
                     .gzip,
                     .default,
-                ) catch {
-                    try stream.end();
-                    return;
-                };
+                );
 
                 var file_read_buf: [16 * 1024]u8 = undefined;
                 var offset: u64 = 0;
@@ -283,12 +327,16 @@ pub const StaticFileServer = struct {
                         try res.text("File not found");
                     },
                     error.StreamTooLong => {
-                        _ = res.statusCode(.payload_too_large);
-                        try res.text("File too large");
+                        // 修复低优先级表：stat 后文件增大导致读取超限，语义是服务器侧问题，
+                        // 不是请求体过大——改回 500 而非 413。
+                        std.log.err("static: file grew past limit while reading '{s}'", .{resolved_path});
+                        _ = res.statusCode(.internal_server_error);
+                        try res.text("internal error");
                     },
                     else => {
+                        std.log.err("static: readFileAlloc failed for '{s}': {s}", .{ resolved_path, @errorName(err) });
                         _ = res.statusCode(.internal_server_error);
-                        try res.text(@errorName(err));
+                        try res.text("internal error");
                     },
                 }
                 return;
@@ -319,8 +367,9 @@ pub const StaticFileServer = struct {
         _ = try res.header("Content-Range", cr);
 
         const file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
+            std.log.err("static: serveRange openFile failed for '{s}': {s}", .{ path, @errorName(err) });
             _ = res.statusCode(.internal_server_error);
-            try res.text(@errorName(err));
+            try res.text("internal error");
             return;
         };
         defer file.close(ctx.io);
@@ -354,6 +403,9 @@ pub const StaticFileServer = struct {
     fn stripPrefix(self: *const StaticFileServer, path: []const u8) ?[]const u8 {
         if (!std.mem.startsWith(u8, path, self.url_prefix)) return null;
         var rest = path[self.url_prefix.len..];
+        // 修复 M13：url_prefix="/static" 不能匹配 "/staticevil/x"——紧随前缀之后
+        // 必须是段分隔符 '/' 或已到结尾，否则视为未命中（与 isPathWithinRoot 同构）。
+        if (rest.len > 0 and rest[0] != '/') return null;
         if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
         return rest;
     }
@@ -370,39 +422,86 @@ pub const StaticFileServer = struct {
     }
 };
 
+/// Range 解析结果：区分「可满足、不可满足（416）、忽略（200 全量）」三类。
+const RangeResult = union(enum) {
+    /// 可满足的单区间 → 206。
+    range: StaticFileServer.ByteRange,
+    /// 不可满足（start>=size / bytes=-0 / 语法非法）→ 416。
+    unsatisfiable,
+    /// 多区间或不可识别 unit：RFC 9110 §14.2 要求忽略该 Range，回 200 全量。
+    ignore,
+};
+
 /// 解析 `Range: bytes=a-b` 头（单一区间），返回包含区间 [start, end]。
 /// 支持：`bytes=0-499`、`bytes=500-`（到末尾）、`bytes=-500`（最后 500 字节）。
-/// 不可满足（越界/格式错/多区间）返回 null（调用方回 416）。
-fn parseByteRange(header: []const u8, size: u64) ?StaticFileServer.ByteRange {
+/// 返回语义：
+///  - `.range`：可满足的单区间，调用方回 206。
+///  - `.unsatisfiable`：start>=size / bytes=-0 / 语法非法，调用方回 416。
+///  - `.ignore`：多区间或不可识别的 range-unit，调用方应忽略 Range 回 200 全量。
+fn parseByteRange(header: []const u8, size: u64) RangeResult {
     const prefix = "bytes=";
-    if (!std.mem.startsWith(u8, header, prefix)) return null;
+    // 不可识别的 range-unit（非 bytes=）→ 忽略，回 200 全量（RFC 9110 §14.2）。
+    if (!std.mem.startsWith(u8, header, prefix)) return .ignore;
     const spec = header[prefix.len..];
-    // 多区间（含 `,`）不支持，返回 null。
-    if (std.mem.indexOfScalar(u8, spec, ',') != null) return null;
-    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    // 多区间（含 `,`）：不支持 → 忽略，回 200 全量。
+    if (std.mem.indexOfScalar(u8, spec, ',') != null) return .ignore;
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return .unsatisfiable;
     const start_str = std.mem.trim(u8, spec[0..dash], " \t");
     const end_str = std.mem.trim(u8, spec[dash + 1 ..], " \t");
 
-    if (size == 0) return null;
+    if (size == 0) return .unsatisfiable;
 
     if (start_str.len == 0) {
         // 后缀形式 `-N`：最后 N 字节。
-        const n = std.fmt.parseInt(u64, end_str, 10) catch return null;
-        if (n == 0) return null;
+        const n = std.fmt.parseInt(u64, end_str, 10) catch return .unsatisfiable;
+        if (n == 0) return .unsatisfiable; // bytes=-0 → 416
         const start = if (n >= size) 0 else size - n;
-        return .{ .start = start, .end = size - 1 };
+        return .{ .range = .{ .start = start, .end = size - 1 } };
     }
 
-    const start = std.fmt.parseInt(u64, start_str, 10) catch return null;
-    if (start >= size) return null; // 起点越界 → 416
+    const start = std.fmt.parseInt(u64, start_str, 10) catch return .unsatisfiable;
+    if (start >= size) return .unsatisfiable; // 起点越界 → 416
     const end = if (end_str.len == 0)
         size - 1
     else blk: {
-        const e = std.fmt.parseInt(u64, end_str, 10) catch return null;
+        const e = std.fmt.parseInt(u64, end_str, 10) catch return .unsatisfiable;
         break :blk @min(e, size - 1);
     };
-    if (end < start) return null;
-    return .{ .start = start, .end = end };
+    if (end < start) return .unsatisfiable;
+    return .{ .range = .{ .start = start, .end = end } };
+}
+
+/// P2-9：对 URL 路径做 percent-decode（`%XX` → 字节）。
+/// 不把 `+` 当空格（那是 application/x-www-form-urlencoded 的规则，路径不适用）。
+/// 非法 `%XX`（不足两位或非十六进制）返回 error.InvalidPercentEncoding。
+fn percentDecode(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '%') {
+            if (i + 2 >= s.len) return error.InvalidPercentEncoding;
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return error.InvalidPercentEncoding;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidPercentEncoding;
+            try out.append(allocator, @as(u8, hi) * 16 + lo);
+            i += 3;
+        } else {
+            try out.append(allocator, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// P2-10：按路径段判断是否含 `..`（而不是整串 indexOf）。
+/// `/` 与 `\`（Windows）都作为分隔符，这样 "my..file" 合法而 "a/../b" 被拒绝。
+fn hasDotDotSegment(path: []const u8) bool {
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..")) return true;
+    }
+    return false;
 }
 
 /// 修复 P2：路径遍历防护
@@ -498,6 +597,75 @@ fn formatHttpDate(buf: []u8, mtime_ns: i128) ?[]const u8 {
     }) catch null;
 }
 
+/// P2-12：判断 If-Modified-Since 是否满足「未修改」（即 mtime <= 请求日期）。
+/// 先尝试把 IMS 解析成 Unix 秒做语义比较；解析失败时回退到与我们生成的
+/// Last-Modified 字符串精确相等（保持旧行为，绝不误判为已修改）。
+fn ifModifiedSinceMatch(ims: []const u8, mtime_ns: i128, last_modified: ?[]const u8) bool {
+    if (mtime_ns <= 0) return false;
+    const mtime_sec: i64 = @intCast(@divTrunc(mtime_ns, 1_000_000_000));
+    if (parseHttpDate(ims)) |ims_sec| {
+        // 资源最后修改时间 <= 客户端已缓存时间 → 未修改 → 304。
+        return mtime_sec <= ims_sec;
+    }
+    // 无法解析：回退字符串精确比较。
+    return last_modified != null and std.mem.eql(u8, std.mem.trim(u8, ims, " "), last_modified.?);
+}
+
+/// 解析 HTTP-date 为 Unix 秒。仅支持 RFC 9110 首选的 IMF-fixdate 格式
+/// （`Sun, 06 Nov 1994 08:49:37 GMT`），这也是我们自己 formatHttpDate 产出的格式，
+/// 覆盖了绝大多数真实客户端。解析失败返回 null。
+fn parseHttpDate(s_raw: []const u8) ?i64 {
+    const s = std.mem.trim(u8, s_raw, " \t");
+    // 形如：Wdy, DD Mon YYYY HH:MM:SS GMT（长度 29）。
+    // 逗号后按空白切词，最少需要 6 段：DD Mon YYYY HH:MM:SS [GMT]。
+    const comma = std.mem.indexOfScalar(u8, s, ',') orelse return null;
+    var it = std.mem.tokenizeAny(u8, s[comma + 1 ..], " ");
+    const day_str = it.next() orelse return null;
+    const mon_str = it.next() orelse return null;
+    const year_str = it.next() orelse return null;
+    const time_str = it.next() orelse return null;
+
+    const day = std.fmt.parseInt(u16, day_str, 10) catch return null;
+    const year = std.fmt.parseInt(u16, year_str, 10) catch return null;
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    var month: u4 = 0;
+    for (months, 0..) |m, i| {
+        if (std.mem.eql(u8, m, mon_str)) {
+            month = @intCast(i + 1);
+            break;
+        }
+    }
+    if (month == 0) return null;
+    if (day < 1 or day > 31) return null;
+    if (year < 1970) return null;
+
+    var time_it = std.mem.tokenizeScalar(u8, time_str, ':');
+    const hh = std.fmt.parseInt(u8, time_it.next() orelse return null, 10) catch return null;
+    const mm = std.fmt.parseInt(u8, time_it.next() orelse return null, 10) catch return null;
+    const ss = std.fmt.parseInt(u8, time_it.next() orelse return null, 10) catch return null;
+    if (hh > 23 or mm > 59 or ss > 60) return null;
+
+    // 按 Unix 纪元累加天数（含闰年）。
+    var days: i64 = 0;
+    var y: u16 = 1970;
+    while (y < year) : (y += 1) {
+        days += if (isLeapYear(y)) 366 else 365;
+    }
+    const mdays = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var m: u4 = 1;
+    while (m < month) : (m += 1) {
+        days += mdays[m - 1];
+        if (m == 2 and isLeapYear(year)) days += 1;
+    }
+    days += @as(i64, day) - 1;
+
+    return days * 86400 + @as(i64, hh) * 3600 + @as(i64, mm) * 60 + @as(i64, ss);
+}
+
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -544,26 +712,116 @@ test "isPathWithinRoot - different root rejected" {
     try std.testing.expect(!isPathWithinRoot("/etc/passwd", "/var/www"));
 }
 
+test "stripPrefix - separator boundary (M13)" {
+    var s = StaticFileServer{
+        .allocator = undefined,
+        .io = undefined,
+        .root_dir = undefined,
+        .url_prefix = "/static",
+    };
+    // 命中：前缀后紧跟 '/' 或已到结尾
+    try std.testing.expectEqualStrings("", s.stripPrefix("/static").?);
+    try std.testing.expectEqualStrings("index.html", s.stripPrefix("/static/index.html").?);
+    try std.testing.expectEqualStrings("sub/file.txt", s.stripPrefix("/static/sub/file.txt").?);
+    // M13：前缀后不是 '/'（如 /staticevil/x）→ 未命中
+    try std.testing.expect(s.stripPrefix("/staticevil/x") == null);
+    try std.testing.expect(s.stripPrefix("/statician") == null);
+    // 完全不同路径 → 未命中
+    try std.testing.expect(s.stripPrefix("/other") == null);
+}
+
 test "parseByteRange" {
     const R = StaticFileServer.ByteRange;
-    // 完整区间
-    try std.testing.expectEqual(R{ .start = 0, .end = 499 }, parseByteRange("bytes=0-499", 1000).?);
+    const expectRange = struct {
+        fn e(hdr: []const u8, size: u64, expected: R) !void {
+            switch (parseByteRange(hdr, size)) {
+                .range => |r| try std.testing.expectEqual(expected, r),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }.e;
+    const expectTag = struct {
+        fn e(hdr: []const u8, size: u64, tag: std.meta.Tag(RangeResult)) !void {
+            if (std.meta.activeTag(parseByteRange(hdr, size)) != tag) return error.TestUnexpectedResult;
+        }
+    }.e;
+
+    // 可满足的单区间 → .range
+    try expectRange("bytes=0-499", 1000, R{ .start = 0, .end = 499 });
     // 开放结尾 → 到最后
-    try std.testing.expectEqual(R{ .start = 500, .end = 999 }, parseByteRange("bytes=500-", 1000).?);
+    try expectRange("bytes=500-", 1000, R{ .start = 500, .end = 999 });
     // 后缀：最后 500 字节
-    try std.testing.expectEqual(R{ .start = 500, .end = 999 }, parseByteRange("bytes=-500", 1000).?);
+    try expectRange("bytes=-500", 1000, R{ .start = 500, .end = 999 });
     // end 越界 → 截到 size-1
-    try std.testing.expectEqual(R{ .start = 0, .end = 999 }, parseByteRange("bytes=0-5000", 1000).?);
-    // start 越界 → 不可满足
-    try std.testing.expect(parseByteRange("bytes=1000-", 1000) == null);
-    // 多区间不支持
-    try std.testing.expect(parseByteRange("bytes=0-1,2-3", 1000) == null);
-    // 格式错
-    try std.testing.expect(parseByteRange("items=0-1", 1000) == null);
-    // 空文件
-    try std.testing.expect(parseByteRange("bytes=0-0", 0) == null);
+    try expectRange("bytes=0-5000", 1000, R{ .start = 0, .end = 999 });
+    // start 越界 → 416
+    try expectTag("bytes=1000-", 1000, .unsatisfiable);
+    // M12：多区间 → 忽略，回 200 全量（RFC 9110 §14.2）
+    try expectTag("bytes=0-1,2-3", 1000, .ignore);
+    // 不可识别的 range-unit（非 bytes=）→ 忽略，回 200 全量
+    try expectTag("items=0-1", 1000, .ignore);
+    // bytes=-0 → 416
+    try expectTag("bytes=-0", 1000, .unsatisfiable);
+    // 空文件 → 416
+    try expectTag("bytes=0-0", 0, .unsatisfiable);
+    // 语法非法 → 416
+    try expectTag("bytes=abc", 1000, .unsatisfiable);
+    try expectTag("bytes=5-abc", 1000, .unsatisfiable);
 }
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "percentDecode - basic" {
+    const a = std.testing.allocator;
+    const r1 = try percentDecode(a, "%74est.html");
+    defer a.free(r1);
+    try std.testing.expectEqualStrings("test.html", r1);
+    // 中文（UTF-8）%E4%B8%AD
+    const r2 = try percentDecode(a, "%E4%B8%AD.txt");
+    defer a.free(r2);
+    try std.testing.expectEqualStrings("\xe4\xb8\xad.txt", r2);
+    // '+' 不当空格（路径语义）
+    const r3 = try percentDecode(a, "a+b");
+    defer a.free(r3);
+    try std.testing.expectEqualStrings("a+b", r3);
+}
+
+test "percentDecode - invalid rejected" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidPercentEncoding, percentDecode(a, "%zz"));
+    try std.testing.expectError(error.InvalidPercentEncoding, percentDecode(a, "abc%2"));
+    try std.testing.expectError(error.InvalidPercentEncoding, percentDecode(a, "%"));
+}
+
+test "hasDotDotSegment" {
+    // 合法：内嵌 '..' 但不是独立段
+    try std.testing.expect(!hasDotDotSegment("my..file.txt"));
+    try std.testing.expect(!hasDotDotSegment("v1..2.tar.gz"));
+    try std.testing.expect(!hasDotDotSegment("a/b/c.txt"));
+    // 非法：独立 '..' 段
+    try std.testing.expect(hasDotDotSegment("../etc/passwd"));
+    try std.testing.expect(hasDotDotSegment("a/../b"));
+    try std.testing.expect(hasDotDotSegment("a/.."));
+    // 反斜杠分隔（Windows）
+    try std.testing.expect(hasDotDotSegment("a\\..\\b"));
+}
+
+test "parseHttpDate + ifModifiedSinceMatch" {
+    // 1994-11-06 08:49:37 GMT 的 Unix 秒 = 784111777
+    try std.testing.expectEqual(@as(?i64, 784111777), parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT"));
+    // 前后多余空白仍可解析
+    try std.testing.expectEqual(@as(?i64, 784111777), parseHttpDate("  Sun, 06 Nov 1994 08:49:37 GMT  "));
+    // 非法格式 → null
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("not a date"));
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("Sun, 06 Foo 1994 08:49:37 GMT"));
+
+    // 语义比较：mtime = 1000秒，IMS = 2000秒（更晚）→ 未修改 → match。
+    const mtime_ns: i128 = 1000 * 1_000_000_000;
+    // 1970-01-01 00:33:20 GMT = 2000秒
+    try std.testing.expect(ifModifiedSinceMatch("Thu, 01 Jan 1970 00:33:20 GMT", mtime_ns, null));
+    // IMS = 500秒（更早）→ 已修改 → 不 304。
+    // 1970-01-01 00:08:20 GMT = 500秒
+    try std.testing.expect(!ifModifiedSinceMatch("Thu, 01 Jan 1970 00:08:20 GMT", mtime_ns, null));
 }

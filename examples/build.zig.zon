@@ -7,7 +7,7 @@
         .http_framework = .{ .path = "../" },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#zig-0.17",
-            .hash = "zio-0.17.0-xHbVVJhmJgDCkSLd-chGMOmcpcOlUTTnpNt2_zJJhZVZ",
+            .hash = "zio-0.17.0-xHbVVGYlKQAC0a3BQkOYap5tXDEBwnjRiTl2q8Yg2szM",
         },
     },
     .minimum_zig_version = "0.17.0-dev.889+e6be5cfe3",

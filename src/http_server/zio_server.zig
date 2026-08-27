@@ -97,6 +97,17 @@ pub const Server = struct {
     }
 
     pub fn setup(self: *Server) !void {
+        // P2-38：对“已设置但未实现”的配置项告警。死开关比没有配置更危险：
+        // 运维会以为自己改变了行为，实际无效。仅在非默认值时提醒，避免噪声。
+        if (self.config.body.lazy_read_size != 0) {
+            std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
+        }
+        if (self.config.network.idle_timeout_ns != 60_000_000_000) {
+            std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
+        }
+        if (self.config.http.access_log_enabled) {
+            std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
+        }
         self.listener = try Listener.init(&self.config.network);
     }
 
@@ -232,6 +243,7 @@ pub const Server = struct {
         conn.* = .{
             .server = self,
             .stream = stream,
+            .peer_ip = toPeerIp(stream.socket.address),
             .read_buf = self.allocator.alloc(u8, @max(self.config.http.read_buffer_size, MIN_READ_BUF)) catch {
                 self.allocator.destroy(conn);
                 stream.close();
@@ -260,6 +272,8 @@ pub const Server = struct {
         stream: zio.net.Stream,
         read_buf: []u8,
         write_buf: []u8,
+        /// 对端 IP（accept 时内核提供，不可伪造）。Unix socket 对端为 null。
+        peer_ip: ?std.Io.net.IpAddress,
 
         fn run(self: *Conn) void {
             defer self.stream.close();
@@ -281,6 +295,7 @@ pub const Server = struct {
                 .stats = &self.server.runtime,
                 .allocator = self.server.allocator,
                 .services = self.server.services,
+                .peer_ip = self.peer_ip,
             };
             runner.run();
         }
@@ -302,3 +317,26 @@ pub const Server = struct {
 
 const MIN_READ_BUF = 2 * 1024;
 const MIN_WRITE_BUF = 512;
+
+/// 把 zio accept 得到的对端地址转成框架的 `std.Io.net.IpAddress`。
+/// 地址来自内核 accept（不可伪造），供 per-IP 限流 / 审计日志 / Geofence 使用。
+/// Unix socket 无 IP 语义，返回 null。
+fn toPeerIp(addr: zio.net.Address) ?std.Io.net.IpAddress {
+    return switch (addr.getFamily()) {
+        .ipv4 => blk: {
+            const sa = addr.ip.in;
+            break :blk .{ .ip4 = .{
+                .bytes = std.mem.toBytes(sa.addr),
+                .port = std.mem.bigToNative(u16, sa.port),
+            } };
+        },
+        .ipv6 => blk: {
+            const sa = addr.ip.in6;
+            break :blk .{ .ip6 = .{
+                .bytes = sa.addr,
+                .port = std.mem.bigToNative(u16, sa.port),
+            } };
+        },
+        .unix => null,
+    };
+}

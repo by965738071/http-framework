@@ -93,8 +93,23 @@ pub fn QueryBuilder(comptime T: type) type {
         data: ?T = null, // 用于 INSERT/UPDATE 的数据
         /// 更新时只更新指定字段
         update_fields: ?[]const []const u8 = null,
+        /// 构建期错误。where/orWhere/orderBy 保持 `*Self` 链式返回，
+        /// 无法直接返回 error，于是把 OOM / 条件数超限记在这里，由引擎
+        /// 执行前（findAll/update/delete/count 调 checkBuildError）统一报出。
+        /// 旧实现是 `catch @panic("OOM")` —— filter 数量来自请求时，
+        /// 内存压力或攻击者塞大量 filter 会把 OOM 变成远程进程 abort（P0-8）。
+        build_error: ?anyerror = null,
 
         const Self = @This();
+
+        /// 单个查询允许的 WHERE 条件数上限。条件数来自请求时（用户可控），
+        /// 无上限会让攻击者用超长 filter 链放大内存与 CPU（P0-8）。
+        pub const MAX_CONDITIONS: usize = 256;
+
+        /// 引擎执行前调用：若构建期发生过错误（OOM / 条件超限）则报出。
+        pub fn checkBuildError(self: *const Self) !void {
+            if (self.build_error) |e| return e;
+        }
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -116,9 +131,15 @@ pub fn QueryBuilder(comptime T: type) type {
         }
 
         /// 设置查询类型为 SELECT，指定字段
+        ///
+        /// P2-31：JsonStore 的读接口一律返回完整结构体 `T`，无法按字段裁剪。
+        /// 旧实现只把字段名存进 `selected_fields` 却从不读取——`selectFields(&.{"id"})`
+        /// 照样返回整行。若有人以为能用它隐藏 `password_hash`，就是静默数据泄漏。
+        /// 因此这里记为构建期错误，执行时（checkBuildError）显式报出，不再假装支持。
         pub fn selectFields(self: *Self, fields: []const []const u8) *Self {
             self.query_type = .select;
             self.selected_fields = fields;
+            self.build_error = error.SelectFieldsUnsupported;
             return self;
         }
 
@@ -152,13 +173,33 @@ pub fn QueryBuilder(comptime T: type) type {
 
         /// 添加 WHERE 条件
         pub fn where(self: *Self, op: Operator, field: []const u8, value: FieldValue) *Self {
+            self.appendCondition(op, field, value, .And);
+            return self;
+        }
+
+        /// 内部：追加一个条件，OOM / 超限时记录 build_error（不 panic）。
+        fn appendCondition(self: *Self, op: Operator, field: []const u8, value: FieldValue, logic: Logic) void {
+            if (self.build_error != null) return;
+            // In/NotIn 在 Operator 里公开、有 symbol()，但 FieldValue 根本没有列表变体，
+            // compareString 硬编码 `.In, .NotIn => false`，数值/布尔分支落 `else => false`
+            // —— 这两个操作符匹配不到任何行，且语义上无法表达（P1-12）。
+            // 宁可在构建期报错，也不要静默返回空结果（静默错误比崩溃更危险）。
+            if (op == .In or op == .NotIn) {
+                self.build_error = error.UnsupportedOperator;
+                return;
+            }
+            if (self.conditions.items.len >= MAX_CONDITIONS) {
+                self.build_error = error.TooManyConditions;
+                return;
+            }
             self.conditions.append(self.allocator, .{
                 .field = field,
                 .operator = op,
                 .value = value,
-                .logic = .And,
-            }) catch @panic("OOM");
-            return self;
+                .logic = logic,
+            }) catch |e| {
+                self.build_error = e;
+            };
         }
 
         /// 添加 AND WHERE 条件（显式 AND 语法糖）
@@ -168,21 +209,19 @@ pub fn QueryBuilder(comptime T: type) type {
 
         /// 添加 OR WHERE 条件
         pub fn orWhere(self: *Self, op: Operator, field: []const u8, value: FieldValue) *Self {
-            self.conditions.append(self.allocator, .{
-                .field = field,
-                .operator = op,
-                .value = value,
-                .logic = .Or,
-            }) catch @panic("OOM");
+            self.appendCondition(op, field, value, .Or);
             return self;
         }
 
         /// 添加排序
         pub fn orderBy(self: *Self, field: []const u8, direction: SortDirection) *Self {
+            if (self.build_error != null) return self;
             self.order_clauses.append(self.allocator, .{
                 .field = field,
                 .direction = direction,
-            }) catch @panic("OOM");
+            }) catch |e| {
+                self.build_error = e;
+            };
             return self;
         }
 
@@ -208,35 +247,31 @@ pub fn QueryBuilder(comptime T: type) type {
         pub fn matches(self: *const Self, row: T) bool {
             if (self.conditions.items.len == 0) return true;
 
-            var result: ?bool = null;
+            // 两级折叠：AND 优先级高于 OR（与 SQL 语义一致）。
+            // 旧实现是纯左结合（`result = result <op> m`），会把
+            // `id=1 OR hash=999 AND created=5` 算成 `((v OR v) AND v)`，
+            // 读会漏数据、update/delete 会改错/删错行（不可逆）。
+            // 这里按 OR 分组：组内用 AND 折叠，组间用 OR 折叠。
+            var or_acc = false;
+            var and_acc: ?bool = null;
 
             for (self.conditions.items) |cond| {
-                const field_value = getFieldValueOpt(T, row, cond.field) orelse {
-                    // 未知字段：该条件不匹配。
-                    const matches_cond = false;
-                    if (result == null) {
-                        result = matches_cond;
-                    } else {
-                        result = switch (cond.logic) {
-                            .And => result.? and matches_cond,
-                            .Or => result.? or matches_cond,
-                        };
-                    }
-                    continue;
-                };
-                const matches_cond = evaluateCondition(cond, field_value);
+                // 未知字段（where 字段名可能来自外部输入）→ 该条件不匹配。
+                const matches_cond = if (getFieldValueOpt(T, row, cond.field)) |fv|
+                    evaluateCondition(cond, fv)
+                else
+                    false;
 
-                if (result == null) {
-                    result = matches_cond;
-                } else {
-                    result = switch (cond.logic) {
-                        .And => result.? and matches_cond,
-                        .Or => result.? or matches_cond,
-                    };
+                switch (cond.logic) {
+                    .And => and_acc = if (and_acc) |a| a and matches_cond else matches_cond,
+                    .Or => {
+                        or_acc = or_acc or (and_acc orelse false);
+                        and_acc = matches_cond;
+                    },
                 }
             }
 
-            return result orelse true;
+            return or_acc or (and_acc orelse false);
         }
 
         /// 对结果集应用排序
@@ -246,8 +281,11 @@ pub fn QueryBuilder(comptime T: type) type {
             const items = rows.items;
             const clauses = self.order_clauses.items;
 
-            std.sort.insertion(T, items, clauses, struct {
-                fn compare(ctx: []const OrderClause, a: T, b: T) bool {
+            // P3-1：用 std.sort.block（O(N log N) 稳定排序）而非插入排序（O(N²)）。
+            // 排序在持 store 锁时进行，用户可控的 orderBy + 几万行 = 幈9 CPU 放大 + 全服阻塞。
+            // compareValues 已对称（P3-5），可安全用于严格弱序比较器。
+            std.sort.block(T, items, clauses, struct {
+                fn lessThan(ctx: []const OrderClause, a: T, b: T) bool {
                     for (ctx) |clause| {
                         // 未知字段：跳过该排序子句（不 panic）。
                         const va = getFieldValueOpt(T, a, clause.field) orelse continue;
@@ -258,7 +296,7 @@ pub fn QueryBuilder(comptime T: type) type {
                     }
                     return false;
                 }
-            }.compare);
+            }.lessThan);
         }
 
         /// 对结果集应用分页
@@ -283,10 +321,17 @@ pub fn QueryBuilder(comptime T: type) type {
 }
 
 /// 比较两个 FieldValue
-fn compareValues(a: FieldValue, b: FieldValue) std.math.Order {
+/// P3-5：必须对称。旧实现 `.integer` 分支对 `.float` 返 `.eq`，但 `.float` 分支
+/// 对 `.integer` 会真比，于是 `cmp(int5,float3)=.eq` 而 `cmp(float3,int5)=.lt`。
+/// 现在靠“两边总来自同一字段”掩盖，一旦换成 std.sort.pdq 就是 UB-adjacent。
+/// 统一：先 normalize（datetime→int、text/json_text→string），int↔float 混合时都提升为 f64。
+fn compareValues(a_raw: FieldValue, b_raw: FieldValue) std.math.Order {
+    const a = normalizeFieldValue(a_raw);
+    const b = normalizeFieldValue(b_raw);
     return switch (a) {
         .integer => |va| switch (b) {
             .integer => |vb| std.math.order(va, vb),
+            .float => |vb| std.math.order(@as(f64, @floatFromInt(va)), vb),
             else => .eq,
         },
         .string => |va| switch (b) {
@@ -297,10 +342,6 @@ fn compareValues(a: FieldValue, b: FieldValue) std.math.Order {
             .float => |vb| std.math.order(va, vb),
             // 数值与整数比较时统一为 f64 再比较
             .integer => |vb| std.math.order(va, @as(f64, @floatFromInt(vb))),
-            else => .eq,
-        },
-        .datetime => |va| switch (b) {
-            .datetime, .integer => |vb| std.math.order(va, vb),
             else => .eq,
         },
         .boolean => |va| switch (b) {
@@ -320,24 +361,43 @@ fn evaluateCondition(cond: WhereCondition, field_value: FieldValue) bool {
         return !isNullValue(field_value);
     }
 
-    return switch (field_value) {
-        .integer => |v| switch (cond.value) {
-            .integer => |cv| compareInteger(cond.operator, v, cv),
+    // 归一化：字段值与条件值都把 .datetime 视作整数、.text/.json_text 视作字符串。
+    // 旧实现要求两边 tag 完全一致，而 toFieldValue 只产出 .integer/.float/.boolean/.string，
+    // 于是用 .datetime/.text/.json_text 写的条件永远落到 `else => false`（静默零结果，
+    // 比崩溃更危险）。
+    const fv = normalizeFieldValue(field_value);
+    const cv = normalizeFieldValue(cond.value);
+
+    return switch (fv) {
+        .integer => |v| switch (cv) {
+            .integer => |c| compareInteger(cond.operator, v, c),
             else => false,
         },
-        .string => |v| switch (cond.value) {
-            .string => |cv| compareString(cond.operator, v, cv),
+        .string => |v| switch (cv) {
+            .string => |c| compareString(cond.operator, v, c),
             else => false,
         },
-        .float => |v| switch (cond.value) {
-            .float => |cv| compareFloat(cond.operator, v, cv),
+        .float => |v| switch (cv) {
+            .float => |c| compareFloat(cond.operator, v, c),
+            // 数值与整数条件比较时统一为 f64。
+            .integer => |c| compareFloat(cond.operator, v, @floatFromInt(c)),
             else => false,
         },
-        .boolean => |v| switch (cond.value) {
-            .boolean => |cv| compareBool(cond.operator, v, cv),
+        .boolean => |v| switch (cv) {
+            .boolean => |c| compareBool(cond.operator, v, c),
             else => false,
         },
         else => false,
+    };
+}
+
+/// 把 .datetime 归一成 .integer、.text/.json_text 归一成 .string，
+/// 便于 evaluateCondition 只需处理 4 种基础 tag。
+fn normalizeFieldValue(v: FieldValue) FieldValue {
+    return switch (v) {
+        .datetime => |x| .{ .integer = x },
+        .text, .json_text => |x| .{ .string = x },
+        else => v,
     };
 }
 
@@ -490,7 +550,14 @@ pub fn getFieldValueOpt(comptime T: type, instance: T, field_name: []const u8) ?
 pub fn toFieldValue(value: anytype) FieldValue {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
-        .int, .comptime_int => FieldValue{ .integer = @intCast(value) },
+        // 超过 i64 范围的整数（如 u64 > 2^63）用 std.math.cast 饱和到边界值，
+        // 而不是 @intCast panic：字段值触到 where/orderBy/matches 就不会打死进程。
+        // 无法表示的极值退化成 i64 边界，比崩溃安全（真正需要 u64 全域的场景
+        // 应在 model.fieldTypeOf 层面拒绝，见该处 @compileError）。
+        .int, .comptime_int => FieldValue{
+            .integer = std.math.cast(i64, value) orelse
+                (if (value < 0) std.math.minInt(i64) else std.math.maxInt(i64)),
+        },
         .float, .comptime_float => FieldValue{ .float = @floatCast(value) },
         .bool => FieldValue{ .boolean = value },
         .pointer => |ptr| {
@@ -528,40 +595,47 @@ pub fn setFieldFromValue(comptime T: type, instance: *T, field_name: []const u8,
     };
     inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
         if (std.mem.eql(u8, fname, field_name)) {
-            switch (@typeInfo(ftype)) {
-                .int, .comptime_int => {
-                    @field(instance, fname) = @intCast(value.integer);
-                },
-                .float, .comptime_float => {
-                    @field(instance, fname) = @floatCast(value.float);
-                },
-                .bool => {
-                    @field(instance, fname) = value.boolean;
-                },
-                .pointer => |ptr| {
-                    if (ptr.size == .slice and ptr.child == u8) {
-                        @field(instance, fname) = value.string;
-                    }
-                },
-                .optional => {
-                    const Child = std.meta.Child(ftype);
-                    switch (@typeInfo(Child)) {
-                        .int, .comptime_int => {
-                            @field(instance, fname) = @as(Child, @intCast(value.integer));
-                        },
-                        .float, .comptime_float => {
-                            @field(instance, fname) = @as(Child, @floatCast(value.float));
-                        },
-                        .bool => {
-                            @field(instance, fname) = value.boolean;
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            }
+            setTyped(ftype, &@field(instance, fname), value);
             return;
         }
+    }
+}
+
+/// 按目标字段类型写入一个 FieldValue。
+///
+/// **必须先看 value 的 active tag，再按目标类型转换**：旧实现直接写
+/// `@field(instance, fname) = @intCast(value.integer)`，完全不管 value 的实际 tag。
+/// FieldValue 是 union，读一个非 active 的字段在 safe 构建下 panic
+/// （`access of union field 'integer' while field 'datetime' is active`），
+/// 在 ReleaseFast 下是静默的 payload 重新解释（类型混淆）。
+/// applyDefaults 会把 schema 的 default_value（可能是 .datetime/.text/...）喂进来，
+/// 所以这条路径是真实可达的。类型不匹配时静默忽略（保持默认值），越界整数用
+/// std.math.cast 饱和而非 panic。
+fn setTyped(comptime FieldT: type, field_ptr: anytype, value: FieldValue) void {
+    switch (@typeInfo(FieldT)) {
+        .int, .comptime_int => switch (value) {
+            .integer, .datetime => |x| field_ptr.* = std.math.cast(FieldT, x) orelse return,
+            else => {},
+        },
+        .float, .comptime_float => switch (value) {
+            .float => |x| field_ptr.* = @floatCast(x),
+            .integer, .datetime => |x| field_ptr.* = @floatFromInt(x),
+            else => {},
+        },
+        .bool => switch (value) {
+            .boolean => |x| field_ptr.* = x,
+            else => {},
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                switch (value) {
+                    .string, .text, .json_text => |x| field_ptr.* = x,
+                    else => {},
+                }
+            }
+        },
+        .optional => |opt| setTyped(opt.child, field_ptr, value),
+        else => {},
     }
 }
 
@@ -602,6 +676,68 @@ test "QueryBuilder where condition" {
 
     const user2 = User{ .id = 2, .name = "Bob", .age = 30 };
     try std.testing.expect(!qb.matches(user2));
+}
+
+test "QueryBuilder In/NotIn 记录 build_error（P0-8/P1-12）" {
+    const allocator = std.testing.allocator;
+    const User = struct { id: u64, name: []const u8 };
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.In, "id", .{ .integer = 1 });
+    try std.testing.expectError(error.UnsupportedOperator, qb.checkBuildError());
+}
+
+test "QueryBuilder 条件数超上限记录 build_error（P0-8）" {
+    const allocator = std.testing.allocator;
+    const User = struct { id: u64, name: []const u8 };
+
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    var i: usize = 0;
+    while (i < QueryBuilder(User).MAX_CONDITIONS + 5) : (i += 1) {
+        _ = qb.where(.Eq, "id", .{ .integer = 1 });
+    }
+    try std.testing.expectError(error.TooManyConditions, qb.checkBuildError());
+}
+
+test "QueryBuilder AND 优先级高于 OR（P1-11）" {
+    const allocator = std.testing.allocator;
+    const User = struct { id: u64, hash: u64, created: u64 };
+
+    // id=1 OR hash=999 AND created=5，SQL 语义 = (id=1) OR (hash=999 AND created=5)。
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = 1 });
+    _ = qb.orWhere(.Eq, "hash", .{ .integer = 999 });
+    _ = qb.where(.Eq, "created", .{ .integer = 5 });
+
+    try std.testing.expect(qb.matches(.{ .id = 1, .hash = 0, .created = 0 }));
+    try std.testing.expect(qb.matches(.{ .id = 0, .hash = 999, .created = 5 }));
+    try std.testing.expect(!qb.matches(.{ .id = 0, .hash = 999, .created = 4 }));
+}
+
+test "QueryBuilder first condition orWhere behaves like where (H1)" {
+    const allocator = std.testing.allocator;
+    const User = struct { id: u64, name: []const u8, age: u32 };
+
+    // 首条件为 orWhere：不应恒为 true，应与 where 等价（只匹配满足条件的行）。
+    var qb = QueryBuilder(User).init(allocator);
+    defer qb.deinit();
+    _ = qb.orWhere(.Eq, "name", .{ .string = "Alice" });
+
+    try std.testing.expect(!qb.isFindAll());
+    // 匹配行
+    try std.testing.expect(qb.matches(.{ .id = 1, .name = "Alice", .age = 25 }));
+    // 不匹配行：H1 修复前会错误返回 true。
+    try std.testing.expect(!qb.matches(.{ .id = 2, .name = "Bob", .age = 30 }));
+
+    // 与首个 where 的行为完全等价
+    var qb2 = QueryBuilder(User).init(allocator);
+    defer qb2.deinit();
+    _ = qb2.where(.Eq, "name", .{ .string = "Alice" });
+    try std.testing.expect(qb2.matches(.{ .id = 1, .name = "Alice", .age = 25 }));
+    try std.testing.expect(!qb2.matches(.{ .id = 2, .name = "Bob", .age = 30 }));
 }
 
 test "QueryBuilder sorting" {
@@ -732,6 +868,8 @@ test "QueryBuilder.selectFields sets query type and fields" {
     try std.testing.expectEqual(@as(usize, 2), qb.selected_fields.?.len);
     try std.testing.expectEqualStrings("id", qb.selected_fields.?[0]);
     try std.testing.expectEqualStrings("name", qb.selected_fields.?[1]);
+    // P2-31：selectFields 在 JsonStore 不受支持，应记录构建期错误，执行时报出。
+    try std.testing.expectError(error.SelectFieldsUnsupported, qb.checkBuildError());
 }
 
 test "QueryBuilder.count sets query type" {

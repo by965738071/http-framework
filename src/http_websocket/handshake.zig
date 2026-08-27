@@ -87,6 +87,9 @@ fn isOriginAllowed(ctx: *Context) bool {
 /// 注意：响应并未发送，只设置了状态和头。调用方负责发送响应（通常通过
 /// `res.flush()` 或直接走框架的发送路径）并在发送后"劫持"底层 stream。
 pub fn handshake(ctx: *Context, res: *Response) !bool {
+    // RFC §4.1: WebSocket 握手请求必须是 GET。
+    if (ctx.request.method != .GET) return false;
+
     // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
     const upgrade_hdr = ctx.header("upgrade") orelse return false;
     if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
@@ -96,8 +99,13 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
     const connection_hdr = ctx.header("connection") orelse return false;
     if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
 
-    // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。这里只校验存在。
+    // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。
+    // P2-19：不能只校验存在——RFC 6455 §4.1 要求客户端发 16 字节随机值的 base64。
+    // 长度必为 24 且以 "==" 结尾，并能合法 base64 解码为 16 字节。
     const key = ctx.header("sec-websocket-key") orelse return false;
+    // RFC §4.1: 重复的 Sec-WebSocket-Key 头必须拒绝（RFC 要求，不能静默取第一个）。
+    if (countHeader(ctx, "sec-websocket-key") != 1) return false;
+    if (!isValidWebSocketKey(key)) return false;
 
     // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
     if (!isOriginAllowed(ctx)) {
@@ -163,6 +171,29 @@ fn containsTokenIgnoreCase(header_value: []const u8, token: []const u8) bool {
     return false;
 }
 
+/// 统计某个请求头在原始 head 里出现的次数（大小写不敏感）。
+/// RFC 6455 §4.1: 出现多个 Sec-WebSocket-Key 时必须拒绝连接。
+fn countHeader(ctx: *const Context, name: []const u8) usize {
+    var count: usize = 0;
+    var it = std.http.HeaderIterator.init(ctx.request.head_bytes);
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) count += 1;
+    }
+    return count;
+}
+
+/// P2-19：Sec-WebSocket-Key 必须是 16 字节的 base64（RFC 6455 §4.1）。
+/// 16 字节 → 标准 base64 = 24 字符，以 "==" 结尾，且能合法解码。
+fn isValidWebSocketKey(key: []const u8) bool {
+    if (key.len != 24) return false;
+    if (!std.mem.endsWith(u8, key, "==")) return false;
+    var buf: [16]u8 = undefined;
+    const decoded = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (decoded != 16) return false;
+    std.base64.standard.Decoder.decode(&buf, key) catch return false;
+    return true;
+}
+
 /// WebSocket 升级（高级 API）——把“校验握手 + 注册连接劫持回调”一步完成。
 ///
 /// 返回 `true`：握手合法，已通过 `ctx.hijack` 注册回调。handler 应**直接 return**，
@@ -181,6 +212,9 @@ pub fn upgrade(
     hijack_ctx: *anyopaque,
     comptime handlerFn: fn (ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void,
 ) !bool {
+    // RFC §4.1: WebSocket 握手请求必须是 GET。
+    if (ctx.request.method != .GET) return false;
+
     // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
     const upgrade_hdr = ctx.header("upgrade") orelse return false;
     if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
@@ -189,6 +223,9 @@ pub fn upgrade(
     if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
 
     const key = ctx.header("sec-websocket-key") orelse return false;
+    // RFC §4.1: 重复的 Sec-WebSocket-Key 头必须拒绝（与 handshake() 行为一致）。
+    if (countHeader(ctx, "sec-websocket-key") != 1) return false;
+    if (!isValidWebSocketKey(key)) return false;
 
     // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
     if (!isOriginAllowed(ctx)) {
@@ -534,6 +571,64 @@ test "upgrade registers hijack and writes 101 + runs handler" {
     const server_written = server_out.written();
     try testing.expect(std.mem.indexOf(u8, server_written, "101 Switching Protocols") != null);
     try testing.expect(std.mem.indexOf(u8, server_written, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+}
+
+test "upgrade rejects invalid Sec-WebSocket-Key (M14)" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = http_app.RequestState{};
+    defer state.deinit(arena.allocator());
+
+    // 垃圾 key：不是 16 字节 base64。
+    const head =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: garbage-not-base64==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    var req = http_app.Request{
+        .method = .GET,
+        .target = "/ws",
+        .path = "/ws",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head,
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = http_app.RequestConfig{};
+    var ctx = http_app.Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    var out_buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    var res = Response.init(arena.allocator(), Sink.testSink(&w));
+    defer res.deinit();
+
+    const H = struct {
+        fn onWs(ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
+            _ = ws;
+            _ = hijack_ctx;
+        }
+    };
+
+    var dummy: u8 = 0;
+    const ok = try upgrade(&ctx, &res, @ptrCast(&dummy), H.onWs);
+    // 非法 key 必须拒绝升级，不注册 hijack。
+    try testing.expect(!ok);
+    try testing.expect(state.hijack == null);
 }
 
 test {

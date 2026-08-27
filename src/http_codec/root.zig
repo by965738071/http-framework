@@ -35,6 +35,15 @@ pub fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const 
     return result;
 }
 
+/// 判断 Content-Type 是否为 application/json。大小写不敏感；匹配后要求下一
+/// 字符是 `;`/空白/结尾，避免误命中 application/json-patch+json 等变体。
+fn isJsonContentType(ct: []const u8) bool {
+    if (!std.ascii.startsWithIgnoreCase(ct, "application/json")) return false;
+    if (ct.len == "application/json".len) return true;
+    const next = ct["application/json".len];
+    return next == ';' or next == ' ' or next == '\t';
+}
+
 /// JSON Body 中间件：预解析 application/json 请求体为 typed struct，
 /// 存入 `ctx.user_data` 槽。handler 用 `ctx.getUserData(T)` 取出。
 ///
@@ -58,8 +67,10 @@ pub fn JsonBody(comptime T: type) type {
             const ct = ctx.request.content_type orelse {
                 return next.call(ctx, res);
             };
-            // 只处理 application/json
-            if (!std.mem.startsWith(u8, ct, "application/json")) {
+            // 只处理 application/json（P2-25：大小写不敏感，Application/JSON 也应命中，
+            // 与 multipart.from 的 startsWithIgnoreCase 保持一致）。匹配后要求下一字符是
+            // `;`/空白/结尾，避免误命中 application/json-patch+json 等变体。
+            if (!isJsonContentType(ct)) {
                 return next.call(ctx, res);
             }
             // 只处理有 body 的请求
@@ -70,6 +81,9 @@ pub fn JsonBody(comptime T: type) type {
 
             const body = ctx.readBody(ctx.arena, self.limit) catch |err| {
                 if (err == error.BodyTooLarge) {
+                    // 413 后连接不应继续复用：避免 keep-alive 连接去 drain 超限 body，
+                    // 放大连接占用（修复低优先：codec 413 后 res.keep_alive = false）。
+                    res.keep_alive = false;
                     _ = res.statusCode(.payload_too_large);
                     try res.text("request body too large");
                     return;
@@ -78,7 +92,9 @@ pub fn JsonBody(comptime T: type) type {
             };
             if (body.len == 0) return next.call(ctx, res);
 
-            const parsed = parseJson(T, ctx.arena, body) catch {
+            const parsed = parseJson(T, ctx.arena, body) catch |err| {
+                // 修复低优先：非解析错误（如 OOM）向上传播，不能吞成 400。
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 _ = res.statusCode(.bad_request);
                 try res.text("invalid JSON body");
                 return;
@@ -135,6 +151,17 @@ test "parseJson rejects malformed JSON" {
     // Malformed JSON should produce a parse error
     _ = parseJson(S, arena.allocator(), "not json") catch return;
     try std.testing.expect(false); // should have returned above
+}
+
+test "isJsonContentType matches application/json but not lookalikes" {
+    try std.testing.expect(isJsonContentType("application/json"));
+    try std.testing.expect(isJsonContentType("application/json; charset=utf-8"));
+    try std.testing.expect(isJsonContentType("Application/JSON"));
+    try std.testing.expect(isJsonContentType("application/json \t"));
+    // 误命中变体：这些都不应匹配
+    try std.testing.expect(!isJsonContentType("application/json-patch+json"));
+    try std.testing.expect(!isJsonContentType("application/json5"));
+    try std.testing.expect(!isJsonContentType("application/xml"));
 }
 
 test {

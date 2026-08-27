@@ -94,6 +94,11 @@ pub const PathParams = struct {
     pub fn deinit(self: *PathParams, _: std.mem.Allocator) void {
         self.len = 0;
     }
+
+    /// 清空所有绑定（保留容量）。供 router 在 HEAD→GET 回退前撤销上一轮残留参数（P2-6）。
+    pub fn clear(self: *PathParams) void {
+        self.len = 0;
+    }
 };
 
 /// 请求级可变状态（每个请求一个实例）。
@@ -184,6 +189,26 @@ pub const Context = struct {
     /// 由 Server 注入；handler 通过 ctx.service(T) 取回，脱离全局变量。
     /// 可能为 null（未注入服务时，如部分单元测试）。
     services: ?*const Services = null,
+    /// 对端 IP 地址（内核 accept 时获得，不可伪造）。
+    /// 由后端（如 zio_server）注入；单元测试手工构造 Context 时为 null。
+    /// per-IP 限流 / 审计日志 / Geofence 必须优先用它，而不是可伪造的代理头（H3/M8）。
+    peer_ip: ?std.Io.net.IpAddress = null,
+
+    /// 对端 IP 的稳定字符串形式（不含端口），适合做 per-IP 限流键 / 审计日志：
+    ///   - IPv4 → 点分十进制，如 "203.0.113.195"
+    ///   - IPv6 → 16 字节大端序的低位十六进制（RFC-5952 压缩省略，但无歧义且稳定）
+    /// 无对端地址时为 null；缓冲区不够时截断不可靠，调用方给足 ≥ 64 字节。
+    pub fn peerIpString(self: *const Context, buf: []u8) ?[]const u8 {
+        const ip = self.peer_ip orelse return null;
+        var w = std.Io.Writer.fixed(buf);
+        switch (ip) {
+            .ip4 => |a| w.print("{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch return null,
+            .ip6 => |a| {
+                for (a.bytes) |b| w.print("{x:0>2}", .{b}) catch return null;
+            },
+        }
+        return w.buffered();
+    }
 
     /// 取回某类型的应用级服务，未注册或未注入服务容器时返回 null。
     /// 用法：`const sm = ctx.service(SessionManager) orelse return error...;`
@@ -347,6 +372,49 @@ test "Context.param delegates to state.path_params" {
     try std.testing.expectEqualStrings("123", ctx.param("id").?);
 }
 
-test{
+test "Context.peerIpString 格式化内核对端 IP（H3  plumbing）" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{};
+    defer state.deinit(arena.allocator());
+    var req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET / HTTP/1.1\r\n\r\n",
+        .head_copy = null,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = RequestConfig{};
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+        .peer_ip = .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 195 }, .port = 8080 } },
+    };
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("203.0.113.195", ctx.peerIpString(&buf).?);
+
+    // v6 也能格式化
+    // v6 也能格式化（16 字节大端 hex，无歧义）
+    ctx.peer_ip = .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } };
+    try std.testing.expectEqualStrings("00000000000000000000000000000001", ctx.peerIpString(&buf).?);
+
+    // 无对端地址 → null
+    ctx.peer_ip = null;
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.peerIpString(&buf));
+}
+
+test {
     std.testing.refAllDecls(@This());
 }

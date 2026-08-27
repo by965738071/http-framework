@@ -162,6 +162,6 @@ test "AppError factories produce correct status codes" {
     try std.testing.expectEqual(http.Status.not_implemented, AppError.notImplemented("x").status);
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }

@@ -13,7 +13,7 @@ const std = @import("std");
 ///
 ///     http_framework  → 以上全部（伞形聚合）
 ///
-/// 回应 bug.md §1：core 不再是一个"最小核心"捷 5 层职责。
+/// 回应 bug.md §1：core 不再是一个"最小核心"，而是按 5 层职责拆分。
 /// 回应 bug.md §6：addon 可以互相依赖（DAG），不再是星形。
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

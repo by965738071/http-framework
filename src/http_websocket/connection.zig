@@ -84,6 +84,12 @@ pub const WebSocket = struct {
     /// 为 null 时退化成计数器派生 —— 仅可用于单元测试，不要用于真实客户端。
     io: ?std.Io = null,
 
+    /// 发送互斥锁（修复 M19）：服务端推送任务与 receive() 内自动 pong/close
+    /// 可能并发写同一个 writer，字节流交错会破坏帧边界。send() 全程持锁，
+    /// 保证单帧的 encode+flush 原子完成（相对其他发送方）。
+    /// io 为 null（仅单元测试）时无并发前提，跳过加锁。
+    send_mutex: std.Io.Mutex = .init,
+
     const Self = @This();
 
     /// 服务端模式构造（发送不 mask）。
@@ -132,6 +138,11 @@ pub const WebSocket = struct {
     /// stream writer，默认 8KB 缓冲）。只 encode 不 flush 的话帧会一直卡在缓冲区，
     /// 对端在缓冲填满前收不到任何东西 —— echo/推送场景表现为「WebSocket 毫无反应」。
     fn send(self: *Self, opcode: OpCode, payload: []const u8) !void {
+        // 修复 M19：持锁发送，避免推送任务与 auto-pong 交错写同一 writer。
+        // 只有真实 io（多任务并发）才有竞态；单元测试 io 为 null，不加锁。
+        if (self.io) |io| self.send_mutex.lockUncancelable(io);
+        defer if (self.io) |io| self.send_mutex.unlock(io);
+
         if (self.is_client) {
             // RFC 6455 §5.3: 客户端每帧必须用不可预测的随机 mask key，
             // 防经过代理时的缓存投毒攻击。
@@ -179,6 +190,10 @@ pub const WebSocket = struct {
     /// payload 格式：2 字节状态码（big endian）+ reason UTF-8。
     pub fn close(self: *Self, code: CloseCode, reason: []const u8) !void {
         if (self.closed) return; // 关闭握手已发起，幂等返回
+
+        // 禁止把 1005/1006/1015 等保留码写到线路上（RFC §7.4.1）。
+        if (!isValidCloseCode(@backingInt(code))) return error.InvalidCloseCode;
+
         self.closed = true;
 
         // close payload = code(2) + reason；控制帧上限 125，减去 2 字节 code 后 reason ≤ 123
@@ -218,6 +233,10 @@ pub const WebSocket = struct {
             // 修复 E3：服务端必须拒绝未 mask 的客户端帧（RFC §5.1）。
             if (!self.is_client and !f.mask) return error.ProtocolError;
 
+            // 修复：客户端模式必须拒绝 mask 的服务端帧（RFC §5.1）——
+            // 服务端→客户端帧不得 mask，否则必须失败连接。
+            if (self.is_client and f.mask) return error.ProtocolError;
+
             switch (f.opcode) {
                 .ping => {
                     // RFC §5.5.2: 收到 ping 必须尽快回相同 payload 的 pong。
@@ -229,6 +248,13 @@ pub const WebSocket = struct {
                     continue;
                 },
                 .close => {
+                    // RFC §5.5.1：close payload 长度必须为 0 或 ≥ 2（P2-17）。
+                    // 长度为 1 无法容纳 2 字节 close code → 协议错误。
+                    if (f.payload.len == 1) return error.ProtocolError;
+                    // close reason（code 之后的字节）必须是合法 UTF-8（RFC §5.5.1 / §8.1）。
+                    if (f.payload.len > 2 and !std.unicode.utf8ValidateSlice(f.payload[2..])) {
+                        return error.ProtocolError;
+                    }
                     // RFC §7.1.2: 收到 close 后应回一个 close（如果还没发过）。
                     if (!self.closed) {
                         self.closed = true;
@@ -310,7 +336,8 @@ pub const WebSocket = struct {
 fn isValidCloseCode(code: u16) bool {
     return switch (code) {
         1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011 => true,
-        3000...4999 => true, // 应用/私有保留区间
+        1012, 1013, 1014 => true, // RFC 6455 §7.4.2: 服务重启/负载过高/处理异常 (修复 M15)
+        3000...4999 => true, // 应用/私有保留区
         else => false,
     };
 }
@@ -507,6 +534,49 @@ test "close method sends close frame and is idempotent" {
     const code = std.mem.readInt(u16, f.payload[0..2], .big);
     try testing.expectEqual(@as(u16, 1000), code);
     try testing.expectEqualStrings("bye", f.payload[2..]);
+}
+
+test "close method rejects reserved code 1005 (low-prio)" {
+    const allocator = testing.allocator;
+
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var dummy_r: std.Io.Reader = .fixed("");
+    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator);
+
+    // 1005 (no_status_received) 不得出现在线路上。
+    const err = ws.close(@fromBackingInt(@intCast(1005)), "");
+    try testing.expectError(error.InvalidCloseCode, err);
+    // 失败后不应发送任何帧。
+    try testing.expectEqual(@as(usize, 0), out_w.written().len);
+}
+
+test "peer closing with 1013/1014 is not re-encoded as 1002 (M15)" {
+    const allocator = testing.allocator;
+
+    var input_w: std.Io.Writer.Allocating = .init(allocator);
+    defer input_w.deinit();
+    var close_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &close_buf, 1013, .big);
+    try writeTestFrame(&input_w.writer, .close, true, &close_buf, true, .{ 0x01, 0x02, 0x03, 0x04 });
+    const input = try allocator.dupe(u8, input_w.written());
+    defer allocator.free(input);
+
+    var r: std.Io.Reader = .fixed(input);
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+
+    try testing.expectError(error.ConnectionClosed, ws.receive());
+
+    const sent = out_w.written();
+    var sent_r: std.Io.Reader = .fixed(sent);
+    var reply = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
+    defer allocator.free(reply.payload);
+    try testing.expectEqual(OpCode.close, reply.opcode);
+    const reply_code = std.mem.readInt(u16, reply.payload[0..2], .big);
+    // 1013 是合法状态码，必须原样回显，不能改成 1002。
+    try testing.expectEqual(@as(u16, 1013), reply_code);
 }
 
 test {

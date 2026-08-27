@@ -81,22 +81,25 @@ pub const FormData = struct {
 
 /// 解析 Content-Type 头里的 boundary 参数。
 /// `multipart/form-data; boundary=----WebKitFormBoundaryxxx`
+/// 按 `;` 切参数，精确匹配 `boundary=` token（修复 M17：`xboundary=` 不再误匹配），
+/// 并拒绝空值 / 超 70 字符（RFC 2046 §5.1.1）。
 pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
-    const boundary_key = "boundary=";
-    const idx = std.mem.indexOf(u8, content_type, boundary_key) orelse return null;
-    var boundary = content_type[idx + boundary_key.len ..];
-    // boundary 可能被引号包围
-    if (boundary.len > 0 and boundary[0] == '"') {
-        boundary = boundary[1..];
-        const end = std.mem.indexOfScalar(u8, boundary, '"') orelse return null;
-        return boundary[0..end];
+    var params = std.mem.splitSequence(u8, content_type, ";");
+    _ = params.next(); // 跳过媒体类型 "multipart/form-data"
+    while (params.next()) |raw_param| {
+        const param = std.mem.trim(u8, raw_param, " \t");
+        if (!std.ascii.startsWithIgnoreCase(param, "boundary=")) continue;
+        var boundary = param["boundary=".len..];
+        // 引号包围：剥掉首尾引号
+        if (boundary.len >= 2 and boundary[0] == '"' and boundary[boundary.len - 1] == '"') {
+            boundary = boundary[1 .. boundary.len - 1];
+        }
+        // RFC 2046 §5.1.1：boundary 必须非空且 ≤70 字符，否则视为无有效 boundary。
+        if (boundary.len == 0) return null;
+        if (boundary.len > 70) return null;
+        return boundary;
     }
-    // 无引号：在第一个 `;` 或空白处截断（否则 `boundary=xyz; charset=..` 会把
-    // 后面的参数当成分隔符的一部分，导致解析不出 parts）。
-    for (boundary, 0..) |c, i| {
-        if (c == ';' or c == ' ' or c == '\t') return boundary[0..i];
-    }
-    return boundary;
+    return null;
 }
 
 /// 从 Context 解析 multipart 表单。
@@ -118,6 +121,8 @@ pub fn from(ctx: *Context, limit: u64) !FormData {
 /// 从 body 字节解析 multipart 表单。
 pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []const u8) !FormData {
     var form = FormData{ .allocator = allocator };
+    // 中途出错时（如 TooManyParts / 分配失败）释放已 put 的哈希桶（修复 M 低危）。
+    errdefer form.deinit();
 
     // 每个 part 以 \r\n--boundary\r\n 分隔
     // 第一个 part 前面有 --boundary\r\n
@@ -146,15 +151,28 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
         part_count += 1;
         if (part_count > MAX_PARTS) return error.TooManyParts;
 
-        // 找下一个 delimiter（以 \r\n 开头）
-        const part_end = std.mem.indexOfPos(u8, body, pos, next_delim_search) orelse break;
-        const part_data = body[pos..part_end];
+        // 找下一个 delimiter（以 \r\n 开头）。命中后必须校验后继字节是
+        // \r\n（下一个 part）或 --（结束标记）；否则是文件内容里的边界子串，
+        // 继续向后找，避免假分割（修复 M18）。
+        var search_from = pos;
+        var part_end: ?usize = null;
+        while (part_end == null) {
+            const found = std.mem.indexOfPos(u8, body, search_from, next_delim_search) orelse break;
+            const after = found + next_delim_search.len;
+            if (after < body.len and (body[after] == '\r' or body[after] == '-')) {
+                part_end = found;
+            } else {
+                search_from = found + 1; // 假命中（boundary 是更长 token 的前缀），往后找
+            }
+        }
+        const pe = part_end orelse break;
+        const part_data = body[pos..pe];
 
         // 解析这个 part
         try parsePart(allocator, part_data, &form);
 
         // 移动到下一个 part
-        pos = part_end + 2 + delimiter.len;
+        pos = pe + 2 + delimiter.len;
     }
 
     return form;
@@ -167,8 +185,9 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
     // \r\n
     // <body>\r\n
 
-    // 找 \r\n\r\n 分隔头和体
-    const header_body_sep = std.mem.indexOf(u8, part, "\r\n\r\n") orelse return;
+    // 找 \r\n\r\n 分隔头和体。P2-27：找不到则这是个畸形 part，
+    // 报错而不是静默丢弃（旧代码 return 会让畸形表单看起来“少了一个字段”）。
+    const header_body_sep = std.mem.indexOf(u8, part, "\r\n\r\n") orelse return error.MalformedPart;
     const header_block = part[0..header_body_sep];
     const body_data = part[header_body_sep + 4 ..];
 
@@ -212,23 +231,49 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
 fn extractParam(line: []const u8, key: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < line.len) {
-        // 定位下一个 key
-        const found = std.mem.indexOfPos(u8, line, i, key) orelse return null;
-        // key 前一字符必须是分隔符（行首 / `;` / 空白），否则是子串误匹配。
-        const boundary_ok = found == 0 or line[found - 1] == ';' or line[found - 1] == ' ' or line[found - 1] == '\t';
-        const after = found + key.len;
-        if (boundary_ok and after < line.len and line[after] == '=') {
-            var v = line[after + 1 ..];
-            if (v.len > 0 and v[0] == '"') {
-                v = v[1..];
-                const end = std.mem.indexOfScalar(u8, v, '"') orelse return null;
-                return v[0..end];
+        const c = line[i];
+        // 进入引号：跳过直到闭合引号（处理 \ 转义），引号内的 key 子串不参与匹配
+        // （修复 M16：`filename="a; name=b"` 不能注入假的 `name` token）。
+        if (c == '"') {
+            i += 1;
+            while (i < line.len) {
+                if (line[i] == '\\') {
+                    i += 2; // 跳过转义字符与下一个字符
+                } else {
+                    const closed = line[i] == '"'; // 记录后再 i+=1
+                    i += 1;
+                    if (closed) break;
+                }
             }
-            // 无引号：到 `;` 或行尾
-            const end = std.mem.indexOfScalar(u8, v, ';') orelse v.len;
-            return std.mem.trim(u8, v[0..end], " \t");
+            continue;
         }
-        i = found + key.len;
+        // 非引号上下文：尝试匹配 key。
+        if (i + key.len <= line.len and std.mem.eql(u8, line[i .. i + key.len], key)) {
+            const boundary_ok = i == 0 or line[i - 1] == ';' or line[i - 1] == ' ' or line[i - 1] == '\t';
+            const after = i + key.len;
+            if (boundary_ok and after < line.len and line[after] == '=') {
+                var v = line[after + 1 ..];
+                if (v.len > 0 and v[0] == '"') {
+                    v = v[1..];
+                    // 找到闭合引号（跳过 `\"` 转义），返回引号内内容（保留转义序列原样）。
+                    var j: usize = 0;
+                    while (j < v.len) {
+                        if (v[j] == '\\') {
+                            j += 2;
+                        } else if (v[j] == '"') {
+                            return v[0..j];
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    return null; // 未闭合：视为缺引号
+                }
+                // 无引号：到 `;` 或行尾
+                const end = std.mem.indexOfScalar(u8, v, ';') orelse v.len;
+                return std.mem.trim(u8, v[0..end], " \t");
+            }
+        }
+        i += 1;
     }
     return null;
 }
@@ -316,6 +361,62 @@ test "parseBody handles multiple fields" {
 
     try std.testing.expectEqualStrings("bob", form.getText("name").?);
     try std.testing.expectEqualStrings("25", form.getText("age").?);
+}
+
+test "extractParam ignores key inside quoted value (M16)" {
+    // filename 的值里含 ` name=b` 子串，不得被当成真的 name token。
+    const line = "form-data; filename=\"a; name=b\"; name=\"real\"";
+    try std.testing.expectEqualStrings("real", extractParam(line, "name").?);
+    try std.testing.expectEqualStrings("a; name=b", extractParam(line, "filename").?);
+}
+
+test "extractParam handles backslash escape inside quotes (M16)" {
+    // filename 值里含 `\"` 转义引号：引号在 ` name=c` 之后才闭合，
+    // 内部的 ` name=c` 不得被当成真的 name token。
+    const line = "form-data; filename=\"a\\\"b; name=c\"; name=\"y\"";
+    try std.testing.expectEqualStrings("y", extractParam(line, "name").?);
+    try std.testing.expectEqualStrings("a\\\"b; name=c", extractParam(line, "filename").?);
+}
+
+test "extractParam still finds unquoted values" {
+    const line = "form-data; name=plain; filename=img.txt";
+    try std.testing.expectEqualStrings("plain", extractParam(line, "name").?);
+    try std.testing.expectEqualStrings("img.txt", extractParam(line, "filename").?);
+}
+
+test "extractBoundary rejects empty boundary (M17)" {
+    try std.testing.expect(extractBoundary("multipart/form-data; boundary=") == null);
+}
+
+test "extractBoundary does not match xboundary (M17)" {
+    try std.testing.expect(extractBoundary("multipart/form-data; xboundary=----foo") == null);
+}
+
+test "extractBoundary enforces 70-char limit (M17)" {
+    const long: [71]u8 = @splat('b');
+    const ct = "multipart/form-data; boundary=" ++ long;
+    try std.testing.expect(extractBoundary(ct) == null);
+}
+
+test "parseBody ignores boundary substring inside file content (M18)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // 文件内容里含 `\r\n--boundaryXYZ` 子串，不得造成假分割。
+    const body =
+        "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"data\"; filename=\"f.bin\"\r\n" ++
+        "\r\n" ++
+        "abc\r\n--boundaryXYZ def\r\n" ++
+        "--boundary--\r\n";
+
+    var form = try parseBody(arena.allocator(), body, "--boundary");
+    defer form.deinit();
+
+    const file = form.getFile("data").?;
+    // 文件内容必须完整包含边界子串，不能在中途被切断（不含终止 CRLF）。
+    try std.testing.expectEqualStrings("abc\r\n--boundaryXYZ def", file.data);
 }
 
 test {

@@ -54,7 +54,8 @@ pub const CorsMiddleware = struct {
             }
             // 不 block 但也不加 CORS 头——浏览器会自己拒绝。
             // 配了白名单时响应随 Origin 而变，补 Vary: Origin 防缓存污染。
-            if (self.config.allowed_origins != null) _ = res.header("Vary", "Origin") catch {};
+            // 通配符配置（null 或列表含 "*"）响应不随 Origin 变，无需 Vary。
+            if (self.config.allowed_origins != null and !self.isWildcardAllow()) _ = res.header("Vary", "Origin") catch {};
             try next.call(ctx, res);
             return;
         }
@@ -73,9 +74,22 @@ pub const CorsMiddleware = struct {
     }
 
     fn isOriginAllowed(self: *const Self, origin: []const u8) bool {
+        // 修复 bug.md §6 cors.zig:86-99：管理员把 `"*"` 写进 allowed_origins 列表时，
+        // 应归一化为通配符语义（任意 Origin 放行），而不是只剩一个字面量 `*` 可匹配
+        // ——旧的精确匹配会让所有真实跨域请求被拒（或反射不了任何浏览器 Origin）。
         const allowed = self.config.allowed_origins orelse return true; // null = 通配符
         for (allowed) |o| {
+            if (std.mem.eql(u8, o, "*")) return true;
             if (std.mem.eql(u8, o, origin)) return true;
+        }
+        return false;
+    }
+
+    /// 是否按通配符处理：allowed_origins 为 null，或列表里显式写了 `"*"`。
+    fn isWildcardAllow(self: *const Self) bool {
+        const allowed = self.config.allowed_origins orelse return true;
+        for (allowed) |o| {
+            if (std.mem.eql(u8, o, "*")) return true;
         }
         return false;
     }
@@ -83,7 +97,8 @@ pub const CorsMiddleware = struct {
     fn addCorsHeaders(self: *Self, arena: std.mem.Allocator, res: *Response, origin: []const u8, is_preflight: bool) !void {
         // Allow-Origin
         // 修复 D1：禁止“反射任意 Origin + 允许凭据”这个 CORS 规范禁止的组合。
-        const wildcard = self.config.allowed_origins == null;
+        // isWildcardAllow：allowed_origins 为 null 或列表含 "*"（归一化，bug.md §6）。
+        const wildcard = self.isWildcardAllow();
         if (wildcard and self.config.allow_credentials) {
             _ = try res.header("Access-Control-Allow-Origin", "*");
             // 此时不发 Allow-Credentials（`*` 与凭据互斥）。

@@ -83,8 +83,7 @@ pub const DeviceStore = DeviceModel.Store;
 
 /// 设备列表（支持 type/status 过滤）
 pub fn deviceListHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
-    const all_devices = try store.all();
-    defer store.allocator.free(all_devices);
+    const all_devices = try store.all(ctx.arena);
 
     // 支持 query 参数过滤
     const type_filter = ctx.query("type");
@@ -93,7 +92,7 @@ pub fn deviceListHandler(ctx: *framework.Context, res: *framework.Response, stor
     // 如果有过滤条件，进行过滤
     if (type_filter != null or status_filter != null) {
         var filtered = std.ArrayList(OrmDevice).empty;
-        defer filtered.deinit(store.allocator);
+        defer filtered.deinit(ctx.arena);
 
         for (all_devices) |device| {
             var match = true;
@@ -108,7 +107,7 @@ pub fn deviceListHandler(ctx: *framework.Context, res: *framework.Response, stor
                 }
             }
             if (match) {
-                try filtered.append(store.allocator, device);
+                try filtered.append(ctx.arena, device);
             }
         }
         try res.json(.{ .total = filtered.items.len, .devices = filtered.items });
@@ -201,7 +200,7 @@ pub fn deviceCreateHandler(ctx: *framework.Context, res: *framework.Response, st
 pub fn deviceGetHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
     const id = parseId(ctx, res) orelse return;
 
-    const device = try store.findById(id) orelse {
+    const device = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(res, framework.AppError.notFound("device not found"));
         return;
     };
@@ -213,7 +212,7 @@ pub fn deviceGetHandler(ctx: *framework.Context, res: *framework.Response, store
 pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
     const id = parseId(ctx, res) orelse return;
 
-    var device = try store.findById(id) orelse {
+    var device = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(res, framework.AppError.notFound("device not found"));
         return;
     };

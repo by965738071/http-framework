@@ -201,8 +201,8 @@ pub const RequireAuthMiddleware = struct {
 
         // 验证用户存在
         const store = self.services.users;
-        const all_users = try store.all();
-        defer self.services.allocator.free(all_users);
+        const all_users = try store.all(self.services.allocator);
+        defer store.freeRows(self.services.allocator, all_users);
 
         var found = false;
         for (all_users) |u| {
@@ -247,8 +247,8 @@ pub const RequireRoleMiddleware = struct {
 
         // 验证角色
         const store = self.services.users;
-        const all_users = try store.all();
-        defer self.services.allocator.free(all_users);
+        const all_users = try store.all(self.services.allocator);
+        defer store.freeRows(self.services.allocator, all_users);
 
         for (all_users) |u| {
             if (std.mem.eql(u8, u.username, username)) {
@@ -320,8 +320,8 @@ pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, servic
     };
 
     const store = services.users;
-    const users = try store.all();
-    defer services.allocator.free(users);
+    const users = try store.all(services.allocator);
+    defer store.freeRows(services.allocator, users);
 
     var user_found = false;
     var role: Role = .viewer;
@@ -380,8 +380,8 @@ pub fn logoutHandler(_: *framework.Context, res: *framework.Response, _: *AdminS
 
 /// GET /admin/dashboard — 仪表盘数据
 pub fn dashboardHandler(_: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    const users = try services.users.all();
-    defer services.allocator.free(users);
+    const users = try services.users.all(services.allocator);
+    defer services.users.freeRows(services.allocator, users);
 
     var admin_count: u64 = 0;
     var editor_count: u64 = 0;
@@ -397,8 +397,8 @@ pub fn dashboardHandler(_: *framework.Context, res: *framework.Response, service
         }
     }
 
-    const logs = try services.logs.all();
-    defer services.allocator.free(logs);
+    const logs = try services.logs.all(services.allocator);
+    defer services.logs.freeRows(services.allocator, logs);
 
     try res.json(.{
         .total_users = users.len,
@@ -412,8 +412,8 @@ pub fn dashboardHandler(_: *framework.Context, res: *framework.Response, service
 
 /// GET /admin/users — 用户列表
 pub fn userListHandler(_: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    const users = try services.users.all();
-    defer services.allocator.free(users);
+    const users = try services.users.all(services.allocator);
+    defer services.users.freeRows(services.allocator, users);
     try res.json(.{ .total = users.len, .users = users });
 }
 
@@ -458,7 +458,7 @@ pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, serv
 /// GET /admin/users/:id — 获取单个用户
 pub fn userGetHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     const id = parseId(ctx, res) orelse return;
-    const user = try services.users.findById(id) orelse {
+    const user = try services.users.findById(ctx.arena, id) orelse {
         try ctx.failWith(res, framework.AppError.notFound("user not found"));
         return;
     };
@@ -476,7 +476,7 @@ pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, serv
     const email = (try ctx.formDecoded("email", 1 << 16)) orelse "";
     const role = (try ctx.formDecoded("role", 1 << 16)) orelse "";
 
-    const existing = try services.users.findById(id) orelse {
+    const existing = try services.users.findById(ctx.arena, id) orelse {
         try ctx.failWith(res, framework.AppError.notFound("user not found"));
         return;
     };
@@ -518,8 +518,8 @@ pub fn logListHandler(ctx: *framework.Context, res: *framework.Response, service
     const offset_str = ctx.query("offset") orelse "0";
     const offset = std.fmt.parseInt(u64, offset_str, 10) catch 0;
 
-    const logs = try services.logs.all();
-    defer services.allocator.free(logs);
+    const logs = try services.logs.all(services.allocator);
+    defer services.logs.freeRows(services.allocator, logs);
 
     const start = if (offset < logs.len) offset else logs.len;
     const end = if (offset + limit < logs.len) offset + limit else logs.len;
@@ -565,8 +565,7 @@ pub fn meHandler(ctx: *framework.Context, res: *framework.Response, services: *A
     const role_str = sessions.getValue(session_id, "role", ctx.arena) catch null orelse "viewer";
 
     const store = services.users;
-    const users = try store.all();
-    defer services.allocator.free(users);
+    const users = try store.all(ctx.arena);
 
     var found_user: ?OrmAdminUser = null;
     for (users) |u| {

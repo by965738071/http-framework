@@ -6,12 +6,11 @@
     .keywords = .{ "zig", "http", "framework", "websocket", "orm" },
     .fingerprint = 0xfe7cb1c07e898ad5,
     .dependencies = .{
-       // .zio = .{ .path = "../../zio" },
-       .zio= .{
-           .url = "git+https://github.com/lalinsky/zio#zig-0.17",
-           .hash = "zio-0.17.0-xHbVVJhmJgDCkSLd-chGMOmcpcOlUTTnpNt2_zJJhZVZ",
-           
-       }
+        // .zio = .{ .path = "../../zio" },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#zig-0.17",
+            .hash = "zio-0.17.0-xHbVVC8rKQC-IaVNQvJWKA_ACKKh6BdQ1PZyS9zqJpq-",
+        },
     },
     .minimum_zig_version = "0.17.0-dev.889+e6be5cfe3",
     .paths = .{

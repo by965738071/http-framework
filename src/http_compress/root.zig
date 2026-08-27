@@ -46,6 +46,9 @@ pub const Encoding = enum {
 pub const CompressConfig = struct {
     /// 最小压缩 body 大小（字节）。小于此值不压缩。
     min_size: usize = 1024,
+    /// 最大压缩 body 大小（字节）。超过此值不压缩、原样透传，避免缓冲模式
+    /// 压缩任意大 body 时峰值内存约 3× body。0 表示不设上限。
+    max_size: usize = 0,
     /// 压缩等级（1=最快, 6=默认, 9=最佳）
     level: flate.Compress.Options = .default,
     /// 支持的编码（按优先级）
@@ -110,6 +113,12 @@ pub const CompressMiddleware = struct {
             return;
         }
 
+        // 跳过条件：太大（缓冲模式压缩峰值内存约 3× body，超限透传避免内存峰值）
+        if (self.config.max_size != 0 and body.len > self.config.max_size) {
+            try res.flush();
+            return;
+        }
+
         // 跳过条件：已有 Content-Encoding
         if (hasHeader(res, "content-encoding")) {
             try res.flush();
@@ -143,31 +152,50 @@ pub const CompressMiddleware = struct {
 /// 修复 F7：按 token 解析并尊重 q=0（显式拒绝），避免 `gzip;q=0` 仍选 gzip、
 /// 以及 `x-gzip` 之类子串误匹配。
 pub fn chooseEncoding(accept: []const u8, supported: []const Encoding) ?Encoding {
+    // 精确匹配：按服务端优先级返回第一个被接受的编码。
     for (supported) |enc| {
-        if (acceptsEncoding(accept, enc.headerValue())) return enc;
+        if (encodingAcceptance(accept, enc.headerValue()) == .accepted) return enc;
+    }
+    // RFC 9110 §12.5.3：`Accept-Encoding: *` 通配符匹配任意编码。当存在
+    // q!=0 的 `*` 且没有精确匹配时，回退到服务端首选编码——但要跳过被
+    // `q=0` 显式拒绝的编码：`gzip;q=0, *` 里 gzip 不可用，应选下一个。
+    if (encodingAcceptance(accept, "*") == .accepted) {
+        for (supported) |enc| {
+            if (encodingAcceptance(accept, enc.headerValue()) != .rejected) return enc;
+        }
     }
     return null;
 }
 
-/// 在 Accept-Encoding 列表里查找某个 token，返回它是否被接受（q!=0）。
-fn acceptsEncoding(accept: []const u8, token: []const u8) bool {
+/// 某个 coding token 在 Accept-Encoding 里的接受度（RFC 9110 §12.5.3）。
+const Acceptance = enum { accepted, rejected, unspecified };
+
+/// 在 Accept-Encoding 列表里查找某个 token，区分显式接受 / 显式拒绝（q=0）/ 未提及。
+fn encodingAcceptance(accept: []const u8, token: []const u8) Acceptance {
     var it = std.mem.splitScalar(u8, accept, ',');
     while (it.next()) |raw| {
         var part = std.mem.trim(u8, raw, " \t");
-        // 拆出 coding 与参数（q 值）
         var q_zero = false;
         if (std.mem.indexOfScalar(u8, part, ';')) |semi| {
             const params = part[semi + 1 ..];
             part = std.mem.trim(u8, part[0..semi], " \t");
-            // 查找 q=0（允许 q=0, q=0.0 等）
-            if (std.mem.indexOf(u8, params, "q=")) |qi| {
-                const qval = std.mem.trim(u8, params[qi + 2 ..], " \t");
-                if (parseQZero(qval)) q_zero = true;
+            // 按 ; 切分参数，精确匹配键名为 q 的参数——避免 `gzip;eq=0;q=1`
+            // 里 eq=0 被误判为 q=0。
+            var pit = std.mem.splitScalar(u8, params, ';');
+            while (pit.next()) |param| {
+                const p = std.mem.trim(u8, param, " \t");
+                if (std.mem.indexOfScalar(u8, p, '=')) |eq| {
+                    const key = std.mem.trim(u8, p[0..eq], " \t");
+                    if (std.ascii.eqlIgnoreCase(key, "q")) {
+                        const qval = std.mem.trim(u8, p[eq + 1 ..], " \t");
+                        if (parseQZero(qval)) q_zero = true;
+                    }
+                }
             }
         }
-        if (std.ascii.eqlIgnoreCase(part, token)) return !q_zero;
+        if (std.ascii.eqlIgnoreCase(part, token)) return if (q_zero) .rejected else .accepted;
     }
-    return false;
+    return .unspecified;
 }
 
 /// 判断 q 值字符串是否等价于 0（如 "0", "0.0", "0.00"）。
@@ -290,6 +318,35 @@ test "chooseEncoding selects deflate when only deflate accepted" {
 
 test "chooseEncoding returns null when no supported encoding" {
     try std.testing.expect(chooseEncoding("br", &.{ .gzip, .deflate }) == null);
+}
+
+test "chooseEncoding does not mis-parse q param with other params" {
+    // `gzip;eq=0;q=1` 里 eq=0 不是 q 值，gzip 应被接受（旧实现会误判为 q=0 拒绝）。
+    const enc = chooseEncoding("gzip;eq=0;q=1", &.{ .gzip, .deflate }).?;
+    try std.testing.expectEqual(Encoding.gzip, enc);
+}
+
+test "chooseEncoding respects explicit q=0 rejection" {
+    try std.testing.expect(chooseEncoding("gzip;q=0", &.{ .gzip, .deflate }) == null);
+}
+
+test "chooseEncoding handles Accept-Encoding wildcard" {
+    // `*` 通配符：无精确匹配时回退服务端首选编码（RFC 9110 §12.5.3）。
+    const enc = chooseEncoding("*", &.{ .gzip, .deflate }).?;
+    try std.testing.expectEqual(Encoding.gzip, enc);
+    // `*;q=0` 拒绝所有：无精确匹配时不应回退。
+    try std.testing.expect(chooseEncoding("*;q=0", &.{ .gzip, .deflate }) == null);
+    // 有精确匹配时精确匹配优先于通配符。
+    const enc2 = chooseEncoding("br, *", &.{ .gzip, .deflate }).?;
+    try std.testing.expectEqual(Encoding.gzip, enc2);
+}
+
+test "chooseEncoding wildcard skips explicitly rejected encodings" {
+    // `gzip;q=0, *`：gzip 被显式拒绝，通配符回退时必须跳过它选 deflate（RFC 9110 §12.5.3）。
+    const enc = chooseEncoding("gzip;q=0, *", &.{ .gzip, .deflate }).?;
+    try std.testing.expectEqual(Encoding.deflate, enc);
+    // 全部显式拒绝时即使有 `*` 也不得回退。
+    try std.testing.expect(chooseEncoding("gzip;q=0, deflate;q=0, *", &.{ .gzip, .deflate }) == null);
 }
 
 test "compress and decompress roundtrip with gzip" {

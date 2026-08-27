@@ -2,6 +2,7 @@
 .zig-cache/
 zig-out
 .DS_Store
+a.dSYM/
 /examples/.zig-cache
 /log
 .test_data/

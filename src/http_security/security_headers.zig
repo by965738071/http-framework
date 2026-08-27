@@ -34,29 +34,32 @@ pub const SecurityHeaders = struct {
     }
 
     pub fn addHeaders(self: *const Self, res: *Response) !void {
+        // 用 setHeader（去重替换）而非 header（追加）：同一响应里若别的中间件/
+        // handler 已设置过同名安全头，应覆盖而不叠加（CSP 多行是交集语义，
+        // Server 头会重复漏出后端，见 bug.md §6）。
         if (self.config.x_content_type_options) |val| {
-            _ = try res.header("X-Content-Type-Options", val);
+            _ = try res.setHeader("X-Content-Type-Options", val);
         }
         if (self.config.x_frame_options) |val| {
-            _ = try res.header("X-Frame-Options", val);
+            _ = try res.setHeader("X-Frame-Options", val);
         }
         if (self.config.content_security_policy) |val| {
-            _ = try res.header("Content-Security-Policy", val);
+            _ = try res.setHeader("Content-Security-Policy", val);
         }
         if (self.config.strict_transport_security) |val| {
-            _ = try res.header("Strict-Transport-Security", val);
+            _ = try res.setHeader("Strict-Transport-Security", val);
         }
         if (self.config.x_xss_protection) |val| {
-            _ = try res.header("X-XSS-Protection", val);
+            _ = try res.setHeader("X-XSS-Protection", val);
         }
         if (self.config.referrer_policy) |val| {
-            _ = try res.header("Referrer-Policy", val);
+            _ = try res.setHeader("Referrer-Policy", val);
         }
         if (self.config.permissions_policy) |val| {
-            _ = try res.header("Permissions-Policy", val);
+            _ = try res.setHeader("Permissions-Policy", val);
         }
         if (self.config.server) |val| {
-            _ = try res.header("Server", val);
+            _ = try res.setHeader("Server", val);
         }
     }
 };

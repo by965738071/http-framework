@@ -88,7 +88,14 @@ pub const Value = union(enum) {
             .string => |s| try writeJsonString(writer, s),
             .int => |n| try writer.print("{d}", .{n}),
             .uint => |n| try writer.print("{d}", .{n}),
-            .float => |n| try writer.print("{d}", .{n}),
+            .float => |n| {
+                if (std.math.isFinite(n)) {
+                    try writer.print("{d}", .{n});
+                } else {
+                    // NaN/±Inf 不是合法 JSON 数字，输出 null 以免破坏整行 JSON
+                    try writer.writeAll("null");
+                }
+            },
             .bool => |b| try writer.writeAll(if (b) "true" else "false"),
             .null => try writer.writeAll("null"),
         }
@@ -193,6 +200,10 @@ pub const Logger = struct {
     /// （writeStreamingAll，无需每请求 stat 重算偏移），跨进程安全且更快。
     /// 为 false（Windows / fcntl 失败）时退回 stat+pwrite 兼容路径。
     append_mode: bool = false,
+    /// 轮转失败后置位：暂停文件写（日志降级到 stderr），不再触碰可能已关闭的 fd。
+    file_paused: bool = false,
+    /// 轮转后待压缩的归档路径（由 log() 在锁外 gzip，压缩后释放）。
+    pending_gzip: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: LoggerConfig) !Logger {
         var self = Logger{
@@ -217,6 +228,9 @@ pub const Logger = struct {
 
     pub fn deinit(self: *Logger) void {
         if (self.config.output == .file) {
+            // 持锁关闭：避免关机期并发日志写已关闭的 fd
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.file.close(self.io);
         }
         if (self.owned_path) |p| {
@@ -276,47 +290,72 @@ pub const Logger = struct {
         const ts: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
 
         switch (self.config.format) {
-            .json => formatJson(&writer, ts, level, ctx, msg, fields) catch return,
-            .text => formatText(&writer, ts, level, ctx, msg, fields) catch return,
+            .json => formatJson(&writer, ts, level, ctx, msg, fields) catch {
+                // 缓冲区写满（WriteFailed）时不能把整条日志丢掉：字段最多、
+                // 最长的日志恰恰是出错时那些。回退成一条截断标记行
+                // （保留 ts/level/rid + "truncated":true）。
+                writer = std.Io.Writer.fixed(&buf);
+                formatTruncated(&writer, ts, level, ctx, msg) catch return;
+            },
+            .text => formatText(&writer, ts, level, ctx, msg, fields) catch {
+                writer = std.Io.Writer.fixed(&buf);
+                formatTruncated(&writer, ts, level, ctx, msg) catch return;
+            },
         }
 
         const written = writer.buffered();
         if (written.len == 0) return;
 
+        // 修复 M10：output 判断与句柄使用整体放在同一把锁内——轮转（可能 close
+        // 文件、reopen 失败降级）也在锁内进行，其它线程不会在锁外读到陈旧 output
+        // 后向已关闭的 fd 写入。
+        self.mutex.lockUncancelable(self.io);
         switch (self.config.output) {
-            .stderr, .stdout => {
-                const out_file = if (self.config.output == .stderr)
-                    std.Io.File.stderr()
-                else
-                    std.Io.File.stdout();
-                // 修复 H4：stderr/stdout 也加锁，避免多线程并发日志行交错（单条
-                // 日志可能超 PIPE_BUF，且 writeStreamingAll 可能拆成多次 write）。
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                out_file.writeStreamingAll(self.io, written) catch {};
-            },
+            .stderr => std.Io.File.stderr().writeStreamingAll(self.io, written) catch {},
+            .stdout => std.Io.File.stdout().writeStreamingAll(self.io, written) catch {},
             .file => {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                if (self.append_mode) {
-                    // O_APPEND 快路径：内核保证每次 write 原子追加到 EOF，
-                    // 无需 stat 重算偏移，也不会留下 NUL 空洞。file_offset 仅
-                    // 增量维护用于轮转判断。
-                    self.file.writeStreamingAll(self.io, written) catch return;
-                    self.file_offset += written.len;
+                if (self.file_paused) {
+                    // 轮转曾失败：file 句柄可能已关闭，暂停文件写降级到 stderr，
+                    // 避免写入被其它 open 复用的 fd（日志字节落进错误文件）。
+                    std.Io.File.stderr().writeStreamingAll(self.io, written) catch {};
                 } else {
-                    // 兼容路径（Windows / fcntl 失败）：每次写入前以 stat 实时
-                    // 校准偏移，避免陈旧偏移 pwrite 在文件中间留下 NUL 空洞。
+                    // 写前以 stat 校准 file_offset（append 与兼容路径统一），避免
+                    // 外部 truncate 后偏移陈旧导致轮转判断过早/过晚（跨进程场景）。
                     if (self.owned_path) |p| {
                         if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
                             self.file_offset = st.size;
                         } else |_| {}
                     }
-                    self.file.writePositionalAll(self.io, written, self.file_offset) catch return;
+                    if (self.append_mode) {
+                        // O_APPEND 快路径：内核保证每次 write 原子追加到 EOF，
+                        // 不会留下 NUL 空洞。
+                        self.file.writeStreamingAll(self.io, written) catch {
+                            self.mutex.unlock(self.io);
+                            return;
+                        };
+                    } else {
+                        // 兼容路径（Windows / fcntl 失败）：stat 校准后 pwrite。
+                        self.file.writePositionalAll(self.io, written, self.file_offset) catch {
+                            self.mutex.unlock(self.io);
+                            return;
+                        };
+                    }
                     self.file_offset += written.len;
+                    self.rotateIfNeeded();
                 }
-                self.rotateIfNeeded();
             },
+        }
+        // 在锁内取走待压缩归档路径：若在锁外读，两个线程可能同时取到同一路径，
+        // 导致重复压缩与双重 free。
+        const pending = self.pending_gzip;
+        self.pending_gzip = null;
+        self.mutex.unlock(self.io);
+
+        // 压缩在锁外执行：轮转时 rename 出归档文件后即释放锁，gzip 整文件
+        // 不阻塞其它日志写（修复低优先：轮转压缩不持日志锁）。
+        if (pending) |rotated| {
+            self.compressToGzip(rotated);
+            self.allocator.free(rotated);
         }
     }
 
@@ -327,8 +366,14 @@ pub const Logger = struct {
         self.rotate();
     }
 
-    /// 轮转：path -> path.1 -> gzip -> path.1.gz，旧备份编号下移，删除最老备份。
-    /// best-effort：任一步失败都退回重开新文件（或 stderr），不阻塞日志写入。
+    /// 轮转：path -> path.1(-> gzip -> path.1.gz)，旧备份编号下移，删除最老备份。
+    ///
+    /// 在 log() 的锁内调用（需持锁才能安全 close/rename/reopen）。gzip 压缩
+    /// 不在锁内做——这里只把当前文件 rename 出并重开新文件，并把待压缩路径
+    /// 记录到 pending_gzip，由 log() 释放锁后压缩。
+    ///
+    /// best-effort：任一步失败都不阻塞日志写入。rename/reopen 失败置
+    /// file_paused（暂停文件写），而非改动 config.output（避免 M10 竞态）。
     fn rotate(self: *Logger) void {
         const path = self.owned_path orelse return;
         const fc = self.config.file orelse return;
@@ -344,58 +389,90 @@ pub const Logger = struct {
             return;
         }
 
-        // 1. 删除最老备份 path.{max}.gz
-        const oldest = std.fmt.allocPrint(allocator, "{s}.{d}.gz", .{ path, max }) catch {
+        // 备份后缀由 compress 设置决定；但无论哪种，都同时迁移 .gz 与裸后缀
+        // 两种备份（修复 M11：compress:false 或某次 gzip 失败留下的未压缩
+        // 备份也能正确下移，max_backups 才真正生效）。
+        const suffix = if (fc.compress) ".gz" else "";
+
+        // 1. 删除最老备份 path.{max}{suffix} 与 path.{max}（两种后缀都清理）
+        const oldest = std.fmt.allocPrint(allocator, "{s}.{d}{s}", .{ path, max, suffix }) catch {
             self.reopen();
             return;
         };
         defer allocator.free(oldest);
         cwd.deleteFile(self.io, oldest) catch {};
+        const oldest_bare = std.fmt.allocPrint(allocator, "{s}.{d}", .{ path, max }) catch {
+            self.reopen();
+            return;
+        };
+        defer allocator.free(oldest_bare);
+        cwd.deleteFile(self.io, oldest_bare) catch {};
 
-        // 2. 反向 shift：path.{i-1}.gz -> path.{i}.gz
+        // 2. 反向 shift：每个索引位同时迁移 .gz 与裸后缀备份
         var i: u8 = max;
         while (i > 1) : (i -= 1) {
-            const from = std.fmt.allocPrint(allocator, "{s}.{d}.gz", .{ path, i - 1 }) catch break;
-            const to = std.fmt.allocPrint(allocator, "{s}.{d}.gz", .{ path, i }) catch {
-                allocator.free(from);
-                break;
-            };
-            cwd.rename(from, cwd, to, self.io) catch {};
-            allocator.free(from);
-            allocator.free(to);
+            const from_gz = std.fmt.allocPrint(allocator, "{s}.{d}.gz", .{ path, i - 1 }) catch break;
+            defer allocator.free(from_gz);
+            const to_gz = std.fmt.allocPrint(allocator, "{s}.{d}.gz", .{ path, i }) catch break;
+            defer allocator.free(to_gz);
+            cwd.rename(from_gz, cwd, to_gz, self.io) catch {};
+
+            const from_bare = std.fmt.allocPrint(allocator, "{s}.{d}", .{ path, i - 1 }) catch break;
+            defer allocator.free(from_bare);
+            const to_bare = std.fmt.allocPrint(allocator, "{s}.{d}", .{ path, i }) catch break;
+            defer allocator.free(to_bare);
+            cwd.rename(from_bare, cwd, to_bare, self.io) catch {};
         }
 
-        // 3. 当前文件改名 path -> path.1
+        // 3. 当前文件改名 path -> path.1。改名成功后，若目标 path.1 已存在
+        //    （上次 gzip 失败遗留的未压缩备份），先显式删除，避免 rename 在
+        //    POSIX 上静默覆盖丢历史（修复低优先：超限残留截断/改名而非静默覆盖）。
         const rotated = std.fmt.allocPrint(allocator, "{s}.{d}", .{ path, 1 }) catch {
             self.reopen();
             return;
         };
+        cwd.deleteFile(self.io, rotated) catch {};
         defer allocator.free(rotated);
         cwd.rename(path, cwd, rotated, self.io) catch {
-            self.reopen();
+            // 改名失败（跨设备/权限等）：暂停文件写，避免向已关闭 fd 写入。
+            self.pauseFileWrites();
             return;
         };
 
-        // 4. gzip 压缩归档（成功后删除未压缩的 path.1）
-        if (fc.compress) self.compressToGzip(rotated);
+        // 4. 需要压缩：记录归档路径，交给 log() 在锁外 gzip。
+        if (fc.compress) {
+            self.pending_gzip = allocator.dupe(u8, rotated) catch null;
+        }
 
-        // 5. 重开新文件
+        // 5. 重开新文件；失败则暂停文件写。
         self.reopen();
     }
 
+    /// 暂停文件写：后续 log() 直接写 stderr，不再触碰可能已关闭的 fd。
+    fn pauseFileWrites(self: *Logger) void {
+        self.file_paused = true;
+    }
+
     /// 将已轮转的归档文件 gzip 压缩为 {src}.gz，并删除未压缩的原文件。
+    /// 由 log() 在释放日志锁后调用，避免阻塞其它日志写。
     fn compressToGzip(self: *Logger, src: []const u8) void {
         const fc = self.config.file orelse return;
         const allocator = self.allocator;
         const cwd = std.Io.Dir.cwd();
 
-        const content = cwd.readFileAlloc(
-            self.io,
-            src,
-            allocator,
-            .limited(fc.max_size + MAX_LOG_LINE),
-        ) catch return;
-        defer allocator.free(content);
+        const cap = fc.max_size + MAX_LOG_LINE;
+        const bytes = blk: {
+            break :blk cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch |e| {
+                // 文件超过压缩上限（异常大）：先截断源文件到 cap 再压缩，避免
+                // 超限归档残留、下次轮转被静默覆盖（修复低优先）。其它错误放弃。
+                if (e != error.StreamTooLong) return;
+                const f = cwd.openFile(self.io, src, .{ .mode = .read_write }) catch return;
+                defer f.close(self.io);
+                if (std.c.ftruncate(f.handle, @intCast(cap)) != 0) return;
+                break :blk cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch return;
+            };
+        };
+        defer allocator.free(bytes);
 
         const gz_path = std.fmt.allocPrint(allocator, "{s}.gz", .{src}) catch return;
         defer allocator.free(gz_path);
@@ -405,19 +482,27 @@ pub const Logger = struct {
 
         var write_buf: [4096]u8 = undefined;
         var file_writer = gz_file.writer(self.io, write_buf[0..]);
-        var hist_buf: [flate.max_window_len]u8 = undefined;
-        var encoder = flate.Compress.init(&file_writer.interface, &hist_buf, .gzip, .default) catch return;
-        encoder.writer.writeAll(content) catch return;
+        // hist_buf (~64KB) 与 flate.Compress (~224KB) 必须堆分配，不能放栈上：
+        // rotate() 在 zio 协程的提交栈里跑，http_compress 模块已明令禁止这种
+        // 模式（“放栈上会直接溢出到 guard page”）。同一仓库不应一个模块知道、
+        // 另一个在犯。
+        const hist_buf = allocator.alloc(u8, flate.max_window_len) catch return;
+        defer allocator.free(hist_buf);
+        const encoder = allocator.create(flate.Compress) catch return;
+        defer allocator.destroy(encoder);
+        encoder.* = flate.Compress.init(&file_writer.interface, hist_buf, .gzip, .default) catch return;
+        encoder.writer.writeAll(bytes) catch return;
         encoder.finish() catch return;
         file_writer.flush() catch return;
 
         cwd.deleteFile(self.io, src) catch {};
     }
 
-    /// 轮转后重开新的日志文件；失败则退回 stderr。
+    /// 轮转后重开新的日志文件；失败则暂停文件写（不改动 config.output，
+    /// 避免 M10 竞态：锁外读到降级后的 output 向已关闭 fd 写入）。
     fn reopen(self: *Logger) void {
         self.openLogFile() catch {
-            self.config.output = .stderr;
+            self.file_paused = true;
         };
     }
 
@@ -496,7 +581,23 @@ fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
     try writer.writeAll("\n");
 }
 
-/// text 日志值转义：将控制字符（含 CR/LF/TAB）转成可见的反斜杠转义，
+/// 当 formatJson/formatText 写满固定缓冲区时的回退：只写最小骨架
+/// （ts/level/rid + "truncated":true），保证出错时那条日志不会整条丢失。
+/// 统一用 JSON 形式（即使配置为 text）——截断行很短，不会再溢出。
+fn formatTruncated(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8) !void {
+    try writer.print("{{\"ts\":{d},\"level\":\"{s}\"", .{ ts, level.name() });
+    if (ctx) |c| {
+        if (c.state.getUserData(RequestId)) |rid| {
+            try writer.writeAll(",\"rid\":");
+            try writeJsonString(writer, rid.slice());
+        }
+    }
+    // msg 只取前 64 字节，避免再次写满。
+    const short = msg[0..@min(msg.len, 64)];
+    try writer.writeAll(",\"msg\":");
+    try writeJsonString(writer, short);
+    try writer.writeAll(",\"truncated\":true}\n");
+}
 /// 防止用户可控内容注入伪造日志行。
 fn writeTextEscaped(writer: *std.Io.Writer, s: []const u8) !void {
     for (s) |c| {

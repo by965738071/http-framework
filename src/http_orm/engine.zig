@@ -78,8 +78,14 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // Try to create the empty file if it doesn't exist
             const file_path = try self.tableFilePath();
             defer allocator.free(file_path);
-            _ = cwd.statFile(self.io, file_path, .{}) catch {
-                try self.writeFile("[]");
+            _ = cwd.statFile(self.io, file_path, .{}) catch |err| {
+                // 仅当文件不存在时初始化空表；其它 stat 错误（如 EACCES）应向上
+                // 传播，避免覆盖已有数据。
+                if (err == error.FileNotFound) {
+                    try self.writeFile("[]");
+                } else {
+                    return err;
+                }
             };
 
             try self.load();
@@ -87,12 +93,12 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         /// 关闭存储：先持久化未写入的数据，再释放资源。
-        /// 若 flush 失败会向上传播错误 — 由调用方决定如何处理。
+        /// 无条件释放资源，最后再报 flush 错误：close 是消费性 API，
+        /// 旧实现在 flush 失败时直接 return，rows / 每行字符串 / id_index / data_dir /
+        /// self 全部泄漏，而调用方连句柄都没了，无法重试。
         pub fn close(self: *Self) !void {
             try self.lock();
-            errdefer self.unlock();
-            try self.flushUnlocked();
-            // 修复 C2：释放所有行的字符串字段。
+            const flush_err = self.flushUnlocked();
             for (self.rows.items) |row| {
                 freeStringFields(T, self.allocator, row);
             }
@@ -102,6 +108,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // mutex 是结构体的一部分，必须先解锁再销毁
             self.unlock();
             self.allocator.destroy(self);
+            return flush_err;
         }
 
         fn tableFilePath(self: *const Self) ![]const u8 {
@@ -153,18 +160,27 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             for (parsed.value) |jrow| {
                 if (jrow != .object) continue;
+                // jsonObjectToType 内部已是泄漏安全的（见其 errdefer）。
                 const row = try jsonObjectToType(T, self.allocator, jrow.object);
-                try self.rows.append(self.allocator, row);
-                const rows_len = self.rows.items.len;
+                // 当前行尚未进入 self.rows：若本迭代后续失败（append OOM / 损坏
+                // 数据返回），errdefer 释放该行已 dup 的字符串，避免与外层 errdefer
+                // （只清理已入列行）冲突或泄漏。
+                errdefer freeStringFields(T, self.allocator, row);
 
-                if (jrow.object.get("id")) |id_val| {
-                    if (id_val == .integer) {
-                        // 修复 H2：负数/越界 id 不直接 @intCast panic，优雅报错。
-                        const row_id: u64 = std.math.cast(u64, id_val.integer) orelse return error.CorruptData;
-                        if (row_id > max_id) max_id = row_id;
-                        try self.id_index.put(row_id, rows_len - 1);
-                    }
-                }
+                // M3：统一以行内实际值 getFieldId 建索引/推进 max_id，不再依赖原始
+                // JSON 的 tag；缺失/≤0/重复 id 一律报损坏数据，杜绝索引与行脱同步。
+                const row_id: u64 = getFieldId(T, row);
+                if (row_id == 0) return error.CorruptData;
+                if (self.id_index.contains(row_id)) return error.CorruptData;
+
+                // 先预留容量，之后 append/putAssumeCapacity 均不可失败（避免把已
+                // dup 的字符串留半截：要么整行进表，要么 errdefer 释放）。
+                try self.id_index.ensureUnusedCapacity(1);
+                try self.rows.ensureUnusedCapacity(self.allocator, 1);
+                const idx = self.rows.items.len;
+                self.rows.appendAssumeCapacity(row);
+                self.id_index.putAssumeCapacity(row_id, idx);
+                if (row_id > max_id) max_id = row_id;
             }
             self.next_id = max_id + 1;
         }
@@ -225,7 +241,8 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 try writer.interface.writeAll(content);
                 try writer.flush();
                 // rename 前落盘，保证 rename 后即使崩溃也不会丢掉内容。
-                file.sync(self.io) catch {};
+                // fsync 失败必须向上传播（不能吞掉，否则数据可能未真正落盘）。
+                try file.sync(self.io);
             }
             try std.Io.Dir.rename(cwd, tmp_path, cwd, file_path, self.io);
         }
@@ -237,7 +254,6 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             defer self.unlock();
 
             const id = self.next_id;
-            self.next_id += 1;
 
             var new_row = row;
             applyDefaults(&new_row);
@@ -245,50 +261,86 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // 唯一约束校验（与其它已存在行比较）
             try self.checkUnique(new_row, null);
 
-            // 修复 C1：deep-copy 字符串字段到 self.allocator，与 load 的所有权模型一致。
+            // 先把两个可失败的容量预留好，之后 append + put 都不会失败。
+            // 旧实现先 dupStringFields 再 append/put：若 id_index.put OOM，
+            // errdefer 会释放字符串，但行已经进了 self.rows → 之后 flush/close 是 UAF。
+            try self.id_index.ensureUnusedCapacity(1);
+            try self.rows.ensureUnusedCapacity(self.allocator, 1);
+            // 字符串深拷贝到 self.allocator（与 load 的所有权模型一致）。
+            // 这是最后一个可失败操作；一旦成功，后续均不会失败。
             try dupStringFields(T, self.allocator, &new_row);
-            errdefer freeStringFields(T, self.allocator, new_row);
 
-            try self.rows.append(self.allocator, new_row);
-            try self.id_index.put(id, self.rows.items.len - 1);
+            self.rows.appendAssumeCapacity(new_row);
+            self.id_index.putAssumeCapacity(id, self.rows.items.len - 1);
+            self.next_id += 1;
             self.dirty = true;
             return id;
         }
 
-        pub fn findAll(self: *Self, query: *QueryBuilder(T)) ![]T {
+        /// 返回匹配的行，行内字符串由 `gpa` 拥有（锁内深拷贝）。
+        /// 调用方负责 freeRow / 或传 ctx.arena 交给请求生命周期。
+        ///
+        /// **必须在锁内深拷贝**：行内 `[]const u8` 由 self.allocator 拥有，
+        /// update/delete/truncate/close 会 freeStringFields 掉它们。若把裸指针越过
+        /// 锁交给调用方（P0-6），并发下就是跨请求数据泄漏 / UAF。
+        pub fn findAll(self: *Self, gpa: std.mem.Allocator, query: *QueryBuilder(T)) ![]T {
+            try query.checkBuildError();
             try self.lock();
             defer self.unlock();
+
+            // 先按未拷贝的行做匹配/排序/分页，最后只对存活行深拷贝字符串，
+            // 否则被分页丢弃的行的 dup 字符串会泄漏。
+            var matched = std.ArrayList(T).empty;
+            defer matched.deinit(self.allocator);
+            for (self.rows.items) |row| {
+                if (query.matches(row)) try matched.append(self.allocator, row);
+            }
+            query.applySorting(&matched);
+            query.applyPagination(&matched);
 
             var results = std.ArrayList(T).empty;
-            errdefer results.deinit(self.allocator);
-
-            for (self.rows.items) |row| {
-                if (query.matches(row)) try results.append(self.allocator, row);
+            errdefer {
+                for (results.items) |r| freeStringFields(T, gpa, r);
+                results.deinit(gpa);
             }
-            query.applySorting(&results);
-            query.applyPagination(&results);
-            return results.toOwnedSlice(self.allocator);
+            try results.ensureTotalCapacityPrecise(gpa, matched.items.len);
+            for (matched.items) |row| {
+                var copy = row;
+                try dupStringFields(T, gpa, &copy);
+                results.appendAssumeCapacity(copy);
+            }
+            return results.toOwnedSlice(gpa);
         }
 
-        pub fn findOne(self: *Self, query: *QueryBuilder(T)) !?T {
+        /// 返回首个匹配行，行内字符串由 `gpa` 拥有（锁内深拷贝）。见 findAll 的所有权说明。
+        pub fn findOne(self: *Self, gpa: std.mem.Allocator, query: *QueryBuilder(T)) !?T {
+            try query.checkBuildError();
             try self.lock();
             defer self.unlock();
 
             for (self.rows.items) |row| {
-                if (query.matches(row)) return row;
+                if (query.matches(row)) {
+                    var copy = row;
+                    try dupStringFields(T, gpa, &copy);
+                    return copy;
+                }
             }
             return null;
         }
 
-        pub fn findById(self: *Self, id: u64) !?T {
+        /// 按主键查找，行内字符串由 `gpa` 拥有（锁内深拷贝）。见 findAll 的所有权说明。
+        pub fn findById(self: *Self, gpa: std.mem.Allocator, id: u64) !?T {
             try self.lock();
             defer self.unlock();
 
             const idx = self.id_index.get(id) orelse return null;
-            return self.rows.items[idx];
+            var copy = self.rows.items[idx];
+            try dupStringFields(T, gpa, &copy);
+            return copy;
         }
 
         pub fn update(self: *Self, query: *QueryBuilder(T)) !usize {
+            try query.checkBuildError();
             try self.lock();
             errdefer self.unlock();
 
@@ -339,7 +391,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         for (matched_indices.items) |mi| {
                             if (mi == idx) continue :outer;
                         }
-                        const fv = query_mod.getFieldValue(T, row, field_name);
+                        // 使用 Opt 版本：field_name 来自运行时 update_fields（可能是用户
+                        // JSON key）。旧用 getFieldValue 在字段不存在时 @panic → 远程 abort。
+                        const fv = query_mod.getFieldValueOpt(T, row, field_name) orelse continue;
                         const key = try fieldValuesKey(key_alloc, fv);
                         try set.put(key, {});
                     }
@@ -347,19 +401,26 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 }
             }
 
-            // Second pass: apply updates to matched rows and check unique conflicts.
-            var updated_count: usize = 0;
+            // Second pass: build + validate ALL updated rows in a scratch copy first.
+            // 只有全部行都通过校验（含唯一约束）后，才整体写回 self.rows，
+            // 避免中途 UniqueViolation 返回时已部分修改 self.rows（数据完整性泄漏）。
+            var new_rows = std.ArrayList(T).empty;
+            defer new_rows.deinit(self.allocator);
             for (matched_indices.items) |idx| {
                 const row = self.rows.items[idx];
+                const orig_id = getFieldId(T, row);
                 var updated = row;
                 if (query.update_fields) |fields| {
                     for (fields) |field_name| {
-                        const val = query_mod.getFieldValue(T, query.data.?, field_name);
+                        // field_name 可能来自用户 JSON key：不存在的字段直接跳过，
+                        // 不能 @panic（P0-8：一个 PATCH handler 把未知 key 传进来就能打死进程）。
+                        const val = query_mod.getFieldValueOpt(T, query.data.?, field_name) orelse continue;
                         setFieldByIdentifier(T, &updated, field_name, val);
                     }
+                    setFieldByIdentifier(T, &updated, "id", orig_id);
                     // Check unique constraints against the pre-built sets.
                     for (unique_field_names.items, 0..) |ufn, ui| {
-                        const new_val = query_mod.getFieldValue(T, updated, ufn);
+                        const new_val = query_mod.getFieldValueOpt(T, updated, ufn) orelse continue;
                         const key = try fieldValuesKey(key_alloc, new_val);
                         if (unique_sets.items[ui].contains(key)) {
                             // 不显式 unlock——让 errdefer 处理（避免双重解锁）
@@ -370,10 +431,19 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         try unique_sets.items[ui].put(key, {});
                     }
                 } else {
+                    // 整行替换路径：同样必须做唯一约束校验（H2），排除自身 id。
                     updated = query.data.?;
+                    setFieldByIdentifier(T, &updated, "id", orig_id);
+                    try self.checkUnique(updated, orig_id);
                 }
-                const orig_id = getFieldId(T, row);
-                setFieldByIdentifier(T, &updated, "id", orig_id);
+                try new_rows.append(self.allocator, updated);
+            }
+
+            // Third pass: commit — 调和字符串所有权并整体写回。所有校验均已通过。
+            var updated_count: usize = 0;
+            for (matched_indices.items, 0..) |idx, j| {
+                const row = self.rows.items[idx];
+                var updated = new_rows.items[j];
                 // 修复 C1/C2：调和字符串字段所有权。对每个发生变化的字符串
                 // 字段：释放旧（已 owned）值、dup 新值入 self.allocator，避免旧值泄漏
                 // 与新值指向调用方内存而悬空。
@@ -390,6 +460,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         pub fn delete(self: *Self, query: *QueryBuilder(T)) !usize {
+            try query.checkBuildError();
             try self.lock();
             defer self.unlock();
 
@@ -403,13 +474,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             const deleted_count = to_delete.items.len;
             if (deleted_count == 0) return 0;
 
-            // 修复 C2：释放被删除行的字符串字段。
-            for (to_delete.items) |idx| {
-                freeStringFields(T, self.allocator, self.rows.items[idx]);
-            }
-
-            // Second pass: compact-copy all rows that are NOT being deleted.
-            // to_delete is in ascending order, so we can walk it with a cursor.
+            // 先把保留行拷到 kept（可能 OOM），全部成功后才释放被删行。
+            // 旧实现先 freeStringFields 再建 kept，若建 kept 中途 OOM，
+            // self.rows 里仍是已释放的字符串 → 之后 flush/close 是 UAF。
             var kept = std.ArrayList(T).empty;
             errdefer kept.deinit(self.allocator);
             var di: usize = 0;
@@ -420,13 +487,21 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 }
                 try kept.append(self.allocator, row);
             }
+
+            // kept 已建好，下面全部不可失败：现在才释放被删行的字符串。
+            for (to_delete.items) |idx| {
+                freeStringFields(T, self.allocator, self.rows.items[idx]);
+            }
             self.rows.deinit(self.allocator);
             self.rows = kept;
 
             // Rebuild id_index in one O(N) pass instead of decrementing per row.
+            // 先确保容量足够，再用 putAssumeCapacity 不可失败地重建，避免中途 OOM
+            // 造成索引半重建 + dirty 仍落盘。
+            try self.id_index.ensureTotalCapacity(std.math.cast(u32, self.rows.items.len) orelse std.math.maxInt(u32));
             self.id_index.clearRetainingCapacity();
             for (self.rows.items, 0..) |row, idx| {
-                try self.id_index.put(getFieldId(T, row), idx);
+                self.id_index.putAssumeCapacity(getFieldId(T, row), idx);
             }
 
             self.dirty = true;
@@ -434,6 +509,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         pub fn count(self: *Self, query: *QueryBuilder(T)) !usize {
+            try query.checkBuildError();
             try self.lock();
             defer self.unlock();
 
@@ -444,13 +520,36 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             return c;
         }
 
-        pub fn all(self: *Self) ![]T {
+        /// 返回所有行的深拷贝，行内字符串由 `gpa` 拥有（锁内深拷贝）。
+        /// 调用方需 freeRows(gpa, rows)（或传 ctx.arena）。见 findAll 的所有权说明。
+        pub fn all(self: *Self, gpa: std.mem.Allocator) ![]T {
             try self.lock();
             defer self.unlock();
 
-            const result = try self.allocator.alloc(T, self.rows.items.len);
-            @memcpy(result, self.rows.items);
+            const result = try gpa.alloc(T, self.rows.items.len);
+            errdefer gpa.free(result);
+            var done: usize = 0;
+            errdefer for (result[0..done]) |r| freeStringFields(T, gpa, r);
+            for (self.rows.items, 0..) |row, i| {
+                var copy = row;
+                try dupStringFields(T, gpa, &copy);
+                result[i] = copy;
+                done = i + 1;
+            }
             return result;
+        }
+
+        /// 释放由 all/findAll 返回的行切片（含每行的字符串字段）。
+        pub fn freeRows(self: *Self, gpa: std.mem.Allocator, rows: []T) void {
+            _ = self;
+            for (rows) |r| freeStringFields(T, gpa, r);
+            gpa.free(rows);
+        }
+
+        /// 释放由 findById/findOne/findBy 返回的单行（含字符串字段）。
+        pub fn freeRow(self: *Self, gpa: std.mem.Allocator, row: T) void {
+            _ = self;
+            freeStringFields(T, gpa, row);
         }
 
         pub fn truncate(self: *Self) !void {
@@ -470,11 +569,12 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         // ── 易用性增强（新增便捷方法）──────────────────
 
         /// 按任意字段查找单条（Equals）。字段值自动转换为 FieldValue。
-        pub fn findBy(self: *Self, comptime field: []const u8, value: anytype) !?T {
+        /// 行内字符串由 `gpa` 拥有（见 findAll 的所有权说明）。
+        pub fn findBy(self: *Self, gpa: std.mem.Allocator, comptime field: []const u8, value: anytype) !?T {
             var qb = QueryBuilder(T).init(self.allocator);
             defer qb.deinit();
             _ = qb.where(.Eq, field, query_mod.toFieldValue(value));
-            return self.findOne(&qb);
+            return self.findOne(gpa, &qb);
         }
 
         /// 按主键更新整行（id 自动保留）。返回是否更新到记录。
@@ -498,11 +598,16 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         /// 分页查询（按 id 升序）。page 从 0 开始。
-        pub fn paginate(self: *Self, page: usize, per_page: usize) ![]T {
+        /// 行内字符串由 `gpa` 拥有（见 findAll 的所有权说明）。
+        pub fn paginate(self: *Self, gpa: std.mem.Allocator, page: usize, per_page: usize) ![]T {
+            // 乘法溢出（page/per_page 可直通请求）：返回空页而非 panic。
+            const offset = std.math.mul(usize, page, per_page) catch {
+                return try gpa.alloc(T, 0);
+            };
             var qb = QueryBuilder(T).init(self.allocator);
             defer qb.deinit();
-            _ = qb.orderBy("id", .Asc).limit(per_page).offset(page * per_page);
-            return self.findAll(&qb);
+            _ = qb.orderBy("id", .Asc).limit(per_page).offset(offset);
+            return self.findAll(gpa, &qb);
         }
 
         // ── 内部辅助 ────────────────────────────────
@@ -582,12 +687,16 @@ fn jsonObjectToType(comptime T: type, allocator: std.mem.Allocator, obj: std.jso
         .@"struct" => |s| s,
         else => @compileError("expected struct"),
     };
+    // 先把所有字段初始化为默认值：中途任一字幕串字段 dup 失败时，errdefer 能
+    // 安全释放已 dup 的字符串（未 dup 的字段是空串/null，free 是 no-op），
+    // 避免 load() 失败行的部分 dup 字符串泄漏。
     inline for (struct_info.field_names, struct_info.field_types) |name, typ| {
-        const default_val = getDefaultForType(typ);
+        @field(result, name) = getDefaultForType(typ);
+    }
+    errdefer freeStringFields(T, allocator, result);
+    inline for (struct_info.field_names, struct_info.field_types) |name, typ| {
         if (obj.get(name)) |jval| {
             @field(result, name) = try jsonValueToField(typ, allocator, jval);
-        } else {
-            @field(result, name) = default_val;
         }
     }
     return result;
@@ -616,8 +725,14 @@ fn typeToJsonString(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
 fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) !T {
     switch (@typeInfo(T)) {
         .int, .comptime_int => {
-            if (value == .integer) return @intCast(value.integer);
-            if (value == .float) return @intFromFloat(value.float);
+            if (value == .integer) return std.math.cast(T, value.integer) orelse error.CorruptData;
+            if (value == .float) {
+                const f = value.float;
+                // @intFromFloat 的前提是值在目标类型（按 i64 界）范围内；越界数值来自
+                // 手工写坏的数据库文件，应报损坏而非 UB/panic。
+                if (!(f >= @as(f64, @floatFromInt(std.math.minInt(i64))) and f <= @as(f64, @floatFromInt(std.math.maxInt(i64))))) return error.CorruptData;
+                return std.math.cast(T, @as(i64, @intFromFloat(f))) orelse error.CorruptData;
+            }
             if (value == .number_string) return std.fmt.parseInt(T, value.number_string, 10) catch 0;
             return 0;
         },
@@ -633,9 +748,12 @@ fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.j
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                if (value == .string) return allocator.dupe(u8, value.string) catch @panic("OOM");
+                // P2-29：不再 `@panic("OOM")`——OOM 沿 `!T` 传播，不把内存压力变成进程 abort。
+                // 另：非字符串 JSON 值（数字/布尔/对象）落到字符串字段不再静默变 ""
+                // （那是静默数据损坏），而是报 error.TypeMismatch。null 仍视为空串。
+                if (value == .string) return try allocator.dupe(u8, value.string);
                 if (value == .null) return &[_]u8{};
-                return allocator.dupe(u8, "") catch @panic("OOM");
+                return error.TypeMismatch;
             }
             @compileError("Unsupported pointer type: " ++ @typeName(T));
         },
@@ -649,7 +767,8 @@ fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.j
                 if (std.meta.stringToEnum(T, value.string)) |e| return e;
             }
             if (value == .integer) {
-                return @fromBackingInt(@intCast(@as(std.meta.Tag(T), @intCast(value.integer))));
+                const tag: std.meta.Tag(T) = std.math.cast(std.meta.Tag(T), value.integer) orelse return error.CorruptData;
+                return @fromBackingInt(tag);
             }
             return @fromBackingInt(@intCast(@as(std.meta.Tag(T), 0)));
         },
@@ -767,46 +886,50 @@ fn setFieldByIdentifier(comptime T: type, instance: *T, field_name: []const u8, 
     };
     inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
         if (std.mem.eql(u8, fname, field_name)) {
-            const ValueT = @TypeOf(value);
-            switch (@typeInfo(ValueT)) {
-                .int, .comptime_int => {
-                    switch (@typeInfo(ftype)) {
-                        .int, .comptime_int => @field(instance, fname) = @intCast(value),
-                        .float, .comptime_float => @field(instance, fname) = @floatFromInt(value),
-                        else => {},
-                    }
-                },
-                else => {
-                    // FieldValue union
-                    switch (value) {
-                        .integer => |v| {
-                            switch (@typeInfo(ftype)) {
-                                .int, .comptime_int => @field(instance, fname) = @intCast(v),
-                                .float, .comptime_float => @field(instance, fname) = @floatFromInt(v),
-                                else => {},
-                            }
-                        },
-                        .string => |v| {
-                            if (@typeInfo(ftype) == .pointer) {
-                                @field(instance, fname) = v;
-                            }
-                        },
-                        .boolean => |v| {
-                            if (ftype == bool) @field(instance, fname) = v;
-                        },
-                        .float => |v| {
-                            switch (@typeInfo(ftype)) {
-                                .float, .comptime_float => @field(instance, fname) = @floatCast(v),
-                                .int, .comptime_int => @field(instance, fname) = @intFromFloat(v),
-                                else => {},
-                            }
-                        },
-                        else => {},
-                    }
-                },
-            }
+            setTypedField(ftype, &@field(instance, fname), value);
             return;
         }
+    }
+}
+
+/// 按目标字段类型写入值。optional 字段递归解包到 child 类型（与 query.zig 的
+/// setTyped 一致），保证 `?T` 字段的更新真正生效而不被静默丢弃（M2）。
+fn setTypedField(comptime FieldT: type, field_ptr: anytype, value: anytype) void {
+    switch (@typeInfo(FieldT)) {
+        .optional => |opt| return setTypedField(opt.child, field_ptr, value),
+        else => {},
+    }
+    const ValueT = @TypeOf(value);
+    switch (@typeInfo(ValueT)) {
+        .int, .comptime_int => {
+            switch (@typeInfo(FieldT)) {
+                .int, .comptime_int => field_ptr.* = @intCast(value),
+                .float, .comptime_float => field_ptr.* = @floatFromInt(value),
+                else => {},
+            }
+        },
+        else => {
+            // FieldValue union
+            switch (value) {
+                .integer => |v| switch (@typeInfo(FieldT)) {
+                    .int, .comptime_int => field_ptr.* = @intCast(v),
+                    .float, .comptime_float => field_ptr.* = @floatFromInt(v),
+                    else => {},
+                },
+                .string => |v| {
+                    if (comptime isConstU8Slice(FieldT)) field_ptr.* = v;
+                },
+                .boolean => |v| {
+                    if (FieldT == bool) field_ptr.* = v;
+                },
+                .float => |v| switch (@typeInfo(FieldT)) {
+                    .float, .comptime_float => field_ptr.* = @floatCast(v),
+                    .int, .comptime_int => field_ptr.* = @intFromFloat(v),
+                    else => {},
+                },
+                else => {},
+            }
+        },
     }
 }
 
@@ -872,39 +995,71 @@ fn isOptionalConstU8Slice(comptime FT: type) bool {
 /// 对每个字符串字段（含 optional）：若 updated 的指针与 original 不同（即被覆写为
 /// 调用方内存），则释放 original（已 owned）、把新值 dup 入 allocator。
 /// 未变的字段保留 original 的 owned 指针（updated 与 original 共享）。
+///
+/// 两阶段提交（低危：避免中途 OOM 时旧值已释放、新值未就位的 UAF）：先把所有
+/// 变更的新字符串 dup 到 scratch，全部成功后才统一释放旧值并回写。
 fn reconcileStringFields(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T) !void {
     const info = switch (@typeInfo(T)) {
         .@"struct" => |s| s,
         else => @compileError("expected struct"),
     };
+
+    const Change = struct {
+        name: []const u8,
+        is_optional: bool,
+        new: ?[]const u8,
+    };
+
+    // Phase 1：dup 所有变更的新值到 scratch，全程不动旧值。
+    var changes = std.ArrayList(Change).empty;
+    defer changes.deinit(allocator);
+    errdefer for (changes.items) |c| if (c.new) |s| allocator.free(s);
+
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime isConstU8Slice(ftype)) {
             const orig_slice = @field(original, fname);
             const new_slice = @field(updated.*, fname);
             if (orig_slice.ptr != new_slice.ptr) {
-                const dup = try allocator.dupe(u8, new_slice);
-                allocator.free(orig_slice);
-                @field(updated.*, fname) = dup;
+                try dupAppendChange(allocator, &changes, fname, false, new_slice);
             }
         } else if (comptime isOptionalConstU8Slice(ftype)) {
             const orig_opt = @field(original, fname);
             const new_opt = @field(updated.*, fname);
-            // 四种情况：null→null(不动)、null→值(dup 新)、值→null(释放旧)、值→值(指针不同则释旧 dup 新)。
-            if (orig_opt) |orig_slice| {
-                if (new_opt) |new_slice| {
-                    if (orig_slice.ptr != new_slice.ptr) {
-                        const dup = try allocator.dupe(u8, new_slice);
-                        allocator.free(orig_slice);
-                        @field(updated.*, fname) = dup;
-                    }
-                } else {
-                    allocator.free(orig_slice);
-                }
-            } else if (new_opt) |new_slice| {
-                @field(updated.*, fname) = try allocator.dupe(u8, new_slice);
+            switch (orig_opt) {
+                null => if (new_opt) |new_slice| try dupAppendChange(allocator, &changes, fname, true, new_slice),
+                else => |orig_slice| switch (new_opt) {
+                    null => try changes.append(allocator, .{ .name = fname, .is_optional = true, .new = null }),
+                    else => |new_slice| if (orig_slice.ptr != new_slice.ptr) {
+                        try dupAppendChange(allocator, &changes, fname, true, new_slice);
+                    },
+                },
             }
         }
     }
+
+    // Phase 2：全部 dup 成功，释放旧值并回写新值（不可失败）。
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime !isConstU8Slice(ftype) and !isOptionalConstU8Slice(ftype)) continue;
+        for (changes.items) |c| {
+            if (!std.mem.eql(u8, c.name, fname)) continue;
+            if (comptime isConstU8Slice(ftype)) {
+                allocator.free(@field(original, fname));
+                @field(updated.*, fname) = c.new.?;
+            } else {
+                if (@field(original, fname)) |old| allocator.free(old);
+                @field(updated.*, fname) = c.new;
+            }
+            break;
+        }
+    }
+}
+
+/// dup 一个变更的新字符串并 append 到 changes；append 失败时释放该 dup，
+/// 保证单个变更原子（旧值尚未动）。
+fn dupAppendChange(allocator: std.mem.Allocator, changes: anytype, comptime name: []const u8, is_optional: bool, src: []const u8) !void {
+    const dup = try allocator.dupe(u8, src);
+    errdefer allocator.free(dup);
+    try changes.append(allocator, .{ .name = name, .is_optional = is_optional, .new = dup });
 }
 
 // ── 测试 ──────────────────────────────────────────
@@ -937,8 +1092,9 @@ test "JsonStore insert and find" {
     const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
     try std.testing.expect(id > 0);
 
-    const found = try store.findById(id);
+    const found = try store.findById(allocator, id);
     try std.testing.expect(found != null);
+    defer store.freeRow(allocator, found.?);
     try std.testing.expectEqualStrings("Alice", found.?.name);
 }
 
@@ -976,7 +1132,8 @@ test "JsonStore update and delete" {
     const updated = try store.update(&qb);
     try std.testing.expectEqual(@as(usize, 1), updated);
 
-    const found = try store.findById(id);
+    const found = try store.findById(allocator, id);
+    defer store.freeRow(allocator, found.?);
     try std.testing.expectEqualStrings("Bobby", found.?.name);
 
     // Delete
@@ -986,7 +1143,7 @@ test "JsonStore update and delete" {
     const deleted = try store.delete(&qd);
     try std.testing.expectEqual(@as(usize, 1), deleted);
 
-    const gone = try store.findById(id);
+    const gone = try store.findById(allocator, id);
     try std.testing.expect(gone == null);
 }
 
@@ -1028,8 +1185,8 @@ test "findAll with no conditions returns all rows" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 3), results.len);
     // All three users should be present
@@ -1065,8 +1222,8 @@ test "findAll with where conditions" {
     defer qb.deinit();
     _ = qb.where(.Eq, "name", .{ .string = "Bob" });
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("Bob", results[0].name);
@@ -1090,8 +1247,8 @@ test "findAll with Neq condition" {
     defer qb.deinit();
     _ = qb.where(.Neq, "name", .{ .string = "Alice" });
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("Bob", results[0].name);
@@ -1114,8 +1271,9 @@ test "findOne found" {
     defer qb.deinit();
     _ = qb.where(.Eq, "name", .{ .string = "Alice" });
 
-    const result = try store.findOne(&qb);
+    const result = try store.findOne(allocator, &qb);
     try std.testing.expect(result != null);
+    defer store.freeRow(allocator, result.?);
     try std.testing.expectEqualStrings("Alice", result.?.name);
     try std.testing.expectEqualStrings("alice@test.com", result.?.email);
 }
@@ -1136,7 +1294,7 @@ test "findOne not found" {
     defer qb.deinit();
     _ = qb.where(.Eq, "name", .{ .string = "NonExistent" });
 
-    const result = try store.findOne(&qb);
+    const result = try store.findOne(allocator, &qb);
     try std.testing.expect(result == null);
 }
 
@@ -1153,8 +1311,9 @@ test "findById found" {
     const id1 = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
     _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
 
-    const found = try store.findById(id1);
+    const found = try store.findById(allocator, id1);
     try std.testing.expect(found != null);
+    defer store.freeRow(allocator, found.?);
     try std.testing.expectEqualStrings("Alice", found.?.name);
 }
 
@@ -1170,7 +1329,7 @@ test "findById not found" {
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
 
-    const found = try store.findById(9999);
+    const found = try store.findById(allocator, 9999);
     try std.testing.expect(found == null);
 }
 
@@ -1249,8 +1408,8 @@ test "all returns copy of all rows" {
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
     _ = try store.insert(.{ .id = 0, .name = "Bob", .email = "bob@test.com" });
 
-    const all_rows = try store.all();
-    defer allocator.free(all_rows);
+    const all_rows = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows);
 
     try std.testing.expectEqual(@as(usize, 2), all_rows.len);
     try std.testing.expectEqualStrings("Alice", all_rows[0].name);
@@ -1337,8 +1496,9 @@ test "update with update_fields partial update" {
     const updated = try store.update(&qb);
     try std.testing.expectEqual(@as(usize, 1), updated);
 
-    const found = try store.findById(id);
+    const found = try store.findById(allocator, id);
     try std.testing.expect(found != null);
+    defer store.freeRow(allocator, found.?);
     try std.testing.expectEqualStrings("Alice Updated", found.?.name);
     try std.testing.expectEqualStrings("alice@test.com", found.?.email);
 }
@@ -1366,8 +1526,8 @@ test "update multiple rows" {
     const updated = try store.update(&qb);
     try std.testing.expectEqual(@as(usize, 3), updated);
 
-    const all_rows = try store.all();
-    defer allocator.free(all_rows);
+    const all_rows = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows);
     for (all_rows) |row| {
         try std.testing.expectEqualStrings("updated@test.com", row.email);
     }
@@ -1399,7 +1559,7 @@ test "delete removes matching rows" {
     const remaining = try store.count(&count_qb);
     try std.testing.expectEqual(@as(usize, 2), remaining);
 
-    const gone = try store.findById(id2);
+    const gone = try store.findById(allocator, id2);
     try std.testing.expect(gone == null);
 }
 
@@ -1441,8 +1601,8 @@ test "findAll with sorting ascending" {
     defer qb.deinit();
     _ = qb.orderBy("name", .Asc);
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqualStrings("Alice", results[0].name);
@@ -1468,8 +1628,8 @@ test "findAll with sorting descending" {
     defer qb.deinit();
     _ = qb.orderBy("name", .Desc);
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqualStrings("Charlie", results[0].name);
@@ -1490,8 +1650,8 @@ test "empty store findAll returns empty" {
     var qb = QueryBuilder(TestUser).init(allocator);
     defer qb.deinit();
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -1523,8 +1683,8 @@ test "empty store all returns empty" {
         store.close() catch {};
     }
 
-    const all_rows = try store.all();
-    defer allocator.free(all_rows);
+    const all_rows = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows);
 
     try std.testing.expectEqual(@as(usize, 0), all_rows.len);
 }
@@ -1539,7 +1699,7 @@ test "empty store findById returns null" {
         store.close() catch {};
     }
 
-    const found = try store.findById(1);
+    const found = try store.findById(allocator, 1);
     try std.testing.expect(found == null);
 }
 
@@ -1557,7 +1717,7 @@ test "empty store findOne returns null" {
     defer qb.deinit();
     _ = qb.where(.Eq, "name", .{ .string = "Nobody" });
 
-    const result = try store.findOne(&qb);
+    const result = try store.findOne(allocator, &qb);
     try std.testing.expect(result == null);
 }
 
@@ -1594,11 +1754,11 @@ test "all returns independent copy" {
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
 
-    const all_rows1 = try store.all();
-    defer allocator.free(all_rows1);
+    const all_rows1 = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows1);
 
-    const all_rows2 = try store.all();
-    defer allocator.free(all_rows2);
+    const all_rows2 = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows2);
 
     // Both should have the same content but be independent allocations
     try std.testing.expectEqual(all_rows1.len, all_rows2.len);
@@ -1658,8 +1818,8 @@ test "multiple inserts and findAll with limit and offset" {
     defer qb.deinit();
     _ = qb.orderBy("name", .Asc).limit(2).offset(1);
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
 
     // Sorted: Alice, Bob, Charlie, Dave, Eve
     // offset=1 skips Alice, limit=2 gives Bob and Charlie
@@ -1707,8 +1867,9 @@ test "insert preserves field values" {
 
     const id = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@test.com" });
 
-    const found = try store.findById(id);
+    const found = try store.findById(allocator, id);
     try std.testing.expect(found != null);
+    defer store.freeRow(allocator, found.?);
     try std.testing.expectEqual(@as(u64, id), found.?.id);
     try std.testing.expectEqualStrings("Alice", found.?.name);
     try std.testing.expectEqualStrings("alice@test.com", found.?.email);
@@ -1733,8 +1894,8 @@ test "Gte and Lte operators" {
     defer qb.deinit();
     _ = qb.where(.Gte, "id", .{ .integer = 2 });
 
-    const results = try store.findAll(&qb);
-    defer allocator.free(results);
+    const results = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, results);
     try std.testing.expectEqual(@as(usize, 2), results.len);
 
     // id <= 1 should match Alice (id=1)
@@ -1742,8 +1903,8 @@ test "Gte and Lte operators" {
     defer qb2.deinit();
     _ = qb2.where(.Lte, "id", .{ .integer = 1 });
 
-    const results2 = try store.findAll(&qb2);
-    defer allocator.free(results2);
+    const results2 = try store.findAll(allocator, &qb2);
+    defer store.freeRows(allocator, results2);
     try std.testing.expectEqual(@as(usize, 1), results2.len);
     try std.testing.expectEqualStrings("Alice", results2[0].name);
 }
@@ -1784,8 +1945,8 @@ test "concurrent inserts are thread-safe" {
     try std.testing.expectEqual(@as(usize, num_threads * per_thread), total);
 
     // 所有 id 应唯一且连续（1..N），证明 next_id 自增在并发下无竞争
-    const all_rows = try store.all();
-    defer allocator.free(all_rows);
+    const all_rows = try store.all(allocator);
+    defer store.freeRows(allocator, all_rows);
     for (all_rows, 0..) |row, i| {
         try std.testing.expectEqual(@as(u64, i + 1), row.id);
     }
@@ -1805,15 +1966,35 @@ test "findById uses index and survives deletions" {
     const b = try store.insert(.{ .id = 0, .name = "B", .email = "b@x.com" });
     const c = try store.insert(.{ .id = 0, .name = "C", .email = "c@x.com" });
 
-    try std.testing.expectEqualStrings("A", (try store.findById(a)).?.name);
-    try std.testing.expectEqualStrings("B", (try store.findById(b)).?.name);
-    try std.testing.expectEqualStrings("C", (try store.findById(c)).?.name);
+    {
+        const fa = (try store.findById(allocator, a)).?;
+        defer store.freeRow(allocator, fa);
+        try std.testing.expectEqualStrings("A", fa.name);
+    }
+    {
+        const fb = (try store.findById(allocator, b)).?;
+        defer store.freeRow(allocator, fb);
+        try std.testing.expectEqualStrings("B", fb.name);
+    }
+    {
+        const fc = (try store.findById(allocator, c)).?;
+        defer store.freeRow(allocator, fc);
+        try std.testing.expectEqualStrings("C", fc.name);
+    }
 
     // 删除中间行后，主键索引必须保持一致
     try std.testing.expect((try store.deleteById(b)));
-    try std.testing.expect((try store.findById(b)) == null);
-    try std.testing.expectEqualStrings("A", (try store.findById(a)).?.name);
-    try std.testing.expectEqualStrings("C", (try store.findById(c)).?.name);
+    try std.testing.expect((try store.findById(allocator, b)) == null);
+    {
+        const fa = (try store.findById(allocator, a)).?;
+        defer store.freeRow(allocator, fa);
+        try std.testing.expectEqualStrings("A", fa.name);
+    }
+    {
+        const fc = (try store.findById(allocator, c)).?;
+        defer store.freeRow(allocator, fc);
+        try std.testing.expectEqualStrings("C", fc.name);
+    }
 }
 
 test "updateById replaces row and preserves id" {
@@ -1828,7 +2009,8 @@ test "updateById replaces row and preserves id" {
 
     const id = try store.insert(.{ .id = 0, .name = "A", .email = "a@x.com" });
     try std.testing.expect((try store.updateById(id, .{ .id = id, .name = "A2", .email = "a2@x.com" })));
-    const f = try store.findById(id);
+    const f = try store.findById(allocator, id);
+    defer store.freeRow(allocator, f.?);
     try std.testing.expectEqualStrings("A2", f.?.name);
     try std.testing.expectEqualStrings("a2@x.com", f.?.email);
     try std.testing.expectEqual(@as(u64, id), f.?.id);
@@ -1847,10 +2029,11 @@ test "findBy finds by arbitrary field" {
     }
 
     _ = try store.insert(.{ .id = 0, .name = "Alice", .email = "alice@x.com" });
-    const f = try store.findBy("email", "alice@x.com");
+    const f = try store.findBy(allocator, "email", "alice@x.com");
     try std.testing.expect(f != null);
+    defer store.freeRow(allocator, f.?);
     try std.testing.expectEqualStrings("Alice", f.?.name);
-    const none = try store.findBy("email", "nobody@x.com");
+    const none = try store.findBy(allocator, "email", "nobody@x.com");
     try std.testing.expect(none == null);
 }
 
@@ -1867,17 +2050,17 @@ test "paginate returns id-ordered pages" {
     var i: u64 = 0;
     while (i < 10) : (i += 1) _ = try store.insert(.{ .id = 0, .name = "u", .email = "e@x.com" });
 
-    const p0 = try store.paginate(0, 4);
-    defer allocator.free(p0);
+    const p0 = try store.paginate(allocator, 0, 4);
+    defer store.freeRows(allocator, p0);
     try std.testing.expectEqual(@as(usize, 4), p0.len);
     try std.testing.expectEqual(@as(u64, 1), p0[0].id);
 
-    const p1 = try store.paginate(1, 4);
-    defer allocator.free(p1);
+    const p1 = try store.paginate(allocator, 1, 4);
+    defer store.freeRows(allocator, p1);
     try std.testing.expectEqual(@as(u64, 5), p1[0].id);
 
-    const p2 = try store.paginate(2, 4);
-    defer allocator.free(p2);
+    const p2 = try store.paginate(allocator, 2, 4);
+    defer store.freeRows(allocator, p2);
     try std.testing.expectEqual(@as(usize, 2), p2.len);
     try std.testing.expectEqual(@as(u64, 9), p2[0].id);
 }
@@ -1923,6 +2106,7 @@ test "default_value applied on insert" {
     }
 
     const id = try store.insert(.{ .id = 0, .role = "" });
-    const f = try store.findById(id);
+    const f = try store.findById(allocator, id);
+    defer store.freeRow(allocator, f.?);
     try std.testing.expectEqualStrings("user", f.?.role);
 }

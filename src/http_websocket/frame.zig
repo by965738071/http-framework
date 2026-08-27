@@ -158,6 +158,13 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator, max_payload:
     const opcode_raw: u4 = @truncate(first & 0x0F);
     const opcode: OpCode = @fromBackingInt(@intCast(opcode_raw));
 
+    // P2-18：拒绝保留 opcode（0x3-0x7 非控制、0xB-0xF 控制）。
+    // decode 是公开 API，单独使用时不能把 0x3 当合法帧返回。
+    switch (opcode) {
+        .continuation, .text, .binary, .close, .ping, .pong => {},
+        _ => return error.ReservedOpcode,
+    }
+
     const second = try reader.takeByte();
     const mask = (second & 0x80) != 0;
     const len7: u8 = second & 0x7F;
@@ -166,10 +173,15 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator, max_payload:
     const payload_len: u64 = switch (len7) {
         LEN_16_BIT => blk: {
             const v = try reader.takeInt(u16, .big);
+            // RFC §5.2 最小长度编码：126 分支的 16-bit 长度必须 ≥126，
+            // 否则用 7-bit 直编码即可，宽编码属于帧走私空间（协议错误）。
+            if (v < 126) return error.ProtocolError;
             break :blk @intCast(v);
         },
         LEN_64_BIT => blk: {
             const v = try reader.takeInt(u64, .big);
+            // RFC §5.2 最小长度编码：127 分支的 64-bit 长度必须 ≥65536。
+            if (v < 65536) return error.ProtocolError;
             // RFC §5.5: 64-bit 长度最高位必须为 0（修复 E1：强制校验）。
             if (v & 0x8000_0000_0000_0000 != 0) return error.InvalidFrameLength;
             break :blk v;
@@ -364,6 +376,34 @@ test "decode empty payload frame" {
     try testing.expectEqual(@as(usize, 0), f.payload.len);
     try testing.expect(f.mask);
     try testing.expectEqual(@as(u8, 0x12), f.masking_key[0]);
+}
+
+test "decode rejects non-minimal 16-bit length (RFC 6455 §5.2)" {
+    // 用 16-bit 扩展长度编码一个仅 5 字节的 payload（正确做法是 7-bit 直编）。
+    // header 4 字节 + payload 5 字节 = 9。
+    var frame_buf: [9]u8 = undefined;
+    var w = std.Io.Writer.fixed(&frame_buf);
+    try w.writeByte(0x81); // FIN + text
+    try w.writeByte(126); // 16-bit 长度标志
+    try w.writeInt(u16, 5, .big); // 非法：5 < 126
+    try w.writeAll("hello");
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    try testing.expectError(error.ProtocolError, decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD));
+}
+
+test "decode rejects non-minimal 64-bit length (RFC 6455 §5.2)" {
+    // 用 64-bit 扩展长度编码一个仅 200 字节的 payload（正确做法是 16-bit）。
+    var frame_buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&frame_buf);
+    try w.writeByte(0x81); // FIN + text
+    try w.writeByte(127); // 64-bit 长度标志
+    try w.writeInt(u64, 200, .big); // 非法：200 < 65536
+    const payload: [5]u8 = @splat('x');
+    try w.writeAll(&payload); // 不足 200 字节无所谓，长度校验在读 body 前触发
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    try testing.expectError(error.ProtocolError, decode(&r, testing.allocator, DEFAULT_MAX_PAYLOAD));
 }
 
 test {

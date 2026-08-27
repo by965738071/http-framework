@@ -27,7 +27,9 @@ pub const CsrfConfig = struct {
     form_field_name: []const u8 = "csrf_token",
     token_length: u8 = 32,
     cookie_path: []const u8 = "/",
-    secure: bool = false,
+    /// CSRF cookie 是否只经 TLS 传输。默认 true（M9）：token 虽无 HttpOnly 仍须
+    /// 防明文嗅探——明文 HTTP 下被嗅探即可伪造表单；纯本机开发请显式关掉。
+    secure: bool = true,
     ignored_methods: []const http.Method = &.{ .GET, .HEAD, .OPTIONS },
 };
 
@@ -42,9 +44,12 @@ pub const CsrfMiddleware = struct {
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
         if (self.isMethodIgnored(ctx.request.method)) {
             // 安全方法：若尚无 CSRF cookie，生成并下发一个（双提交模式需先有 cookie）。
+            // bug.md §6 csrf.zig:46-49：token 生成失败（OOM/随机源故障）不能静默
+            // 放行——那样后续任何 POST 都会神秘 403。显式 500 让管理员能看见。
             if (ctx.request.getCookie(self.config.cookie_name) == null) {
                 const token = self.generateToken(ctx.arena) catch {
-                    try next.call(ctx, res);
+                    _ = res.statusCode(.internal_server_error);
+                    try res.text("Failed to generate CSRF token");
                     return;
                 };
                 self.setCookie(res, token) catch {};
@@ -60,8 +65,23 @@ pub const CsrfMiddleware = struct {
         // （request.zig: `if (!has_body) .none else .{ .streaming = request }`），
         // 所以那条回退**恒为 null**：纯 HTML `<form method="post">` 一律 403，
         // 只有能读 cookie 并设 X-CSRF-Token 的 JS 客户端能通过。
-        const submitted = ctx.request.getHeader(self.config.header_name) orelse
-            (ctx.formDecoded(self.config.form_field_name, MAX_FORM_TOKEN_BODY) catch null);
+        const submitted: ?[]const u8 = if (ctx.request.getHeader(self.config.header_name)) |h|
+            h
+        else
+            ctx.formDecoded(self.config.form_field_name, MAX_FORM_TOKEN_BODY) catch |err| {
+                // bug.md §6 csrf.zig:63-64：表单超过 MAX_FORM_TOKEN_BODY 是「body 太大」
+                // 而非「token 缺失」——分开报错，日志才能区分「攻击者灌大 body」与
+                // 「正常表单忘带 token」两种 4xx。
+                if (err == error.BodyTooLarge) {
+                    _ = res.statusCode(.payload_too_large);
+                    try res.text("CSRF form body too large");
+                    return;
+                }
+                // OOM 等其它错误：保守按验证失败处理。
+                _ = res.statusCode(.forbidden);
+                try res.text("CSRF token missing");
+                return;
+            };
 
         if (cookie_token == null or submitted == null) {
             _ = res.statusCode(.forbidden);

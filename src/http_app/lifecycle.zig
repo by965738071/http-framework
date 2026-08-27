@@ -112,6 +112,6 @@ test "Logger as a Hook implementation" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "/hello") != null);
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }

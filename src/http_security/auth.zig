@@ -14,6 +14,9 @@ const Response = root.Response;
 const Next = root.Next;
 const constantTimeEql = root.constantTimeEql;
 
+/// api_key_query=true 的一次性告警闸（进程生命周期只告警一次）。
+var api_key_query_warned = std.atomic.Value(bool).init(false);
+
 pub const AuthStrategy = enum {
     bearer,
     basic,
@@ -35,6 +38,10 @@ pub const AuthConfig = struct {
     basic_password: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     api_key_header: []const u8 = "X-API-Key",
+    /// 是否接受 `?api_key=...` 查询参数作为备用 API key 载体。
+    /// ⚠️ 风险（bug.md §6 auth.zig:148-152）：query 里的 key 会出现在访问日志、
+    /// 浏览器历史、Referer 头里，等同明文泄露。建议仅用于受控的脚本/内网测试；
+    /// 生产优先用 header 方案。启用时框架会打一条一次性 WARN 提醒。
     api_key_query: bool = false,
     custom_auth: ?*const fn (*Context) bool = null,
     realm: []const u8 = "Protected",
@@ -87,13 +94,24 @@ pub const AuthMiddleware = struct {
         // 所有策略都失败 → 401
         _ = res.statusCode(.unauthorized);
         // 修复 D3：根据已启用的策略发合适的挑战头（RFC 7235/6750）。
-        // bearer-only API 不应发 Basic（否则浏览器弹 Basic 登录框）。
-        const scheme: []const u8 = if (self.config.bearer_token != null and self.config.basic_username == null)
-            "Bearer"
-        else
-            "Basic";
-        const challenge = try std.fmt.allocPrint(ctx.arena, "{s} realm=\"{s}\"", .{ scheme, self.config.realm });
-        _ = try res.header("WWW-Authenticate", challenge);
+        // 修复 bug.md §6 auth.zig:91-94：只配 api_key/custom 时不应再发
+        // `WWW-Authenticate: Basic`——否则浏览器会弹 Basic 登录框，而该端点
+        // 根本不接受 Basic 凭据，纯属 UX 缺陷（还把登录框当成 auth 入口）。
+        const challenge: ?[]const u8 = blk: {
+            if (self.config.bearer_token != null) {
+                break :blk try std.fmt.allocPrint(ctx.arena, "Bearer realm=\"{s}\"", .{self.config.realm});
+            }
+            // Basic 需要在 basic_username 与 basic_password 都启用时才发挑战，
+            // 否则发出来也无法用。
+            if (self.config.basic_username != null and self.config.basic_password != null) {
+                break :blk try std.fmt.allocPrint(ctx.arena, "Basic realm=\"{s}\"", .{self.config.realm});
+            }
+            // api_key / custom-only：无标准挑战头，不发送。
+            break :blk null;
+        };
+        if (challenge) |c| {
+            _ = try res.setHeader("WWW-Authenticate", c);
+        }
         try res.text("Unauthorized");
     }
 
@@ -112,6 +130,9 @@ pub const AuthMiddleware = struct {
 
     fn checkBasic(self: *Self, ctx: *Context, username: []const u8, password: []const u8) !bool {
         _ = self;
+        // P2-20：空凭据不放行（与 checkBearer/checkApiKey 一致）。
+        // 否则配置里密码为空串时，客户端发 `user:` 就能通过认证。
+        if (username.len == 0 or password.len == 0) return false;
         const header = ctx.request.getHeader("Authorization") orelse return false;
         const encoded = stripSchemePrefix(header, "Basic ") orelse return false;
 
@@ -143,6 +164,10 @@ pub const AuthMiddleware = struct {
             return constantTimeEql(key, expected);
         }
         if (self.config.api_key_query) {
+            // bug.md §6 auth.zig:148-152：query 里的 key 会进访问日志/浏览器历史/
+            // Referer。一次性 WARN 提醒（避免每个请求都打日志）。
+            if (!api_key_query_warned.swap(true, .acq_rel))
+                std.log.warn("auth: api_key_query=true 启用——API key 走 URL query，会泄露到访问日志、浏览器历史与 Referer 头（见 auth.zig api_key_query 字段注释）", .{});
             if (ctx.request.getQuery("api_key")) |key| {
                 return constantTimeEql(key, expected);
             }
@@ -197,13 +222,12 @@ pub const AuthMiddleware = struct {
 };
 
 /// 计算 base64 解码后的长度
+/// P2-21：用 std 的 calcSizeForSlice——它会拒绝非法填充（`=` 不在末尾、
+/// 长度非 4 的倍数等）。旧实现自己算长度，不校验 `=` 位置，
+/// 也不接受无填充 base64（不一致的宽容）。无效返回 0。
 fn base64DecodedLen(encoded: []const u8) usize {
     if (encoded.len == 0) return 0;
-    if (encoded.len % 4 != 0) return 0; // 无效 base64
-    var len = (encoded.len / 4) * 3;
-    if (encoded[encoded.len - 1] == '=') len -= 1;
-    if (encoded.len > 1 and encoded[encoded.len - 2] == '=') len -= 1;
-    return len;
+    return std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return 0;
 }
 
 // ===========================================================================

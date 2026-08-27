@@ -151,6 +151,9 @@ pub const Router = struct {
         // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
         // std.http 在 HEAD 请求下会自动抑制 body，所以直接跑 GET handler 即可。
         if (result.route == null and method == .HEAD) {
+            // P2-6：第一次 HEAD 匹配可能在 param 节点写过 path_params（即使未命中
+            // handler）。回退前清空，否则 GET 重试可能叠加上一轮的残留参数。
+            ctx.state.path_params.clear();
             const get_result = self.trie.match(.GET, ctx.request.path, ctx.state, ctx.arena);
             if (get_result.route != null) result = get_result;
         }
@@ -377,14 +380,15 @@ const MarkerMiddleware = struct {
 // 能捕获 header 的 sink（testSink 丢弃了 header，不能验证中间件写入的头）。
 fn capturingSink(writer: *std.Io.Writer) @import("http_protocol").Sink {
     const impl = struct {
-        fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8) anyerror!void {
+        fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) anyerror!void {
+            _ = keep_alive;
             const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
             try w.print("HTTP/1.1 {d}\r\n", .{@backingInt(status)});
             for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
             try w.writeAll("\r\n");
             try w.writeAll(body);
         }
-        fn startStream(_: *anyopaque, _: http.Status, _: []const http.Header, _: ?u64, _: []u8) anyerror!http.BodyWriter {
+        fn startStream(_: *anyopaque, _: http.Status, _: []const http.Header, _: ?u64, _: []u8, _: bool) anyerror!http.BodyWriter {
             return error.NotSupported;
         }
     };

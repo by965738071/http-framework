@@ -279,6 +279,6 @@ test "Handler.initFactory creates and destroys per request" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..writer.end], "factory") != null);
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }

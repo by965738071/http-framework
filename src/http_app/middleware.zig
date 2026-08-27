@@ -461,6 +461,6 @@ test "Pipeline(0): 无中间件直接调 handler" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..writer.end], "ok") != null);
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }
