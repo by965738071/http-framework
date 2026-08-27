@@ -18,6 +18,8 @@ pub const RateLimitConfig = struct {
     window_seconds: u32 = 60,
     max_requests: u32 = 100,
     per_ip: bool = true,
+    /// 从自定义头（如网关注入的可信 client id）读取限流标识。
+    /// 仅在 trust_proxy=true 时生效——否则客户端可任意伪造该头绕过限流（P2-22）。
     identifier_header: ?[]const u8 = null,
     limit_message: []const u8 = "Rate limit exceeded",
     /// 是否信任 X-Forwarded-For / X-Real-IP 头。
@@ -163,7 +165,17 @@ pub const RateLimiter = struct {
 
     fn getIdentifier(self: *const Self, ctx: *Context) ?[]const u8 {
         if (self.config.identifier_header) |header_name| {
-            return ctx.request.getHeader(header_name);
+            // P2-22：identifier_header 模式直接返回客户端可控的头值——
+            // 攻击者任意伪造该头即能为每个请求换一个新 identifier，直接绕过限流。
+            // 只有在信任上游代理（trust_proxy=true）时才该信这个头；否则跳过，
+            // 交给下方 per_ip / global 逻辑处理。
+            if (self.config.trust_proxy) {
+                if (ctx.request.getHeader(header_name)) |v| {
+                    if (v.len > 0) return v;
+                }
+            } else {
+                std.log.debug("rate limiter: identifier_header set but trust_proxy=false, ignoring client-controlled header", .{});
+            }
         }
         if (self.config.per_ip) {
             // 不信任代理头时，不读 X-Forwarded-For / X-Real-IP——
@@ -393,6 +405,39 @@ test "per_ip=false: 返回 global 标识" {
     const id = rl.getIdentifier(&ctx);
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("global", id.?);
+}
+
+test "P2-22: identifier_header 在 trust_proxy=false 时被忽略（防伪造绕过）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req = makeRateReq("GET / HTTP/1.1\r\nX-Client-Id: attacker-rotating-value\r\n\r\n");
+    var ctx = makeRateCtx(arena.allocator(), &req);
+    // identifier_header 设了，但 trust_proxy=false → 不信客户端头，回退到 global
+    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        .identifier_header = "X-Client-Id",
+        .per_ip = false,
+        .trust_proxy = false,
+    });
+    defer rl.deinit();
+    const id = rl.getIdentifier(&ctx);
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("global", id.?);
+}
+
+test "P2-22: identifier_header 在 trust_proxy=true 时生效" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req = makeRateReq("GET / HTTP/1.1\r\nX-Client-Id: tenant-42\r\n\r\n");
+    var ctx = makeRateCtx(arena.allocator(), &req);
+    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        .identifier_header = "X-Client-Id",
+        .per_ip = false,
+        .trust_proxy = true,
+    });
+    defer rl.deinit();
+    const id = rl.getIdentifier(&ctx);
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("tenant-42", id.?);
 }
 test {
     std.testing.refAllDecls(@This());

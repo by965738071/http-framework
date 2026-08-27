@@ -58,8 +58,9 @@ pub fn JsonBody(comptime T: type) type {
             const ct = ctx.request.content_type orelse {
                 return next.call(ctx, res);
             };
-            // 只处理 application/json
-            if (!std.mem.startsWith(u8, ct, "application/json")) {
+            // 只处理 application/json（P2-25：大小写不敏感，Application/JSON 也应命中，
+            // 与 multipart.from 的 startsWithIgnoreCase 保持一致）。
+            if (!std.ascii.startsWithIgnoreCase(ct, "application/json")) {
                 return next.call(ctx, res);
             }
             // 只处理有 body 的请求

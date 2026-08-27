@@ -77,7 +77,9 @@ pub const SessionManager = struct {
         // 1. 尝试从 Cookie 获取 session_id
         if (ctx.request.getCookie(self.config.cookie_name)) |session_id| {
             if (self.sessions.getPtr(session_id)) |record| {
-                const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+                // 单调时钟（.awake）：墙钟（.real）被 NTP 回跳/手工改时间会让
+                // session 永不过期（安全问题）或全部立即过期（可用性问题）。
+                const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
                 if (now < record.expires) {
                     // 滑动窗口：更新过期时间
                     record.expires = now + @as(i96, self.config.session_timeout_sec) * 1_000_000_000;
@@ -97,11 +99,17 @@ pub const SessionManager = struct {
     }
 
     fn createSessionLocked(self: *Self, res: *Response) ![]const u8 {
-        // 先尝试清理过期项，再判上限，避免匿名高频请求堆积 session 耗尽内存。
+        // 先尝试清理过期项，再处理上限。
         if (self.sessions.count() >= self.config.max_sessions) {
             self.cleanupExpiredLocked();
+            // 仍超上限：驱逐最早创建的一条（近似 LRU），而不是拒绝新建。
+            // 旧实现直接 return error.TooManySessions：匹名请求不带 cookie 时每次都
+            // 新建一条 session，攻击者不带 cookie 打满 max_sessions 后，所有人（含
+            // 合法登录）都拿到 500，且要等 session_timeout_sec（默认 1 小时）才恢复
+            // —— 把限额变成了一个长达 1 小时的完全拒绝服务。LRU 驱逐把“永久 DoS”
+            // 降级为“旧 session 被提前注销”。
             if (self.sessions.count() >= self.config.max_sessions) {
-                return error.TooManySessions;
+                self.evictOldestLocked();
             }
         }
 
@@ -112,7 +120,7 @@ pub const SessionManager = struct {
         // 只在所有权移交给 map（put）之前有效；put 成功后正常返回不会触发。
         errdefer self.allocator.free(session_id);
 
-        const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const now_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         const id_dup = try self.allocator.dupe(u8, session_id);
         errdefer self.allocator.free(id_dup);
         var data = SessionData.init(self.allocator);
@@ -156,7 +164,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.sessions.getPtr(session_id)) |record| {
-            const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+            const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
             if (now < record.expires) {
                 if (record.data.get(key)) |v| {
                     return try allocator.dupe(u8, v);
@@ -199,6 +207,25 @@ pub const SessionManager = struct {
         gop.value_ptr.* = val_dup;
     }
 
+    /// 驱逐创建时间最早的一条 session（近似 LRU）。在 max_sessions 达到上限
+    /// 且没有可清理的过期项时调用，避免把限额变成永久拒绝服务。
+    fn evictOldestLocked(self: *Self) void {
+        var oldest_key: ?[]const u8 = null;
+        var oldest_created: i96 = std.math.maxInt(i96);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.created < oldest_created) {
+                oldest_created = entry.value_ptr.*.created;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |key| {
+            // deleteSessionLocked 会 free 掉 map 的 key，而我们传的正是 map 内部的
+            // key 指针；fetchRemove 会先把 key 所有权移交出来，不会在查找中途失效。
+            self.deleteSessionLocked(key);
+        }
+    }
+
     /// 删除 Session（线程安全）
     fn deleteSessionLocked(self: *Self, session_id: []const u8) void {
         if (self.sessions.fetchRemove(session_id)) |kv| {
@@ -224,7 +251,7 @@ pub const SessionManager = struct {
     }
 
     fn maybeCleanupLocked(self: *Self) void {
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         const interval_ns = @as(i96, self.config.cleanup_interval_sec) * 1_000_000_000;
         if (now - self.last_cleanup < interval_ns) return;
         self.last_cleanup = now;
@@ -232,7 +259,7 @@ pub const SessionManager = struct {
     }
 
     fn cleanupExpiredLocked(self: *Self) void {
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         var to_remove = std.ArrayList([]const u8).empty;
         defer to_remove.deinit(self.allocator);
 
@@ -278,7 +305,7 @@ pub const SessionManager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         var stats = Stats{ .total = 0, .active = 0, .expired = 0 };
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
@@ -309,7 +336,7 @@ test "SessionManager.setData/getData round trip" {
     defer sm.deinit();
 
     // 手动插入一条 session（绕过 createSessionLocked 避免设置 cookie）
-    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const now = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
     const id_dup = try allocator.dupe(u8, "test_session");
     const record = SessionRecord{
         .id = try allocator.dupe(u8, "test_session"),
@@ -335,7 +362,7 @@ test "SessionManager.setData overwrites without leak" {
     var sm = SessionManager.init(allocator, std.testing.io, .{});
     defer sm.deinit();
 
-    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const now = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
     const id_dup = try allocator.dupe(u8, "overwrite_test");
     const record = SessionRecord{
         .id = try allocator.dupe(u8, "overwrite_test"),
@@ -368,7 +395,7 @@ test "SessionManager.getStats with sessions" {
     var sm = SessionManager.init(allocator, std.testing.io, .{});
     defer sm.deinit();
 
-    const now = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+    const now = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
 
     // Active
     const id1 = try allocator.dupe(u8, "active_1");

@@ -93,8 +93,29 @@ fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
         try ctx.failWith(res, .{ .status = .bad_request, .message = "Missing id" });
         return;
     };
-    try res.statusCode(.ok).html("<h1>User ");
-    try res.html(id);
+    // P2-41：旧代码连发两次 res.html 必然 error.AlreadyResponded，
+    // 且把路径参数未转义地拼进 HTML（示范 XSS）。
+    // 改为一次 respond + 对用户输入做 HTML 转义。
+    const escaped = try escapeHtml(ctx.arena, id);
+    const body = try std.fmt.allocPrint(ctx.arena, "<h1>User {s}</h1>", .{escaped});
+    try res.statusCode(.ok).html(body);
+}
+
+/// 对用户控制的文本做最小 HTML 转义，防止反射型 XSS。
+fn escapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            '\'' => try out.appendSlice(allocator, "&#39;"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn healthHandler(ctx: *framework.Context, res: *framework.Response) !void {

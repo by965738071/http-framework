@@ -94,6 +94,11 @@ pub const PathParams = struct {
     pub fn deinit(self: *PathParams, _: std.mem.Allocator) void {
         self.len = 0;
     }
+
+    /// 清空所有绑定（保留容量）。供 router 在 HEAD→GET 回退前撤销上一轮残留参数（P2-6）。
+    pub fn clear(self: *PathParams) void {
+        self.len = 0;
+    }
 };
 
 /// 请求级可变状态（每个请求一个实例）。
@@ -347,6 +352,6 @@ test "Context.param delegates to state.path_params" {
     try std.testing.expectEqualStrings("123", ctx.param("id").?);
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }

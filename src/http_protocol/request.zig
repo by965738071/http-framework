@@ -286,11 +286,13 @@ pub const Request = struct {
         return switch (self.body) {
             .none => null,
             .buffered => |data| .{ .internal = .{ .buffered = .{ .data = data, .pos = 0 } } },
-            .streaming => |req| .{ .internal = .{
-                // 与 readBodyInto 同理：必须用 readerExpectContinue，
-                // readerExpectNone 会对带 Expect: 100-continue 的请求 assert 崩溃。
-                .streaming = .{ .reader = try req.readerExpectContinue(transfer_buf) },
-            } },
+            .streaming => |req| .{
+                .internal = .{
+                    // 与 readBodyInto 同理：必须用 readerExpectContinue，
+                    // readerExpectNone 会对带 Expect: 100-continue 的请求 assert 崩溃。
+                    .streaming = .{ .reader = try req.readerExpectContinue(transfer_buf) },
+                },
+            },
         };
     }
 

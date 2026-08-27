@@ -167,8 +167,9 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
     // \r\n
     // <body>\r\n
 
-    // 找 \r\n\r\n 分隔头和体
-    const header_body_sep = std.mem.indexOf(u8, part, "\r\n\r\n") orelse return;
+    // 找 \r\n\r\n 分隔头和体。P2-27：找不到则这是个畸形 part，
+    // 报错而不是静默丢弃（旧代码 return 会让畸形表单看起来“少了一个字段”）。
+    const header_body_sep = std.mem.indexOf(u8, part, "\r\n\r\n") orelse return error.MalformedPart;
     const header_block = part[0..header_body_sep];
     const body_data = part[header_body_sep + 4 ..];
 

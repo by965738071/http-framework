@@ -229,6 +229,13 @@ pub const WebSocket = struct {
                     continue;
                 },
                 .close => {
+                    // RFC §5.5.1：close payload 长度必须为 0 或 ≥ 2（P2-17）。
+                    // 长度为 1 无法容纳 2 字节 close code → 协议错误。
+                    if (f.payload.len == 1) return error.ProtocolError;
+                    // close reason（code 之后的字节）必须是合法 UTF-8（RFC §5.5.1 / §8.1）。
+                    if (f.payload.len > 2 and !std.unicode.utf8ValidateSlice(f.payload[2..])) {
+                        return error.ProtocolError;
+                    }
                     // RFC §7.1.2: 收到 close 后应回一个 close（如果还没发过）。
                     if (!self.closed) {
                         self.closed = true;

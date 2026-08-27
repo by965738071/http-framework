@@ -96,8 +96,11 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
     const connection_hdr = ctx.header("connection") orelse return false;
     if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
 
-    // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。这里只校验存在。
+    // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。
+    // P2-19：不能只校验存在——RFC 6455 §4.1 要求客户端发 16 字节随机值的 base64。
+    // 长度必为 24 且以 "==" 结尾，并能合法 base64 解码为 16 字节。
     const key = ctx.header("sec-websocket-key") orelse return false;
+    if (!isValidWebSocketKey(key)) return false;
 
     // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
     if (!isOriginAllowed(ctx)) {
@@ -161,6 +164,18 @@ fn containsTokenIgnoreCase(header_value: []const u8, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
     }
     return false;
+}
+
+/// P2-19：Sec-WebSocket-Key 必须是 16 字节的 base64（RFC 6455 §4.1）。
+/// 16 字节 → 标准 base64 = 24 字符，以 "==" 结尾，且能合法解码。
+fn isValidWebSocketKey(key: []const u8) bool {
+    if (key.len != 24) return false;
+    if (!std.mem.endsWith(u8, key, "==")) return false;
+    var buf: [16]u8 = undefined;
+    const decoded = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (decoded != 16) return false;
+    std.base64.standard.Decoder.decode(&buf, key) catch return false;
+    return true;
 }
 
 /// WebSocket 升级（高级 API）——把“校验握手 + 注册连接劫持回调”一步完成。

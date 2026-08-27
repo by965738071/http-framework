@@ -85,6 +85,6 @@ test "Arenas retains capacity for keep-alive hot path" {
     }
 }
 
-test{
+test {
     std.testing.refAllDecls(@This());
 }

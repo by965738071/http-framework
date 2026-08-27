@@ -87,7 +87,12 @@ pub const Trie = struct {
             &[_]Middleware{};
         node.handlers.put(method, .{ .handler = route.handler, .middleware = mw_copy });
         node.has_any_handler = true;
-        node.pattern = try alloc.dupe(u8, pattern);
+        // P2-3：只在首次记录 pattern。同一节点上不同方法共享相同路径结构，
+        // 但 :param 命名可能写法不同（/users/:id vs /users/:uid）。固定用首次，
+        // 避免后续 insert 覆盖导致日志/指标聚合的 route_pattern 串台，并省一次 dupe。
+        if (node.pattern.len == 0) {
+            node.pattern = try alloc.dupe(u8, pattern);
+        }
     }
 
     fn findOrCreateChild(parent: *Node, seg: []const u8, alloc: std.mem.Allocator) !*Node {
@@ -221,9 +226,27 @@ pub const Trie = struct {
     fn collectAllowed(self: *const Trie, node: *Node, result: *MatchResult) void {
         _ = self;
         var it = node.handlers.iterator();
+        var has_get = false;
         while (it.next()) |entry| {
+            if (entry.key == .GET) has_get = true;
             if (result.allowed_count < 16) {
                 result.allowed_methods[result.allowed_count] = entry.key;
+                result.allowed_count += 1;
+            }
+        }
+        // P2-5：dispatch 实现了 HEAD→GET 回退，所以只要有 GET 就支持 HEAD。
+        // 不把 HEAD 算进 Allow 会让 Allow 头与实际行为矛盾（RFC 9110 §10.2.1）。
+        if (has_get and result.allowed_count < 16) {
+            var already = false;
+            var i: u8 = 0;
+            while (i < result.allowed_count) : (i += 1) {
+                if (result.allowed_methods[i] == .HEAD) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                result.allowed_methods[result.allowed_count] = .HEAD;
                 result.allowed_count += 1;
             }
         }

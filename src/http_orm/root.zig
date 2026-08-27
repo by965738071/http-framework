@@ -41,9 +41,9 @@
 //! const UserModel = orm.Model(User, "users");
 //! const UserStore = UserModel.Store;
 //!
-//! // 3. 打开数据库
-//! var store = try UserStore.open(allocator, "./data");
-//! defer store.close() catch {};
+//! // 3. 打开数据库（需传入 std.Io）
+//! var store = try UserStore.open(allocator, io, "./data");
+//! defer store.close() catch |err| std.log.err("store close failed: {}", .{err});
 //!
 //! // 4. CRUD
 //! const id = try store.insert(.{ .id = 0, .username = "alice", .email = "alice@example.com" });
@@ -121,7 +121,7 @@ test "ORM persistence - data survives reopen" {
 
         var qb = Query(User).init(allocator);
         defer qb.deinit();
-        const all = try store.findAll(&qb);
+        const all = try store.findAll(store_alloc, &qb);
         // Arena owns the allocation, no need to free
 
         try std_testing.testing.expectEqual(@as(usize, 2), all.len);
@@ -163,8 +163,8 @@ test "ORM integration - full CRUD lifecycle" {
     var qb = Query(User).init(allocator);
     defer qb.deinit();
     _ = qb.orderBy("age", .Asc);
-    const all = try store.findAll(&qb);
-    defer allocator.free(all);
+    const all = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, all);
     try std_testing.testing.expectEqual(@as(usize, 2), all.len);
     try std_testing.testing.expectEqual(@as(u32, 25), all[0].age);
     try std_testing.testing.expectEqual(@as(u32, 30), all[1].age);

@@ -73,7 +73,15 @@ pub const ConnectionRunner = struct {
 
             _ = self.stats.active_requests.fetchAdd(1, .monotonic);
             var request_failed = false;
-            const hijack = self.processRequest(&request, http_request, &arenas) catch |err| blk: {
+            // keep-alive 决策提前到这里，并传给 processRequest：服务端主动断连
+            // （报错 / 优雅关机）时，Response 底层才能写出 `Connection: close`（P1-3），
+            // 否则客户端连接池把死连接当可复用 → 下一个请求 ECONNRESET。
+            const client_keep_alive = conn_loop.shouldKeepAlive(&request);
+            const shutting_down = self.stats.shutting_down.load(.monotonic);
+            // P2-38：尊重 HttpConfig.keep_alive_enabled——旧代码从不读这个开关，
+            // 运维设 false 以为关了 keep-alive 实际仍在复用连接（虚假的控制感）。
+            const response_keep_alive = client_keep_alive and !shutting_down and self.config.http.keep_alive_enabled;
+            const hijack = self.processRequest(&request, http_request, &arenas, response_keep_alive) catch |err| blk: {
                 std.log.err("processRequest: {s}", .{@errorName(err)});
                 request_failed = true;
                 break :blk null;
@@ -91,7 +99,7 @@ pub const ConnectionRunner = struct {
                 break;
             }
 
-            const keep_alive = conn_loop.shouldKeepAlive(&request);
+            const keep_alive = client_keep_alive and !shutting_down and self.config.http.keep_alive_enabled;
             arenas.endRequest(self.config.pool.request_arena_retain_bytes);
             // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
             // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
@@ -110,6 +118,7 @@ pub const ConnectionRunner = struct {
         request: *http_protocol.Request,
         http_request: *http.Server.Request,
         arenas: *http_app.Arenas,
+        keep_alive: bool,
     ) !?http_app.Hijack {
         const arena_alloc = arenas.requestAllocator();
 
@@ -133,6 +142,15 @@ pub const ConnectionRunner = struct {
 
         var res = http_protocol.Response.init(arena_alloc, http_protocol.Sink.fromHttp(http_request));
         defer res.deinit();
+        // keep-alive 决策由 ConnectionRunner 统一下发：为 false 时 std 写
+        // `Connection: close`，客户端不会把即将关闭的连接当可复用（P1-3）。
+        res.keep_alive = keep_alive;
+
+        // P2-38：尊重 HttpConfig.server_name——旧代码从不发 `Server:` 头，配置项形同虚设。
+        // 在 dispatch 前写入，handler / 中间件仍可覆盖。空串视为“不发”。
+        if (self.config.http.server_name.len > 0) {
+            _ = try res.header("Server", self.config.http.server_name);
+        }
 
         self.lifecycle.emit(.request_start, .{
             .ctx = &ctx,

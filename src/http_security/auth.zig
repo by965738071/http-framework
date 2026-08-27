@@ -112,6 +112,9 @@ pub const AuthMiddleware = struct {
 
     fn checkBasic(self: *Self, ctx: *Context, username: []const u8, password: []const u8) !bool {
         _ = self;
+        // P2-20：空凭据不放行（与 checkBearer/checkApiKey 一致）。
+        // 否则配置里密码为空串时，客户端发 `user:` 就能通过认证。
+        if (username.len == 0 or password.len == 0) return false;
         const header = ctx.request.getHeader("Authorization") orelse return false;
         const encoded = stripSchemePrefix(header, "Basic ") orelse return false;
 
@@ -197,13 +200,12 @@ pub const AuthMiddleware = struct {
 };
 
 /// 计算 base64 解码后的长度
+/// P2-21：用 std 的 calcSizeForSlice——它会拒绝非法填充（`=` 不在末尾、
+/// 长度非 4 的倍数等）。旧实现自己算长度，不校验 `=` 位置，
+/// 也不接受无填充 base64（不一致的宽容）。无效返回 0。
 fn base64DecodedLen(encoded: []const u8) usize {
     if (encoded.len == 0) return 0;
-    if (encoded.len % 4 != 0) return 0; // 无效 base64
-    var len = (encoded.len / 4) * 3;
-    if (encoded[encoded.len - 1] == '=') len -= 1;
-    if (encoded.len > 1 and encoded[encoded.len - 2] == '=') len -= 1;
-    return len;
+    return std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return 0;
 }
 
 // ===========================================================================

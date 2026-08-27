@@ -135,13 +135,13 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     defer sessions.deinit();
 
     // 5. ORM store（打开/创建表 ./data/users.json）
-    const store = try UserStore.open(allocator, io, "./data");
+    const store = try UserStore.open(allocator, io, "data");
     defer store.close() catch {};
 
     // 5b. Admin ORM stores
-    const admin_users = try admin.UserModel.Store.open(allocator, io, "./data/admin");
+    const admin_users = try admin.UserModel.Store.open(allocator, io, "data/admin");
     defer admin_users.close() catch {};
-    const admin_logs = try admin.LogStore.open(allocator, io, "./data/admin");
+    const admin_logs = try admin.LogStore.open(allocator, io, "data/admin");
     defer admin_logs.close() catch {};
 
     // 5c. Admin notifications broadcaster
@@ -149,7 +149,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     defer notifications.deinit();
 
     // 5d. Admin static file server
-    var admin_static = framework.StaticFileServer.init(allocator, io, "./public/admin", "/admin");
+    var admin_static = framework.StaticFileServer.init(allocator, io, "public/admin", "/admin");
 
     var admin_services = admin.AdminServices{
         .allocator = allocator,
@@ -160,7 +160,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     };
 
     // 5e. Device store
-    const device_store = try devices.DeviceStore.open(allocator, io, "./data/devices");
+    const device_store = try devices.DeviceStore.open(allocator, io, "data/devices");
     defer device_store.close() catch {};
 
     // 5b. 应用级服务容器（修复 #2）：把进程级单例注册进去，
@@ -352,7 +352,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // ── 设备管理 API（需要认证）─────────────────────────────────
     // 使用 admin 的 session 鉴权（复用 admin_services 的 RequireAuthMiddleware）
     {
-        var api_device_routes = try router.group("/api/devices");
+        var api_device_routes = router.group("/api/devices");
         try api_device_routes.use(admin.requireAuth(&admin_services));
 
         try api_device_routes.route(.GET, "", framework.Handler.initSingleton(devices.DeviceListHandler, &device_list_handler));
@@ -705,9 +705,8 @@ fn ormListHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     };
 
-    // 方法一：拿全部行（返回的切片由 store 的 allocator 分配，用完要 free）
-    const rows = try store.all();
-    defer store.allocator.free(rows);
+    // 方法一：拿全部行（返回的切片由 gpa 分配、行内字符串也已深拷贝，用完要 freeRows）
+    const rows = try store.all(ctx.arena);
 
     try res.json(.{ .total = rows.len, .users = rows });
 }
@@ -756,7 +755,7 @@ fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
     };
     const id = parseId(ctx, res) orelse return;
 
-    const user = try store.findById(id) orelse {
+    const user = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(res, framework.AppError.notFound("user not found"));
         return;
     };

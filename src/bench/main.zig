@@ -46,13 +46,14 @@ const NoopMiddleware = struct {
 
 fn discardingSink(w: *std.Io.Writer) Sink {
     const impl = struct {
-        fn respond(ptr: *anyopaque, status: std.http.Status, headers: []const std.http.Header, body: []const u8) anyerror!void {
+        fn respond(ptr: *anyopaque, status: std.http.Status, headers: []const std.http.Header, body: []const u8, keep_alive: bool) anyerror!void {
             _ = status;
             _ = headers;
+            _ = keep_alive;
             const dw: *std.Io.Writer = @ptrCast(@alignCast(ptr));
             try dw.writeAll(body);
         }
-        fn startStream(_: *anyopaque, _: std.http.Status, _: []const std.http.Header, _: ?u64, _: []u8) anyerror!std.http.BodyWriter {
+        fn startStream(_: *anyopaque, _: std.http.Status, _: []const std.http.Header, _: ?u64, _: []u8, _: bool) anyerror!std.http.BodyWriter {
             return error.NotSupported;
         }
     };

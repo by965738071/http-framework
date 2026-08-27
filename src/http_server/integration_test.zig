@@ -27,7 +27,8 @@ const http = std.http;
 /// 用于集成测试断言响应头。
 fn capturingSink(writer: *std.Io.Writer) Sink {
     const ctx = struct {
-        fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8) anyerror!void {
+        fn respond(ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) anyerror!void {
+            _ = keep_alive;
             const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
             try w.print("HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), @tagName(status) });
             for (headers) |h| {
@@ -36,12 +37,13 @@ fn capturingSink(writer: *std.Io.Writer) Sink {
             try w.writeAll("\r\n");
             try w.writeAll(body);
         }
-        fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8) anyerror!http.BodyWriter {
+        fn startStream(ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8, keep_alive: bool) anyerror!http.BodyWriter {
             _ = ptr;
             _ = status;
             _ = headers;
             _ = content_length;
             _ = buffer;
+            _ = keep_alive;
             return error.NotSupportedInCapturingSink;
         }
     };

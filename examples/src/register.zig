@@ -60,8 +60,8 @@ pub fn registerHandler(ctx: *framework.Context, res: *framework.Response, io: st
 
     // 检查用户名是否已存在
     {
-        const existing = try users.all();
-        defer users.allocator.free(existing);
+        const existing = try users.all(ctx.arena);
+        defer users.freeRows(ctx.arena, existing);
         for (existing) |u| {
             if (std.mem.eql(u8, u.username, username)) {
                 try ctx.failWith(res, framework.AppError.conflict("username already exists"));

@@ -97,6 +97,17 @@ pub const Server = struct {
     }
 
     pub fn setup(self: *Server) !void {
+        // P2-38：对“已设置但未实现”的配置项告警。死开关比没有配置更危险：
+        // 运维会以为自己改变了行为，实际无效。仅在非默认值时提醒，避免噪声。
+        if (self.config.body.lazy_read_size != 0) {
+            std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
+        }
+        if (self.config.network.idle_timeout_ns != 60_000_000_000) {
+            std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
+        }
+        if (self.config.http.access_log_enabled) {
+            std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
+        }
         self.listener = try Listener.init(&self.config.network);
     }
 

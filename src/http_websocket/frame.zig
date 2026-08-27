@@ -158,6 +158,13 @@ pub fn decode(reader: *std.Io.Reader, allocator: std.mem.Allocator, max_payload:
     const opcode_raw: u4 = @truncate(first & 0x0F);
     const opcode: OpCode = @fromBackingInt(@intCast(opcode_raw));
 
+    // P2-18：拒绝保留 opcode（0x3-0x7 非控制、0xB-0xF 控制）。
+    // decode 是公开 API，单独使用时不能把 0x3 当合法帧返回。
+    switch (opcode) {
+        .continuation, .text, .binary, .close, .ping, .pong => {},
+        _ => return error.ReservedOpcode,
+    }
+
     const second = try reader.takeByte();
     const mask = (second & 0x80) != 0;
     const len7: u8 = second & 0x7F;

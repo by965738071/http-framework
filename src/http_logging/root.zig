@@ -276,8 +276,17 @@ pub const Logger = struct {
         const ts: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
 
         switch (self.config.format) {
-            .json => formatJson(&writer, ts, level, ctx, msg, fields) catch return,
-            .text => formatText(&writer, ts, level, ctx, msg, fields) catch return,
+            .json => formatJson(&writer, ts, level, ctx, msg, fields) catch {
+                // 缓冲区写满（WriteFailed）时不能把整条日志丢掉：字段最多、
+                // 最长的日志恰恰是出错时那些。回退成一条截断标记行
+                // （保留 ts/level/rid + "truncated":true）。
+                writer = std.Io.Writer.fixed(&buf);
+                formatTruncated(&writer, ts, level, ctx, msg) catch return;
+            },
+            .text => formatText(&writer, ts, level, ctx, msg, fields) catch {
+                writer = std.Io.Writer.fixed(&buf);
+                formatTruncated(&writer, ts, level, ctx, msg) catch return;
+            },
         }
 
         const written = writer.buffered();
@@ -405,8 +414,15 @@ pub const Logger = struct {
 
         var write_buf: [4096]u8 = undefined;
         var file_writer = gz_file.writer(self.io, write_buf[0..]);
-        var hist_buf: [flate.max_window_len]u8 = undefined;
-        var encoder = flate.Compress.init(&file_writer.interface, &hist_buf, .gzip, .default) catch return;
+        // hist_buf (~64KB) 与 flate.Compress (~224KB) 必须堆分配，不能放栈上：
+        // rotate() 在 zio 协程的提交栈里跑，http_compress 模块已明令禁止这种
+        // 模式（“放栈上会直接溢出到 guard page”）。同一仓库不应一个模块知道、
+        // 另一个在犯。
+        const hist_buf = allocator.alloc(u8, flate.max_window_len) catch return;
+        defer allocator.free(hist_buf);
+        const encoder = allocator.create(flate.Compress) catch return;
+        defer allocator.destroy(encoder);
+        encoder.* = flate.Compress.init(&file_writer.interface, hist_buf, .gzip, .default) catch return;
         encoder.writer.writeAll(content) catch return;
         encoder.finish() catch return;
         file_writer.flush() catch return;
@@ -496,7 +512,23 @@ fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
     try writer.writeAll("\n");
 }
 
-/// text 日志值转义：将控制字符（含 CR/LF/TAB）转成可见的反斜杠转义，
+/// 当 formatJson/formatText 写满固定缓冲区时的回退：只写最小骨架
+/// （ts/level/rid + "truncated":true），保证出错时那条日志不会整条丢失。
+/// 统一用 JSON 形式（即使配置为 text）——截断行很短，不会再溢出。
+fn formatTruncated(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8) !void {
+    try writer.print("{{\"ts\":{d},\"level\":\"{s}\"", .{ ts, level.name() });
+    if (ctx) |c| {
+        if (c.state.getUserData(RequestId)) |rid| {
+            try writer.writeAll(",\"rid\":");
+            try writeJsonString(writer, rid.slice());
+        }
+    }
+    // msg 只取前 64 字节，避免再次写满。
+    const short = msg[0..@min(msg.len, 64)];
+    try writer.writeAll(",\"msg\":");
+    try writeJsonString(writer, short);
+    try writer.writeAll(",\"truncated\":true}\n");
+}
 /// 防止用户可控内容注入伪造日志行。
 fn writeTextEscaped(writer: *std.Io.Writer, s: []const u8) !void {
     for (s) |c| {

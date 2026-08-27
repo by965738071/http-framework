@@ -8,9 +8,6 @@
 //! http_protocol   字节 ↔ 报文（Request/Response/ConnectionLoop）
 //! http_app        生命周期 + 管道（Context/Handler/Middleware/AppError/Config/Lifecycle）
 //! http_router     radix trie 路由（Router/Trie）
-//! http_framework   字节 ↔ 报文（Request/Response/ConnectionLoop）
-//! http_app        生命周期 + 管道（Context/Handler/Middleware/AppError/Config/Lifecycle）
-//! http_router     radix trie 路由（Router/Trie）
 //! http_server     组装（zio_server + 后端无关的 ConnectionRunner）
 //! ```
 //!
