@@ -477,14 +477,13 @@ test "SessionManager.rotate 轮换会话（M5，防会话固定）" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
         .body = .none,
     };
-    var state = RequestState{};
-    defer state.deinit(arena_alloc);
+    var state = RequestState{ .arena = arena_alloc };
+    defer state.deinit();
     const cfg = RequestConfig{};
     var ctx = Context{
         .request = &request,
@@ -550,14 +549,13 @@ test "SessionManager 满员时采样驱逐而非拒绝（M7）" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
         .body = .none,
     };
-    var state = RequestState{};
-    defer state.deinit(allocator);
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
     const cfg = RequestConfig{};
     var ctx = Context{
         .request = &request,

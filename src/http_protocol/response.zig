@@ -152,7 +152,6 @@ pub const Response = struct {
     /// 是否已真正写入 sink（flush 或直接 send 之后置位）。防止缓冲模式下
     /// 中间件 flush 一次、ConnectionRunner 再 flush 一次导致 double-send（wire 错帧）。
     flushed: bool = false,
-    stream_open: bool = false,
     owned_strings: std.ArrayList([]u8) = .empty,
     /// 缓冲模式：sendResponse 只存不发送，flush() 才真正写入 sink。
     /// 中间件在 next() 之后添加的头能进入最终响应。
@@ -198,7 +197,10 @@ pub const Response = struct {
     /// 替换缓冲模式下的待发送 body。
     /// 用于中间件在 next() 之后修改 body（如压缩、签名）。
     /// 必须在 flush() 之前调用。返回旧 body（如有）。
+    /// 非缓冲模式下与 `pendingBody` 对称：no-op 返回 null（R8）——直发模式下
+    /// pending_body 永远不会被写出，静默写入只会造成「以为替换了」的假象。
     pub fn replacePendingBody(self: *Self, body: []const u8) ?[]const u8 {
+        if (!self.buffered) return null;
         const old = self.pending_body;
         self.pending_body = body;
         return old;
@@ -245,7 +247,9 @@ pub const Response = struct {
     }
 
     pub fn header(self: *Self, name: []const u8, value: []const u8) !*Self {
-        try validateHeaderValue(name);
+        // R1：name 必须是 RFC 9110 token——std 写头时 assert name 非空且不含 ':'
+        // （Server.zig:340-341），违规不是返回错误而是**进程 panic**。框架层前置拦截。
+        try validateHeaderName(name);
         try validateHeaderValue(value);
         const owned_name = try self.dupeOwned(name);
         const owned_value = try self.dupeOwned(value);
@@ -261,19 +265,29 @@ pub const Response = struct {
     /// 所有权说明：新值用 `dupeOwned`（计入 owned_strings，deinit 统一释放）；
     /// 旧值指针替换后仍留在 owned_strings 中，deinit 时会一并释放，无 double-free。
     pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !*Self {
-        try validateHeaderValue(name);
+        try validateHeaderName(name);
         try validateHeaderValue(value);
-        for (self.headers.items) |*h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) {
-                h.value = try self.dupeOwned(value);
-                return self;
-            }
+        // R6：替换第一条并删除其余同名头——只改第一条的话，经 header() 追加的
+        // 重复行仍会原样上 wire，违背「去重替换」承诺（重复 CSP/Server 头）。
+        var replaced = false;
+        var i: usize = 0;
+        while (i < self.headers.items.len) {
+            if (std.ascii.eqlIgnoreCase(self.headers.items[i].name, name)) {
+                if (!replaced) {
+                    self.headers.items[i].value = try self.dupeOwned(value);
+                    replaced = true;
+                    i += 1;
+                } else {
+                    _ = self.headers.orderedRemove(i);
+                }
+            } else i += 1;
         }
+        if (replaced) return self;
         return self.header(name, value);
     }
 
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !*Self {
-        try validateCookieToken(name);
+        try validateCookieName(name);
         try validateCookieToken(value);
         const owned_name = try self.dupeOwned(name);
         const owned_value = try self.dupeOwned(value);
@@ -283,7 +297,7 @@ pub const Response = struct {
 
     /// 设置完整 Cookie（带属性）。
     pub fn setCookieFull(self: *Self, cookie: Cookie) !*Self {
-        try validateCookieToken(cookie.name);
+        try validateCookieName(cookie.name);
         try validateCookieToken(cookie.value);
         const owned_name = try self.dupeOwned(cookie.name);
         const owned_value = try self.dupeOwned(cookie.value);
@@ -340,12 +354,16 @@ pub const Response = struct {
         try self.addCookiesToHeaders();
         _ = try self.header("Location", location);
         self.sent = true;
+        // R5：status 同步进 self.status——lifecycle 的 request_end 读 res.status，
+        // 旧代码直发分支不改，导致 302/303 在日志里显示为默认 200。
+        self.status = status;
         if (self.buffered) {
-            self.status = status;
             self.pending_body = "";
             return;
         }
         try self.sink.respond(status, self.headers.items, "", self.keep_alive);
+        // R3：直发已上 wire，与 sendResponse 同样置 flushed。
+        self.flushed = true;
     }
 
     /// 便捷：permanent=true → 301，false → 302。
@@ -368,8 +386,10 @@ pub const Response = struct {
         try self.addCookiesToHeaders();
         try self.appendHeaderIfAbsent("Content-Type", options.content_type);
 
+        // 注意：sent/flushed 必须在调 startStream **之前**置位（P0-2 回归测试依赖）——
+        // startStream 失败时状态行/头可能已部分上 wire；若留 sent==false，
+        // ErrorRenderer / connection 层兜底会再补一个 500 → 双响应投毒。
         self.sent = true;
-        self.stream_open = true;
         // 流式响应已经把状态行 + 头直接交给 sink（startStream）。此后任何 flush()
         // 都必须是 no-op：缓冲中间件（CompressMiddleware / TimingMiddleware 会
         // setBuffered）在 next() 返回后会调 flush()，而 ConnectionRunner 结尾还会
@@ -384,7 +404,7 @@ pub const Response = struct {
             buffer,
             self.keep_alive,
         );
-        return .{ .body = body, .response = self };
+        return .{ .body = body };
     }
 
     pub const StreamOptions = struct {
@@ -394,7 +414,6 @@ pub const Response = struct {
 
     pub const Stream = struct {
         body: http.BodyWriter,
-        response: *Self,
 
         pub fn writer(self: *Stream) *std.Io.Writer {
             return &self.body.writer;
@@ -425,7 +444,6 @@ pub const Response = struct {
                 }
             }
             try self.body.end();
-            self.response.stream_open = false;
         }
     };
 
@@ -448,6 +466,9 @@ pub const Response = struct {
             return;
         }
         try self.sink.respond(self.status, self.headers.items, content, self.keep_alive);
+        // R3：直发已真正写入 sink，同步置 flushed——否则后续违规 setBuffered()
+        // 会让 flush() 走 sent&&!pending 分支补发第二个响应（wire 双响应投毒）。
+        self.flushed = true;
     }
 
     fn dupeOwned(self: *Self, s: []const u8) ![]const u8 {
@@ -518,12 +539,58 @@ fn validateHeaderValue(s: []const u8) !void {
     }
 }
 
-/// 校验 cookie name/value：除 CRLF/NUL 外，还禁止 `;` `,` 空白（RFC 6265 §4.1.1），
+/// 校验 cookie value：除 CRLF/NUL 外，还禁止 `;` `,` 空白（RFC 6265 §4.1.1），
 /// 防止通过值里的 `;` 注入 Domain/Path/Secure 等属性（cookie 属性注入）。
+/// name 走更严格的 validateCookieName。
 fn validateCookieToken(s: []const u8) !void {
     for (s) |c| {
         if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
         if (c == ';' or c == ',' or c == ' ' or c == '\t') return error.InvalidCookieValue;
+    }
+}
+
+/// RFC 9110 tchar（token 字符集）。
+fn isTokenChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z',
+        'A'...'Z',
+        '0'...'9',
+        '!',
+        '#',
+        '$',
+        '%',
+        '&',
+        '\'',
+        '*',
+        '+',
+        '-',
+        '.',
+        '^',
+        '_',
+        '`',
+        '|',
+        '~',
+        => true,
+        else => false,
+    };
+}
+
+/// 头名校验（R1）：std 对 header name 有硬 assert（非空、不含 ':'，
+/// Server.zig:340-341），违规会 panic 整个进程；含空格/CR/LF 还会错帧或注入。
+/// 一律收敛到 RFC 9110 token 校验，在框架层报错，绝不上 wire。
+fn validateHeaderName(name: []const u8) !void {
+    if (name.len == 0) return error.InvalidHeaderName;
+    for (name) |c| {
+        if (!isTokenChar(c)) return error.InvalidHeaderName;
+    }
+}
+
+/// cookie name 必须是严格 RFC 6265 token（R7）：'=' 是 cookie-pair 分隔符，
+/// 出现在 name 里会让客户端把 "a=b" 解析成 name="a"、value="b=v"。
+fn validateCookieName(name: []const u8) !void {
+    if (name.len == 0) return error.InvalidCookieName;
+    for (name) |c| {
+        if (!isTokenChar(c)) return error.InvalidCookieName;
     }
 }
 
@@ -549,7 +616,10 @@ test "Response.header rejects CR/LF injection" {
     var res = Response.init(std.testing.allocator, Sink.testSink(&writer));
     defer res.deinit();
 
-    try std.testing.expectError(error.InvalidHeaderValue, res.header("Evil\r\nInjected", "value"));
+    // name 含 CR/LF：现在由 validateHeaderName（R1）拦截，报 InvalidHeaderName
+    try std.testing.expectError(error.InvalidHeaderName, res.header("Evil\r\nInjected", "value"));
+    // value 含 CR/LF：仍由 validateHeaderValue 拦截
+    try std.testing.expectError(error.InvalidHeaderValue, res.header("X-Evil", "v\r\nInjected"));
 }
 
 test "Response.json serializes struct" {
@@ -702,6 +772,107 @@ test "缓冲模式 flush 幂等：只 respond 一次（P0-2 回归）" {
     try res.text("hello");
     try res.flush();
     try res.flush();
+    try res.flush();
+    try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
+}
+
+// ── R1-R8 回归测试（response.zig 审查轮）────────────────────────────────
+
+test "header/setHeader 拒绝非法头名，避免 std assert panic（R1）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    // std Server.zig:340-341 对 name 硬 assert：非空、不含 ':'。空格名会错帧。
+    try std.testing.expectError(error.InvalidHeaderName, res.header("X-Foo: Bar", "v"));
+    try std.testing.expectError(error.InvalidHeaderName, res.header("", "v"));
+    try std.testing.expectError(error.InvalidHeaderName, res.header("Bad Name", "v"));
+    try std.testing.expectError(error.InvalidHeaderName, res.setHeader("Bad:Name", "v"));
+    // 合法 RFC 9110 token 名必须通过
+    _ = try res.header("X-Good-Name_1", "v");
+    try std.testing.expectEqual(@as(usize, 1), res.headers.items.len);
+}
+
+test "直发后 flush 幂等：违规 setBuffered 也不补发第二个响应（R3）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    try res.text("hi"); // 直发：respond 一次
+    try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
+    // 契约违例场景：直发之后才 setBuffered。修复前 flushed==false，
+    // flush() 会从 sent&&!pending 分支补发空响应 → wire 双响应。
+    res.setBuffered();
+    try res.flush();
+    try res.flush();
+    try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
+}
+
+test "redirectStatus 直发模式同步 self.status 并置 flushed（R5/R3）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    try res.redirectStatus("/next", .see_other);
+    // lifecycle 的 request_end 读 res.status：修复前直发分支不更新，日志显示 200
+    try std.testing.expectEqual(http.Status.see_other, res.status);
+    try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
+    try std.testing.expect(res.flushed);
+}
+
+test "setHeader 替换全部同名头而非仅第一条（R6）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    _ = try res.header("X-Dup", "1");
+    _ = try res.header("x-dup", "2");
+    _ = try res.header("X-DUP", "3");
+    _ = try res.setHeader("X-Dup", "final");
+
+    try std.testing.expectEqual(@as(usize, 1), res.headers.items.len);
+    try std.testing.expectEqualStrings("final", res.headers.items[0].value);
+}
+
+test "setCookie 拒绝 name 含 '=' 等非 token 字符（R7）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    try std.testing.expectError(error.InvalidCookieName, res.setCookie("a=b", "v"));
+    try std.testing.expectError(error.InvalidCookieName, res.setCookie("na me", "v"));
+    // value 含 '=' 合法（RFC 6265 cookie-value 允许）
+    _ = try res.setCookie("sid", "a=b");
+    try std.testing.expectEqual(@as(usize, 1), res.cookies.items.len);
+}
+
+test "replacePendingBody 非缓冲模式下不生效（R8，与 pendingBody 对称）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    // 直发模式：写入无效，返回 null
+    try std.testing.expect(res.replacePendingBody("x") == null);
+    try std.testing.expect(res.pending_body == null);
+    // 缓冲模式：正常替换
+    res.setBuffered();
+    try res.text("old");
+    const old = res.replacePendingBody("new");
+    try std.testing.expect(old != null);
+    try std.testing.expectEqualStrings("new", res.pending_body.?);
+}
+
+test "缓冲模式 status-only 响应：connection 层兜底 text(\"\") + flush 能写出（R2）" {
+    var counter = CountingSink{};
+    var res = Response.init(std.testing.allocator, counter.sink());
+    defer res.deinit();
+
+    // 模拟 204 No Content handler：只设 status，从不写 body。
+    // 缓冲模式（Timing/Compress 会开）下 flush() 对 !sent 是 no-op，
+    // 依赖 connection.zig 兜底改调 text("")；这里断言兜底路径可写出响应。
+    res.setBuffered();
+    _ = res.statusCode(.no_content);
+    if (!res.sent) try res.text("");
     try res.flush();
     try std.testing.expectEqual(@as(usize, 1), counter.respond_calls);
 }

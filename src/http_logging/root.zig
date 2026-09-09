@@ -352,10 +352,13 @@ pub const Logger = struct {
         self.mutex.unlock(self.io);
 
         // 压缩在锁外执行：轮转时 rename 出归档文件后即释放锁，gzip 整文件
-        // 不阻塞其它日志写（修复低优先：轮转压缩不持日志锁）。
+        // 不阻塞其它日志写（修复低优先：轮转压缩不持日志锁）。失败只打
+        // stderr 提示（直接写，不再经 log()，避免压缩失败触发新的日志写）。
         if (pending) |rotated| {
-            self.compressToGzip(rotated);
-            self.allocator.free(rotated);
+            defer self.allocator.free(rotated);
+            self.compressToGzip(rotated) catch |e| {
+                std.debug.print("http_logging: compress {s} failed: {s}\n", .{ rotated, @errorName(e) });
+            };
         }
     }
 
@@ -455,29 +458,31 @@ pub const Logger = struct {
 
     /// 将已轮转的归档文件 gzip 压缩为 {src}.gz，并删除未压缩的原文件。
     /// 由 log() 在释放日志锁后调用，避免阻塞其它日志写。
-    fn compressToGzip(self: *Logger, src: []const u8) void {
+    /// 返回错误，处置策略由调用方决定（log() 只打 stderr，不阻塞日志写）。
+    fn compressToGzip(self: *Logger, src: []const u8) !void {
         const fc = self.config.file orelse return;
         const allocator = self.allocator;
         const cwd = std.Io.Dir.cwd();
 
         const cap = fc.max_size + MAX_LOG_LINE;
         const bytes = blk: {
-            break :blk cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch |e| {
+            const data = cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch |e| {
                 // 文件超过压缩上限（异常大）：先截断源文件到 cap 再压缩，避免
-                // 超限归档残留、下次轮转被静默覆盖（修复低优先）。其它错误放弃。
-                if (e != error.StreamTooLong) return;
-                const f = cwd.openFile(self.io, src, .{ .mode = .read_write }) catch return;
+                // 超限归档残留、下次轮转被静默覆盖（M11）。其它错误原样上报。
+                if (e != error.StreamTooLong) return e;
+                const f = cwd.openFile(self.io, src, .{ .mode = .read_write }) catch |oe| return oe;
                 defer f.close(self.io);
-                if (std.c.ftruncate(f.handle, @intCast(cap)) != 0) return;
-                break :blk cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch return;
+                try f.setLength(self.io, @intCast(cap));
+                break :blk cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch |oe| return oe;
             };
+            break :blk data;
         };
         defer allocator.free(bytes);
 
-        const gz_path = std.fmt.allocPrint(allocator, "{s}.gz", .{src}) catch return;
+        const gz_path = try std.fmt.allocPrint(allocator, "{s}.gz", .{src});
         defer allocator.free(gz_path);
 
-        const gz_file = cwd.createFile(self.io, gz_path, .{ .truncate = true }) catch return;
+        const gz_file = try cwd.createFile(self.io, gz_path, .{ .truncate = true });
         defer gz_file.close(self.io);
 
         var write_buf: [4096]u8 = undefined;
@@ -486,16 +491,17 @@ pub const Logger = struct {
         // rotate() 在 zio 协程的提交栈里跑，http_compress 模块已明令禁止这种
         // 模式（“放栈上会直接溢出到 guard page”）。同一仓库不应一个模块知道、
         // 另一个在犯。
-        const hist_buf = allocator.alloc(u8, flate.max_window_len) catch return;
+        const hist_buf = try allocator.alloc(u8, flate.max_window_len);
         defer allocator.free(hist_buf);
-        const encoder = allocator.create(flate.Compress) catch return;
+        const encoder = try allocator.create(flate.Compress);
         defer allocator.destroy(encoder);
-        encoder.* = flate.Compress.init(&file_writer.interface, hist_buf, .gzip, .default) catch return;
-        encoder.writer.writeAll(bytes) catch return;
-        encoder.finish() catch return;
-        file_writer.flush() catch return;
+        encoder.* = try flate.Compress.init(&file_writer.interface, hist_buf, .gzip, .default);
+        try encoder.writer.writeAll(bytes);
+        try encoder.finish();
+        try file_writer.flush();
 
-        cwd.deleteFile(self.io, src) catch {};
+        // gz 已生成，删源文件；失败也应上报（否则超限归档仍会残留）。
+        try cwd.deleteFile(self.io, src);
     }
 
     /// 轮转后重开新的日志文件；失败则暂停文件写（不改动 config.output，
@@ -695,7 +701,7 @@ pub const LoggingHook = struct {
     logger: *Logger,
 
     pub fn onEvent(self: *@This(), event: http_app.Event, data: *const http_app.EventData) void {
-        const ctx: ?*const Context = if (data.ctx) |c| c else null;
+        const ctx = if (data.ctx) |c| c else null;
 
         switch (event) {
             .request_start => {
@@ -706,6 +712,7 @@ pub const LoggingHook = struct {
                 // 重复 key 的 JSON 行为未定义，Loki/ES/jq 处理各异，最坏整行被拒收 ——
                 // 也就是出事时最需要的那条日志没了。
                 // ctx 为 null（无请求上下文）时才补上，保证信息不丢。
+
                 if (ctx != null) {
                     self.logger.info(ctx, "request_start", &.{});
                 } else {
@@ -1049,8 +1056,8 @@ test "formatJson includes request context when ctx provided" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var req = http_protocol.Request{
         .method = .POST,
@@ -1059,7 +1066,6 @@ test "formatJson includes request context when ctx provided" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "POST /login HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -1076,7 +1082,7 @@ test "formatJson includes request context when ctx provided" {
     // 设置 RequestId
     const rid = try arena.allocator().create(RequestId);
     rid.* = .{ .value = "abcdef0123456789abcdef0123456789".*, .len = 32 };
-    try ctx.state.setUserData(RequestId, rid, arena.allocator());
+    try ctx.state.setUserData(RequestId, rid);
 
     var buf: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);

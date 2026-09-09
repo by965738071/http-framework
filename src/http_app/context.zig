@@ -52,8 +52,7 @@ pub const PathParams = struct {
     values: [CAP][]const u8 = undefined,
     len: usize = 0,
 
-    /// allocator 参数保留是为了与旧 HashMap 调用点签名兼容（本实现不分配）。
-    pub fn put(self: *PathParams, _: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    pub fn put(self: *PathParams, key: []const u8, value: []const u8) !void {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
             if (std.mem.eql(u8, self.keys[i], key)) {
@@ -90,8 +89,7 @@ pub const PathParams = struct {
         return false;
     }
 
-    /// 与旧 HashMap 签名兼容；内联数组无需释放。
-    pub fn deinit(self: *PathParams, _: std.mem.Allocator) void {
+    pub fn deinit(self: *PathParams) void {
         self.len = 0;
     }
 
@@ -103,6 +101,9 @@ pub const PathParams = struct {
 
 /// 请求级可变状态（每个请求一个实例）。
 pub const RequestState = struct {
+    /// 请求级分配器（生产上是连接复用的 request arena；测试里可为任意 allocator）。
+    /// setUserData 用它分配链表节点；节点随 arena reset 统一回收，不单独 free。
+    arena: std.mem.Allocator,
     path_params: PathParams = .{},
     user_data: ?*UserData = null,
     route_pattern: ?[]const u8 = null,
@@ -117,18 +118,19 @@ pub const RequestState = struct {
     /// 跳过常规响应并把裸连接交给 hijack.run。
     hijack: ?Hijack = null,
 
-    pub fn deinit(self: *RequestState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *RequestState) void {
         // path_params: 内联数组，key/value 切片指向 trie/arena，无需释放内存。
-        self.path_params.deinit(allocator);
+        self.path_params.deinit();
 
-        // user_data: 链表节点由 arena 分配，arena reset 时回收。
-        // 但 destroyFn 可能需要释放非 arena 资源。
+        // user_data: 节点由 self.arena 分配、这里用同一个 self.arena 释放，
+        // 不存在分配/释放 allocator 不匹配的风险。arena 分配器下 destroy 是 no-op
+        // （随 arena reset 统一回收）；裸 allocator（如测试）下正常释放节点。
+        // 注：ud.ptr 指向的数据由调用方拥有（通常是 arena），不在此释放。
         var node = self.user_data;
         self.user_data = null;
         while (node) |ud| {
             const next = ud.next;
-            ud.destroyFn(ud.ptr, allocator);
-            allocator.destroy(ud);
+            self.arena.destroy(ud);
             node = next;
         }
     }
@@ -146,17 +148,25 @@ pub const RequestState = struct {
     }
 
     /// 设置中间件通讯槽（按类型索引，不覆盖其它类型的槽）。
-    pub fn setUserData(self: *RequestState, comptime T: type, ptr: *T, allocator: std.mem.Allocator) !void {
-        const node = try allocator.create(UserData);
-        node.* = .{
-            .key = @typeName(T),
+    /// 同类型重复设置时原地更新 ptr，不产生孤儿节点（与 PathParams.put 对齐）。
+    /// 链表节点用 self.arena 分配，随 arena 统一回收。
+    pub fn setUserData(self: *RequestState, comptime T: type, ptr: *T) !void {
+        const key = @typeName(T);
+        var node = self.user_data;
+        while (node) |ud| {
+            if (std.mem.eql(u8, ud.key, key)) {
+                ud.ptr = @ptrCast(ptr);
+                return;
+            }
+            node = ud.next;
+        }
+        const new_node = try self.arena.create(UserData);
+        new_node.* = .{
+            .key = key,
             .ptr = @ptrCast(ptr),
-            .destroyFn = struct {
-                fn destroy(_: *anyopaque, _: std.mem.Allocator) void {}
-            }.destroy,
             .next = self.user_data,
         };
-        self.user_data = node;
+        self.user_data = new_node;
     }
 };
 
@@ -164,7 +174,6 @@ pub const RequestState = struct {
 pub const UserData = struct {
     key: []const u8,
     ptr: *anyopaque,
-    destroyFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
     next: ?*UserData = null,
 };
 
@@ -197,7 +206,7 @@ pub const Context = struct {
     /// 对端 IP 的稳定字符串形式（不含端口），适合做 per-IP 限流键 / 审计日志：
     ///   - IPv4 → 点分十进制，如 "203.0.113.195"
     ///   - IPv6 → 16 字节大端序的低位十六进制（RFC-5952 压缩省略，但无歧义且稳定）
-    /// 无对端地址时为 null；缓冲区不够时截断不可靠，调用方给足 ≥ 64 字节。
+    /// 无对端地址时为 null；缓冲区不够时返回 null，调用方给足 ≥ 64 字节。
     pub fn peerIpString(self: *const Context, buf: []u8) ?[]const u8 {
         const ip = self.peer_ip orelse return null;
         var w = std.Io.Writer.fixed(buf);
@@ -266,7 +275,7 @@ pub const Context = struct {
     }
 
     pub fn setUserData(self: *Context, comptime T: type, ptr: *T) !void {
-        try self.state.setUserData(T, ptr, self.arena);
+        try self.state.setUserData(T, ptr);
     }
 
     /// 注册连接劫持钩子（WebSocket 升级等）。
@@ -298,15 +307,14 @@ pub const Context = struct {
     /// 取出 AppError 并用 `toResponse` 渲染（fix.md §一.3）。
     ///
     /// handler 用法：
-    ///   try ctx.failWith(res, .unauthorized, "bad token");
-    ///   return;  // 实际上 failWith 返回 error，会自动 return
-    pub fn failWith(self: *Context, res: *http_protocol.Response, app_err: AppError) !void {
-        _ = res;
+    ///   try ctx.failWith(AppError.unauthorized("bad token"));
+    ///   return;  // failWith 返回 error.AppError，会自动 return
+    pub fn failWith(self: *Context, app_err: AppError) !void {
         // 在请求 arena 上分配 AppError 实例，存进 user_data 槽。
         // 连接结束 arena 回收，无需手动 free。
         const slot = try self.arena.create(AppError);
         slot.* = app_err;
-        try self.state.setUserData(AppError, slot, self.arena);
+        try self.state.setUserData(AppError, slot);
         return error.AppError;
     }
 };
@@ -321,8 +329,8 @@ test "RequestState.setUserData / getUserData by type" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var state = RequestState{};
-    defer state.deinit(arena_alloc);
+    var state = RequestState{ .arena = arena_alloc };
+    defer state.deinit();
 
     const AuthInfo = struct { user_id: u32 };
     const Session = struct { session_id: []const u8 };
@@ -330,8 +338,8 @@ test "RequestState.setUserData / getUserData by type" {
     var auth = AuthInfo{ .user_id = 42 };
     var session = Session{ .session_id = "abc123" };
 
-    try state.setUserData(AuthInfo, &auth, arena_alloc);
-    try state.setUserData(Session, &session, arena_alloc);
+    try state.setUserData(AuthInfo, &auth);
+    try state.setUserData(Session, &session);
 
     try std.testing.expectEqual(@as(u32, 42), state.getUserData(AuthInfo).?.user_id);
     try std.testing.expectEqualStrings("abc123", state.getUserData(Session).?.session_id);
@@ -343,9 +351,9 @@ test "Context.param delegates to state.path_params" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = RequestState{};
-    defer state.deinit(arena.allocator());
-    try state.path_params.put(arena.allocator(), "id", "123");
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+    try state.path_params.put("id", "123");
 
     var req = Request{
         .method = .GET,
@@ -354,7 +362,6 @@ test "Context.param delegates to state.path_params" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -377,8 +384,9 @@ test "Context.peerIpString 格式化内核对端 IP（H3  plumbing）" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+
     var req = Request{
         .method = .GET,
         .target = "/",
@@ -386,7 +394,6 @@ test "Context.peerIpString 格式化内核对端 IP（H3  plumbing）" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

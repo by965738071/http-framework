@@ -184,18 +184,18 @@ pub const RequireAuthMiddleware = struct {
 
     pub fn process(self: *RequireAuthMiddleware, ctx: *framework.Context, res: *framework.Response, next: framework.Next) !void {
         const sessions = ctx.service(framework.SessionManager) orelse {
-            try ctx.failWith(res, framework.AppError.internal("session service unavailable"));
+            try ctx.failWith(framework.AppError.internal("session service unavailable"));
             return;
         };
 
         const session_id = ctx.request.getCookie("sid") orelse {
-            try ctx.failWith(res, framework.AppError.unauthorized("not logged in"));
+            try ctx.failWith(framework.AppError.unauthorized("not logged in"));
             return;
         };
 
         const username = sessions.getValue(session_id, "username", ctx.arena) catch null;
         if (username == null) {
-            try ctx.failWith(res, framework.AppError.unauthorized("session expired"));
+            try ctx.failWith(framework.AppError.unauthorized("session expired"));
             return;
         }
 
@@ -213,7 +213,7 @@ pub const RequireAuthMiddleware = struct {
         }
 
         if (!found) {
-            try ctx.failWith(res, framework.AppError.unauthorized("user not found"));
+            try ctx.failWith(framework.AppError.unauthorized("user not found"));
             return;
         }
 
@@ -231,17 +231,17 @@ pub const RequireRoleMiddleware = struct {
 
     pub fn process(self: *RequireRoleMiddleware, ctx: *framework.Context, res: *framework.Response, next: framework.Next) !void {
         const sessions = ctx.service(framework.SessionManager) orelse {
-            try ctx.failWith(res, framework.AppError.internal("session unavailable"));
+            try ctx.failWith(framework.AppError.internal("session unavailable"));
             return;
         };
 
         const session_id = ctx.request.getCookie("sid") orelse {
-            try ctx.failWith(res, framework.AppError.unauthorized("not logged in"));
+            try ctx.failWith(framework.AppError.unauthorized("not logged in"));
             return;
         };
 
         const username = sessions.getValue(session_id, "username", ctx.arena) catch null orelse {
-            try ctx.failWith(res, framework.AppError.unauthorized("session expired"));
+            try ctx.failWith(framework.AppError.unauthorized("session expired"));
             return;
         };
 
@@ -261,7 +261,7 @@ pub const RequireRoleMiddleware = struct {
                     .viewer => true,
                 };
                 if (!can_access) {
-                    try ctx.failWith(res, framework.AppError.forbidden("insufficient permissions"));
+                    try ctx.failWith(framework.AppError.forbidden("insufficient permissions"));
                     return;
                 }
                 break;
@@ -283,7 +283,7 @@ pub fn loginPageHandler(ctx: *framework.Context, res: *framework.Response, servi
     // 检查是否已登录
     const sessions = ctx.service(framework.SessionManager) orelse {
         std.log.err("loginPageHandler: session service not found", .{});
-        try ctx.failWith(res, framework.AppError.internal("session unavailable"));
+        try ctx.failWith(framework.AppError.internal("session unavailable"));
         return;
     };
     std.log.info("loginPageHandler: got session service", .{});
@@ -311,11 +311,11 @@ pub fn loginPageHandler(ctx: *framework.Context, res: *framework.Response, servi
 pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     // 简单解析：支持 JSON 和 form-urlencoded（经 ctx.formDecoded 读取并缓冲 body）
     const username = (try ctx.formDecoded("username", 1 << 16)) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("username required"));
+        try ctx.failWith(framework.AppError.badRequest("username required"));
         return;
     };
     const password = (try ctx.formDecoded("password", 1 << 16)) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("password required"));
+        try ctx.failWith(framework.AppError.badRequest("password required"));
         return;
     };
 
@@ -341,13 +341,13 @@ pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, servic
     }
 
     if (!user_found) {
-        try ctx.failWith(res, framework.AppError.unauthorized("invalid credentials"));
+        try ctx.failWith(framework.AppError.unauthorized("invalid credentials"));
         return;
     }
 
     // 创建 session
     const sessions = ctx.service(framework.SessionManager) orelse {
-        try ctx.failWith(res, framework.AppError.internal("session unavailable"));
+        try ctx.failWith(framework.AppError.internal("session unavailable"));
         return;
     };
     const sid = try sessions.getOrCreate(ctx, res);
@@ -420,18 +420,18 @@ pub fn userListHandler(_: *framework.Context, res: *framework.Response, services
 /// POST /admin/users — 创建用户
 pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     const username = (ctx.formDecoded("username", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("username required"));
+        try ctx.failWith(framework.AppError.badRequest("username required"));
         return;
     };
     const email = (try ctx.formDecoded("email", 1 << 16)) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("email required"));
+        try ctx.failWith(framework.AppError.badRequest("email required"));
         return;
     };
     const password = (try ctx.formDecoded("password", 1 << 16)) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("password required"));
+        try ctx.failWith(framework.AppError.badRequest("password required"));
         return;
     };
     const role_str = (try ctx.formDecoded("role", 1 << 16)) orelse "viewer";
@@ -445,7 +445,7 @@ pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, serv
         .created_at = @as(u64, @intCast(@divTrunc(std.Io.Timestamp.now(services.io, .real).nanoseconds, 1_000_000))),
     }) catch |err| {
         if (err == error.UniqueViolation) {
-            try ctx.failWith(res, framework.AppError.conflict("username already exists"));
+            try ctx.failWith(framework.AppError.conflict("username already exists"));
             return;
         }
         return err;
@@ -459,7 +459,7 @@ pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, serv
 pub fn userGetHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     const id = parseId(ctx, res) orelse return;
     const user = try services.users.findById(ctx.arena, id) orelse {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     };
     try res.json(user);
@@ -470,14 +470,14 @@ pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, serv
     const id = parseId(ctx, res) orelse return;
 
     const username = (ctx.formDecoded("username", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse "";
     const email = (try ctx.formDecoded("email", 1 << 16)) orelse "";
     const role = (try ctx.formDecoded("role", 1 << 16)) orelse "";
 
     const existing = try services.users.findById(ctx.arena, id) orelse {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     };
 
@@ -492,7 +492,7 @@ pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, serv
     });
 
     if (!updated) {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     }
     try services.users.flush();
@@ -504,7 +504,7 @@ pub fn userDeleteHandler(ctx: *framework.Context, res: *framework.Response, serv
     const id = parseId(ctx, res) orelse return;
     const deleted = try services.users.deleteById(id);
     if (!deleted) {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     }
     try services.users.flush();
@@ -550,16 +550,16 @@ pub fn settingsHandler(ctx: *framework.Context, res: *framework.Response, servic
 /// GET /admin/me — 当前登录用户信息
 pub fn meHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     const sessions = ctx.service(framework.SessionManager) orelse {
-        try ctx.failWith(res, framework.AppError.unauthorized("not logged in"));
+        try ctx.failWith(framework.AppError.unauthorized("not logged in"));
         return;
     };
     const session_id = ctx.request.getCookie("sid") orelse {
-        try ctx.failWith(res, framework.AppError.unauthorized("no session cookie"));
+        try ctx.failWith(framework.AppError.unauthorized("no session cookie"));
         return;
     };
 
     const username = sessions.getValue(session_id, "username", ctx.arena) catch null orelse {
-        try ctx.failWith(res, framework.AppError.unauthorized("session expired"));
+        try ctx.failWith(framework.AppError.unauthorized("session expired"));
         return;
     };
     const role_str = sessions.getValue(session_id, "role", ctx.arena) catch null orelse "viewer";
@@ -700,7 +700,7 @@ pub const WsNotificationsHandler = struct {
 
 pub fn wsNotificationsHandler(ctx: *framework.Context, res: *framework.Response, _: *AdminServices) !void {
     const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), wsNotifications) catch |err| {
-        try ctx.failWith(res, framework.AppError.badRequest("websocket upgrade failed"));
+        try ctx.failWith(framework.AppError.badRequest("websocket upgrade failed"));
         return err;
     };
     if (!upgraded) {
@@ -740,11 +740,11 @@ fn wsNotifications(ws: *framework.WebSocket, raw: *anyopaque) anyerror!void {
 
 fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(res, framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
         return null;
     };
     return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(res, framework.AppError.badRequest("id must be an integer")) catch {};
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
         return null;
     };
 }

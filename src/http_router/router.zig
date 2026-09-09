@@ -243,8 +243,8 @@ test "Router dispatches to matched route" {
     }.h);
     try router.route(.GET, "/hello", handler);
 
-    var state = http_app.RequestState{};
-    defer state.deinit(allocator);
+    var state = http_app.RequestState{ .arena = allocator };
+    defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -253,7 +253,6 @@ test "Router dispatches to matched route" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET /hello HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -282,8 +281,8 @@ test "Router returns 404 for unmatched route" {
     var router = try Router.init(allocator);
     defer router.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(allocator);
+    var state = http_app.RequestState{ .arena = allocator };
+    defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -292,7 +291,6 @@ test "Router returns 404 for unmatched route" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET /nope HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -330,8 +328,8 @@ test "Router records route pattern instead of raw path (fix TODO)" {
     }.h);
     try router.route(.GET, "/users/:id", handler);
 
-    var state = http_app.RequestState{};
-    defer state.deinit(allocator);
+    var state = http_app.RequestState{ .arena = allocator };
+    defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -340,7 +338,6 @@ test "Router records route pattern instead of raw path (fix TODO)" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET /users/42 HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -401,8 +398,8 @@ fn dispatchPath(router: *Router, allocator: std.mem.Allocator, path: []const u8,
     defer req_arena.deinit();
     const arena = req_arena.allocator();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena);
+    var state = http_app.RequestState{ .arena = arena };
+    defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var head_buf: [128]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buf, "GET {s} HTTP/1.1\r\n\r\n", .{path});
@@ -413,7 +410,6 @@ fn dispatchPath(router: *Router, allocator: std.mem.Allocator, path: []const u8,
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

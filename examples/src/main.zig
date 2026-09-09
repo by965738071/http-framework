@@ -173,6 +173,8 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try services.register(framework.SessionManager, &sessions);
     try services.register(UserStore, store);
     try services.register(admin.AdminServices, &admin_services);
+    // 注册完毕，封箱：开始服务后任何 register 都会显式失败（防并发 realloc 竞态）。
+    services.seal();
 
     // 6. 路由器
     var router = try framework.Router.init(allocator);
@@ -420,11 +422,11 @@ fn healthHandler(_: *framework.Context, res: *framework.Response) !void {
 /// 路径参数示例：GET /users/42
 fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const id = ctx.param("id") orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("missing :id"));
+        try ctx.failWith(framework.AppError.badRequest("missing :id"));
         return;
     };
     const id_num = std.fmt.parseInt(u64, id, 10) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("id must be an integer"));
+        try ctx.failWith(framework.AppError.badRequest("id must be an integer"));
         return;
     };
     try res.json(.{ .id = id_num, .name = std.fmt.allocPrint(ctx.arena, "user-{d}", .{id_num}) catch "?" });
@@ -457,7 +459,7 @@ fn redirectHandler(_: *framework.Context, res: *framework.Response) !void {
 /// curl -X POST -d 'name=Jane+Doe&city=%E5%8C%97%E4%BA%AC' http://127.0.0.1:9000/form
 fn formHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const name = (ctx.formDecoded("name", 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse "anonymous";
     const city = (try ctx.formDecoded("city", 1 << 20)) orelse "unknown";
@@ -476,17 +478,17 @@ const LoginRequest = struct {
 fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // parseJson(T, arena, body)：解析并返回 *T（arena 分配，请求结束自动回收）
     const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
         return;
     };
 
     if (std.mem.eql(u8, body.username, "alice") and std.mem.eql(u8, body.password, "secret")) {
         try res.json(.{ .ok = true, .user = body.username });
     } else {
-        try ctx.failWith(res, framework.AppError.unauthorized("invalid credentials"));
+        try ctx.failWith(framework.AppError.unauthorized("invalid credentials"));
     }
 }
 
@@ -497,10 +499,10 @@ const CreateItemRequest = struct {
 
 fn createItemHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const body = framework.parseJson(CreateItemRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
         return;
     };
 
@@ -524,16 +526,28 @@ fn createItemHandler(ctx: *framework.Context, res: *framework.Response) !void {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("not a multipart request"));
-        return;
+    // 逐项映射 multipartFrom 的错误（见其文档）：一律 catch 成 400 会把
+    // BodyTooLarge（413）/ OOM（500）的语义吞掉。
+    var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch |err| switch (err) {
+        error.NotMultipart, error.MissingBoundary, error.TooManyParts, error.MalformedPart, error.DuplicateField => {
+            try ctx.failWith(framework.AppError.badRequest("invalid multipart request"));
+            return;
+        },
+        error.BodyTooLarge => {
+            // chunked 超限只能在读了半截后发现，std 不会排空残留 body：
+            // 413 后必须关连接，否则残余字节会被当成下一个请求（走私面）。
+            res.keep_alive = false;
+            try ctx.failWith(framework.AppError.payloadTooLarge("upload too large (max 10MB)"));
+            return;
+        },
+        else => return err, // OutOfMemory 等继续向上传播，由连接层统一 500
     };
     defer form.deinit();
 
     const username = form.getText("username") orelse "anonymous";
 
     if (form.getFile("avatar")) |file| {
-        const file_name = file.file_name orelse "upload.bin";
+        const file_name = file.safeBaseName() orelse "upload.bin";
         var target_file = try std.Io.Dir.createFile(.cwd(), ctx.io, file_name, .{});
         defer target_file.close(ctx.io);
         var writer = target_file.writer(ctx.io, &.{});
@@ -553,7 +567,7 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     }
 
-    try ctx.failWith(res, framework.AppError.badRequest("no file field \"avatar\" found"));
+    try ctx.failWith(framework.AppError.badRequest("no file field \"avatar\" found"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -607,21 +621,21 @@ fn errorDemoHandler(ctx: *framework.Context, res: *framework.Response) !void {
 /// POST /session/login  {"username":"alice","password":"secret"}
 fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
         return;
     };
 
     if (!std.mem.eql(u8, body.username, "alice") or !std.mem.eql(u8, body.password, "secret")) {
-        try ctx.failWith(res, framework.AppError.unauthorized("invalid credentials"));
+        try ctx.failWith(framework.AppError.unauthorized("invalid credentials"));
         return;
     }
 
     // getOrCreate：没有 cookie 就新建 session 并写 Set-Cookie
     const sessions = ctx.service(framework.SessionManager) orelse {
-        try ctx.failWith(res, framework.AppError.internal("session service not available"));
+        try ctx.failWith(framework.AppError.internal("session service not available"));
         return;
     };
     const session_id = try sessions.getOrCreate(ctx, res);
@@ -637,19 +651,19 @@ fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void 
 /// GET /session/me （带 cookie）→ 返回当前登录用户
 fn sessionMeHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const sessions = ctx.service(framework.SessionManager) orelse {
-        try ctx.failWith(res, framework.AppError.internal("session service not available"));
+        try ctx.failWith(framework.AppError.internal("session service not available"));
         return;
     };
     const session_id = ctx.request.getCookie("sid") orelse {
-        try ctx.failWith(res, framework.AppError.unauthorized("no session cookie"));
+        try ctx.failWith(framework.AppError.unauthorized("no session cookie"));
         return;
     };
 
     const username = sessions.getValue(session_id, "username", ctx.arena) catch {
-        try ctx.failWith(res, framework.AppError.unauthorized("session expired or invalid"));
+        try ctx.failWith(framework.AppError.unauthorized("session expired or invalid"));
         return;
     } orelse {
-        try ctx.failWith(res, framework.AppError.unauthorized("session expired or invalid"));
+        try ctx.failWith(framework.AppError.unauthorized("session expired or invalid"));
         return;
     };
     try res.json(.{ .ok = true, .username = username });
@@ -703,7 +717,7 @@ const NewUserBody = struct {
 
 fn ormListHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const store = ctx.service(UserStore) orelse {
-        try ctx.failWith(res, framework.AppError.internal("store not initialized"));
+        try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
 
@@ -715,15 +729,15 @@ fn ormListHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const store = ctx.service(UserStore) orelse {
-        try ctx.failWith(res, framework.AppError.internal("store not initialized"));
+        try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
 
     const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
         return;
     };
 
@@ -734,7 +748,7 @@ fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
         // id 标为主键，其余字段无约束），所以这里实际不会触发——
         // 保留该分支以演示 error.UniqueViolation 的处理方式。
         if (err == error.UniqueViolation) {
-            try ctx.failWith(res, framework.AppError.conflict("email already exists"));
+            try ctx.failWith(framework.AppError.conflict("email already exists"));
             return;
         }
         return err;
@@ -752,13 +766,13 @@ fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const store = ctx.service(UserStore) orelse {
-        try ctx.failWith(res, framework.AppError.internal("store not initialized"));
+        try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
     const id = parseId(ctx, res) orelse return;
 
     const user = try store.findById(ctx.arena, id) orelse {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     };
     try res.json(user);
@@ -766,22 +780,22 @@ fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const store = ctx.service(UserStore) orelse {
-        try ctx.failWith(res, framework.AppError.internal("store not initialized"));
+        try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
     const id = parseId(ctx, res) orelse return;
 
     const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
         return;
     };
 
     const updated = try store.updateById(id, .{ .id = id, .name = body.name, .email = body.email });
     if (!updated) {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     }
     try store.flush();
@@ -790,14 +804,14 @@ fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn ormDeleteHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const store = ctx.service(UserStore) orelse {
-        try ctx.failWith(res, framework.AppError.internal("store not initialized"));
+        try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
     const id = parseId(ctx, res) orelse return;
 
     const deleted = try store.deleteById(id);
     if (!deleted) {
-        try ctx.failWith(res, framework.AppError.notFound("user not found"));
+        try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
     }
     try store.flush();
@@ -807,11 +821,11 @@ fn ormDeleteHandler(ctx: *framework.Context, res: *framework.Response) !void {
 /// 从路径参数解析 id；失败时已写好 400 响应，返回 null。
 fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(res, framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
         return null;
     };
     return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(res, framework.AppError.badRequest("id must be an integer")) catch {};
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
         return null;
     };
 }
@@ -910,7 +924,7 @@ const TimingMiddleware = struct {
 
 fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), wsEcho) catch {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "websocket upgrade failed" });
+        try ctx.failWith(.{ .status = .bad_request, .message = "websocket upgrade failed" });
         return;
     };
     if (!upgraded) {

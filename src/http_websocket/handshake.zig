@@ -329,8 +329,8 @@ test "handshake rejects non-upgrade requests" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
 
     var req = http_app.Request{
         .method = .GET,
@@ -340,7 +340,6 @@ test "handshake rejects non-upgrade requests" {
         .version = .@"HTTP/1.1",
         // 不带 Upgrade 头
         .head_bytes = "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -369,8 +368,8 @@ test "handshake accepts valid upgrade request" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
 
     // 构造带完整握手头的请求 head
     const head =
@@ -388,7 +387,6 @@ test "handshake accepts valid upgrade request" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -429,8 +427,8 @@ test "handshake rejects unsupported Sec-WebSocket-Version with 426" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
 
     // Sec-WebSocket-Version: 8（不支持）
     const head =
@@ -448,7 +446,6 @@ test "handshake rejects unsupported Sec-WebSocket-Version with 426" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -486,8 +483,8 @@ test "upgrade registers hijack and writes 101 + runs handler" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
 
     const head =
         "GET /ws HTTP/1.1\r\n" ++
@@ -504,7 +501,6 @@ test "upgrade registers hijack and writes 101 + runs handler" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -578,8 +574,8 @@ test "upgrade rejects invalid Sec-WebSocket-Key (M14)" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
 
     // 垃圾 key：不是 16 字节 base64。
     const head =
@@ -597,7 +593,6 @@ test "upgrade rejects invalid Sec-WebSocket-Key (M14)" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

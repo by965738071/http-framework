@@ -119,48 +119,48 @@ pub fn deviceListHandler(ctx: *framework.Context, res: *framework.Response, stor
 /// 创建设备
 pub fn deviceCreateHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore, io: std.Io) !void {
     const name = (ctx.formDecoded("name", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("name required"));
+        try ctx.failWith(framework.AppError.badRequest("name required"));
         return;
     };
 
     const device_type = (ctx.formDecoded("type", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("type required"));
+        try ctx.failWith(framework.AppError.badRequest("type required"));
         return;
     };
 
     // 验证设备类型
     if (DeviceType.fromString(device_type) == null) {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid device type. Must be: sensor, actuator, gateway, controller"));
+        try ctx.failWith(framework.AppError.badRequest("invalid device type. Must be: sensor, actuator, gateway, controller"));
         return;
     }
 
     const serial_number = (ctx.formDecoded("serial_number", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("serial_number required"));
+        try ctx.failWith(framework.AppError.badRequest("serial_number required"));
         return;
     };
 
     const location = (ctx.formDecoded("location", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse "";
 
     const status_str = (ctx.formDecoded("status", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse "offline";
 
     // 验证设备状态
     if (DeviceStatus.fromString(status_str) == null) {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid device status. Must be: online, offline, maintenance, error"));
+        try ctx.failWith(framework.AppError.badRequest("invalid device status. Must be: online, offline, maintenance, error"));
         return;
     }
 
@@ -177,7 +177,7 @@ pub fn deviceCreateHandler(ctx: *framework.Context, res: *framework.Response, st
         .last_seen = now,
     }) catch |err| {
         if (err == error.UniqueViolation) {
-            try ctx.failWith(res, framework.AppError.conflict("serial number already exists"));
+            try ctx.failWith(framework.AppError.conflict("serial number already exists"));
             return;
         }
         return err;
@@ -201,7 +201,7 @@ pub fn deviceGetHandler(ctx: *framework.Context, res: *framework.Response, store
     const id = parseId(ctx, res) orelse return;
 
     const device = try store.findById(ctx.arena, id) orelse {
-        try ctx.failWith(res, framework.AppError.notFound("device not found"));
+        try ctx.failWith(framework.AppError.notFound("device not found"));
         return;
     };
 
@@ -213,7 +213,7 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
     const id = parseId(ctx, res) orelse return;
 
     var device = try store.findById(ctx.arena, id) orelse {
-        try ctx.failWith(res, framework.AppError.notFound("device not found"));
+        try ctx.failWith(framework.AppError.notFound("device not found"));
         return;
     };
 
@@ -224,7 +224,7 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
 
     if (ctx.formDecoded("type", 1 << 16) catch null) |device_type| {
         if (DeviceType.fromString(device_type) == null) {
-            try ctx.failWith(res, framework.AppError.badRequest("invalid device type"));
+            try ctx.failWith(framework.AppError.badRequest("invalid device type"));
             return;
         }
         device.type = device_type;
@@ -232,7 +232,7 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
 
     if (ctx.formDecoded("status", 1 << 16) catch null) |status_str| {
         if (DeviceStatus.fromString(status_str) == null) {
-            try ctx.failWith(res, framework.AppError.badRequest("invalid device status"));
+            try ctx.failWith(framework.AppError.badRequest("invalid device status"));
             return;
         }
         device.status = status_str;
@@ -258,7 +258,7 @@ pub fn deviceDeleteHandler(ctx: *framework.Context, res: *framework.Response, st
 
     const deleted = try store.deleteById(id);
     if (!deleted) {
-        try ctx.failWith(res, framework.AppError.notFound("device not found"));
+        try ctx.failWith(framework.AppError.notFound("device not found"));
         return;
     }
     try store.flush();
@@ -316,11 +316,11 @@ pub const DeviceDeleteHandler = struct {
 
 fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(res, framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
         return null;
     };
     return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(res, framework.AppError.badRequest("id must be an integer")) catch {};
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
         return null;
     };
 }

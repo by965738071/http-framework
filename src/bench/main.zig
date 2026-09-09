@@ -82,7 +82,6 @@ fn buildRequest(path: []const u8) Request {
         .query = q,
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\nHost: bench\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -103,8 +102,8 @@ fn runCase(
     {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var state = framework.RequestState{};
-        defer state.deinit(arena.allocator());
+        var state = framework.RequestState{ .arena = arena.allocator() };
+        defer state.deinit();
         const cfg = framework.RequestConfig{};
         var req = buildRequest(case.path);
         var ctx = Context{ .request = &req, .state = &state, .config = &cfg, .arena = arena.allocator(), .io = io };
@@ -120,14 +119,14 @@ fn runCase(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     while (i < iterations) : (i += 1) {
-        var state = framework.RequestState{};
+        var state = framework.RequestState{ .arena = arena.allocator() };
         const cfg = framework.RequestConfig{};
         var req = buildRequest(case.path);
         var ctx = Context{ .request = &req, .state = &state, .config = &cfg, .arena = arena.allocator(), .io = io };
         var res = Response.init(arena.allocator(), discardingSink(&discard.writer));
         _ = try router.dispatch(&ctx, &res);
         res.deinit();
-        state.deinit(arena.allocator());
+        state.deinit();
         _ = arena.reset(.retain_capacity);
     }
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start;

@@ -46,7 +46,7 @@ pub const ConnectionRunner = struct {
         defer arenas.deinit();
 
         var http_server = http.Server.init(self.reader, self.writer);
-        var conn_loop = http_protocol.ConnectionLoop.init(self.io, &http_server, &arenas.request);
+        var conn_loop = http_protocol.ConnectionLoop.init(&http_server, &arenas.request);
 
         while (true) {
             if (self.stats.shutting_down.load(.monotonic)) break;
@@ -125,8 +125,8 @@ pub const ConnectionRunner = struct {
     ) !?http_app.Hijack {
         const arena_alloc = arenas.requestAllocator();
 
-        var state = http_app.RequestState{};
-        defer state.deinit(arena_alloc);
+        var state = http_app.RequestState{ .arena = arena_alloc };
+        defer state.deinit();
 
         const req_config = http_app.RequestConfig{
             .trust_proxy = self.config.body.trust_proxy_headers,
@@ -212,9 +212,12 @@ pub const ConnectionRunner = struct {
         // 其 ctx 指针指向用户稳定存储（singleton handler 实例等），不依赖 arena。
         if (state.hijack) |h| return h;
 
-        // 兵底：非缓冲模式下 handler 若只设了 status 而从未写 body，补发一个空响应，
-        // 避免 client 挂到超时（缓冲模式由 res.flush 处理）。
-        if (!res.buffered and !res.sent) {
+        // 兜底：handler 若只设了 status 而从未写 body（典型：204 No Content），
+        // 补发一个空响应，避免 client 挂到超时。旧条件带 !res.buffered（R2）：
+        // 缓冲模式（Timing/Compress 中间件会开）下 flush() 对 !sent 是 no-op，
+        // 于是「只设 status + 缓冲模式」的响应一个字节都写不出去。
+        // text("") 在缓冲模式只存 pending_body，由下面的 flush() 统一写出。
+        if (!res.sent) {
             try res.text("");
         }
         try res.flush();

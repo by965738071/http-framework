@@ -59,7 +59,7 @@ pub const RequestIdMiddleware = struct {
         }
 
         // 存进 ctx.state，供下游中间件/handler/日志取用
-        try ctx.state.setUserData(RequestId, rid, ctx.arena);
+        try ctx.state.setUserData(RequestId, rid);
 
         // 先把头加到响应（缓冲模式下也能在 flush 时输出）
         _ = res.header(REQUEST_ID_HEADER, rid.slice()) catch {};
@@ -105,8 +105,8 @@ test "RequestIdMiddleware reuses client-provided X-Request-Id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -115,7 +115,6 @@ test "RequestIdMiddleware reuses client-provided X-Request-Id" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\nX-Request-Id: abc-123\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

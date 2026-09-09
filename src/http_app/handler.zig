@@ -142,8 +142,8 @@ test "Handler.fromFn dispatches to pure function (zero alloc)" {
     var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
     defer res.deinit();
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(std.testing.allocator);
+    var state = @import("context.zig").RequestState{ .arena = std.testing.allocator };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -152,7 +152,6 @@ test "Handler.fromFn dispatches to pure function (zero alloc)" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -194,8 +193,8 @@ test "Handler.initSingleton dispatches to instance handle method" {
     var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
     defer res.deinit();
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(std.testing.allocator);
+    var state = @import("context.zig").RequestState{ .arena = std.testing.allocator };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -204,7 +203,6 @@ test "Handler.initSingleton dispatches to instance handle method" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -251,8 +249,8 @@ test "Handler.initFactory creates and destroys per request" {
     var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
     defer res.deinit();
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(std.testing.allocator);
+    var state = @import("context.zig").RequestState{ .arena = std.testing.allocator };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -261,7 +259,6 @@ test "Handler.initFactory creates and destroys per request" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

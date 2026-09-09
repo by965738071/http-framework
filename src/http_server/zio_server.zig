@@ -36,10 +36,7 @@ pub fn run(
     });
     defer rt.deinit();
     var handle = try zio.spawn(appFn, .{ rt.io(), allocator });
-    handle.join() catch |err| {
-        std.log.err("zio app failed: {s}", .{@errorName(err)});
-        return err;
-    };
+    try handle.join();
 }
 
 /// TCP 监听器 + 并发连接背压（zio.net.Server + zio.Semaphore）。
@@ -88,7 +85,6 @@ pub const Server = struct {
             .io = io,
             .config = config,
             .runtime = .{},
-            .listener = null,
             .router = router,
             .lifecycle = .{},
             .group = .init,
@@ -230,39 +226,50 @@ pub const Server = struct {
                 continue;
             };
 
-            self.spawnConnection(stream);
+            self.spawnConnection(stream) catch |e| {
+                // spawnConnection 内部已用 errdefer 回滚（关流/释放/还名额），
+                // 这里只记录，accept 循环继续。
+                std.log.warn("connection spawn failed: {s}", .{@errorName(e)});
+            };
         }
     }
 
-    fn spawnConnection(self: *Server, stream: zio.net.Stream) void {
+    /// 派发一个连接。返回错误时（分配失败）已回滚全部已认领资源，可安全重试。
+    fn spawnConnection(self: *Server, stream: zio.net.Stream) !void {
+        // 分界：conn 尚未拥有任何资源，失败只需关流 + 还名额。
         const conn = self.allocator.create(Conn) catch {
             stream.close();
             self.listener.?.semaphore.post();
             return;
         };
+
+        // 每个资源在"到手之后"注册自己的 errdefer（LIFO 逆序执行）：
+        // 之后的任意错误返回都会回滚已认领的全部资源。注意 errdefer
+        // 只在错误返回时触发，无值 return 不会。
+        errdefer self.allocator.destroy(conn);
+        errdefer stream.close();
+        errdefer self.listener.?.semaphore.post();
+
+        const read_buf = try self.allocator.alloc(u8, @max(self.config.http.read_buffer_size, MIN_READ_BUF));
+        errdefer self.allocator.free(read_buf);
+
+        const write_buf = try self.allocator.alloc(u8, @max(self.config.http.write_buffer_size, MIN_WRITE_BUF));
+        errdefer self.allocator.free(write_buf);
+
+        // 全部就绪后整体提交；提交之后若 spawn 失败返错，armed 的 errdefer
+        // 会经本地副本释放缓冲、close 流、destroy conn、归还名额，无需在此
+        // 再写显式回滚。
         conn.* = .{
             .server = self,
             .stream = stream,
             .peer_ip = toPeerIp(stream.socket.address),
-            .read_buf = self.allocator.alloc(u8, @max(self.config.http.read_buffer_size, MIN_READ_BUF)) catch {
-                self.allocator.destroy(conn);
-                stream.close();
-                self.listener.?.semaphore.post();
-                return;
-            },
-            .write_buf = self.allocator.alloc(u8, @max(self.config.http.write_buffer_size, MIN_WRITE_BUF)) catch {
-                self.allocator.free(conn.read_buf);
-                self.allocator.destroy(conn);
-                stream.close();
-                self.listener.?.semaphore.post();
-                return;
-            },
+            .read_buf = read_buf,
+            .write_buf = write_buf,
         };
 
-        self.group.spawn(connectionTask, .{conn}) catch {
-            conn.run(); // 派发失败：同步降级
-            conn.destroy();
-        };
+        // 派发失败（几乎没有哪条路径，通常是 OOM）：优先保证 accept 循环
+        // 的响应性，丢弃该连接（关流 + 归还名额），而不是阻塞当前协程内联跑。
+        try self.group.spawn(connectionTask, .{conn});
     }
 
     /// 每连接的 zio 侧资源 + 生命周期。持有 zio.net.Stream 与缓冲区，

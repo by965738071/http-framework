@@ -203,8 +203,8 @@ test "Middleware with next can run code after handler" {
     defer pipeline.deinit();
     try pipeline.add(Middleware.init(Track, &track));
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -213,7 +213,6 @@ test "Middleware with next can run code after handler" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -264,8 +263,8 @@ test "Middleware can short-circuit by not calling next" {
     defer pipeline.deinit();
     try pipeline.add(Middleware.init(Blocker, &blocker));
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -274,7 +273,6 @@ test "Middleware can short-circuit by not calling next" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -329,8 +327,8 @@ test "Pipeline(N): comptime 长度管道，栈数组，零堆分配" {
     try pipeline.add(Middleware.init(Track, &track));
     try pipeline.add(Middleware.init(Track, &track));
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -339,7 +337,6 @@ test "Pipeline(N): comptime 长度管道，栈数组，零堆分配" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -428,8 +425,8 @@ test "Pipeline(0): 无中间件直接调 handler" {
 
     var pipeline = Pipeline(0).init(handler);
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -438,7 +435,6 @@ test "Pipeline(0): 无中间件直接调 handler" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,

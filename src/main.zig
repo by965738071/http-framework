@@ -14,6 +14,7 @@ pub fn main(init: std.process.Init) !void {
         // 泄漏时打印报告并以非零码退出，而不是直接 panic——调试期的任何小泄漏
         // 不应表现为无法区分的「Ctrl-C 后崩溃」。
         if (debug_allocator.deinit() == .leak) {
+            std.debug.print("error:memory leak", .{});
             std.process.exit(1);
         }
     }
@@ -92,7 +93,7 @@ fn helloHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const id = ctx.param("id") orelse {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "Missing id" });
+        try ctx.failWith(.{ .status = .bad_request, .message = "Missing id" });
         return;
     };
     // P2-41：旧代码连发两次 res.html 必然 error.AlreadyResponded，
@@ -148,10 +149,10 @@ const LoginRequest = struct {
 ///   http://127.0.0.1:9000/login
 fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "failed to read body" });
+        try ctx.failWith(.{ .status = .bad_request, .message = "failed to read body" });
         return;
     }) catch {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "invalid JSON body" });
+        try ctx.failWith(.{ .status = .bad_request, .message = "invalid JSON body" });
         return;
     };
 
@@ -159,7 +160,7 @@ fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     if (std.mem.eql(u8, body.username, "alice") and std.mem.eql(u8, body.password, "secret")) {
         try res.json(.{ .ok = true, .user = body.username });
     } else {
-        try ctx.failWith(res, .{ .status = .unauthorized, .message = "invalid credentials" });
+        try ctx.failWith(.{ .status = .unauthorized, .message = "invalid credentials" });
     }
 }
 
@@ -169,16 +170,28 @@ fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
 /// curl -X POST -F "username=bob" -F "avatar=@photo.png" \
 ///   http://127.0.0.1:9000/upload
 fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "not a multipart request" });
-        return;
+    // 逐项映射 multipartFrom 的错误（见其文档）：一律 catch 成 400 会把
+    // BodyTooLarge（413）/ OOM（500）的语义吞掉。
+    var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch |err| switch (err) {
+        error.NotMultipart, error.MissingBoundary, error.TooManyParts, error.MalformedPart, error.DuplicateField => {
+            try ctx.failWith(.{ .status = .bad_request, .message = "invalid multipart request" });
+            return;
+        },
+        error.BodyTooLarge => {
+            // chunked 超限只能在读了半截后发现，std 不会排空残留 body：
+            // 413 后必须关连接，否则残余字节会被当成下一个请求（走私面）。
+            res.keep_alive = false;
+            try ctx.failWith(.{ .status = .payload_too_large, .message = "upload too large (max 10MB)" });
+            return;
+        },
+        else => return err, // OutOfMemory 等继续向上传播，由连接层统一 500
     };
     defer form.deinit();
 
     const username = form.getText("username") orelse "anonymous";
 
     if (form.getFile("avatar")) |file| {
-        const file_name = file.file_name orelse "upload.bin";
+        const file_name = file.safeBaseName() orelse "upload.bin";
         const msg = try std.fmt.allocPrint(
             ctx.arena,
             "uploaded \"{s}\" ({d} bytes, {s}) by {s}",
@@ -193,7 +206,7 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     }
 
-    try ctx.failWith(res, .{ .status = .bad_request, .message = "no file field \"avatar\" found" });
+    try ctx.failWith(.{ .status = .bad_request, .message = "no file field \"avatar\" found" });
 }
 
 // ── Middleware ────────────────────────────────────────────────

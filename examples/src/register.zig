@@ -15,46 +15,46 @@ const admin = @import("admin");
 pub fn registerHandler(ctx: *framework.Context, res: *framework.Response, io: std.Io, users: *admin.UserModel.Store) !void {
     // 读取 username
     const username = (ctx.formDecoded("username", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("username required"));
+        try ctx.failWith(framework.AppError.badRequest("username required"));
         return;
     };
 
     // 验证用户名长度
     if (username.len < 3 or username.len > 32) {
-        try ctx.failWith(res, framework.AppError.badRequest("username must be 3-32 characters"));
+        try ctx.failWith(framework.AppError.badRequest("username must be 3-32 characters"));
         return;
     }
 
     // 读取 email
     const email = (ctx.formDecoded("email", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("email required"));
+        try ctx.failWith(framework.AppError.badRequest("email required"));
         return;
     };
 
     // 简单验证 email 格式（包含 @）
     if (std.mem.indexOf(u8, email, "@") == null) {
-        try ctx.failWith(res, framework.AppError.badRequest("invalid email format"));
+        try ctx.failWith(framework.AppError.badRequest("invalid email format"));
         return;
     }
 
     // 读取 password
     const password = (ctx.formDecoded("password", 1 << 16) catch {
-        try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("password required"));
+        try ctx.failWith(framework.AppError.badRequest("password required"));
         return;
     };
 
     // 验证密码长度
     if (password.len < 6) {
-        try ctx.failWith(res, framework.AppError.badRequest("password must be at least 6 characters"));
+        try ctx.failWith(framework.AppError.badRequest("password must be at least 6 characters"));
         return;
     }
 
@@ -64,7 +64,7 @@ pub fn registerHandler(ctx: *framework.Context, res: *framework.Response, io: st
         defer users.freeRows(ctx.arena, existing);
         for (existing) |u| {
             if (std.mem.eql(u8, u.username, username)) {
-                try ctx.failWith(res, framework.AppError.conflict("username already exists"));
+                try ctx.failWith(framework.AppError.conflict("username already exists"));
                 return;
             }
         }
@@ -83,7 +83,7 @@ pub fn registerHandler(ctx: *framework.Context, res: *framework.Response, io: st
         .last_login = 0,
     }) catch |err| {
         if (err == error.UniqueViolation) {
-            try ctx.failWith(res, framework.AppError.conflict("username already exists"));
+            try ctx.failWith(framework.AppError.conflict("username already exists"));
             return;
         }
         return err;

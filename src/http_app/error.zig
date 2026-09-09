@@ -112,8 +112,8 @@ test "ErrorRenderer extracts AppError from ctx.state (fix.md §一.3)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var state = @import("context.zig").RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const cfg = @import("context.zig").RequestConfig{};
     var req = @import("http_protocol").Request{
         .method = .GET,
@@ -122,7 +122,6 @@ test "ErrorRenderer extracts AppError from ctx.state (fix.md §一.3)" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = "GET / HTTP/1.1\r\n\r\n",
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -142,7 +141,7 @@ test "ErrorRenderer extracts AppError from ctx.state (fix.md §一.3)" {
     };
 
     // 调 failWith：应返回 error.AppError 并把 AppError 存进 ctx.state
-    const fail_err = ctx.failWith(&res, AppError.unauthorized("bad token"));
+    const fail_err = ctx.failWith(AppError.unauthorized("bad token"));
     try std.testing.expectError(error.AppError, fail_err);
     const stored = ctx.state.getUserData(AppError);
     try std.testing.expect(stored != null);

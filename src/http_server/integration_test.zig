@@ -69,8 +69,7 @@ fn makeCtx(arena: std.mem.Allocator, req: *Request, state: *http_app.RequestStat
 
 /// 构建一个最小 GET 请求。
 /// `extra_headers` 必须是完整 header 行（含 `\r\n`），如 `"X-Request-Id: abc\r\n"`。
-/// 注意：getHeader 读 head_bytes，所以 extra_headers 要拼进 head_bytes，
-/// 而不是放到 head_copy（head_copy 只在带 body 的请求里用于保存 head 副本）。
+/// 注意：getHeader 读 head_bytes，所以 extra_headers 要拼进 head_bytes。
 fn makeReq(allocator: std.mem.Allocator, path: []const u8, extra_headers: []const u8) !Request {
     // 在 allocator 上分配 head 字节，保证生命周期覆盖整个测试。
     var buf: [256]u8 = undefined;
@@ -83,7 +82,6 @@ fn makeReq(allocator: std.mem.Allocator, path: []const u8, extra_headers: []cons
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -133,8 +131,8 @@ fn helloHandler(_: *Context, res: *Response) !void {
 
 // 用 failWith 抛出带状态码的 AppError，验证 ErrorRenderer 能从 ctx.state
 // 提取并正确渲染（fix.md §一.3 的端到端验证）。
-fn boomHandler(ctx: *Context, res: *Response) !void {
-    try ctx.failWith(res, AppError.forbidden("no access"));
+fn boomHandler(ctx: *Context, _: *Response) !void {
+    try ctx.failWith(AppError.forbidden("no access"));
 }
 
 const TimingMiddleware = struct {
@@ -213,8 +211,8 @@ test "命中路由：200 + body + 中间件头齐全" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     var req = try makeReq(arena.allocator(), "/", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
@@ -242,8 +240,8 @@ test "404：经过中间件管道，带 X-Request-Id / timing / tag" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     var req = try makeReq(arena.allocator(), "/no-such-path", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
@@ -272,8 +270,8 @@ test "405：经过中间件管道，带 X-Request-Id" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     // /echo 只注册了 POST，用 GET 访问应 405
     var req = try makeReq(arena.allocator(), "/echo", "");
     req.method = .GET;
@@ -301,8 +299,8 @@ test "客户端 X-Request-Id 被沿用" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     const hdr = "X-Request-Id: trace-abc-123\r\n";
     var req = try makeReq(arena.allocator(), "/", hdr);
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
@@ -330,8 +328,8 @@ test "handler 抛错：ErrorRenderer 兜底 500，但仍带中间件头" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     var req = try makeReq(arena.allocator(), "/boom", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
@@ -365,8 +363,8 @@ test "中间件管道顺序：外层先于内层 setBuffered，handler 后外层
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     var req = try makeReq(arena.allocator(), "/", "");
     var ctx = makeCtx(arena.allocator(), &req, &state, io);
 
@@ -410,8 +408,8 @@ test "HEAD 自动回退到 GET 路由" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     // 只注册了 GET /，用 HEAD 访问应命中 GET handler（而非 405）。
     var req = try makeReq(arena.allocator(), "/", "");
     req.method = .HEAD;
@@ -439,8 +437,8 @@ test "405 Allow 头无重复方法" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var state = http_app.RequestState{};
-    defer state.deinit(arena.allocator());
+    var state = http_app.RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
     var req = try makeReq(arena.allocator(), "/a/b", "");
     req.method = .POST;
     var ctx = makeCtx(arena.allocator(), &req, &state, io);

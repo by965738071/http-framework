@@ -7,11 +7,12 @@
 //!   body 缓存由 http_app 层的 Context.readBody → RequestState.body_buffer 承载，
 //!   不再修改 Request.body。
 //!
-//! # head_copy 的必要性
+//! # 为什么 head 总是复制
 //!
 //! `request.head_buffer` 是连接读缓冲的一段切片，std 明确写了"读 body 会
-//! 覆盖它"。所以带 body 的请求在 init 时把 head 复制到 arena。不带 body
-//! 的请求（绝大多数 GET/HEAD）保持零拷贝。
+//! 覆盖它"，后续 keep-alive 的 `receiveHead` 同样会覆盖。所以 init 无条件
+//! 把 head 复制到请求 arena——`head_bytes`/`target`/`path`/`query`/
+//! `content_type` 的生命周期全部绑定 arena，不存在零拷贝路径。
 
 const std = @import("std");
 const http = std.http;
@@ -28,10 +29,9 @@ pub const Request = struct {
     query: []const u8,
     version: http.Version,
 
-    /// 原始 head 字节（head_buffer 或其 arena 副本）。
+    /// 原始 head 字节（arena 副本，init 后恒为副本）。
     /// 用于 HeaderIterator 按需解析 header，避免预分配 header 数组。
     head_bytes: []const u8,
-    head_copy: ?[]const u8,
 
     content_type: ?[]const u8,
     content_length: ?u64,
@@ -48,22 +48,51 @@ pub const Request = struct {
 
     /// 从 std.http.Server.Request 构建不可变 Request。
     ///
-    /// `allocator` 通常是请求级 arena。head_copy 用它分配，请求结束随
+    /// `allocator` 通常是请求级 arena。head 副本用它分配，请求结束随
     /// arena 一起回收——不需要手动 free。
+    ///
+    /// 可能返回 `error.ProtocolError`（body framing 有歧义，见下方校验），
+    /// 调用方应映射为 400 并关连接。
     pub fn init(allocator: mem.Allocator, request: *http.Server.Request) !Request {
         const head = request.head;
+        const original_head = request.head_buffer;
+
+        // ── body framing 校验（在任何分配之前）──────────────────────────
+        // CL 与 Transfer-Encoding 并存：std 的 head 解析不拒绝这个组合
+        // （只拒绝重复 CL / 重复 TE），其 bodyReader 按 chunked 成帧但
+        // head.content_length 保持非 null。我们若按 CL「读满即停」，剩余
+        // chunk 字节滞留连接缓冲，而 std 的 discardBody 对未读完的 chunk
+        // 流不排空 → 残留字节被当成下一个请求解析（经典 CL.TE 走私面）。
+        // RFC 9112 §6.3 也要求对这种组合按不可信处理。直接 400 + 关连接。
+        if (head.content_length != null and head.transfer_encoding != .none) {
+            return error.ProtocolError;
+        }
+        // 不允许 body 的方法（GET/HEAD/DELETE/…，std requestHasBody 的口径）
+        // 携带真实 framing：std 对它们返回恒空的 .ending reader，从不消费那
+        // 些字节，却仍视连接可复用 → body 残留污染下一个请求。CL:0 无字节
+        // 可残留，保持合法。
+        if (!head.method.requestHasBody()) {
+            if (head.transfer_encoding != .none) return error.ProtocolError;
+            if (head.content_length) |len| {
+                if (len > 0) return error.ProtocolError;
+            }
+        }
+        // 重复 Content-Type 头：std 的 head.content_type 是后值覆盖，而
+        // HeaderIterator 取首个——两条取法会拿到不同的值，判定分裂
+        // （框架用 content_type，用户用 getHeader）。拒绝以消除歧义。
+        if (countHeader(original_head, "content-type") > 1) {
+            return error.ProtocolError;
+        }
+
         const target = head.target;
         const query_start = mem.indexOfScalar(u8, target, '?');
         var path = if (query_start) |idx| target[0..idx] else target;
         var query = if (query_start) |idx| target[idx + 1 ..] else "";
         var content_type = head.content_type;
 
-        const original_head = request.head_buffer;
-        var head_copy: ?[]const u8 = null;
         // 始终复制 head_bytes 到 arena，避免连接缓冲区被后续 receiveHead 覆盖导致悬空指针。
         // 即使不带 body 的请求也复制，保证 head_bytes 生命周期绑定请求 arena。
         const copy = try allocator.dupe(u8, original_head);
-        head_copy = copy;
         path = rebase(path, original_head, copy);
         query = rebase(query, original_head, copy);
         if (content_type) |ct| content_type = rebase(ct, original_head, copy);
@@ -72,7 +101,11 @@ pub const Request = struct {
         // keep-alive 请求覆盖 head_buffer 后 ctx.request.target 悬空。
         const target_rebased = rebase(target, original_head, copy);
 
-        const has_body = head.content_length != null or head.transfer_encoding != .none;
+        // 有 body 的判定与 std 的 reader 语义同口径：方法不允许 body 时
+        // std 根本不会按 CL/TE 消费字节（上面已拒绝非零 framing，只剩 CL:0，
+        // 无内容可读）。
+        const has_body = head.method.requestHasBody() and
+            (head.content_length != null or head.transfer_encoding != .none);
         const body: Body = if (!has_body) .none else .{ .streaming = request };
 
         return .{
@@ -82,7 +115,6 @@ pub const Request = struct {
             .query = query,
             .version = head.version,
             .head_bytes = head_bytes,
-            .head_copy = head_copy,
             .content_type = content_type,
             .content_length = head.content_length,
             .transfer_encoding = head.transfer_encoding,
@@ -136,17 +168,24 @@ pub const Request = struct {
         return null;
     }
 
-    /// 获取 Cookie 值（零分配线性扫描 Cookie 头）。
-    /// Cookie 头格式：`name1=value1; name2=value2`
+    /// 获取 Cookie 值（零分配线性扫描）。
+    /// Cookie 头格式：`name1=value1; name2=value2`。
+    ///
+    /// Cookie 是允许多行的头（RFC 6265：UA 合并 cookie 时可能拆成多个
+    /// Cookie 头发送），getHeader 只看第一个 → 必须扫全部 cookie 头，
+    /// 否则第二个头里的 session cookie 直接不可见。
     pub fn getCookie(self: *const Request, key: []const u8) ?[]const u8 {
-        const cookie_header = self.getHeader("cookie") orelse return null;
-        var it = mem.splitScalar(u8, cookie_header, ';');
-        while (it.next()) |pair_raw| {
-            const pair = mem.trim(u8, pair_raw, " \t");
-            if (pair.len == 0) continue;
-            const eq_idx = mem.indexOfScalar(u8, pair, '=') orelse continue;
-            const k = mem.trim(u8, pair[0..eq_idx], " \t");
-            if (std.mem.eql(u8, k, key)) return pair[eq_idx + 1 ..];
+        var it = http.HeaderIterator.init(self.head_bytes);
+        while (it.next()) |h| {
+            if (!std.ascii.eqlIgnoreCase(h.name, "cookie")) continue;
+            var pairs = mem.splitScalar(u8, h.value, ';');
+            while (pairs.next()) |pair_raw| {
+                const pair = mem.trim(u8, pair_raw, " \t");
+                if (pair.len == 0) continue;
+                const eq_idx = mem.indexOfScalar(u8, pair, '=') orelse continue;
+                const k = mem.trim(u8, pair[0..eq_idx], " \t");
+                if (std.mem.eql(u8, k, key)) return pair[eq_idx + 1 ..];
+            }
         }
         return null;
     }
@@ -208,11 +247,26 @@ pub const Request = struct {
     }
 
     /// 从 streaming body 读取到新分配的 buffer。不修改 self（fix.md §四.7）。
-    /// 调用方负责缓存（Context.readBody 会存入 RequestState.body_buffer）。
-    /// 支持 Content-Length 与 chunked（Transfer-Encoding）两种。limit==0 表示无限。
+    /// 调用方负责缓存（Context.readBody 会存入 state.body_buffer）。
+    /// 支持 Content-Length 与 chunked（Transfer-Encoding）两种。limit==0 表示无限
+    /// （实际封顶 HARD_BODY_CAP）。
+    ///
+    /// **只能调一次**：std 构造 reader 时 assert 状态为 .received_head，第二次
+    /// 调用（或再走 bodyReader）直接 panic 打死进程。务必经 Context.readBody 的
+    /// 缓存读 body。
+    ///
+    /// **BodyTooLarge 后 CL 与 chunked 的处置不同**：
+    /// - CL 超限在建 reader 前判出（状态仍 .received_head），std 的
+    ///   discardBody 会把 body 排空 → 连接可安全复用；
+    /// - chunked 无法预知长度，必然读了半截才发现 → std 的 discardBody 对
+    ///   `.body_remaining_chunk_len` **不排空** → 调用方回 413 时必须
+    ///   `res.keep_alive = false` 关连接（http_codec 的 JsonBody 是范例），
+    ///   否则残留 chunk 字节会被当成下一个请求解析（走私面）。
     ///
     /// 可能返回 `error.HttpExpectationFailed`（客户端发了无法满足的 Expect 值），
     /// 调用方应映射为 417 Expectation Failed。
+    /// 可能返回 `error.UnexpectedEof`（声明的 Content-Length 大于实收字节，
+    /// 连接被提前切断），调用方应映射为 400 且关连接。
     pub fn readBodyInto(self: *const Request, allocator: mem.Allocator, limit: u64) ![]const u8 {
         return switch (self.body) {
             .none => "",
@@ -330,6 +384,17 @@ fn rebase(slice: []const u8, old: []const u8, new: []const u8) []const u8 {
     return new[s - base ..][0..slice.len];
 }
 
+/// 统计 head 字节里某 header 名出现的次数（大小写不敏感）。
+/// 用于检测「必须单值」的头被重复发送（如 Content-Type）。
+fn countHeader(head_bytes: []const u8, name: []const u8) usize {
+    var n: usize = 0;
+    var it = http.HeaderIterator.init(head_bytes);
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) n += 1;
+    }
+    return n;
+}
+
 /// application/x-www-form-urlencoded 解码：`+`→空格，`%XX`→字节。
 /// 非法 `%` 序列原样保留。结果由 allocator 分配。
 fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8 {
@@ -377,7 +442,6 @@ test "Request.getHeader returns value case-insensitively" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = "text/plain",
         .content_length = null,
         .transfer_encoding = .none,
@@ -397,7 +461,6 @@ test "Request.getQuery parses key=value pairs" {
         .query = "q=hello&page=2",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -417,7 +480,6 @@ test "Request.getQuery handles empty values" {
         .query = "flag&key=val",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -436,7 +498,6 @@ test "Request.getCookie parses Cookie header" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -456,7 +517,6 @@ test "Request.getForm extracts from buffered body" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -485,7 +545,6 @@ test "getQueryDecoded decodes percent and plus" {
         .query = "q=hello+world&name=caf%C3%A9",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -509,7 +568,6 @@ test "getFormDecoded decodes urlencoded body" {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -519,6 +577,174 @@ test "getFormDecoded decodes urlencoded body" {
     const msg = (try req.getFormDecoded(a, "msg")).?;
     defer a.free(msg);
     try std.testing.expectEqualStrings("a b&c", msg);
+}
+
+// ── init 校验测试用假 Server.Request ────────────────────────────────────
+// init 只读 head 与 head_buffer，不碰 server 指针（校验失败时连
+// head_buffer 都不需要），故 server 字段置 undefined 安全。
+fn fakeSrvReq(
+    head_text: []const u8,
+    method: http.Method,
+    target: []const u8,
+    content_type: ?[]const u8,
+    content_length: ?u64,
+    transfer_encoding: http.TransferEncoding,
+) http.Server.Request {
+    return .{
+        .server = undefined,
+        .head = .{
+            .method = method,
+            .target = target,
+            .version = .@"HTTP/1.1",
+            .expect = null,
+            .content_type = content_type,
+            .content_length = content_length,
+            .transfer_encoding = transfer_encoding,
+            .transfer_compression = .identity,
+            .keep_alive = true,
+        },
+        .head_buffer = head_text,
+    };
+}
+
+test "Request.init rejects Content-Length + Transfer-Encoding coexistence" {
+    // CL.TE 走私面：std 不拒绝该组合且 chunked 优先成帧，而本框架按
+    // CL 读满会留下未消费的 chunk 字节 → init 层面直接 400。
+    const head_text = "POST /up HTTP/1.1\r\n\r\n";
+    var srv = fakeSrvReq(head_text, .POST, head_text[5..8], null, 5, .chunked);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ProtocolError, Request.init(arena.allocator(), &srv));
+}
+
+test "Request.init rejects framing on methods that do not allow a body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const head_text = "GET /up HTTP/1.1\r\n\r\n";
+    // GET + 非零 CL：std 给的是恒空 .ending reader，body 字节永远无人消费
+    var get_cl = fakeSrvReq(head_text, .GET, head_text[4..7], null, 5, .none);
+    try std.testing.expectError(error.ProtocolError, Request.init(a, &get_cl));
+
+    // GET + chunked：同理
+    var get_te = fakeSrvReq(head_text, .GET, head_text[4..7], null, null, .chunked);
+    try std.testing.expectError(error.ProtocolError, Request.init(a, &get_te));
+
+    // HEAD + 非零 CL
+    var head_cl = fakeSrvReq(head_text, .HEAD, head_text[4..7], null, 5, .none);
+    try std.testing.expectError(error.ProtocolError, Request.init(a, &head_cl));
+
+    // 但 GET + Content-Length: 0 无字节可残留，保持合法（body 为 .none）
+    var get0 = fakeSrvReq(head_text, .GET, head_text[4..7], null, 0, .none);
+    const req0 = try Request.init(a, &get0);
+    try std.testing.expect(req0.body == .none);
+    // std 的 requestHasBody 口径：POST/PUT/PATCH/QUERY 才允许 body
+    var del = fakeSrvReq(head_text, .DELETE, head_text[4..7], null, 5, .none);
+    try std.testing.expectError(error.ProtocolError, Request.init(a, &del));
+}
+
+test "Request.init rejects duplicate Content-Type" {
+    // std 的 head.content_type 后值胜，HeaderIterator 首值胜——两条取法
+    // 分裂，必须拒绝。
+    const head_text = "GET / HTTP/1.1\r\nContent-Type: a\r\nContent-Type: b\r\n\r\n";
+    var srv = fakeSrvReq(head_text, .GET, head_text[4..5], head_text[33..34], null, .none);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ProtocolError, Request.init(arena.allocator(), &srv));
+}
+
+test "Request.init copies head to arena and rebases all slices" {
+    const head_text = "POST /up HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n";
+    // head_text[33..43] = "text/plain"
+    var srv = fakeSrvReq(head_text, .POST, head_text[5..8], head_text[33..43], 5, .none);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try Request.init(arena.allocator(), &srv);
+
+    try std.testing.expect(req.body == .streaming);
+    try std.testing.expectEqual(@as(u64, 5), req.content_length.?);
+    // head_bytes 是 arena 副本，不再指向原缓冲
+    try std.testing.expect(req.head_bytes.ptr != head_text.ptr);
+    try std.testing.expectEqualStrings(head_text, req.head_bytes);
+    // 所有切片平移到副本内（模拟连接缓冲被覆盖后仍安全）
+    const base = @intFromPtr(req.head_bytes.ptr);
+    try std.testing.expectEqualStrings("/up", req.target);
+    try std.testing.expectEqual(base + 5, @intFromPtr(req.target.ptr));
+    try std.testing.expectEqualStrings("/up", req.path);
+    try std.testing.expectEqual(base + 5, @intFromPtr(req.path.ptr));
+    try std.testing.expectEqualStrings("text/plain", req.content_type.?);
+    try std.testing.expectEqual(base + 33, @intFromPtr(req.content_type.?.ptr));
+}
+
+test "getCookie scans all Cookie headers (RFC 6265 allows multiple)" {
+    const head_bytes = "GET / HTTP/1.1\r\nCookie: a=1\r\nCookie: sid=xyz; b=2\r\n\r\n";
+    const req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head_bytes,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    // 第一个头里的 cookie
+    try std.testing.expectEqualStrings("1", req.getCookie("a").?);
+    // 只在第二个头里的 cookie：只看 getHeader("cookie") 的旧实现会漏
+    try std.testing.expectEqualStrings("xyz", req.getCookie("sid").?);
+    try std.testing.expectEqualStrings("2", req.getCookie("b").?);
+    try std.testing.expect(req.getCookie("missing") == null);
+}
+
+test "countHeader counts case-insensitively, skips request line" {
+    const head_bytes = "GET / HTTP/1.1\r\nX-H: 1\r\nx-h: 2\r\nY-H: 3\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, 2), countHeader(head_bytes, "X-H"));
+    try std.testing.expectEqual(@as(usize, 1), countHeader(head_bytes, "y-h"));
+    try std.testing.expectEqual(@as(usize, 0), countHeader(head_bytes, "get"));
+    try std.testing.expect(countHeader(head_bytes, "nope") < 2);
+}
+
+test "urlDecode edge cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectEqualStrings("A", try urlDecode(a, "%41")); // 串尾完整序列
+    try std.testing.expectEqualStrings("a", try urlDecode(a, "%61"));
+    try std.testing.expectEqualStrings(" ", try urlDecode(a, "+"));
+    try std.testing.expectEqualStrings("a%4", try urlDecode(a, "a%4")); // 截断序列原样保留
+    try std.testing.expectEqualStrings("100%", try urlDecode(a, "100%")); // 裸 % 在串尾
+    try std.testing.expectEqualStrings("%zz", try urlDecode(a, "%zz")); // 非十六进制
+    try std.testing.expectEqualStrings("aA%zz", try urlDecode(a, "a%41%zz")); // 混合
+    try std.testing.expectEqualStrings("", try urlDecode(a, ""));
+}
+
+test "readBodyInto: CL超限在建 reader 前判出（undefined 指针不解引用）" {
+    // 同时验证 limit==0 封顶 HARD_BODY_CAP（伪造巨大 CL 的放大 DoS）。
+    const head_bytes = "POST / HTTP/1.1\r\n\r\n";
+    var req = Request{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head_bytes,
+        .content_type = null,
+        .content_length = 1000,
+        .transfer_encoding = .none,
+        .body = .{ .streaming = undefined },
+    };
+    try std.testing.expectError(error.BodyTooLarge, req.readBodyInto(std.testing.allocator, 100));
+    // “无限”（limit==0）实为 HARD_BODY_CAP 封顶
+    req.content_length = HARD_BODY_CAP + 1;
+    try std.testing.expectError(error.BodyTooLarge, req.readBodyInto(std.testing.allocator, 0));
+    // .none 分支：空 body 合法
+    var none_req = req;
+    none_req.body = .none;
+    try std.testing.expectEqualStrings("", try none_req.readBodyInto(std.testing.allocator, 10));
 }
 
 test {

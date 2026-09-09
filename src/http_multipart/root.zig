@@ -32,9 +32,19 @@ pub const FileField = struct {
     content_type: ?[]const u8, // Content-Type of this part
     data: []const u8, // file content
 
-    /// 返回可安全用于文件系统的基名：剥掉任何路径成分（`/`、`\`），
-    /// 拒绝 `.`/`..`。防止调用方直接用 file_name 拼盘造成路径穿越/覆盖。
+    /// 返回可安全用于文件系统的基名：
+    /// - 剥掉任何路径成分（取最后一个 `/` 或 `\` 之后的部分）。
+    /// - 拒绝空、`.`/`..`、NUL 及控制字符（0x00-0x1F、0x7F）。
+    /// - 拒绝 `:` —— Windows 上是盘符相对路径（`C:evil.txt`）或 NTFS
+    ///   备用数据流（`photo.jpg:$DATA`）。
+    /// - 拒绝结尾 `.`/空格 —— Windows 会规范化剥离，`hosts.` 与 `hosts`
+    ///   是同一文件，可用来绕过扩展名黑名单。
+    /// - 拒绝 Windows 保留设备名（CON/PRN/AUX/NUL/COM0-9/LPT0-9，大小写
+    ///   不敏感，带扩展名同样成立，如 `nul.txt`）。
     /// 无有效基名时返回 null——调用方应改用自己生成的名字。
+    ///
+    /// 注：file_name 是 extractParam 的**原文**（引号内 `\` 转义序列不还原），
+    /// 故可能含字面 `\`；此处一律按路径分隔符处理并剥掉。
     pub fn safeBaseName(self: FileField) ?[]const u8 {
         const raw = self.file_name orelse return null;
         if (raw.len == 0) return null;
@@ -46,11 +56,33 @@ pub const FileField = struct {
         const base = raw[start..];
         if (base.len == 0) return null;
         if (std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
-        // 含 NUL 的名字拒绝（防止截断攻击）。
-        if (std.mem.indexOfScalar(u8, base, 0) != null) return null;
+        for (base) |c| {
+            // NUL（截断攻击）、控制字符、`:`（盘符/ADS）一律拒绝。
+            if (c < 0x20 or c == 0x7F or c == ':') return null;
+        }
+        if (base[base.len - 1] == '.' or base[base.len - 1] == ' ') return null;
+        if (isWindowsReservedName(base)) return null;
         return base;
     }
 };
+
+/// Windows 保留设备名判定（大小写不敏感）：首个 `.` 之前的部分命中列表即
+/// 保留名——`nul`、`com1.log` 这类名字在 Windows 上根本创建不了普通文件。
+fn isWindowsReservedName(base: []const u8) bool {
+    const reserved = [_][]const u8{
+        "CON",  "PRN",  "AUX",  "NUL",
+        "COM0", "COM1", "COM2", "COM3",
+        "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT0", "LPT1",
+        "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    };
+    const stem = std.mem.sliceTo(base, '.');
+    for (reserved) |r| {
+        if (std.ascii.eqlIgnoreCase(stem, r)) return true;
+    }
+    return false;
+}
 
 /// 单个 multipart 请求允许的最大 part 数，防止构造海量极小 part 放大内存/CPU。
 pub const MAX_PARTS = 1024;
@@ -104,6 +136,17 @@ pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
 
 /// 从 Context 解析 multipart 表单。
 /// `limit` 是 body 最大字节数。
+///
+/// 错误 → 建议状态码（调用方应逐项映射到 failWith/ErrorRenderer，
+/// **不要一律 catch 成 400**——那会把 413/500 的语义吞掉）：
+/// - `error.NotMultipart` / `error.MissingBoundary` → 400（Content-Type 不对）
+/// - `error.TooManyParts` / `error.MalformedPart` / `error.DuplicateField` → 400
+///   （构造畸形或不符合本解析器模型的表单）
+/// - `error.BodyTooLarge` → 413（body 超过 `limit`）。若 body 是 chunked，
+///   回 413 时调用方**必须** `res.keep_alive = false`：std 不会排空残留的
+///   半截 chunk 流，复用连接会把残留字节当成下一个请求（CL 超限在建
+///   reader 前拦截，无此问题，但统一关连接最稳）。
+/// - `error.OutOfMemory` → 500（应继续向上传播，不要拦截为客户端错误）
 pub fn from(ctx: *Context, limit: u64) !FormData {
     const ct = ctx.request.content_type orelse return error.NotMultipart;
     // 媒体类型大小写不敏感（RFC 9110 §8.3.1）。
@@ -118,7 +161,16 @@ pub fn from(ctx: *Context, limit: u64) !FormData {
     return parseBody(ctx.arena, body, delimiter);
 }
 
-/// 从 body 字节解析 multipart 表单。
+/// 校验 delimiter 之后两字节是否合法后继：`\r\n`（下一个 part）或 `--`
+/// （结束标记）。单字节判断会把 `\r\n--boundary\rZ`、`--boundary-Z` 这类
+/// 内容里的边界前缀误判成分隔符（M18 校验的补全）。
+fn delimSuffixOk(body: []const u8, after: usize) bool {
+    if (after + 2 > body.len) return false;
+    const pair = body[after..][0..2];
+    return std.mem.eql(u8, pair, "\r\n") or std.mem.eql(u8, pair, "--");
+}
+
+/// 从 body 字节解析 multipart 表单。错误传播与状态码映射见 `from`。
 pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []const u8) !FormData {
     var form = FormData{ .allocator = allocator };
     // 中途出错时（如 TooManyParts / 分配失败）释放已 put 的哈希桶（修复 M 低危）。
@@ -127,11 +179,25 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
     // 每个 part 以 \r\n--boundary\r\n 分隔
     // 第一个 part 前面有 --boundary\r\n
     // 最后一个 part 后面有 --boundary--\r\n
-    var pos: usize = 0;
-
-    // 找第一个 delimiter
-    const first_delim = std.mem.indexOf(u8, body, delimiter) orelse return form;
-    pos = first_delim + delimiter.len;
+    // 找第一个 delimiter：必须位于行首（body 开头或前面是 \r\n）且后继合法。
+    // preamble（RFC 2046 允许首边界前有任意文本）可能包含边界前缀子串，
+    // 裸 indexOf 会假命中（补全 M18 同款校验）。
+    var first_delim: ?usize = null;
+    {
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, body, search_from, delimiter)) |found| {
+            const at_line_start = found == 0 or
+                (found >= 2 and std.mem.eql(u8, body[found - 2 .. found], "\r\n"));
+            if (at_line_start and delimSuffixOk(body, found + delimiter.len)) {
+                first_delim = found;
+                break;
+            }
+            search_from = found + 1;
+        }
+    }
+    // 无有效首分隔符：视为空表单（保持旧语义，不报错）。
+    const fd = first_delim orelse return form;
+    var pos: usize = fd + delimiter.len;
 
     // 修复 M3：next_delim_search 在循环外分配一次复用（而非每轮 allocPrint），
     // 并限制 part 数上限，防止海量极小 part 放大内存/CPU。
@@ -158,8 +224,9 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
         var part_end: ?usize = null;
         while (part_end == null) {
             const found = std.mem.indexOfPos(u8, body, search_from, next_delim_search) orelse break;
-            const after = found + next_delim_search.len;
-            if (after < body.len and (body[after] == '\r' or body[after] == '-')) {
+            // 后继两字节必须是 \r\n 或 --，否则是内容里的边界子串（旧单字节
+            // 判断遇 `\rZ`/`-Z` 会假分割），继续向后找。
+            if (delimSuffixOk(body, found + next_delim_search.len)) {
                 part_end = found;
             } else {
                 search_from = found + 1; // 假命中（boundary 是更长 token 的前缀），往后找
@@ -209,10 +276,16 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
         }
     }
 
-    const name = field_name orelse return;
+    // 与 P2-27「畸形要响」同一精神：没有 name= 或 name 为空的 part 既不能
+    // 静默丢弃（表单会「少字段」），也不能拿空串当 key。
+    const name = field_name orelse return error.MalformedPart;
+    if (name.len == 0) return error.MalformedPart;
 
     if (file_name != null) {
-        // 文件字段
+        // 文件字段。P2-26：重名 part（如 <input multiple> 多文件）此前被
+        // put 静默覆盖只剩最后一个；现在显式报 DuplicateField——本解析器
+        // 的 name→单值模型承载不了多值，调用方应拒绝该表单。
+        if (form.files.contains(name)) return error.DuplicateField;
         try form.files.put(allocator, name, .{
             .name = name,
             .file_name = file_name,
@@ -220,7 +293,7 @@ fn parsePart(allocator: std.mem.Allocator, part: []const u8, form: *FormData) !v
             .data = body_data,
         });
     } else {
-        // 普通字段
+        if (form.fields.contains(name)) return error.DuplicateField;
         try form.fields.put(allocator, name, body_data);
     }
 }
@@ -417,6 +490,274 @@ test "parseBody ignores boundary substring inside file content (M18)" {
     const file = form.getFile("data").?;
     // 文件内容必须完整包含边界子串，不能在中途被切断（不含终止 CRLF）。
     try std.testing.expectEqualStrings("abc\r\n--boundaryXYZ def", file.data);
+}
+
+// ── safeBaseName：Windows 清洗 + 路径穿越 ────────────────────────────
+
+fn fileWithName(file_name: ?[]const u8) FileField {
+    return .{ .name = "f", .file_name = file_name, .content_type = null, .data = "" };
+}
+
+test "safeBaseName strips path components" {
+    try std.testing.expectEqualStrings("passwd", fileWithName("/etc/passwd").safeBaseName().?);
+    try std.testing.expectEqualStrings("a.txt", fileWithName("C:\\Users\\me\\a.txt").safeBaseName().?);
+    try std.testing.expectEqualStrings("evil.txt", fileWithName("..\\..\\evil.txt").safeBaseName().?);
+    try std.testing.expectEqualStrings("ok.png", fileWithName("ok.png").safeBaseName().?);
+    // 引号原文保留字面 `\`：仍按分隔符剥掉（见 safeBaseName 文档）。
+    try std.testing.expectEqualStrings("b.txt", fileWithName("a\\b.txt").safeBaseName().?);
+}
+
+test "safeBaseName rejects traversal, empty and control chars" {
+    try std.testing.expect(fileWithName(null).safeBaseName() == null);
+    try std.testing.expect(fileWithName("").safeBaseName() == null);
+    try std.testing.expect(fileWithName(".").safeBaseName() == null);
+    try std.testing.expect(fileWithName("..").safeBaseName() == null);
+    try std.testing.expect(fileWithName("a/").safeBaseName() == null);
+    try std.testing.expect(fileWithName("a\\").safeBaseName() == null);
+    // NUL 截断攻击
+    try std.testing.expect(fileWithName("evil.txt\x00.png").safeBaseName() == null);
+    // 其他控制字符
+    try std.testing.expect(fileWithName("ev\x01il.txt").safeBaseName() == null);
+    try std.testing.expect(fileWithName("ev\x7Fil.txt").safeBaseName() == null);
+}
+
+test "safeBaseName rejects Windows-specific hazards" {
+    // 盘符相对路径与 NTFS 备用数据流
+    try std.testing.expect(fileWithName("C:evil.txt").safeBaseName() == null);
+    try std.testing.expect(fileWithName("photo.jpg::$DATA").safeBaseName() == null);
+    // 保留设备名（大小写不敏感，带扩展名同样成立）
+    try std.testing.expect(fileWithName("nul").safeBaseName() == null);
+    try std.testing.expect(fileWithName("NUL.txt").safeBaseName() == null);
+    try std.testing.expect(fileWithName("com1.log").safeBaseName() == null);
+    try std.testing.expect(fileWithName("LPT9").safeBaseName() == null);
+    // 结尾点/空格（Windows 规范化会剥掉）
+    try std.testing.expect(fileWithName("hosts.").safeBaseName() == null);
+    try std.testing.expect(fileWithName("hosts ").safeBaseName() == null);
+    // 正常名字不误伤
+    try std.testing.expectEqualStrings("read.me", fileWithName("read.me").safeBaseName().?);
+    try std.testing.expectEqualStrings("mycom1.txt", fileWithName("mycom1.txt").safeBaseName().?);
+}
+
+// ── parseBody：分隔符后继校验回归（M18 补全） ─────────────────────
+
+test "parseBody rejects false delimiter with single-char-like suffix" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // 内容嵌了 `\r\n--boundary\rZ` 和 `\r\n--boundary-Z`：delimiter 后两字节
+    // 既非 \r\n 也非 --，不得当成边界（旧单字节判 \r / - 会假分割）。
+    const body =
+        "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"data\"\r\n" ++
+        "\r\n" ++
+        "x\r\n--boundary\rZ\r\n--boundary-Z\r\n" ++
+        "y\r\n" ++
+        "--boundary--\r\n";
+
+    var form = try parseBody(arena.allocator(), body, "--boundary");
+    defer form.deinit();
+
+    try std.testing.expectEqualStrings(
+        "x\r\n--boundary\rZ\r\n--boundary-Z\r\ny",
+        form.getText("data").?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), form.fields.count());
+}
+
+test "parseBody skips preamble false delimiter (line-start + suffix check)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // preamble 里含 “--boundary” 子串但不在行首，不得被当作首分隔符。
+    const body =
+        "junk--boundaryjunk\r\n" ++
+        "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n" ++
+        "\r\n" ++
+        "v\r\n" ++
+        "--boundary--\r\n";
+
+    var form = try parseBody(arena.allocator(), body, "--boundary");
+    defer form.deinit();
+
+    try std.testing.expectEqualStrings("v", form.getText("a").?);
+    try std.testing.expectEqual(@as(usize, 1), form.fields.count());
+}
+
+// ── parsePart：畸形 / 重名必须响（P2-26 / P2-27） ───────────────────
+
+test "parseBody rejects malformed parts (P2-27 同批)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // 无 header/body 分隔（\r\n\r\n）
+    const b1 = "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n" ++
+        "--boundary--\r\n";
+    try std.testing.expectError(error.MalformedPart, parseBody(arena.allocator(), b1, "--boundary"));
+
+    // 没有 Content-Disposition（无 name=）
+    const b2 = "--boundary\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++
+        "v\r\n" ++
+        "--boundary--\r\n";
+    try std.testing.expectError(error.MalformedPart, parseBody(arena.allocator(), b2, "--boundary"));
+
+    // name="" 空 key
+    const b3 = "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"\"\r\n\r\n" ++
+        "v\r\n" ++
+        "--boundary--\r\n";
+    try std.testing.expectError(error.MalformedPart, parseBody(arena.allocator(), b3, "--boundary"));
+}
+
+test "parseBody rejects duplicate names (P2-26)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // 两个同名文本字段
+    const b1 = "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n" ++
+        "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\n2\r\n" ++
+        "--boundary--\r\n";
+    try std.testing.expectError(error.DuplicateField, parseBody(arena.allocator(), b1, "--boundary"));
+
+    // 两个同名文件字段（<input multiple> 场景：显式拒绝而非静默剩最后一个）
+    const b2 = "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"docs\"; filename=\"1.txt\"\r\n\r\na\r\n" ++
+        "--boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"docs\"; filename=\"2.txt\"\r\n\r\nb\r\n" ++
+        "--boundary--\r\n";
+    try std.testing.expectError(error.DuplicateField, parseBody(arena.allocator(), b2, "--boundary"));
+}
+
+test "parseBody rejects more than MAX_PARTS parts" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf = std.ArrayList(u8).empty;
+    try buf.appendSlice(a, "--boundary\r\n");
+    var i: usize = 0;
+    while (i <= MAX_PARTS) : (i += 1) { // MAX_PARTS+1 个 part，name 互不相同
+        const part = try std.fmt.allocPrint(
+            a,
+            "Content-Disposition: form-data; name=\"f{d}\"\r\n\r\nv\r\n--boundary\r\n",
+            .{i},
+        );
+        try buf.appendSlice(a, part);
+    }
+    try buf.appendSlice(a, "--boundary--\r\n");
+
+    try std.testing.expectError(error.TooManyParts, parseBody(a, buf.items, "--boundary"));
+}
+
+// ── from()：Context 端到端 ───────────────────────────────────────
+
+/// 测试脚手架：栈上组装 Request/Context 驱动 from()（同 http_codec 的 CodecEnv）。
+const MpEnv = struct {
+    arena: std.heap.ArenaAllocator = undefined,
+    state: http_app.RequestState = undefined,
+    cfg: http_app.RequestConfig = .{},
+    req: Request = undefined,
+    ctx: Context = undefined,
+
+    const Opts = struct {
+        content_type: ?[]const u8 = null,
+        body: Request.Body = .none,
+        content_length: ?u64 = null,
+    };
+
+    fn begin(self: *MpEnv, opts: Opts) void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        const a = self.arena.allocator();
+        self.state = .{ .arena = a };
+        self.req = .{
+            .method = .POST,
+            .target = "/",
+            .path = "/",
+            .query = "",
+            .version = .@"HTTP/1.1",
+            .head_bytes = "POST / HTTP/1.1\r\n\r\n",
+            .content_type = opts.content_type,
+            .content_length = opts.content_length,
+            .transfer_encoding = .none,
+            .body = opts.body,
+        };
+        self.ctx = .{
+            .request = &self.req,
+            .state = &self.state,
+            .config = &self.cfg,
+            .arena = a,
+            .io = undefined,
+        };
+    }
+
+    fn end(self: *MpEnv) void {
+        self.state.deinit();
+        self.arena.deinit();
+    }
+};
+
+test "from: 端到端解析文本 + 文件 part" {
+    var env: MpEnv = .{};
+    env.begin(.{
+        .content_type = "multipart/form-data; boundary=XX",
+        .body = .{ .buffered = "--XX\r\n" ++
+            "Content-Disposition: form-data; name=\"username\"\r\n\r\n" ++
+            "alice\r\n" ++
+            "--XX\r\n" ++
+            "Content-Disposition: form-data; name=\"avatar\"; filename=\"C:\\\\tmp\\\\photo.png\"\r\n" ++
+            "Content-Type: image/png\r\n\r\n" ++
+            "PNG\r\n" ++
+            "--XX--\r\n" },
+    });
+    defer env.end();
+
+    var form = try from(&env.ctx, 1 << 20);
+    defer form.deinit();
+
+    try std.testing.expectEqualStrings("alice", form.getText("username").?);
+    const file = form.getFile("avatar").?;
+    try std.testing.expectEqualStrings("image/png", file.content_type.?);
+    try std.testing.expectEqualStrings("PNG", file.data);
+    // 原始 file_name 带路径，safeBaseName 剥到基名
+    try std.testing.expectEqualStrings("photo.png", file.safeBaseName().?);
+}
+
+test "from: 非 multipart Content-Type → NotMultipart" {
+    var env: MpEnv = .{};
+    env.begin(.{ .content_type = "application/json", .body = .{ .buffered = "{}" } });
+    defer env.end();
+
+    try std.testing.expectError(error.NotMultipart, from(&env.ctx, 1 << 20));
+}
+
+test "from: 缺 boundary 参数 → MissingBoundary" {
+    var env: MpEnv = .{};
+    env.begin(.{ .content_type = "multipart/form-data", .body = .{ .buffered = "x" } });
+    defer env.end();
+
+    try std.testing.expectError(error.MissingBoundary, from(&env.ctx, 1 << 20));
+}
+
+test "from: body 超 limit → BodyTooLarge" {
+    var env: MpEnv = .{};
+    // .streaming 载荷在 BodyTooLarge 预检查前不会被解引用，可用 undefined。
+    env.begin(.{
+        .content_type = "multipart/form-data; boundary=XX",
+        .body = .{ .streaming = undefined },
+        .content_length = 1000,
+    });
+    defer env.end();
+
+    try std.testing.expectError(error.BodyTooLarge, from(&env.ctx, 10));
 }
 
 test {

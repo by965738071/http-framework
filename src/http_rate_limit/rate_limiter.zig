@@ -385,7 +385,6 @@ fn makeRateReq(head_bytes: []const u8) http_protocol.Request {
         .query = "",
         .version = .@"HTTP/1.1",
         .head_bytes = head_bytes,
-        .head_copy = null,
         .content_type = null,
         .content_length = null,
         .transfer_encoding = .none,
@@ -397,7 +396,7 @@ fn makeRateReq(head_bytes: []const u8) http_protocol.Request {
 /// state / config 分配在 arena 上，生命周期随 arena。
 fn makeRateCtx(arena: std.mem.Allocator, req: *http_protocol.Request, peer_ip: ?std.Io.net.IpAddress) Context {
     const state_ptr = arena.create(http_app.RequestState) catch unreachable;
-    state_ptr.* = .{};
+    state_ptr.* = .{ .arena = arena };
     const cfg_ptr = arena.create(http_app.RequestConfig) catch unreachable;
     cfg_ptr.* = .{};
     return .{

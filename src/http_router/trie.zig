@@ -226,7 +226,7 @@ pub const Trie = struct {
         // 再匹配 :param 子节点
         for (node.children.items) |child| {
             if (child.param_name != null) {
-                state.path_params.put(alloc, child.param_name.?, seg) catch {};
+                state.path_params.put(child.param_name.?, seg) catch {};
                 self.matchNode(child, path[seg_end..], method, state, alloc, result);
                 if (result.route != null) return;
                 _ = state.path_params.remove(child.param_name.?);
@@ -236,7 +236,7 @@ pub const Trie = struct {
         // 最后匹配 *catch_all
         for (node.children.items) |child| {
             if (child.catch_all_name != null) {
-                state.path_params.put(alloc, child.catch_all_name.?, path) catch {};
+                state.path_params.put(child.catch_all_name.?, path) catch {};
                 self.matchNode(child, "", method, state, alloc, result);
                 if (result.route != null) return;
                 _ = state.path_params.remove(child.catch_all_name.?);
@@ -288,8 +288,8 @@ test "Trie matches static route" {
     }.h);
     try trie.insert(.GET, "/hello", .{ .handler = handler });
 
-    var state = RequestState{};
-    defer state.deinit(allocator);
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
     const result = trie.match(.GET, "/hello", &state, allocator);
     try std.testing.expect(result.route != null);
 }
@@ -304,8 +304,8 @@ test "Trie extracts path params" {
     }.h);
     try trie.insert(.GET, "/users/:id", .{ .handler = handler });
 
-    var state = RequestState{};
-    defer state.deinit(allocator);
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
     const result = trie.match(.GET, "/users/42", &state, allocator);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
@@ -321,8 +321,8 @@ test "Trie returns 405 when pattern matches but method doesn't" {
     }.h);
     try trie.insert(.GET, "/items", .{ .handler = handler });
 
-    var state = RequestState{};
-    defer state.deinit(allocator);
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
     const result = trie.match(.POST, "/items", &state, allocator);
     try std.testing.expect(result.pattern_matched);
     try std.testing.expect(result.route == null);
@@ -340,8 +340,8 @@ test "Trie catch_all matches remaining path" {
     }.h);
     try trie.insert(.GET, "/static/*filepath", .{ .handler = handler });
 
-    var state = RequestState{};
-    defer state.deinit(allocator);
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
     const result = trie.match(.GET, "/static/css/app.css", &state, allocator);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("filepath").?);
