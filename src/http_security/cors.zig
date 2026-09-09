@@ -25,6 +25,11 @@ pub const CorsConfig = struct {
     block_unauthorized: bool = false,
 };
 
+/// allow_credentials=true 与通配符 origin 同用的一次性告警。规范禁止此组合，
+/// 框架静默降级为 `*` 且不发 credentials——跨域请求将无法携带 cookie，
+/// 管理员往往以为配置生效，实际功能故障且极难排查，故启动时告警一次。
+var wildcard_cred_warned = std.atomic.Value(bool).init(false);
+
 pub const CorsMiddleware = struct {
     config: CorsConfig,
     // 注意：不再持有 arena 字段。CORS 头字符串用请求级 ctx.arena
@@ -55,7 +60,7 @@ pub const CorsMiddleware = struct {
             // 不 block 但也不加 CORS 头——浏览器会自己拒绝。
             // 配了白名单时响应随 Origin 而变，补 Vary: Origin 防缓存污染。
             // 通配符配置（null 或列表含 "*"）响应不随 Origin 变，无需 Vary。
-            if (self.config.allowed_origins != null and !self.isWildcardAllow()) _ = res.header("Vary", "Origin") catch {};
+            if (self.config.allowed_origins != null and !self.isWildcardAllow()) _ = res.setHeader("Vary", "Origin") catch {};
             try next.call(ctx, res);
             return;
         }
@@ -100,16 +105,18 @@ pub const CorsMiddleware = struct {
         // isWildcardAllow：allowed_origins 为 null 或列表含 "*"（归一化，bug.md §6）。
         const wildcard = self.isWildcardAllow();
         if (wildcard and self.config.allow_credentials) {
-            _ = try res.header("Access-Control-Allow-Origin", "*");
+            if (!wildcard_cred_warned.swap(true, .acq_rel))
+                std.log.warn("cors: allow_credentials=true 与通配符 origin（*）同用——规范禁止此组合，已降级为 * 且不发 credentials，跨域请求将无法携带 cookie", .{});
+            _ = try res.setHeader("Access-Control-Allow-Origin", "*");
             // 此时不发 Allow-Credentials（`*` 与凭据互斥）。
         } else if (wildcard) {
-            _ = try res.header("Access-Control-Allow-Origin", "*");
+            _ = try res.setHeader("Access-Control-Allow-Origin", "*");
         } else {
             // 白名单命中：反射具体 Origin，补 Vary: Origin 防缓存污染。
-            _ = try res.header("Access-Control-Allow-Origin", origin);
-            _ = try res.header("Vary", "Origin");
+            _ = try res.setHeader("Access-Control-Allow-Origin", origin);
+            _ = try res.setHeader("Vary", "Origin");
             if (self.config.allow_credentials) {
-                _ = try res.header("Access-Control-Allow-Credentials", "true");
+                _ = try res.setHeader("Access-Control-Allow-Credentials", "true");
             }
         }
 
@@ -118,17 +125,17 @@ pub const CorsMiddleware = struct {
         if (is_preflight) {
             if (self.config.allowed_methods.len > 0) {
                 const methods_str = try joinMethods(arena, self.config.allowed_methods);
-                _ = try res.header("Access-Control-Allow-Methods", methods_str);
+                _ = try res.setHeader("Access-Control-Allow-Methods", methods_str);
             }
             if (self.config.allowed_headers) |headers| {
                 if (headers.len > 0) {
                     const headers_str = try joinStrings(arena, headers, ", ");
-                    _ = try res.header("Access-Control-Allow-Headers", headers_str);
+                    _ = try res.setHeader("Access-Control-Allow-Headers", headers_str);
                 }
             }
             if (self.config.max_age) |age| {
                 const age_str = try std.fmt.allocPrint(arena, "{d}", .{age});
-                _ = try res.header("Access-Control-Max-Age", age_str);
+                _ = try res.setHeader("Access-Control-Max-Age", age_str);
             }
         }
 
@@ -136,7 +143,7 @@ pub const CorsMiddleware = struct {
         if (self.config.exposed_headers) |headers| {
             if (headers.len > 0) {
                 const exposed_str = try joinStrings(arena, headers, ", ");
-                _ = try res.header("Access-Control-Expose-Headers", exposed_str);
+                _ = try res.setHeader("Access-Control-Expose-Headers", exposed_str);
             }
         }
     }
@@ -170,7 +177,7 @@ test "CorsConfig defaults" {
     const cfg = CorsConfig{};
     try std.testing.expect(cfg.allowed_origins == null);
     try std.testing.expectEqual(@as(usize, 6), cfg.allowed_methods.len);
-    try std.testing.expectEqual(true, cfg.allow_credentials == false);
+    try std.testing.expectEqual(false, cfg.allow_credentials);
 }
 
 test "CorsMiddleware isOriginAllowed - wildcard (null)" {

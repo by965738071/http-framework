@@ -189,19 +189,26 @@ pub const AuthMiddleware = struct {
 
         switch (strategy) {
             .bearer => {
-                const header = ctx.request.getHeader("Authorization").?;
-                const token = stripSchemePrefix(header, "Bearer ") orelse "";
-                info_ptr.token = try ctx.arena.dupe(u8, token);
+                // checkBearer 已确认 header 存在，但防御性处理：缺失时 token 保持
+                // null 而非 .? panic（避免未来重构改了调用顺序时崩溃）。
+                if (ctx.request.getHeader("Authorization")) |header| {
+                    const token = stripSchemePrefix(header, "Bearer ") orelse "";
+                    info_ptr.token = try ctx.arena.dupe(u8, token);
+                }
             },
             .basic => {
-                const header = ctx.request.getHeader("Authorization").?;
-                const encoded = stripSchemePrefix(header, "Basic ") orelse "";
-                const dec_len = base64DecodedLen(encoded);
-                if (dec_len > 0) {
-                    const dec_buf = try ctx.arena.alloc(u8, dec_len);
-                    std.base64.standard.Decoder.decode(dec_buf, encoded) catch return error.InvalidBase64;
-                    const colon = std.mem.indexOfScalar(u8, dec_buf, ':') orelse 0;
-                    info_ptr.username = try ctx.arena.dupe(u8, dec_buf[0..colon]);
+                if (ctx.request.getHeader("Authorization")) |header| {
+                    const encoded = stripSchemePrefix(header, "Basic ") orelse "";
+                    const dec_len = base64DecodedLen(encoded);
+                    if (dec_len > 0) {
+                        const dec_buf = try ctx.arena.alloc(u8, dec_len);
+                        // checkBasic 已 decode 成功，这里理论上不会失败；若失败
+                        // 保持 username=null（不返回 error 触发 500，与 checkBasic
+                        // 的 catch return false 语义一致）。
+                        std.base64.standard.Decoder.decode(dec_buf, encoded) catch return;
+                        const colon = std.mem.indexOfScalar(u8, dec_buf, ':') orelse 0;
+                        info_ptr.username = try ctx.arena.dupe(u8, dec_buf[0..colon]);
+                    }
                 }
             },
             .api_key => {

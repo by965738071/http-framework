@@ -52,7 +52,13 @@ pub const CsrfMiddleware = struct {
                     try res.text("Failed to generate CSRF token");
                     return;
                 };
-                self.setCookie(res, token) catch {};
+                self.setCookie(res, token) catch {
+                    // setCookie 失败（OOM 或 token 含非法字符）不应静默：
+                    // cookie 没下发，后续 POST 一律 403，管理员无法从日志定位。
+                    _ = res.statusCode(.internal_server_error);
+                    try res.text("Failed to set CSRF cookie");
+                    return;
+                };
             }
             try next.call(ctx, res);
             return;
