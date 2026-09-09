@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
         // 泄漏时打印报告并以非零码退出，而不是直接 panic——调试期的任何小泄漏
         // 不应表现为无法区分的「Ctrl-C 后崩溃」。
         if (debug_allocator.deinit() == .leak) {
-            std.debug.print("error:memory leak", .{});
+            std.debug.print("error:memory leak\n", .{});
             std.process.exit(1);
         }
     }
@@ -39,7 +39,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try router.route(.GET, "/users/:id", framework.Handler.fromFn(userHandler));
     try router.route(.GET, "/health", framework.Handler.fromFn(healthHandler));
 
-    var api_handler = ApiHandler{ .request_count = 0 };
+    var api_handler = ApiHandler{};
     try router.route(.GET, "/api", framework.Handler.initSingleton(ApiHandler, &api_handler));
     try router.route(.POST, "/login", framework.Handler.fromFn(loginHandler));
     try router.route(.POST, "/upload", framework.Handler.fromFn(uploadHandler));
@@ -93,8 +93,7 @@ fn helloHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const id = ctx.param("id") orelse {
-        try ctx.failWith(.{ .status = .bad_request, .message = "Missing id" });
-        return;
+        return ctx.failWith(.{ .status = .bad_request, .message = "Missing id" });
     };
     // P2-41：旧代码连发两次 res.html 必然 error.AlreadyResponded，
     // 且把路径参数未转义地拼进 HTML（示范 XSS）。
@@ -126,13 +125,14 @@ fn healthHandler(ctx: *framework.Context, res: *framework.Response) !void {
     try res.json(.{ .status = "ok", .timestamp = 42 });
 }
 
-// 单例 handler
+// 单例 handler。request_count 跨并发请求共享，必须用原子值
+// 避免数据竞争（非原子 += 在多线程下丢失更新且违反 Zig 安全检查）。
 const ApiHandler = struct {
-    request_count: u32,
+    request_count: std.atomic.Value(u32) = .{ .raw = 0 },
 
     pub fn handle(self: *ApiHandler, _: *framework.Context, res: *framework.Response) !void {
-        self.request_count += 1;
-        try res.json(.{ .endpoint = "api", .requests = self.request_count });
+        const count = self.request_count.fetchAdd(1, .monotonic) + 1;
+        try res.json(.{ .endpoint = "api", .requests = count });
     }
 };
 
@@ -149,18 +149,17 @@ const LoginRequest = struct {
 ///   http://127.0.0.1:9000/login
 fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        try ctx.failWith(.{ .status = .bad_request, .message = "failed to read body" });
-        return;
+        return ctx.failWith(.{ .status = .bad_request, .message = "failed to read body" });
     }) catch {
-        try ctx.failWith(.{ .status = .bad_request, .message = "invalid JSON body" });
-        return;
+        return ctx.failWith(.{ .status = .bad_request, .message = "invalid JSON body" });
     };
 
     // 实际应用这里应该查数据库验证密码
-    if (std.mem.eql(u8, body.username, "alice") and std.mem.eql(u8, body.password, "secret")) {
+    // 用 constantTimeEql 做恒定时间比较，避免 timing 侧信道
+    if (framework.constantTimeEql(body.username, "alice") and framework.constantTimeEql(body.password, "secret")) {
         try res.json(.{ .ok = true, .user = body.username });
     } else {
-        try ctx.failWith(.{ .status = .unauthorized, .message = "invalid credentials" });
+        return ctx.failWith(.{ .status = .unauthorized, .message = "invalid credentials" });
     }
 }
 
@@ -174,15 +173,13 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // BodyTooLarge（413）/ OOM（500）的语义吞掉。
     var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch |err| switch (err) {
         error.NotMultipart, error.MissingBoundary, error.TooManyParts, error.MalformedPart, error.DuplicateField => {
-            try ctx.failWith(.{ .status = .bad_request, .message = "invalid multipart request" });
-            return;
+            return ctx.failWith(.{ .status = .bad_request, .message = "invalid multipart request" });
         },
         error.BodyTooLarge => {
             // chunked 超限只能在读了半截后发现，std 不会排空残留 body：
             // 413 后必须关连接，否则残余字节会被当成下一个请求（走私面）。
             res.keep_alive = false;
-            try ctx.failWith(.{ .status = .payload_too_large, .message = "upload too large (max 10MB)" });
-            return;
+            return ctx.failWith(.{ .status = .payload_too_large, .message = "upload too large (max 10MB)" });
         },
         else => return err, // OutOfMemory 等继续向上传播，由连接层统一 500
     };
@@ -206,7 +203,7 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     }
 
-    try ctx.failWith(.{ .status = .bad_request, .message = "no file field \"avatar\" found" });
+    return ctx.failWith(.{ .status = .bad_request, .message = "no file field \"avatar\" found" });
 }
 
 // ── Middleware ────────────────────────────────────────────────
