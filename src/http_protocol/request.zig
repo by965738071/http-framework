@@ -395,15 +395,22 @@ fn countHeader(head_bytes: []const u8, name: []const u8) usize {
     return n;
 }
 
-/// application/x-www-form-urlencoded 解码：`+`→空格，`%XX`→字节。
-/// 非法 `%` 序列原样保留。结果由 allocator 分配。
-fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8 {
+/// 百分比解码核心：`%XX`→字节；`plus_as_space` 决定是否**额外**应用
+/// form-urlencoded 的 `+`→空格 规则。非法 `%` 序列原样保留，不返回 error。
+///
+/// 为什么把规则差异做成 comptime 开关，而不是复制成两个函数：
+/// query/表单（`+`=空格）与路径（`+`=字面量，RFC 3986 §2.2 把 `+` 列为
+/// sub-delims，在 path segment 里就是普通字符）只差一个字符的处理，拆两份
+/// 必然漂移——项目里已经有一份独立的 http_static.percentDecode，再加一份就
+/// 三套行为了。comptime 保证两侧的 `%XX` 解析与「非法序列原样保留」行为是
+/// 同一份代码，且分支在编译期消掉，热路径零开销。
+fn urlDecodeImpl(allocator: mem.Allocator, s: []const u8, comptime plus_as_space: bool) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
-        if (c == '+') {
+        if (plus_as_space and c == '+') {
             try out.append(allocator, ' ');
             i += 1;
         } else if (c == '%' and i + 2 < s.len) {
@@ -425,6 +432,29 @@ fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// application/x-www-form-urlencoded 解码：`+`→空格，`%XX`→字节。
+/// 非法 `%` 序列原样保留。结果由 allocator 分配。
+///
+/// 对外可见是为了让上层的「解码版 getter」（Request.getQueryDecoded 与
+/// Request.getFormDecodedFrom）共用同一套规则——各写一份必然漂移，最后变成
+/// 「query 和表单对同一个 %zz 解出不同结果」这类难查的 bug。
+///
+/// 为什么不开 comptime 参数而用两个命名包装：x-www-form-urlencoded 语义是
+/// query 与 body 的默认，`urlDecode(a, s, true)` 这种写法读不出 `true` 的
+/// 含义，且 6 处既有调用点（query ×2、form ×2、测试）都要跟着改形参——漏一
+/// 处就静默变成路径语义。命名包装把意图写在函数名上，同时保持现有签名不变。
+pub fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8 {
+    return urlDecodeImpl(allocator, s, true);
+}
+
+/// RFC 3986 路径解码：`%XX`→字节，`+` **保持字面量**。
+/// 用于路径段（`Context.paramDecoded`）——`/files/a+b.txt` 必须解成
+/// `a+b.txt` 而不是 `a b.txt`；把路径当 form 解码会让含 `+` 的文件名永远
+/// 取不到。非法 `%` 序列的行为与 `urlDecode` 一致（原样保留）。
+pub fn urlDecodePath(allocator: mem.Allocator, s: []const u8) ![]const u8 {
+    return urlDecodeImpl(allocator, s, false);
 }
 
 // ===========================================================================
@@ -720,6 +750,27 @@ test "urlDecode edge cases" {
     try std.testing.expectEqualStrings("%zz", try urlDecode(a, "%zz")); // 非十六进制
     try std.testing.expectEqualStrings("aA%zz", try urlDecode(a, "a%41%zz")); // 混合
     try std.testing.expectEqualStrings("", try urlDecode(a, ""));
+}
+
+test "urlDecodePath: '+' 保持字面量，%XX 与非法序列行为同 urlDecode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 路径段：'+' 是普通字符（RFC 3986 sub-delims）
+    try std.testing.expectEqualStrings("a+b.txt", try urlDecodePath(a, "a+b.txt"));
+    try std.testing.expectEqualStrings("+", try urlDecodePath(a, "+"));
+    // %XX 照常解码
+    try std.testing.expectEqualStrings("a b.txt", try urlDecodePath(a, "a%20b.txt"));
+    try std.testing.expectEqualStrings("中文", try urlDecodePath(a, "%E4%B8%AD%E6%96%87"));
+    // 非法序列：与 urlDecode 同口径，原样保留而不是报错（契约不变）
+    try std.testing.expectEqualStrings("%zz", try urlDecodePath(a, "%zz"));
+    try std.testing.expectEqualStrings("abc%2", try urlDecodePath(a, "abc%2"));
+    try std.testing.expectEqualStrings("100%", try urlDecodePath(a, "100%"));
+    try std.testing.expectEqualStrings("", try urlDecodePath(a, ""));
+
+    // 对照：form 语义下 '+' 仍然是空格，两个包装共用同一核心但行为不同
+    try std.testing.expectEqualStrings("a b", try urlDecode(a, "a+b"));
 }
 
 test "readBodyInto: CL超限在建 reader 前判出（undefined 指针不解引用）" {

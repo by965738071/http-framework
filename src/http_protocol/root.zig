@@ -9,6 +9,10 @@
 
 pub const Request = @import("request.zig").Request;
 pub const BodyReader = @import("request.zig").Request.BodyReader;
+/// 共享的 percent/form-urlencoded 解码器（Context.queryDecoded 等复用同一规则）。
+pub const urlDecode = @import("request.zig").urlDecode;
+/// 同一解码器的 RFC 3986 变体（`+` 保持字面量），供路径参数使用。
+pub const urlDecodePath = @import("request.zig").urlDecodePath;
 pub const Response = @import("response.zig").Response;
 pub const Cookie = @import("response.zig").Cookie;
 pub const Sink = @import("response.zig").Sink;

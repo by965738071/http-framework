@@ -236,9 +236,27 @@ pub const Context = struct {
         return buf;
     }
 
-    /// 便捷方法：获取路径参数
+    /// 便捷方法：获取路径参数（原始，未解码）
     pub fn param(self: *const Context, name: []const u8) ?[]const u8 {
         return self.state.path_params.get(name);
+    }
+
+    /// 便捷方法：获取路径参数并按 **RFC 3986** 解码（`%XX`→字节，`+` 保持
+    /// 字面量，用 ctx.arena）。非法 `%` 序列原样保留（不报错），参数不存在
+    /// 返回 null。
+    ///
+    /// 为什么不用 form 语义（`+`→空格）：那是 `queryDecoded` / `formDecoded`
+    /// 的规则，只适用于 application/x-www-form-urlencoded。RFC 3986 把 `+`
+    /// 列为 sub-delims，在路径段里就是普通字符——`/files/a+b.txt` 若按 form
+    /// 解成 `a b.txt`，这个文件名就永远取不到。
+    ///
+    /// `param` 保持返回原始值：trie 匹配时把路径段原样塞进 PathParams，改成
+    /// 匹配期解码会破坏现有调用方（http_static 依赖原始段做 `..` 与前缀校验，
+    /// 且「先校验再解码」正是它防路径穿越的顺序），也会让 match 在热路径上
+    /// 为每个请求分配。解码因此推迟到真正要用的这一刻。
+    pub fn paramDecoded(self: *const Context, name: []const u8) !?[]const u8 {
+        const raw = self.state.path_params.get(name) orelse return null;
+        return try http_protocol.urlDecodePath(self.arena, raw);
     }
 
     /// 便捷方法：获取请求头
@@ -377,6 +395,130 @@ test "Context.param delegates to state.path_params" {
     };
 
     try std.testing.expectEqualStrings("123", ctx.param("id").?);
+}
+
+test "Context.paramDecoded 解码路径参数，param 保持原始值" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+    try state.path_params.put("id", "%41");
+
+    var req = Request{
+        .method = .GET,
+        .target = "/users/%41",
+        .path = "/users/%41",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET /users/%41 HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = RequestConfig{};
+    const ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    // param 必须继续返回原始段（http_static 依赖它做遍历校验）
+    try std.testing.expectEqualStrings("%41", ctx.param("id").?);
+    try std.testing.expectEqualStrings("A", (try ctx.paramDecoded("id")).?);
+
+    // 空参数值：解码结果仍是空串，不是 null
+    try state.path_params.put("empty", "");
+    try std.testing.expectEqualStrings("", (try ctx.paramDecoded("empty")).?);
+}
+
+test "Context.paramDecoded 按 RFC 3986 解码：多字节 UTF-8、%20、加号字面量" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+    try state.path_params.put("name", "%E4%B8%AD%E6%96%87");
+    try state.path_params.put("q", "a+b");
+    try state.path_params.put("sp", "%20x");
+
+    var req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = RequestConfig{};
+    const ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    try std.testing.expectEqualStrings("中文", (try ctx.paramDecoded("name")).?);
+    try std.testing.expectEqualStrings(" x", (try ctx.paramDecoded("sp")).?);
+    // 路径按 RFC 3986：`+` 是字面量（form 语义的 '+'→空格 只属于 query/表单）。
+    try std.testing.expectEqualStrings("a+b", (try ctx.paramDecoded("q")).?);
+
+    // `/files/a+b.txt`：解出来必须还是 a+b.txt，否则这个文件名永远取不到。
+    try state.path_params.put("file", "a+b.txt");
+    try std.testing.expectEqualStrings("a+b.txt", (try ctx.paramDecoded("file")).?);
+    // %20 照常解成空格
+    try state.path_params.put("sp2", "a%20b.txt");
+    try std.testing.expectEqualStrings("a b.txt", (try ctx.paramDecoded("sp2")).?);
+}
+
+test "Context.paramDecoded 对非法 % 序列与 queryDecoded 同口径：原样保留" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+    try state.path_params.put("bad", "%zz");
+    try state.path_params.put("trunc", "abc%2");
+    try state.path_params.put("tail", "100%");
+
+    var req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    const cfg = RequestConfig{};
+    const ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    // urlDecode 不把非法序列当错误，原样吐回（queryDecoded 已经是这个行为）。
+    try std.testing.expectEqualStrings("%zz", (try ctx.paramDecoded("bad")).?);
+    try std.testing.expectEqualStrings("abc%2", (try ctx.paramDecoded("trunc")).?);
+    try std.testing.expectEqualStrings("100%", (try ctx.paramDecoded("tail")).?);
+    // 不存在的参数 → null（不是 error）
+    try std.testing.expect(try ctx.paramDecoded("nope") == null);
 }
 
 test "Context.peerIpString 格式化内核对端 IP（H3  plumbing）" {

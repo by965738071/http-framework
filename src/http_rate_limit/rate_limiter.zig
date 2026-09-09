@@ -43,6 +43,9 @@ pub const RateLimiter = struct {
     mutex: std.Io.Mutex = .init,
     /// 上次清理过期记录的时间（纳秒）。用于周期性驱逐，防止 map 无限增长（修复 B1）。
     last_cleanup: i96 = 0,
+    /// 清理时暂存待删 key 的复用缓冲。这条路径每窗口一次、且在全局锁内执行，
+    /// 临时建一个 ArrayList 会让清理成本随 map 大小线性抖动（全是持锁时间）。
+    cleanup_scratch: std.ArrayList([]const u8) = .empty,
 
     const Self = @This();
 
@@ -52,6 +55,10 @@ pub const RateLimiter = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: RateLimitConfig) Self {
+        // window_seconds=0 是致命的手误：窗口长度 0 意味着每条记录在写入的
+        // 同一纳秒就已过期——isRateLimitedLocked 恒为 false、updateRecordLocked
+        // 每次重置、maybeCleanupLocked 立刻回收，限流器静默失效且无任何报错。
+        std.debug.assert(config.window_seconds > 0);
         return .{
             .config = config,
             .allocator = allocator,
@@ -65,6 +72,7 @@ pub const RateLimiter = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.records.deinit(self.allocator);
+        self.cleanup_scratch.deinit(self.allocator);
     }
 
     /// 一次限流判定的结果快照。在锁内填好，锁外用于写响应头 —— 这样
@@ -121,8 +129,9 @@ pub const RateLimiter = struct {
 
         _ = res.statusCode(.too_many_requests);
         // Retry-After = 距当前窗口重置还剩多少秒（RFC 9110 §10.2.3）。
-        const retry_str = try std.fmt.allocPrint(ctx.arena, "{d}", .{snap.retry_after_s});
-        _ = try res.header("Retry-After", retry_str);
+        // 栈缓冲即可：res.setHeader 内部会 dupe，没必要在 arena 上留一份。
+        var retry_buf: [24]u8 = undefined;
+        _ = try res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{snap.retry_after_s}) catch "1");
         try res.text(self.config.limit_message);
     }
 
@@ -161,13 +170,15 @@ pub const RateLimiter = struct {
         if (now - self.last_cleanup < interval_ns) return;
         self.last_cleanup = now;
 
-        var to_remove = std.ArrayList([]const u8).empty;
-        defer to_remove.deinit(self.allocator);
+        // 复用成员缓冲，稳态零分配（仍然在锁内，但不做堆分配）。
+        const to_remove = &self.cleanup_scratch;
+        defer to_remove.clearRetainingCapacity();
 
         var it = self.records.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.window_start >= window_ns) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+                // OOM 时停止收集，但下面仍会删掉已收集的部分——下次窗口再补。
+                to_remove.append(self.allocator, entry.key_ptr.*) catch break;
             }
         }
         for (to_remove.items) |key| {
@@ -205,7 +216,11 @@ pub const RateLimiter = struct {
                 // 每请求生成新键绕过限流——必须从右向左跳过可信代理再取第一个
                 // 不可信地址，才是真正的客户端。
                 if (ctx.request.getHeader("X-Forwarded-For")) |xff| {
-                    if (xff.len > 0) return proxyChainClient(xff, self.config.trusted_proxies);
+                    // 解析结果可能为空（畸形 XFF，如 "1.2.3.4, " 或纯空白）：
+                    // 不能拿空串当 identifier——所有这类请求会挤进同一个桶，
+                    // 一个畸形头就能让全站互踢。空则继续回退到对端 IP。
+                    const client = proxyChainClient(xff, self.config.trusted_proxies);
+                    if (client.len > 0) return client;
                 }
                 // 没有代理头：退回对端 IP。
             }
@@ -222,6 +237,7 @@ pub const RateLimiter = struct {
 
     /// X-Forwarded-For 从右向左扫描：跳过可信代理集合，返回第一个不可信地址。
     /// 全部地址都在可信集合内（或只有代理一跳）时回退到最右值。无逗号时即整体。
+    /// 跳过空 entry（尾随逗号 / 纯空白）；整条链为空时返回 ""，由调用方回退。
     fn proxyChainClient(xff: []const u8, trusted: []const []const u8) []const u8 {
         var fallback: []const u8 = "";
         var end: usize = xff.len;
@@ -229,6 +245,11 @@ pub const RateLimiter = struct {
             const comma = std.mem.lastIndexOfScalar(u8, xff[0..end], ',');
             const start = if (comma) |c| c + 1 else 0;
             const entry = std.mem.trim(u8, xff[start..end], " \t");
+            if (entry.len == 0) {
+                if (comma == null) break;
+                end = comma.?;
+                continue;
+            }
             if (fallback.len == 0) fallback = entry;
             var is_trusted = false;
             for (trusted) |t| {
@@ -272,28 +293,18 @@ pub const RateLimiter = struct {
             });
         }
     }
-
-    /// 距当前窗口重置还剩多少秒（向上取整，至少 1）。
-    fn secondsUntilResetLocked(self: *Self, identifier: []const u8, now: i96) u64 {
-        const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
-        if (self.records.get(identifier)) |record| {
-            const elapsed = now - record.window_start;
-            const remaining_ns = window_ns - elapsed;
-            if (remaining_ns <= 0) return 1;
-            return @intCast(@divTrunc(remaining_ns + 999_999_999, 1_000_000_000));
-        }
-        return self.config.window_seconds;
-    }
 };
 
 /// 写 X-RateLimit-* 响应头。**锁外**调用（入参是锁内取好的快照）。
+/// 用 `setHeader` 而非 `header`：后者是追加语义，同一响应上跑两次限流器
+/// （中间件链里注册重复 / 嵌套 dispatch）会写出两组同名头。
 fn writeRateLimitHeaders(res: *Response, snap: RateLimiter.Snapshot) !void {
     var buf: [24]u8 = undefined;
-    _ = try res.header("X-RateLimit-Limit", std.fmt.bufPrint(&buf, "{d}", .{snap.limit}) catch "0");
+    _ = try res.setHeader("X-RateLimit-Limit", std.fmt.bufPrint(&buf, "{d}", .{snap.limit}) catch "0");
     var buf2: [24]u8 = undefined;
-    _ = try res.header("X-RateLimit-Remaining", std.fmt.bufPrint(&buf2, "{d}", .{snap.remaining}) catch "0");
+    _ = try res.setHeader("X-RateLimit-Remaining", std.fmt.bufPrint(&buf2, "{d}", .{snap.remaining}) catch "0");
     var buf3: [24]u8 = undefined;
-    _ = try res.header("X-RateLimit-Reset", std.fmt.bufPrint(&buf3, "{d}", .{snap.reset_unix_sec}) catch "0");
+    _ = try res.setHeader("X-RateLimit-Reset", std.fmt.bufPrint(&buf3, "{d}", .{snap.reset_unix_sec}) catch "0");
 }
 
 // ===========================================================================
@@ -533,6 +544,34 @@ test "P2-22: identifier_header 在 trust_proxy=true 时生效" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("tenant-42", id.?);
 }
-test {
-    std.testing.refAllDecls(@This());
+
+test "畸形 X-Forwarded-For 不产生空 identifier（回退对端 IP）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // 纯空白 / 只剩逗号：解析结果为空串。空串当 key 会让所有畸形请求挤进
+    // 同一个桶，一个畸形头就能让全站互踢——必须回退到对端 IP。
+    for ([_][]const u8{
+        "GET / HTTP/1.1\r\nX-Forwarded-For:    \r\n\r\n",
+        "GET / HTTP/1.1\r\nX-Forwarded-For: ,  \r\n\r\n",
+    }) |raw| {
+        var req = makeRateReq(raw);
+        var ctx = makeRateCtx(arena.allocator(), &req, v4);
+        var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+            .per_ip = true,
+            .trust_proxy = true,
+        });
+        defer rl.deinit();
+        var buf: [64]u8 = undefined;
+        const id = rl.getIdentifier(&ctx, &buf);
+        try std.testing.expect(id != null);
+        try std.testing.expectEqualStrings("203.0.113.195", id.?);
+    }
+}
+
+test "空 entry 被跳过，取左侧真正客户端" {
+    // 尾随逗号/空白：最右 entry 为空，应继续往左找到 198.51.100.7
+    try std.testing.expectEqualStrings(
+        "198.51.100.7",
+        RateLimiter.proxyChainClient("198.51.100.7, 203.0.113.10,   ", &.{"203.0.113.10"}),
+    );
 }

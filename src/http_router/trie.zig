@@ -19,6 +19,11 @@ pub const Route = struct {
     middleware: []const Middleware = &.{},
 };
 
+/// 单个 pattern 里参数段（`:param` / `*catch_all`）的个数上限。
+/// 与 router 的 MAX_PATH_SEGMENTS 同量级：参数再多 PathParams 也装不下，
+/// 与其让匹配时静默丢参数，不如注册时直接拒绝。
+const MAX_PATTERN_SEGMENTS = 64;
+
 const Node = struct {
     segment: []const u8 = "",
     param_name: ?[]const u8 = null,
@@ -49,6 +54,8 @@ pub const Trie = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Trie {
         var arena = std.heap.ArenaAllocator.init(allocator);
+        // Node.init 失败时 arena 还没交出去，必须在这里回收，否则整个 arena 泄漏。
+        errdefer arena.deinit();
         const root = try Node.init(arena.allocator());
         return .{
             .root = root,
@@ -66,11 +73,14 @@ pub const Trie = struct {
     /// 注册路由。pattern 用 `:param` / `*catch_all` 语法。
     /// route.middleware 会被拷贝到 trie arena（生命周期与 trie 绑定）。
     pub fn insert(self: *Trie, method: http.Method, pattern: []const u8, route: Route) !void {
+        // 先整段校验、确认 pattern 合法，再动 trie。校验与建节点交错会把
+        // 非法 pattern 的前半段留在树里（见 validatePattern 的说明）。
+        try validatePattern(pattern);
+
         const alloc = self.arena.allocator();
         var node = self.root;
         var it = std.mem.splitScalar(u8, pattern, '/');
         var first = true;
-        var saw_catch_all = false;
         while (it.next()) |seg| {
             if (first) {
                 first = false;
@@ -78,12 +88,7 @@ pub const Trie = struct {
             }
             if (seg.len == 0) continue;
 
-            // catch-all 必须是最后一段，否则后续段永远不可达（回应审查 H3）。
-            if (saw_catch_all) return error.InvalidRoute;
-            if (seg[0] == '*') saw_catch_all = true;
-
-            const child = try Trie.findOrCreateChild(node, seg, alloc);
-            node = child;
+            node = try Trie.findOrCreateChild(node, seg, alloc);
         }
         if (node.handlers.get(method) != null) return error.RouteConflict;
         // 先登记到 deinit 列表，再写入 node：登记失败时 insert 返回错误，
@@ -113,6 +118,50 @@ pub const Trie = struct {
         // 避免后续 insert 覆盖导致日志/指标聚合的 route_pattern 串台，并省一次 dupe。
         if (node.pattern.len == 0) {
             node.pattern = try alloc.dupe(u8, pattern);
+        }
+    }
+
+    /// 注册前的 pattern 段校验。
+    ///
+    /// 必须在动到 trie 之前跑完：如果校验和建节点交错，非法 pattern 的前半段会
+    /// 作为孤儿节点留在树里。孤儿节点没有 handler 所以不会误命中，但会污染后续
+    /// 注册的冲突检测——`/a/*rest/b` 注册失败后残留的 `*rest`，会让之后合法的
+    /// `/a/*other` 报 RouteConflict。
+    fn validatePattern(pattern: []const u8) !void {
+        var it = std.mem.splitScalar(u8, pattern, '/');
+        var first = true;
+        var saw_catch_all = false;
+        var names: [MAX_PATTERN_SEGMENTS][]const u8 = undefined;
+        var n: usize = 0;
+        while (it.next()) |seg| {
+            if (first) {
+                first = false;
+                if (seg.len == 0) continue; // 前导 /
+            }
+            if (seg.len == 0) continue; // 空段（连续 / 或尾斜杠）
+
+            // catch-all 必须是最后一段，否则后续段永远不可达（回应审查 H3）。
+            if (saw_catch_all) return error.InvalidRoute;
+
+            if (seg[0] == '*') {
+                saw_catch_all = true;
+            } else if (seg[0] == ':') {
+                // 只有 ':' 没有名字：空名参数在 PathParams 里是个取不到也删不掉的
+                // 键，而且它与任何其它参数名都不相等，冲突检测形同虚设。直接拒绝。
+                if (seg.len == 1) return error.InvalidRoute;
+            } else {
+                continue; // 静态段无需校验
+            }
+
+            // 同一 pattern 内参数名不得重复：PathParams 对同名 key 是原地覆盖，
+            // 回溯撤销又只能按 key 删除，嵌套同名参数（/:id/x/:id）必然取错值。
+            const name = seg[1..];
+            for (names[0..n]) |existing| {
+                if (std.mem.eql(u8, existing, name)) return error.InvalidRoute;
+            }
+            if (n == names.len) return error.InvalidRoute;
+            names[n] = name;
+            n += 1;
         }
     }
 
@@ -155,7 +204,10 @@ pub const Trie = struct {
         if (seg.len > 0 and seg[0] == ':') {
             child.param_name = try alloc.dupe(u8, seg[1..]);
         } else if (seg.len > 0 and seg[0] == '*') {
-            child.catch_all_name = try alloc.dupe(u8, seg[1..]);
+            // 裸 "*"（整段只有一个 '*'，如 main.zig 注册的 /static/*）名字取整个
+            // 段 "*"：按「去掉 '*' 前缀」的规则会得到空名，空名参数调用方根本
+            // 取不到——http_static 正是按 ctx.param("*") 取 catch-all 值的。
+            child.catch_all_name = if (seg.len == 1) "*" else try alloc.dupe(u8, seg[1..]);
         } else {
             child.segment = try alloc.dupe(u8, seg);
         }
@@ -208,8 +260,27 @@ pub const Trie = struct {
         const seg = path[0..seg_end];
 
         if (seg.len == 0) {
-            // 双斜杠或尾部斜杠
-            self.matchNode(node, path[seg_end..], method, state, alloc, result);
+            // 空段有两种成因，必须分开处理：
+            //   path.len > 0 → 连续 '/'（"//a"），跳过错段继续匹配。
+            //   path.len == 0 → 路径已到末尾且带尾斜杠（"/static/"），见下。
+            if (path.len > 0) {
+                self.matchNode(node, path, method, state, alloc, result);
+                return;
+            }
+            // 先按「路径结束」在本节点结算（尾斜杠容错：/hello/ 命中 /hello）。
+            self.matchNode(node, "", method, state, alloc, result);
+            if (result.route != null or result.pattern_matched) return;
+            // 本节点没命中，再给 *catch_all 一次「空剩余路径」的机会：否则
+            // /static/ 会 404 而 /static/x 能命中，与上面的尾斜杠容错自相矛盾。
+            for (node.children.items) |child| {
+                if (child.catch_all_name) |name| {
+                    const saved = state.path_params.len;
+                    state.path_params.put(name, "") catch continue;
+                    self.matchNode(child, "", method, state, alloc, result);
+                    if (result.route != null or result.pattern_matched) return;
+                    state.path_params.len = saved;
+                }
+            }
             return;
         }
 
@@ -218,28 +289,38 @@ pub const Trie = struct {
             if (child.param_name == null and child.catch_all_name == null) {
                 if (std.mem.eql(u8, child.segment, seg)) {
                     self.matchNode(child, path[seg_end..], method, state, alloc, result);
-                    if (result.route != null) return;
+                    // pattern_matched 也要停：路径已经精确命中一个有 handler 的节点
+                    // （只是 method 不对 → 405）。继续往 :param / *catch_all 回落，
+                    // 等于让更低优先级的 pattern 抢走本该 405 的请求，
+                    // Allow 头和 route_pattern 也会跟着串到那个 pattern 上。
+                    if (result.route != null or result.pattern_matched) return;
                 }
             }
         }
 
         // 再匹配 :param 子节点
         for (node.children.items) |child| {
-            if (child.param_name != null) {
-                state.path_params.put(child.param_name.?, seg) catch {};
+            if (child.param_name) |name| {
+                // 用「回滚长度」而不是 remove(key) 撤销绑定：PathParams 是内联数组，
+                // put 对同名 key 是原地覆盖、remove 是 swap-remove，遇到嵌套同名
+                // 参数时 remove 会误删外层绑定。
+                const saved = state.path_params.len;
+                // 参数槽满时宁可放弃这条分支（404），也不要静默返回残缺参数。
+                state.path_params.put(name, seg) catch continue;
                 self.matchNode(child, path[seg_end..], method, state, alloc, result);
-                if (result.route != null) return;
-                _ = state.path_params.remove(child.param_name.?);
+                if (result.route != null or result.pattern_matched) return;
+                state.path_params.len = saved;
             }
         }
 
         // 最后匹配 *catch_all
         for (node.children.items) |child| {
-            if (child.catch_all_name != null) {
-                state.path_params.put(child.catch_all_name.?, path) catch {};
+            if (child.catch_all_name) |name| {
+                const saved = state.path_params.len;
+                state.path_params.put(name, path) catch continue;
                 self.matchNode(child, "", method, state, alloc, result);
-                if (result.route != null) return;
-                _ = state.path_params.remove(child.catch_all_name.?);
+                if (result.route != null or result.pattern_matched) return;
+                state.path_params.len = saved;
             }
         }
     }
@@ -388,6 +469,85 @@ test "Trie deinit frees registered factory handler ctx (bug.md §5)" {
     // 这里不手动调用 h.deinit()：FactoryCtx 由 std.testing.allocator 分配，
     // 若 trie.deinit 漏释放（或释放两次），泄漏/双重释放检测会失败。
 }
+test "Trie: 精确命中但 method 不匹配时不回落到更低优先级的 :param" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    try trie.insert(.POST, "/users/me", .{ .handler = h });
+    try trie.insert(.GET, "/users/:id", .{ .handler = h });
+
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
+    // /users/me 是精确命中，但该节点只有 POST → 应 405。
+    // 旧实现会继续回落进 /users/:id，把 GET /users/me 交给 :id 的 handler，
+    // 顺带把 route_pattern / Allow 也串成 /users/:id。
+    const result = trie.match(.GET, "/users/me", &state, allocator);
+    try std.testing.expect(result.route == null);
+    try std.testing.expect(result.pattern_matched);
+    try std.testing.expectEqualStrings("/users/me", result.pattern);
+    try std.testing.expectEqual(@as(u8, 1), result.allowed_count);
+    try std.testing.expectEqual(http.Method.POST, result.allowed_methods[0].?);
+}
+
+test "Trie: catch_all 匹配带尾斜杠的空剩余路径" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    try trie.insert(.GET, "/static/*filepath", .{ .handler = h });
+
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
+    // 静态路由允许 /hello/ 命中 /hello，catch_all 也必须允许空剩余路径，
+    // 否则 /static/ 404 而 /static/x 命中，两套 trailing slash 语义打架。
+    const result = trie.match(.GET, "/static/", &state, allocator);
+    try std.testing.expect(result.route != null);
+    try std.testing.expectEqualStrings("", state.path_params.get("filepath").?);
+}
+
+test "Trie: 裸 * 的 catch_all 参数名取 '*'" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    // main.zig 就是这么注册静态目录的；http_static 按 ctx.param("*") 取值。
+    try trie.insert(.GET, "/static/*", .{ .handler = h });
+
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
+    const result = trie.match(.GET, "/static/css/app.css", &state, allocator);
+    try std.testing.expect(result.route != null);
+    try std.testing.expectEqualStrings("css/app.css", state.path_params.get("*").?);
+}
+
+test "Trie: 非法 pattern 拒绝注册且不残留幽灵节点" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    // catch_all 不在末段
+    try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, "/a/*rest/b", .{ .handler = h }));
+    // 上面若残留了 *rest 幽灵节点，这条合法注册会误报 RouteConflict
+    try trie.insert(.GET, "/a/*other", .{ .handler = h });
+    // 空参数名
+    try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, "/users/:", .{ .handler = h }));
+    // 同一 pattern 内参数名重复
+    try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, "/:id/x/:id", .{ .handler = h }));
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
