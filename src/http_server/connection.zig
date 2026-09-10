@@ -102,11 +102,12 @@ pub const ConnectionRunner = struct {
                 break;
             }
 
-            const keep_alive = client_keep_alive and !shutting_down and self.config.http.keep_alive_enabled;
+            // response_keep_alive 与旧的 keep_alive 是两个逐字相同的表达式（同一
+            // shutting_down 快照），合并消除「看起来像两个决策」的误导。
             arenas.endRequest(self.config.pool.request_arena_retain_bytes);
             // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
             // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
-            if (request_failed or !keep_alive) break;
+            if (request_failed or !response_keep_alive) break;
             // 真正的空闲等待发生在下一次 conn_loop.next() 的阻塞读里，
             // 由 reader 的 read_timeout_ns 约束。旧代码在 next() 前采样 idle_start、
             // 在处理完后算差，实际测的是“读+处理”总耗时，既无法在真正空闲时
@@ -182,7 +183,12 @@ pub const ConnectionRunner = struct {
             // 缓冲模式下（压缩/计时中间件会开启）res.text 只存入 pending_body，
             // 必须 flush 才会真正写出。不在这里 flush 会导致 client 永远收不到响应
             // → 连接死锁到超时（回应审查发现 #2）。
-            try res.flush();
+            // 尽力而为：flush 自身失败（连接已死等）不得顶替原始 handler 错误——
+            // 否则 run() 记录的是 flush 的错误名，真实病因被掩蔽。
+            res.flush() catch |flush_err| std.log.warn(
+                "flush after dispatch error failed: {s}",
+                .{@errorName(flush_err)},
+            );
             return err;
         };
         const latency = std.Io.Timestamp.now(self.io, .awake).nanoseconds - dispatch_start;

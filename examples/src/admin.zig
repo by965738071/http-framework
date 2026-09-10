@@ -457,7 +457,7 @@ pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, serv
 
 /// GET /admin/users/:id — 获取单个用户
 pub fn userGetHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
     const user = try services.users.findById(ctx.arena, id) orelse {
         try ctx.failWith(framework.AppError.notFound("user not found"));
         return;
@@ -467,7 +467,7 @@ pub fn userGetHandler(ctx: *framework.Context, res: *framework.Response, service
 
 /// PUT /admin/users/:id — 更新用户
 pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const username = (ctx.formDecoded("username", 1 << 16) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
@@ -501,7 +501,7 @@ pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, serv
 
 /// DELETE /admin/users/:id — 删除用户
 pub fn userDeleteHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
     const deleted = try services.users.deleteById(id);
     if (!deleted) {
         try ctx.failWith(framework.AppError.notFound("user not found"));
@@ -738,15 +738,20 @@ fn wsNotifications(ws: *framework.WebSocket, raw: *anyopaque) anyerror!void {
 // 辅助函数
 // ────────────────────────────────────────────────────────────────────────────
 
-fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
+/// 从路径参数解析 :id；失败时把 AppError 存入 ctx 并返回 error，由
+/// ErrorRenderer 统一渲染 400。旧实现的 `catch {}` 吞掉了 failWith 返回的
+/// error.AppError，导致 400 从未送达（handler 直接 return 空响应）；
+/// `res` 参数也因此从未被使用（编译错误 unused function parameter）。
+fn parseId(ctx: *framework.Context) !?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch |err| return err;
         return null;
     };
-    return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
+    const id = std.fmt.parseInt(u64, id_str, 10) catch {
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch |err| return err;
         return null;
     };
+    return id;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

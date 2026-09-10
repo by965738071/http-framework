@@ -65,6 +65,13 @@ pub const Handler = union(enum) {
 
     /// **请求级处理器** — 框架自动管理创建和销毁。
     /// T 必须有 `init(allocator) !*T` / `handle(ctx, res) !void` / `deinit() void`
+    ///
+    /// 所有权：返回的 Handler 持有 `allocator` 分配的 FactoryCtx。一旦把它
+    /// 注册进 Router（route/notFoundHandler），释放责任即移交给
+    /// `router.deinit()`（对每个唯一值恰好 deinit 一次）；调用方**不得**再对
+    /// 注册过的 Handler 调 `deinit()`，否则同一个 FactoryCtx 被 free 两次
+    ///（double-free）。只有从未注册进 Router 的 Handler 才由创建方自行
+    /// `deinit()`。
     pub fn initFactory(comptime T: type, allocator: std.mem.Allocator) !Handler {
         const FactoryCtx = struct { alloc: std.mem.Allocator };
         const ctx = try allocator.create(FactoryCtx);
@@ -123,7 +130,9 @@ pub const Handler = union(enum) {
         }
     }
 
-    /// 释放注册时分配的上下文。func/singleton 为 no-op。
+    /// 释放 initFactory 分配的上下文。func/singleton 为 no-op。
+    /// 只能由当前持有所有权的一方调用一次：注册进 Router 后所有权归
+    /// Router（router.deinit 统一释放），再调一次 = double-free。
     pub fn deinit(self: Handler) void {
         switch (self) {
             .func, .singleton => {},

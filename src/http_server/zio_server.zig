@@ -45,6 +45,10 @@ const Listener = struct {
     semaphore: zio.Semaphore,
 
     fn init(config: *const http_app.NetworkConfig) !Listener {
+        // 死开关防护：max_connections=0 意味着零许可，semaphore.wait 永远阻塞——
+        // 服务能正常启动却永不接受任何连接，且无任何日志。启动时显式报错
+        // 好过静默瘫痪。
+        if (config.max_connections == 0) return error.MaxConnectionsZero;
         const address = try zio.net.IpAddress.parseIp4(config.address, config.port);
         const server = try address.listen(.{
             .kernel_backlog = config.tcp_backlog,
@@ -139,7 +143,7 @@ pub const Server = struct {
     /// 1. 把 accept 循环 spawn 为可取消的 group 任务；
     /// 2. 当前协程阻塞等 SIGINT **或 SIGTERM**；
     /// 3. 收到信号：置关机标志、cancel accept（accept 返回 Canceled）；
-    /// 4. 取消并等待在途连接任务，drain 兜底。
+    /// 4. drain 在途连接（限时），仍未退出的再强制 cancel 并回收。
     pub fn run(self: *Server) !void {
         var accept_group: zio.Group = .init;
         try accept_group.spawn(acceptLoop, .{self});
@@ -159,9 +163,14 @@ pub const Server = struct {
         accept_group.cancel();
         try accept_group.wait();
 
+        // 优雅关机顺序（修复）：旧代码先 group.cancel() 再 drain()——cancel 会
+        // 立刻打断所有在途连接（阻塞中的读写返回 Canceled），轮到最后一条 keep-alive
+        // 请求处理中途被掐死；drain 跑到时 active_connections 恒为 0，形同虚设。
+        // 新顺序：先 drain 让在途请求自然完成（空闲 keep-alive 连接被 read_timeout
+        // 唤醒后检查 shutting_down 退出）；超过上限仍未退出的才 cancel 强制打断。
+        self.drain();
         self.group.cancel();
         try self.group.wait();
-        self.drain();
     }
 
     /// 等待 SIGINT 或 SIGTERM 之一。
@@ -169,27 +178,41 @@ pub const Server = struct {
     /// 必须同时监听 SIGTERM：容器（docker stop）、systemd、k8s 发的都是 SIGTERM，
     /// 只监听 SIGINT 等于「优雅关机在生产环境不生效」——进程被 SIGKILL 强杀，
     /// 在途请求直接断、drain 逻辑白写。
+    ///
+    /// 修复：旧逻辑只要 SIGINT 注册失败就直接放弃等待信号——哪怕 SIGTERM 可用
+    /// （docker stop 会因此失效）。现改为两个信号各自独立注册：都可用则 select，
+    /// 只剩其一就只等它，都不可用退化为等 accept 循环（只能外部 kill）。
     fn waitForShutdownSignal(accept_group: *zio.Group) !void {
-        var sigint = zio.Signal.init(.interrupt) catch |err| {
+        var sigint: ?zio.Signal = zio.Signal.init(.interrupt) catch |err| blk: {
             std.log.warn("signal init (SIGINT) failed: {s}", .{@errorName(err)});
-            accept_group.wait() catch {};
-            return;
+            break :blk null;
         };
-        defer sigint.deinit();
-
-        var sigterm = zio.Signal.init(.terminate) catch |err| {
-            // SIGTERM 注册失败不致命，退化成只等 SIGINT。
+        var sigterm: ?zio.Signal = zio.Signal.init(.terminate) catch |err| blk: {
             std.log.warn("signal init (SIGTERM) failed: {s}", .{@errorName(err)});
-            try sigint.wait();
+            break :blk null;
+        };
+        defer if (sigint) |*s| s.deinit();
+        defer if (sigterm) |*s| s.deinit();
+
+        if (sigint) |*si| {
+            if (sigterm) |*st| {
+                switch (try zio.select(.{ .int = si, .term = st })) {
+                    .int => std.log.info("shutdown signal received (SIGINT)", .{}),
+                    .term => std.log.info("shutdown signal received (SIGTERM)", .{}),
+                }
+                return;
+            }
+            try si.wait();
             std.log.info("shutdown signal received (SIGINT)", .{});
             return;
-        };
-        defer sigterm.deinit();
-
-        switch (try zio.select(.{ .int = &sigint, .term = &sigterm })) {
-            .int => std.log.info("shutdown signal received (SIGINT)", .{}),
-            .term => std.log.info("shutdown signal received (SIGTERM)", .{}),
         }
+        if (sigterm) |*st| {
+            try st.wait();
+            std.log.info("shutdown signal received (SIGTERM)", .{});
+            return;
+        }
+        std.log.warn("SIGINT/SIGTERM 均无法注册：优雅关机不可用，进程只能被外部 kill", .{});
+        accept_group.wait() catch {};
     }
 
     /// 等所有活跃连接结束，最多等 drain_timeout_ns（兜底）。
@@ -237,10 +260,12 @@ pub const Server = struct {
     /// 派发一个连接。返回错误时（分配失败）已回滚全部已认领资源，可安全重试。
     fn spawnConnection(self: *Server, stream: zio.net.Stream) !void {
         // 分界：conn 尚未拥有任何资源，失败只需关流 + 还名额。
+        // 返回错误而非静默 return：让 acceptLoop 统一记录（旧写法丢连接无日志，
+        // 高并发 OOM 时完全不可观测）。
         const conn = self.allocator.create(Conn) catch {
             stream.close();
             self.listener.?.semaphore.post();
-            return;
+            return error.OutOfMemory;
         };
 
         // 每个资源在"到手之后"注册自己的 errdefer（LIFO 逆序执行）：

@@ -148,15 +148,30 @@ const LoginRequest = struct {
 ///   -d '{"username":"alice","password":"secret"}' \
 ///   http://127.0.0.1:9000/login
 fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-        return ctx.failWith(.{ .status = .bad_request, .message = "failed to read body" });
-    }) catch {
+    // P2-42：拆开 readBody / parseJson 的错误处理（对齐 uploadHandler 与
+    // http_codec.JsonBody 的既有惯例）——一律 catch 成 400 会把 BodyTooLarge
+    // （413）和 OOM（500）的语义吞掉。chunked 超限的残留 body std 不会排空，
+    // 413 之后必须关连接，否则残余字节会被当成下一个请求（请求走私面）。
+    const raw = ctx.readBody(ctx.arena, 1 << 20) catch |err| switch (err) {
+        error.BodyTooLarge => {
+            res.keep_alive = false;
+            return ctx.failWith(.{ .status = .payload_too_large, .message = "request body too large" });
+        },
+        else => return err, // OutOfMemory 等继续向上传播，由连接层统一 500
+    };
+    const body = framework.parseJson(LoginRequest, ctx.arena, raw) catch |err| {
+        // 非解析错误（OOM）不能吞成 400。
+        if (err == error.OutOfMemory) return err;
         return ctx.failWith(.{ .status = .bad_request, .message = "invalid JSON body" });
     };
 
     // 实际应用这里应该查数据库验证密码
-    // 用 constantTimeEql 做恒定时间比较，避免 timing 侧信道
-    if (framework.constantTimeEql(body.username, "alice") and framework.constantTimeEql(body.password, "secret")) {
+    // 用 constantTimeEql 做恒定时间比较，避免 timing 侧信道。
+    // P2-42：两个比较不能写进同一个 `and` 表达式——`and` 会短路，用户名不
+    // 匹配时密码比较被整个跳过，"恒定时间"名存实亡（比较耗时泄露用户名是否正确）。
+    const user_ok = framework.constantTimeEql(body.username, "alice");
+    const pass_ok = framework.constantTimeEql(body.password, "secret");
+    if (user_ok and pass_ok) {
         try res.json(.{ .ok = true, .user = body.username });
     } else {
         return ctx.failWith(.{ .status = .unauthorized, .message = "invalid credentials" });
@@ -217,10 +232,15 @@ const TimingMiddleware = struct {
         res.setBuffered();
         const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
         // 错误时也要加 timing 头——计时应该包含错误处理时间，
-        // 且 ErrorRenderer 在外层兌底时已经能看到这个头（fix.md §三.1）。
+        // 且 ErrorRenderer 在外层兜底时已经能看到这个头（fix.md §三.1）。
         next.call(ctx, res) catch |err| {
             const elapsed_err = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
-            _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch "?");
+            // P2-43：错误路径写头是「锦上添花」，不能因为 allocPrint/header
+            // 失败就用新错误顶替原始 handler 错误（原代码的 `try` 会吞掉 err）。
+            timing_hdr: {
+                const hv = std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed_err}) catch break :timing_hdr;
+                _ = res.header("X-Response-Time-ns", hv) catch break :timing_hdr;
+            }
             return err;
         };
         const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;

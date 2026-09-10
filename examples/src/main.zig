@@ -243,9 +243,13 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var api_handler = ApiHandler{ .request_count = 0 };
     try router.route(.GET, "/api", framework.Handler.initSingleton(ApiHandler, &api_handler));
 
-    // factory handler（每个请求创建/销毁实例）
+    // factory handler（每个请求创建/销毁实例）。
+    // 所有权契约：Handler 一旦注册进 Router，FactoryCtx 的释放责任就移交
+    // 给 router.deinit()（trie.deinit 对每个注册过的 handler 恰好 deinit 一次，
+    // 见 router.zig 的去重逻辑与回归测试）。这里若再
+    // `defer factory_handler.deinit()`，同一个 FactoryCtx 被释放两次 →
+    // 关服时 double-free（实测 segfault 于 Allocator.rawFree）。
     const factory_handler = try framework.Handler.initFactory(FactoryHandler, allocator);
-    defer factory_handler.deinit();
     try router.route(.GET, "/factory", factory_handler);
 
     // ── JSON body 解析 ────────────────────────────────────────
@@ -303,7 +307,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // ── Admin 后台管理 ────────────────────────────────────────
     {
         // 创建 admin 路由组
-        var admin_routes = router.group("/admin");
+        var admin_routes = try router.group("/admin");
         std.log.info("Registering admin routes...", .{});
 
         // 登录/登出（无需认证）
@@ -356,7 +360,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // ── 设备管理 API（需要认证）─────────────────────────────────
     // 使用 admin 的 session 鉴权（复用 admin_services 的 RequireAuthMiddleware）
     {
-        var api_device_routes = router.group("/api/devices");
+        var api_device_routes = try router.group("/api/devices");
         try api_device_routes.use(admin.requireAuth(&admin_services));
 
         try api_device_routes.route(.GET, "", framework.Handler.initSingleton(devices.DeviceListHandler, &device_list_handler));
@@ -769,7 +773,7 @@ fn ormGetHandler(ctx: *framework.Context, res: *framework.Response) !void {
         try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const user = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(framework.AppError.notFound("user not found"));
@@ -783,7 +787,7 @@ fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
         try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
@@ -807,7 +811,7 @@ fn ormDeleteHandler(ctx: *framework.Context, res: *framework.Response) !void {
         try ctx.failWith(framework.AppError.internal("store not initialized"));
         return;
     };
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const deleted = try store.deleteById(id);
     if (!deleted) {
@@ -818,16 +822,19 @@ fn ormDeleteHandler(ctx: *framework.Context, res: *framework.Response) !void {
     try res.json(.{ .ok = true, .deleted = id });
 }
 
-/// 从路径参数解析 id；失败时已写好 400 响应，返回 null。
-fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
+/// 从路径参数解析 id；失败时把 AppError 存入 ctx 并返回 error，由
+/// ErrorRenderer 统一渲染 400（旧实现的 `catch {}` 吞掉了 failWith 返回的
+/// error.AppError，400 从未送达；`res` 参数也因此从未被使用）。
+fn parseId(ctx: *framework.Context) !?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch |err| return err;
         return null;
     };
-    return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
+    const id = std.fmt.parseInt(u64, id_str, 10) catch {
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch |err| return err;
         return null;
     };
+    return id;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1024,4 +1031,16 @@ test "websocket: wsEncodeFrame / wsDecodeFrame roundtrip" {
     try std.testing.expect(frame.mask);
     try std.testing.expectEqual(framework.OpCode.text, frame.opcode);
     try std.testing.expectEqualStrings("hi", frame.payload);
+}
+
+test "factory handler 所有权：注册后由 router.deinit 释放，不得再自行 deinit" {
+    // 复刻 appMain 里的所有权模式：initFactory → route → 只由 router.deinit 释放。
+    // - 若有人把 `defer factory_handler.deinit()` 加回来：testing.allocator
+    //   （SafeAllocator）会检测到同一个 FactoryCtx 被 free 两次而 panic。
+    // - 若 trie.deinit 漏掉注册 handler 的释放：测试结束时的 allocator
+    //   泄漏检查会直接报错。
+    var router = try framework.Router.init(std.testing.allocator);
+    defer router.deinit();
+    const h = try framework.Handler.initFactory(FactoryHandler, std.testing.allocator);
+    try router.route(.GET, "/factory", h);
 }

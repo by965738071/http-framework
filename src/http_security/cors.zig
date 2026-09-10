@@ -60,7 +60,8 @@ pub const CorsMiddleware = struct {
             // 不 block 但也不加 CORS 头——浏览器会自己拒绝。
             // 配了白名单时响应随 Origin 而变，补 Vary: Origin 防缓存污染。
             // 通配符配置（null 或列表含 "*"）响应不随 Origin 变，无需 Vary。
-            if (self.config.allowed_origins != null and !self.isWildcardAllow()) _ = res.setHeader("Vary", "Origin") catch {};
+            // Vary 是多值头，用合并而非 setHeader 盲替换（见 addVaryOrigin）。
+            if (self.config.allowed_origins != null and !self.isWildcardAllow()) addVaryOrigin(res) catch {};
             try next.call(ctx, res);
             return;
         }
@@ -114,7 +115,7 @@ pub const CorsMiddleware = struct {
         } else {
             // 白名单命中：反射具体 Origin，补 Vary: Origin 防缓存污染。
             _ = try res.setHeader("Access-Control-Allow-Origin", origin);
-            _ = try res.setHeader("Vary", "Origin");
+            try addVaryOrigin(res);
             if (self.config.allow_credentials) {
                 _ = try res.setHeader("Access-Control-Allow-Credentials", "true");
             }
@@ -148,6 +149,39 @@ pub const CorsMiddleware = struct {
         }
     }
 };
+
+/// Vary 是集合型多值头（RFC 9110 §6.2.2：多个字段行/逗号条目取并集）。
+/// 不能直接 setHeader("Vary", "Origin")：CompressMiddleware（注册在外层、
+/// 先于 CORS 执行）已写入 Vary: Accept-Encoding，替换语义会把它摸掉 →
+/// 缓存丢失编码维度（把 gzip 变体喂给不支持的客户端）。
+/// 正确做法：合并既有条目（去重）并保证 Origin 存在，最后以 setHeader
+/// 整体替换成单行（顺带清理历史重复行）。
+fn addVaryOrigin(res: *Response) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(res.allocator);
+    for (res.headers.items) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "Vary")) continue;
+        var it = std.mem.splitScalar(u8, h.value, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " \t");
+            // 去重：Origin 稍后统一补；其余条目首次出现才保留。
+            if (t.len == 0 or std.ascii.eqlIgnoreCase(t, "Origin")) continue;
+            var dup = false;
+            var chk = std.mem.splitScalar(u8, buf.items, ',');
+            while (chk.next()) |existing| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing, " \t"), t)) dup = true;
+            }
+            if (dup) continue;
+            if (buf.items.len > 0) try buf.appendSlice(res.allocator, ", ");
+            try buf.appendSlice(res.allocator, t);
+        }
+    }
+    if (buf.items.len > 0) try buf.appendSlice(res.allocator, ", ");
+    try buf.appendSlice(res.allocator, "Origin");
+    const val = try buf.toOwnedSlice(res.allocator);
+    defer res.allocator.free(val);
+    _ = try res.setHeader("Vary", val);
+}
 
 fn joinMethods(arena: std.mem.Allocator, methods: []const http.Method) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
@@ -195,6 +229,42 @@ test "CorsMiddleware isOriginAllowed - exact match" {
     try std.testing.expect(cors.isOriginAllowed("https://api.example.com"));
     try std.testing.expect(!cors.isOriginAllowed("https://evil.com"));
 }
+
+test "addVaryOrigin 合并而非替换既有 Vary（回归：CORS 吞掉 compress 的 Accept-Encoding）" {
+    var wbuf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&wbuf);
+    var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+
+    // 模拟 CompressMiddleware（外层，先于 CORS）已经写入的 Vary
+    _ = try res.header("Vary", "Accept-Encoding");
+    try addVaryOrigin(&res);
+    try addVaryOrigin(&res); // 幂等：重复调用不得叠加 Origin
+
+    var vary_count: usize = 0;
+    var last: []const u8 = "";
+    for (res.headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Vary")) {
+            vary_count += 1;
+            last = h.value;
+        }
+    }
+    // 只剩单行，且 Accept-Encoding 未被替换掉（旧 setHeader 直接丢维度）
+    try std.testing.expectEqual(@as(usize, 1), vary_count);
+    try std.testing.expectEqualStrings("Accept-Encoding, Origin", last);
+}
+
+test "addVaryOrigin 无既有 Vary 时只写 Origin" {
+    var wbuf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&wbuf);
+    var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+
+    try addVaryOrigin(&res);
+    try std.testing.expectEqual(@as(usize, 1), res.headers.items.len);
+    try std.testing.expectEqualStrings("Origin", res.headers.items[0].value);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

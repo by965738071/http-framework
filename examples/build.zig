@@ -30,11 +30,6 @@ pub fn build(b: *std.Build) void {
     });
     const http_framework_mod = http_framework_dep.module("http_framework");
 
-    const zio_mod = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("zio");
-
     // Admin module - backend admin management system
     const admin_mod = b.addModule("admin", .{
         .root_source_file = b.path("src/admin.zig"),
@@ -126,7 +121,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "devices", .module = devices_mod },
                 .{ .name = "register", .module = register_mod },
                 .{ .name = "http_framework", .module = http_framework_mod },
-                .{ .name = "zio", .module = zio_mod },
             },
         }),
     });

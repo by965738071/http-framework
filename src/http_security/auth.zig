@@ -203,11 +203,16 @@ pub const AuthMiddleware = struct {
                     if (dec_len > 0) {
                         const dec_buf = try ctx.arena.alloc(u8, dec_len);
                         // checkBasic 已 decode 成功，这里理论上不会失败；若失败
-                        // 保持 username=null（不返回 error 触发 500，与 checkBasic
-                        // 的 catch return false 语义一致）。
-                        std.base64.standard.Decoder.decode(dec_buf, encoded) catch return;
-                        const colon = std.mem.indexOfScalar(u8, dec_buf, ':') orelse 0;
-                        info_ptr.username = try ctx.arena.dupe(u8, dec_buf[0..colon]);
+                        // 保持 username=null 并**继续**存入 AuthInfo——旧代码的
+                        // `catch return` 会从 authOk 提前返回，连下面的
+                        // setUserData(AuthInfo) 一起跳过，下游 handler 根本取不到
+                        // 认证信息（与注释意图矛盾）。也不 return error 触发 500，
+                        // 与 checkBasic 的 catch return false 语义一致。
+                        // 失败分支不得读 dec_buf：arena.alloc 未初始化。
+                        if (std.base64.standard.Decoder.decode(dec_buf, encoded)) {
+                            const colon = std.mem.indexOfScalar(u8, dec_buf, ':') orelse 0;
+                            info_ptr.username = try ctx.arena.dupe(u8, dec_buf[0..colon]);
+                        } else |_| {}
                     }
                 }
             },

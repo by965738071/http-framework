@@ -198,7 +198,7 @@ pub fn deviceCreateHandler(ctx: *framework.Context, res: *framework.Response, st
 
 /// 获取单个设备
 pub fn deviceGetHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const device = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(framework.AppError.notFound("device not found"));
@@ -210,7 +210,7 @@ pub fn deviceGetHandler(ctx: *framework.Context, res: *framework.Response, store
 
 /// 更新设备
 pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     var device = try store.findById(ctx.arena, id) orelse {
         try ctx.failWith(framework.AppError.notFound("device not found"));
@@ -254,7 +254,7 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
 
 /// 删除设备
 pub fn deviceDeleteHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore) !void {
-    const id = parseId(ctx, res) orelse return;
+    const id = (try parseId(ctx)) orelse return;
 
     const deleted = try store.deleteById(id);
     if (!deleted) {
@@ -314,15 +314,20 @@ pub const DeviceDeleteHandler = struct {
 // 辅助函数
 // ────────────────────────────────────────────────────────────────────────────
 
-fn parseId(ctx: *framework.Context, res: *framework.Response) ?u64 {
+/// 从路径参数解析 :id；失败时把 AppError 存入 ctx 并返回 error，由
+/// ErrorRenderer 统一渲染 400。旧实现的 `catch {}` 吞掉了 failWith 返回的
+/// error.AppError，导致 400 从未送达（handler 直接 return 空响应）；
+/// `res` 参数也因此从未被使用（编译错误 unused function parameter）。
+fn parseId(ctx: *framework.Context) !?u64 {
     const id_str = ctx.param("id") orelse {
-        ctx.failWith(framework.AppError.badRequest("missing :id")) catch {};
+        ctx.failWith(framework.AppError.badRequest("missing :id")) catch |err| return err;
         return null;
     };
-    return std.fmt.parseInt(u64, id_str, 10) catch {
-        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch {};
+    const id = std.fmt.parseInt(u64, id_str, 10) catch {
+        ctx.failWith(framework.AppError.badRequest("id must be an integer")) catch |err| return err;
         return null;
     };
+    return id;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

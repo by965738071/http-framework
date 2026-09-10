@@ -35,7 +35,11 @@ pub const StaticFileServer = struct {
         // 修复 D5：去掉 root_dir 尾部 '/'，否则 isPathWithinRoot 的
         // full_path[root_dir.len]=='/' 检查会落到真实文件名字符上。
         var normalized_root = root_dir;
-        while (normalized_root.len > 1 and normalized_root[normalized_root.len - 1] == '/') {
+        // 修复 P2-14：Windows 下 root_dir 常写成 "F:\www\"，尾部剥离必须同时认
+        // 反斜杠，否则 isPathWithinRoot 的边界字符检查会错位。
+        while (normalized_root.len > 1) {
+            const last = normalized_root[normalized_root.len - 1];
+            if (last != '/' and last != '\\') break;
             normalized_root = normalized_root[0 .. normalized_root.len - 1];
         }
         return .{
@@ -217,7 +221,14 @@ pub const StaticFileServer = struct {
 
         // Range 请求（RFC 9110 §14.2）：仅支持单一 `bytes=a-b` 区间。
         if (ctx.request.getHeader("Range")) |range_hdr| {
-            switch (parseByteRange(range_hdr, stat.size)) {
+            // 修复 P2-15：If-Range（RFC 9110 §14.6，MUST）。验证器不匹配时必须
+            // 忽略 Range 回 200 全量，否则客户端缓存会把旧区间片段和新全量
+            // 拼接成损坏文件。
+            const if_range_ok = if (ctx.request.getHeader("If-Range")) |ir|
+                ifRangeMatch(ir, etag, stat.mtime.nanoseconds)
+            else
+                true;
+            if (if_range_ok) switch (parseByteRange(range_hdr, stat.size)) {
                 .range => |rng| return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng),
                 .unsatisfiable => {
                     // 不可满足的范围 → 416 + Content-Range: bytes */size
@@ -230,7 +241,7 @@ pub const StaticFileServer = struct {
                 },
                 // 多区间 / 不可识别 unit：RFC 9110 §14.2 要求忽略该 Range，回 200 全量。
                 .ignore => {},
-            }
+            };
         }
 
         // 修复 fix.md 架构缺陷 #2：流式响应绕过缓冲中间件 → 压缩失效。
@@ -253,7 +264,8 @@ pub const StaticFileServer = struct {
             if (use_gzip) {
                 // gzip 流式压缩：Content-Length 未知（压缩后大小不确定）
                 _ = try res.header("Content-Encoding", "gzip");
-                _ = try res.header("Vary", "Accept-Encoding");
+                // 修复 P2-16：Vary: Accept-Encoding 已在上方 can_compress 分支追加，
+                // use_gzip 蕴含 can_compress，这里再加会产生重复响应头。
                 var stream_buf: [8192]u8 = undefined;
                 var stream = try res.stream(&stream_buf, .{
                     .content_length = null,
@@ -282,7 +294,9 @@ pub const StaticFileServer = struct {
                     const bufs: []const []u8 = &.{file_read_buf[0..to_read]};
                     // 读错直接传播，不静默截断（否则 Content-Length 不符 / 连接错帧）。
                     const n = try file.readPositional(ctx.io, bufs, offset);
-                    if (n == 0) break;
+                    // 修复 P2-17：n==0 说明文件在 stat 之后被并发截断。gzip 分帧虽
+                    // 不会坏，但静默 break 等于无错交付半截内容——必须报错终止。
+                    if (n == 0) return error.UnexpectedEof;
                     try encoder.writer.writeAll(file_read_buf[0..n]);
                     try stream.flush();
                     offset += n;
@@ -307,7 +321,9 @@ pub const StaticFileServer = struct {
                     const to_read = @min(file_read_buf.len, stat.size - offset);
                     const bufs: []const []u8 = &.{file_read_buf[0..to_read]};
                     const n = try file.readPositional(ctx.io, bufs, offset);
-                    if (n == 0) break;
+                    // 修复 P2-17：同上（本分支是 chunked，不会撞 BodyWriter 断言，
+                    // 但同样不能无错交付半截文件）。
+                    if (n == 0) return error.UnexpectedEof;
                     try stream.writeAll(file_read_buf[0..n]);
                     offset += n;
                 }
@@ -511,8 +527,29 @@ fn isPathWithinRoot(full_path: []const u8, root_dir: []const u8) bool {
     if (full_path.len < root_dir.len) return false;
     if (!std.mem.eql(u8, full_path[0..root_dir.len], root_dir)) return false;
     if (full_path.len == root_dir.len) return true;
-    // 紧跟 root_dir 之后必须是路径分隔符
-    return full_path[root_dir.len] == '/';
+    // 紧跟 root_dir 之后必须是路径分隔符。
+    // 修复 P2-14：Windows 上 std.fs.path.join 产出原生 '\'（混合分隔符合法），
+    // realPathFile 返回全 '\'；只接受 '/' 会让 Windows 下所有静态请求被误拒 403。
+    const sep = full_path[root_dir.len];
+    return sep == '/' or sep == '\\';
+}
+
+/// If-Range 验证器比较（RFC 9110 §14.6 / RFC 7232 §3.2）。
+/// 支持的形态：
+/// - `*`：恒匹配（无条件应用 Range）；
+/// - 强 ETag（`"` 开头）：与当前 ETag 字节全等才算匹配；
+/// - 弱 ETag（`W/` 开头）：恒不匹配——弱验证器不能用于 If-Range（RFC 7232 §2.2.2）；
+/// - HTTP-date：与 Last-Modified 按语义比较，mtime <= 该时刻算匹配；
+/// - 解析失败：保守视为不匹配（忽略 Range，回 200 全量）。
+fn ifRangeMatch(header: []const u8, etag: []const u8, mtime_ns: i128) bool {
+    const v = std.mem.trim(u8, header, " \t");
+    if (v.len == 0) return false;
+    if (std.mem.eql(u8, v, "*")) return true;
+    if (std.mem.startsWith(u8, v, "W/")) return false;
+    if (v[0] == '"') return std.mem.eql(u8, v, etag);
+    const dt = parseHttpDate(v) orelse return false;
+    const mtime_sec = @divFloor(mtime_ns, std.time.ns_per_s);
+    return mtime_sec <= dt;
 }
 
 fn getContentType(path: []const u8) []const u8 {
@@ -728,6 +765,51 @@ test "stripPrefix - separator boundary (M13)" {
     try std.testing.expect(s.stripPrefix("/statician") == null);
     // 完全不同路径 → 未命中
     try std.testing.expect(s.stripPrefix("/other") == null);
+}
+
+test "isPathWithinRoot accepts both separators (P2-14 regression)" {
+    // Windows：join 产出原生 '\'，且允许混合分隔符（边界 '\'、内层 '/'）
+    try std.testing.expect(isPathWithinRoot("F:\\www\\sub\\a.txt", "F:\\www"));
+    try std.testing.expect(isPathWithinRoot("F:\\www\\sub/a.txt", "F:\\www"));
+    // POSIX
+    try std.testing.expect(isPathWithinRoot("/var/www/a.txt", "/var/www"));
+    // 恰好等于 root
+    try std.testing.expect(isPathWithinRoot("/var/www", "/var/www"));
+    // 兄弟目录前缀冲突必须拒绝
+    try std.testing.expect(!isPathWithinRoot("F:\\www2\\x", "F:\\www"));
+    try std.testing.expect(!isPathWithinRoot("/var/www2/a.txt", "/var/www"));
+    // 比 root 短
+    try std.testing.expect(!isPathWithinRoot("/var/w", "/var/www"));
+}
+
+test "init strips trailing '/' and backslash from root_dir (P2-14 regression)" {
+    const a = std.testing.allocator;
+    var s = StaticFileServer.init(a, undefined, "F:\\www\\", "/static");
+    try std.testing.expectEqualStrings("F:\\www", s.root_dir);
+    s = StaticFileServer.init(a, undefined, "/var/www/", "/static");
+    try std.testing.expectEqualStrings("/var/www", s.root_dir);
+    // 单="/"根不能被剥成空
+    s = StaticFileServer.init(a, undefined, "/", "/static");
+    try std.testing.expectEqualStrings("/", s.root_dir);
+    // url_prefix 尾部 '/' 照旧剥离
+    s = StaticFileServer.init(a, undefined, "/var/www", "/static/");
+    try std.testing.expectEqualStrings("/static", s.url_prefix);
+}
+
+test "ifRangeMatch validator forms (P2-15 regression)" {
+    const etag = "\"100-200\"";
+    // '*' 恒匹配
+    try std.testing.expect(ifRangeMatch("*", etag, 1_000));
+    // 强 ETag 必须字节全等
+    try std.testing.expect(ifRangeMatch(etag, etag, 1_000));
+    try std.testing.expect(!ifRangeMatch("\"100-201\"", etag, 1_000));
+    // 弱 ETag 恒不匹配（不能用于 If-Range 条件）
+    try std.testing.expect(!ifRangeMatch("W/\"100-200\"", etag, 1_000));
+    // HTTP-date：mtime_sec <= 该时刻 → 匹配；晚于 → 不匹配
+    try std.testing.expect(ifRangeMatch("Wed, 21 Oct 2015 07:28:00 GMT", etag, 1_000));
+    try std.testing.expect(!ifRangeMatch("Wed, 21 Oct 2015 07:28:00 GMT", etag, 2_000_000_000_000_000_000));
+    // 无法解析 → 保守视为不匹配（忽略 Range）
+    try std.testing.expect(!ifRangeMatch("garbage", etag, 1_000));
 }
 
 test "parseByteRange" {

@@ -92,6 +92,13 @@ pub const WebSocket = struct {
 
     const Self = @This();
 
+    /// M22：单次 receive() 组装一个 message 允许消费的帧数上限（数据帧 +
+    /// 控制帧都计数）。max_message_size 只限总字节数，挡不住「无穷多个
+    /// 0 长度 continuation / ping 帧」——总字节恒为 0，receive() 永不返回，
+    /// 阻塞式服务端线程被钉死（DoS）。65536 对现实客户端（分片粒度 ≥ 数百
+    /// 字节、默认消息上限 16MB）有约 3 个数量级的余量。
+    pub const MAX_FRAMES_PER_MESSAGE: usize = 65536;
+
     /// 服务端模式构造（发送不 mask）。
     pub fn initServer(reader: *std.Io.Reader, writer: *std.Io.Writer, allocator: std.mem.Allocator) Self {
         return .{ .reader = reader, .writer = writer, .allocator = allocator };
@@ -194,11 +201,19 @@ pub const WebSocket = struct {
         // 禁止把 1005/1006/1015 等保留码写到线路上（RFC §7.4.1）。
         if (!isValidCloseCode(@backingInt(code))) return error.InvalidCloseCode;
 
+        // M20：close reason 必须是合法 UTF-8（RFC §7.1.5）——发到线路上会被
+        // 对端判 1007 断连，不如从源头拒绝。
+        if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
+
+        // M20：长度校验也必须发生在置位 closed 之前——旧顺序（先 closed=true
+        // 再查长度）一旦 reason 超长，close 帧没发出、close 机会却被烧掉，
+        // 后续合法的 close 会被幂等分支吞掉。
+        if (reason.len > 123) return error.ControlFramePayloadTooLong;
+
         self.closed = true;
 
         // close payload = code(2) + reason；控制帧上限 125，减去 2 字节 code 后 reason ≤ 123
         var buf: [125]u8 = undefined;
-        if (reason.len > 123) return error.ControlFramePayloadTooLong;
         std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
         @memcpy(buf[2 .. 2 + reason.len], reason);
         try self.send(.close, buf[0 .. 2 + reason.len]);
@@ -219,8 +234,17 @@ pub const WebSocket = struct {
 
         var first_opcode: OpCode = .text; // 默认值，首帧循环里会被覆盖
         var saw_first_frame: bool = false;
+        // M22：本次 receive() 消费的帧计数（数据帧 + 控制帧都算）。
+        var frame_count: usize = 0;
 
         while (true) {
+            frame_count += 1;
+            if (frame_count > MAX_FRAMES_PER_MESSAGE) {
+                // 超限：0 长度 continuation / 无穷 ping 永远触不到字节上限，
+                // 却能让本函数永不返回。按 1009（too big）关闭握手后报错。
+                self.closeWithCode(1009) catch {};
+                return error.MessageTooBig;
+            }
             var f = try frame_mod.decode(self.reader, self.allocator, self.max_frame_payload);
             defer self.allocator.free(f.payload);
 
@@ -325,6 +349,10 @@ pub const WebSocket = struct {
     /// 向分片缓冲追加，受 max_message_size 限制（修复 E2：防分片总大小无限增长 OOM）。
     fn appendBounded(self: *Self, list: *std.ArrayList(u8), data: []const u8) !void {
         if (list.items.len + data.len > self.max_message_size) {
+            // M21：RFC §7.1.7 —— 因消息超过本地承受上限而断连，必须以
+            // 1009 (Message Too Big) 完成关闭握手（与 finishMessage 里
+            // InvalidUtf8 → 1007 的既有处理对称），不能只报错裸断。
+            self.closeWithCode(1009) catch {};
             return error.MessageTooBig;
         }
         try list.appendSlice(self.allocator, data);
@@ -577,6 +605,85 @@ test "peer closing with 1013/1014 is not re-encoded as 1002 (M15)" {
     const reply_code = std.mem.readInt(u16, reply.payload[0..2], .big);
     // 1013 是合法状态码，必须原样回显，不能改成 1002。
     try testing.expectEqual(@as(u16, 1013), reply_code);
+}
+
+test "close rejects non-UTF-8 reason and does not burn the close (M20)" {
+    const allocator = testing.allocator;
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var dummy_r: std.Io.Reader = .fixed("");
+    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator);
+
+    // 非法 UTF-8 reason → 拒绝，不发帧，不置位 closed
+    try testing.expectError(error.InvalidUtf8, ws.close(.policy_violation, "\xff\xfe"));
+    try testing.expect(!ws.closed);
+    // 超长 reason 同样不得烧掉 close 机会
+    var long_buf: [124]u8 = @splat('x');
+    try testing.expectError(error.ControlFramePayloadTooLong, ws.close(.policy_violation, &long_buf));
+    try testing.expect(!ws.closed);
+    // 之后一次合法 close 仍应成功发出
+    try ws.close(.normal_closure, "ok");
+    try testing.expect(ws.closed);
+    try testing.expect(out_w.written().len > 0);
+}
+
+test "message over max_message_size closes with 1009 (M21)" {
+    const allocator = testing.allocator;
+
+    var input_w: std.Io.Writer.Allocating = .init(allocator);
+    defer input_w.deinit();
+    const k: [4]u8 = .{ 1, 2, 3, 4 };
+    try writeTestFrame(&input_w.writer, .text, false, "part1", true, k);
+    try writeTestFrame(&input_w.writer, .continuation, false, "part2", true, k);
+    try writeTestFrame(&input_w.writer, .continuation, true, "part3", true, k);
+    const input = try allocator.dupe(u8, input_w.written());
+    defer allocator.free(input);
+
+    var r: std.Io.Reader = .fixed(input);
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    ws.max_message_size = 10; // 第三片累计 13 字节 > 10
+
+    try testing.expectError(error.MessageTooBig, ws.receive());
+
+    // 对端必须收到 close 1009（RFC §7.1.7）
+    var sent_r: std.Io.Reader = .fixed(out_w.written());
+    var f = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
+    defer allocator.free(f.payload);
+    try testing.expectEqual(OpCode.close, f.opcode);
+    try testing.expectEqual(@as(usize, 2), f.payload.len);
+    try testing.expectEqual(@as(u16, 1009), std.mem.readInt(u16, f.payload[0..2], .big));
+}
+
+test "zero-length continuation flood is capped (M22)" {
+    const allocator = testing.allocator;
+
+    var input_w: std.Io.Writer.Allocating = .init(allocator);
+    defer input_w.deinit();
+    const k: [4]u8 = .{ 9, 8, 7, 6 };
+    // 首帧空 payload + FIN=0，再灌入恰好触限数量的空 continuation 帧：
+    // 字节上限永远不触发，若无帧数上限则 receive() 永不返回。
+    try writeTestFrame(&input_w.writer, .text, false, "", true, k);
+    var i: usize = 0;
+    while (i < WebSocket.MAX_FRAMES_PER_MESSAGE) : (i += 1) {
+        try writeTestFrame(&input_w.writer, .continuation, false, "", true, k);
+    }
+    const input = try allocator.dupe(u8, input_w.written());
+    defer allocator.free(input);
+
+    var r: std.Io.Reader = .fixed(input);
+    var out_w: std.Io.Writer.Allocating = .init(allocator);
+    defer out_w.deinit();
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+
+    try testing.expectError(error.MessageTooBig, ws.receive());
+    // 同样须发 close 1009 告知对端断开原因
+    var sent_r: std.Io.Reader = .fixed(out_w.written());
+    var f = try frame_mod.decode(&sent_r, allocator, frame_mod.DEFAULT_MAX_PAYLOAD);
+    defer allocator.free(f.payload);
+    try testing.expectEqual(OpCode.close, f.opcode);
+    try testing.expectEqual(@as(u16, 1009), std.mem.readInt(u16, f.payload[0..2], .big));
 }
 
 test {

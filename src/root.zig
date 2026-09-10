@@ -11,7 +11,7 @@
 //! http_server     组装（zio_server + 后端无关的 ConnectionRunner）
 //! ```
 //!
-//! 回应 bug.md §1：core 不再是一个"最小核心"扴 5 层职责。
+//! 回应 bug.md §1：core 不再是一个"最小核心"扛 5 层职责。
 //! 回应 bug.md §6：模块图是 DAG，不是星形。
 
 pub const http_protocol = @import("http_protocol");
