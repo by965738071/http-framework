@@ -143,8 +143,14 @@ pub const Notifications = struct {
     /// 注册客户端连接
     pub fn register(self: *Notifications, ws: *framework.WebSocket) void {
         if (self.connections.len < self.capacity) {
-            self.connections[self.connections.len] = ws;
-            self.connections.len += 1;
+            // 先把「窗口」扩一格再写：connections 是 ptr[0..len] 的视图，
+            // 直接 self.connections[self.connections.len] = ws 是用
+            // index == len 当下标 → Debug/ReleaseSafe 下
+            // "index out of bounds" panic（第一个 ws 客户端连上就触发）；
+            // ReleaseFast 无检查，碰巧写进分配内而不崩。
+            const n = self.connections.len;
+            self.connections = self.connections.ptr[0 .. n + 1];
+            self.connections[n] = ws;
         }
     }
 

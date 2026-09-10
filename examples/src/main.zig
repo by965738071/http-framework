@@ -101,8 +101,16 @@ const UserStore = UserModel.Store;
 // ────────────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
+    _ = init;
     // 使用框架的 runZio 启动 zio 运行时
-    try framework.runZio(init.gpa, appMain);
+    var allocator = std.heap.DebugAllocator(.{}){};
+    defer {
+        if (allocator.deinit() == .leak) {
+            std.debug.panic("allocator leak detected\n", .{});
+        }
+    }
+    const alloc = allocator.allocator();
+    try framework.runZio(alloc, appMain);
 }
 
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
