@@ -290,35 +290,18 @@ pub const RequireRoleMiddleware = struct {
 // Handlers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// GET /admin/login — 返回登录页面
+/// GET /admin/ 或 /admin/login — 返回 SPA HTML 页面
+///
+/// SPA 架构：index.html 始终返回同一个 HTML 页面，前端 JS 通过
+/// fetch('/admin/me') 判断登录状态后自行渲染登录表单或后台界面。
+/// 旧代码在已登录时 303 重定向到 /admin/dashboard——但那是返回 JSON
+/// 的 API 端点，浏览器直接显示原始 JSON 而非渲染后的页面。
+/// 不再重定向，直接返回 HTML，让前端 JS 处理登录态切换。
 pub fn loginPageHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
-    std.log.info("loginPageHandler: starting", .{});
-
-    // 检查是否已登录
-    const sessions = ctx.service(framework.SessionManager) orelse {
-        std.log.err("loginPageHandler: session service not found", .{});
-        try ctx.failWith(framework.AppError.internal("session unavailable"));
-        return;
-    };
-    std.log.info("loginPageHandler: got session service", .{});
-
-    const session_id = ctx.request.getCookie("sid");
-    if (session_id != null) {
-        std.log.info("loginPageHandler: found session cookie", .{});
-        const username = sessions.getValue(session_id.?, "username", ctx.arena) catch null;
-        if (username != null) {
-            std.log.info("loginPageHandler: user is logged in, redirecting", .{});
-            try res.redirectStatus("/admin/dashboard", .see_other);
-            return;
-        }
-    }
-
-    std.log.info("loginPageHandler: reading HTML file", .{});
+    _ = ctx;
     const html = try std.Io.Dir.cwd().readFileAlloc(services.io, "./public/admin/index.html", services.allocator, .limited(10 * 1024 * 1024));
     defer services.allocator.free(html);
-    std.log.info("loginPageHandler: sending HTML response", .{});
     try res.html(html);
-    std.log.info("loginPageHandler: done", .{});
 }
 
 /// POST /admin/login — 处理登录
