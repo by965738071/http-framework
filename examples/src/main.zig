@@ -155,7 +155,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     defer admin_logs.close() catch {};
 
     // 5c. Admin notifications broadcaster
-    var notifications = admin.Notifications.init(allocator);
+    var notifications = admin.Notifications.init(allocator, io);
     defer notifications.deinit();
 
     // 5d. Admin static file server

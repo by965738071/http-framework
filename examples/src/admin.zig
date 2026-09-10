@@ -49,7 +49,7 @@ pub const AdminServices = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AdminServices {
         const users = try UserModel.Store.open(allocator, io, "./data/admin");
         const logs = try LogStore.open(allocator, io, "./data/admin");
-        const notifications = Notifications.init(allocator);
+        const notifications = Notifications.init(allocator, io);
         return .{
             .allocator = allocator,
             .io = io,
@@ -99,13 +99,16 @@ pub const LogStore = LogModel.Store;
 
 pub const Notifications = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     connections: []*framework.WebSocket,
     capacity: usize,
 
-    pub fn init(allocator: std.mem.Allocator) Notifications {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Notifications {
         const buf = allocator.alloc(*framework.WebSocket, 16) catch unreachable;
         return .{
             .allocator = allocator,
+            .io = io,
             // connections.len 跟踪活跃连接数（初始 0），capacity 是缓冲容量。
             .connections = buf[0..0],
             .capacity = 16,
@@ -119,29 +122,32 @@ pub const Notifications = struct {
 
     /// 广播消息到所有 WebSocket 连接
     pub fn broadcast(self: *Notifications, msg: []const u8) !void {
-        var i: usize = 0;
-        while (i < self.connections.len) {
-            const ws = self.connections[i];
-            // 写入失败时移除
-            ws.sendText(msg) catch |err| {
-                if (err == error.ConnectionReset) {
-                    // swap with last and shrink
-                    const last = self.connections.len - 1;
-                    if (i != last) {
-                        self.connections[i] = self.connections[last];
-                    }
-                    self.connections.len = last;
-                    continue;
-                } else {
-                    return err;
-                }
+        // zio 线程池是多 OS 线程的：register/unregister/broadcast 可能在
+        // 不同 worker 上并发。不加锁 → connections 切片竞态 → 内存损坏。
+        //
+        // 快照策略：锁内拷一份指针副本，锁外逐个 sendText——避免 I/O
+        // 期间持有锁（sendText 可能 yield 给事件循环，持锁会饿死其他
+        // register/unregister 调用，甚至死锁）。
+        self.mutex.lockUncancelable(self.io);
+        const snapshot = self.allocator.dupe(*framework.WebSocket, self.connections) catch {
+            self.mutex.unlock(self.io);
+            return error.OutOfMemory;
+        };
+        self.mutex.unlock(self.io);
+        defer self.allocator.free(snapshot);
+
+        for (snapshot) |ws| {
+            ws.sendText(msg) catch {
+                // 发送失败：注销该连接。在锁内做 swap-remove。
+                self.unregister(ws);
             };
-            i += 1;
         }
     }
 
     /// 注册客户端连接
     pub fn register(self: *Notifications, ws: *framework.WebSocket) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.connections.len < self.capacity) {
             // 先把「窗口」扩一格再写：connections 是 ptr[0..len] 的视图，
             // 直接 self.connections[self.connections.len] = ws 是用
@@ -156,6 +162,8 @@ pub const Notifications = struct {
 
     /// 注销客户端连接
     pub fn unregister(self: *Notifications, ws: *framework.WebSocket) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var i: usize = 0;
         while (i < self.connections.len) {
             if (self.connections[i] == ws) {
@@ -704,8 +712,14 @@ pub const WsNotificationsHandler = struct {
     }
 };
 
-pub fn wsNotificationsHandler(ctx: *framework.Context, res: *framework.Response, _: *AdminServices) !void {
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), wsNotifications) catch |err| {
+pub fn wsNotificationsHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
+    // 劫持回调上下文必须是稳定指针——它会在 processRequest 返回后、
+    // hijack.run 执行时才被解引用。@ptrCast(res) 指向栈上 Response，
+    // processRequest 返回后栈帧失效 → use-after-free + type confusion
+    // （把 Response 内存当 AdminServices 读 → 访问 services.notifications
+    // 读到乱码 → 内存损坏，工作线程崩溃，新请求无人处理 → 卡死）。
+    // 传入 services（appMain 栈上的 admin_services 地址，在整个进程生命周期内稳定）。
+    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(services), wsNotifications) catch |err| {
         try ctx.failWith(framework.AppError.badRequest("websocket upgrade failed"));
         return err;
     };
@@ -772,7 +786,8 @@ test "admin: Role enum" {
 
 test "admin: Notifications init/deinit" {
     const alloc = std.testing.allocator;
-    var notifications = Notifications.init(alloc);
+    const io = std.testing.io;
+    var notifications = Notifications.init(alloc, io);
     defer notifications.deinit();
     try std.testing.expectEqual(@as(usize, 0), notifications.connections.len);
 }

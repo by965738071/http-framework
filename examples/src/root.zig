@@ -45,7 +45,8 @@ pub const RegisterHandler = register.RegisterHandler;
 
 test "Notifications: register 在 capacity 内扩窗写入（越界写回归）" {
     const allocator = std.testing.allocator;
-    var notifications = admin.Notifications.init(allocator);
+    const io = std.testing.io;
+    var notifications = admin.Notifications.init(allocator, io);
     defer notifications.deinit();
 
     var fakes: [3]*framework.WebSocket = undefined;
