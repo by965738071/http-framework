@@ -37,6 +37,7 @@ pub const HttpConfig = struct {
     read_buffer_size: usize = 16384,
     write_buffer_size: usize = 8192,
     access_log_enabled: bool = false,
+    data_dir: ?[]const u8 = null,
 };
 
 pub const BodyConfig = struct {
