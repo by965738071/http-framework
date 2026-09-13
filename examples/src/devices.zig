@@ -78,6 +78,38 @@ pub const DeviceModel = framework.orm.Model(OrmDevice, "devices");
 pub const DeviceStore = DeviceModel.Store;
 
 // ────────────────────────────────────────────────────────────────────────────
+// 请求 DTO（JSON body，与 /api/v1 业务接口同风格）
+// ────────────────────────────────────────────────────────────────────────────
+
+const DeviceCreateRequest = struct {
+    name: []const u8,
+    type: []const u8,
+    status: []const u8 = "offline",
+    serial_number: []const u8,
+    location: []const u8 = "",
+};
+
+const DeviceUpdateRequest = struct {
+    name: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    serial_number: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+};
+
+fn readJsonBody(comptime T: type, ctx: *framework.Context) !T {
+    const body = ctx.readBody(ctx.arena, 1 << 20) catch {
+        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
+        return error.BadRequest;
+    };
+    const parsed = framework.parseJson(T, ctx.arena, body) catch {
+        try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
+        return error.BadRequest;
+    };
+    return parsed.*;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Handler 实现函数
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -118,45 +150,18 @@ pub fn deviceListHandler(ctx: *framework.Context, res: *framework.Response, stor
 
 /// 创建设备
 pub fn deviceCreateHandler(ctx: *framework.Context, res: *framework.Response, store: *DeviceStore, io: std.Io) !void {
-    const name = (ctx.formDecoded("name", 1 << 16) catch {
-        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
-        return;
-    }) orelse {
-        try ctx.failWith(framework.AppError.badRequest("name required"));
-        return;
-    };
-
-    const device_type = (ctx.formDecoded("type", 1 << 16) catch {
-        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
-        return;
-    }) orelse {
-        try ctx.failWith(framework.AppError.badRequest("type required"));
-        return;
-    };
+    const req = (readJsonBody(DeviceCreateRequest, ctx) catch return);
+    const name = req.name;
+    const device_type = req.type;
+    const serial_number = req.serial_number;
+    const location = req.location;
+    const status_str = req.status;
 
     // 验证设备类型
     if (DeviceType.fromString(device_type) == null) {
         try ctx.failWith(framework.AppError.badRequest("invalid device type. Must be: sensor, actuator, gateway, controller"));
         return;
     }
-
-    const serial_number = (ctx.formDecoded("serial_number", 1 << 16) catch {
-        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
-        return;
-    }) orelse {
-        try ctx.failWith(framework.AppError.badRequest("serial_number required"));
-        return;
-    };
-
-    const location = (ctx.formDecoded("location", 1 << 16) catch {
-        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
-        return;
-    }) orelse "";
-
-    const status_str = (ctx.formDecoded("status", 1 << 16) catch {
-        try ctx.failWith(framework.AppError.badRequest("failed to read body"));
-        return;
-    }) orelse "offline";
 
     // 验证设备状态
     if (DeviceStatus.fromString(status_str) == null) {
@@ -217,12 +222,13 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
         return;
     };
 
-    // 更新字段（可选）
-    if (ctx.formDecoded("name", 1 << 16) catch null) |name| {
+    const req = (readJsonBody(DeviceUpdateRequest, ctx) catch return);
+
+    if (req.name) |name| {
         device.name = name;
     }
 
-    if (ctx.formDecoded("type", 1 << 16) catch null) |device_type| {
+    if (req.type) |device_type| {
         if (DeviceType.fromString(device_type) == null) {
             try ctx.failWith(framework.AppError.badRequest("invalid device type"));
             return;
@@ -230,7 +236,7 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
         device.type = device_type;
     }
 
-    if (ctx.formDecoded("status", 1 << 16) catch null) |status_str| {
+    if (req.status) |status_str| {
         if (DeviceStatus.fromString(status_str) == null) {
             try ctx.failWith(framework.AppError.badRequest("invalid device status"));
             return;
@@ -238,11 +244,11 @@ pub fn deviceUpdateHandler(ctx: *framework.Context, res: *framework.Response, st
         device.status = status_str;
     }
 
-    if (ctx.formDecoded("serial_number", 1 << 16) catch null) |serial_number| {
+    if (req.serial_number) |serial_number| {
         device.serial_number = serial_number;
     }
 
-    if (ctx.formDecoded("location", 1 << 16) catch null) |location| {
+    if (req.location) |location| {
         device.location = location;
     }
 

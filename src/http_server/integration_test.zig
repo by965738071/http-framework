@@ -475,6 +475,158 @@ test "缓冲模式 flush 幂等：中间件 flush 后 ConnectionRunner 再 flush
     try std.testing.expectEqual(after_first, writer.end); // 没有第二次写入
 }
 
+// 吞掉 failWith 错误的 handler：调用 failWith 后 catch {} return。
+// 没有 ErrorRenderer 时，dispatch 成功返回但 res.sent=false，
+// 靠 ConnectionRunner 兑底用 AppError 渲染（修复：静默 200 空 body）。
+fn swallowFailHandler(ctx: *Context, _: *Response) !void {
+    ctx.failWith(AppError.notFound("resource gone")) catch {};
+    return;
+}
+
+// 抛出 failWith 错误的 handler（不 catch）：dispatch 返回 error.AppError，
+// 靠 ConnectionRunner 兑底用 AppError 渲染（修复：静默 500）。
+fn propagateFailHandler(ctx: *Context, _: *Response) !void {
+    try ctx.failWith(AppError.unauthorized("bad token"));
+}
+
+// ── 驱动真实的 ConnectionRunner ─────────────────────────────────────────
+//
+// 这两个测试以前是「逻辑复刻型」：把 connection.zig 的兜底分支抄一份自己跑，
+// 于是兜底逻辑被改坏时测试照样绿——它测的是测试自己。现在改成驱动真实的
+// ConnectionRunner，断言的是"连接上真正写出了什么"。
+
+const ConnectionRunner = @import("connection.zig").ConnectionRunner;
+
+/// 用内存 Reader/Writer 喂真实 HTTP 字节，跑完整的 `ConnectionRunner.run()`：
+/// conn_loop 解析报文 → router dispatch → processRequest → keep-alive 收尾。
+/// 没有 TCP、没有 zio 运行时，但走的是生产那条代码路径。
+fn runConnection(
+    allocator: std.mem.Allocator,
+    router: *const http_router.Router,
+    raw_request: []const u8,
+    out: []u8,
+) []const u8 {
+    var reader = std.Io.Reader.fixed(raw_request);
+    var writer = std.Io.Writer.fixed(out);
+    var config = http_app.Config{};
+    var stats = http_app.RuntimeState{};
+    var runner = ConnectionRunner{
+        .reader = &reader,
+        .writer = &writer,
+        .io = std.testing.io,
+        .router = router,
+        .config = &config,
+        .lifecycle = .{},
+        .stats = &stats,
+        .allocator = allocator,
+    };
+    runner.run();
+    return out[0..writer.end];
+}
+
+pub const ProcessResult = struct {
+    written: []const u8,
+    dispatch_err: ?anyerror,
+};
+
+/// 只驱动 `processRequest`（跳过 keep-alive 循环）。
+///
+/// 为什么不统一用 `run()`：run() 在 dispatch 报错时会 `std.log.err`，而 zig 的
+/// test runner 把任何 err 级日志都计为失败、让整个测试二进制 exit 1
+/// （std/compiler/test_runner.zig: log_err_count）。于是"handler 抛错 → 兜底
+/// 渲染"这条路径只能在 log 之前的那层驱动它。processRequest 正是那层：它是
+/// 真实的生产代码，只是没有外面那层循环。
+fn processRequestOnce(
+    allocator: std.mem.Allocator,
+    router: *const http_router.Router,
+    raw_request: []const u8,
+    out: []u8,
+) !ProcessResult {
+    var reader = std.Io.Reader.fixed(raw_request);
+    var writer = std.Io.Writer.fixed(out);
+    var server = http.Server.init(&reader, &writer);
+    var arenas = http_app.Arenas.init(allocator);
+    defer arenas.deinit();
+
+    // 真实地收一个 head——Request.init 与 Sink 都建立在 std 的 Request 之上，
+    // 用假 Server.Request 会绕开 prepareBodyNone 这类真实行为。
+    var raw_req = try server.receiveHead();
+    var parsed = try http_protocol.Request.init(arenas.requestAllocator(), &raw_req);
+
+    var config = http_app.Config{};
+    var stats = http_app.RuntimeState{};
+    var runner = ConnectionRunner{
+        .reader = &reader,
+        .writer = &writer,
+        .io = std.testing.io,
+        .router = router,
+        .config = &config,
+        .lifecycle = .{},
+        .stats = &stats,
+        .allocator = allocator,
+    };
+    var dispatch_err: ?anyerror = null;
+    _ = runner.processRequest(&parsed, &raw_req, &arenas, false) catch |e| {
+        dispatch_err = e;
+    };
+    return .{ .written = out[0..writer.end], .dispatch_err = dispatch_err };
+}
+
+test "failWith 被吞：ConnectionRunner 成功路径兜底渲染 404（不是静默 200）" {
+    // handler 调 failWith 后 catch {} return：dispatch 成功但 res.sent=false。
+    // processRequest 的成功路径兜底必须查 ctx.state 里的 AppError 并按其状态码
+    // 渲染——以前这里没有测试保护（旧测试是抄一遍逻辑自己跑）。
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.GET, "/missing", Handler.fromFn(swallowFailHandler));
+
+    var out: [4096]u8 = undefined;
+    const written = runConnection(
+        allocator,
+        &router,
+        "GET /missing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        &out,
+    );
+
+    try std.testing.expectEqual(@as(u16, 404), extractStatus(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "resource gone") != null);
+}
+
+test "failWith 拋出：processRequest 错误路径兜底渲染 401（不是静默 500）" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.GET, "/forbidden", Handler.fromFn(propagateFailHandler));
+
+    var out: [4096]u8 = undefined;
+    const r = try processRequestOnce(allocator, &router, "GET /forbidden HTTP/1.1\r\n\r\n", &out);
+
+    // dispatch 确实把 error.AppError 抛上来了
+    try std.testing.expectEqual(error.AppError, r.dispatch_err.?);
+    // 兜底用 AppError 的状态码渲染，而不是一律 500
+    try std.testing.expectEqual(@as(u16, 401), extractStatus(r.written));
+    try std.testing.expect(std.mem.indexOf(u8, r.written, "bad token") != null);
+}
+
+test "processRequest：没有 AppError 的未知错误兜底 500 + 关连接" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.GET, "/boom", Handler.fromFn(struct {
+        fn handle(_: *Context, _: *Response) !void {
+            return error.SomethingBroke;
+        }
+    }.handle));
+
+    var out: [4096]u8 = undefined;
+    const r = try processRequestOnce(allocator, &router, "GET /boom HTTP/1.1\r\n\r\n", &out);
+
+    try std.testing.expectEqual(error.SomethingBroke, r.dispatch_err.?);
+    try std.testing.expectEqual(@as(u16, 500), extractStatus(r.written));
+    try std.testing.expect(std.mem.indexOf(u8, r.written, "Internal Server Error") != null);
+}
+
 test "Cookie 值含分号被拒绝（属性注入防护）" {
     const allocator = std.testing.allocator;
     var buf: [256]u8 = undefined;

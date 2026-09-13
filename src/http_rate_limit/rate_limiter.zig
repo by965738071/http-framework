@@ -15,6 +15,7 @@ const http_protocol = @import("http_protocol");
 const Context = http_app.Context;
 const Response = http_protocol.Response;
 const Next = http_app.Next;
+const Handler = http_app.Handler;
 
 pub const RateLimitConfig = struct {
     window_seconds: u32 = 60,
@@ -33,6 +34,21 @@ pub const RateLimitConfig = struct {
     /// 跳过这些地址，返回第一个不可信地址（真正客户端）。为空列表则取最右值。
     /// 条目是 IP 字面量（如 "203.0.113.10"），精确匹配。
     trusted_proxies: []const []const u8 = &.{},
+    /// 不受限流约束的**路径前缀**（F-13）。典型用途：健康检查、监控探针、
+    /// 静态资源、登录接口——它们要么由基础设施高频调用，要么本身就有
+    /// 更强的保护（验证码 / 口令错误计数）。
+    ///
+    /// 匹配按 `/` 段对齐：`/health` 命中 `/health` 与 `/health/live`，
+    /// 但**不**命中 `/healthz`（纯字节前缀会把豁免泄漏给拼写相近的 URL）。
+    /// 空列表（默认）= 所有路径都限流。
+    ///
+    /// 豁免的请求既不计数也不写 `X-RateLimit-*` 头——没有这几个头本身就是
+    /// 「该路径不参与限流」的信号。
+    ///
+    /// 想要「不同路径不同阈值」而不是全豁免：本类型不提供（records 只有一个
+    /// 窗口配置），但可以把另一个 `RateLimiter` 实例挂到 `RouteGroup.use` 上，
+    /// 按组做独立窗口。
+    exclude_paths: []const []const u8 = &.{},
 };
 
 pub const RateLimiter = struct {
@@ -95,6 +111,12 @@ pub const RateLimiter = struct {
     /// handler 里再进一次限流器（嵌套 dispatch / 重试）会直接自死锁。
     /// 一个为了防 DoS 而存在的中间件，反而制造了一个更好的 DoS。
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
+        // 豁免判定放在最前面：既不该计数，也不该因为拿不到 identifier 而误判。
+        if (self.isExcluded(ctx.request.path)) {
+            try next.call(ctx, res);
+            return;
+        }
+
         // ip_buf 供 peerIpString 格式化对端 IP；identifier 的生命周期只到本次
         // updateRecordLocked（内部会 dup 成键），栈缓冲足够。
         var ip_buf: [64]u8 = undefined;
@@ -186,6 +208,18 @@ pub const RateLimiter = struct {
                 self.allocator.free(kv.key);
             }
         }
+    }
+
+    /// 路径是否落在豁免前缀里（段对齐，见 `RateLimitConfig.exclude_paths`）。
+    fn isExcluded(self: *const Self, path: []const u8) bool {
+        for (self.config.exclude_paths) |prefix| {
+            const p = std.mem.trimEnd(u8, prefix, "/");
+            // 空前缀（"/" 或 ""）等于全部豁免：显式写出来的意图，照做。
+            if (p.len == 0) return true;
+            if (!std.mem.startsWith(u8, path, p)) continue;
+            if (path.len == p.len or path[p.len] == '/') return true;
+        }
+        return false;
     }
 
     /// 解析客户端标识。返回的切片生命期：
@@ -566,6 +600,105 @@ test "畸形 X-Forwarded-For 不产生空 identifier（回退对端 IP）" {
         try std.testing.expect(id != null);
         try std.testing.expectEqualStrings("203.0.113.195", id.?);
     }
+}
+
+// ── F-13：按路径前缀豁免 ───────────────────────────────────────────
+
+fn makeExcludedReq(path: []const u8) http_protocol.Request {
+    return .{
+        .method = .GET,
+        .target = path,
+        .path = path,
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+}
+
+/// 跑一次完整的 `process`，返回响应文本（状态行 + 头 + body）。
+fn runProcess(
+    rl: *RateLimiter,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    buf: []u8,
+) ![]const u8 {
+    var req = makeExcludedReq(path);
+    var ctx = makeRateCtx(arena, &req, null);
+    var writer = std.Io.Writer.fixed(buf);
+    var res = Response.init(arena, http_protocol.Sink.testSink(&writer));
+    defer res.deinit();
+    const next = Next.root(&.{}, Handler.fromFn(struct {
+        fn h(_: *Context, r: *Response) !void {
+            try r.text("ok");
+        }
+    }.h));
+    try rl.process(&ctx, &res, next);
+    return buf[0..writer.end];
+}
+
+test "F-13: exclude_paths 命中的路径完全跳过限流" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // max_requests=1：第二个非豁免请求就该 429。
+    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        .window_seconds = 60,
+        .max_requests = 1,
+        .per_ip = false,
+        .exclude_paths = &.{"/health"},
+    });
+    defer rl.deinit();
+
+    var buf: [512]u8 = undefined;
+    // 豁免路径连打 3 次都不限流，也不写 X-RateLimit-* 头
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const r = try runProcess(&rl, arena.allocator(), "/health", &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "X-RateLimit-Limit") == null);
+    }
+
+    // 非豁免路径：第 1 次放过，第 2 次 429
+    const ok = try runProcess(&rl, arena.allocator(), "/api/users", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "200") != null);
+    const limited = try runProcess(&rl, arena.allocator(), "/api/users", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "429") != null);
+
+    // 限流触发后，豁免路径依然畅通（没有被挤进同一个桶）
+    const still_ok = try runProcess(&rl, arena.allocator(), "/health", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, still_ok, "200") != null);
+}
+
+test "F-13: 豁免前缀按段对齐（/health 不豁免 /healthz）" {
+    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        .window_seconds = 60,
+        .max_requests = 1,
+        .per_ip = false,
+        .exclude_paths = &.{ "/health", "/api/v1/auth/login" },
+    });
+    defer rl.deinit();
+
+    try std.testing.expect(rl.isExcluded("/health"));
+    try std.testing.expect(rl.isExcluded("/health/live"));
+    try std.testing.expect(rl.isExcluded("/api/v1/auth/login"));
+    // 段不对齐的话，/healthz 会白拿豁免——一个拼写相近的 URL 就绕过了限流
+    try std.testing.expect(!rl.isExcluded("/healthz"));
+    try std.testing.expect(!rl.isExcluded("/api/v1/users"));
+}
+
+test "F-13: exclude_paths 为空时全部限流（默认行为不变）" {
+    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        .window_seconds = 60,
+        .max_requests = 1,
+        .per_ip = false,
+    });
+    defer rl.deinit();
+    try std.testing.expect(!rl.isExcluded("/health"));
+    try std.testing.expect(!rl.isExcluded("/"));
 }
 
 test "空 entry 被跳过，取左侧真正客户端" {

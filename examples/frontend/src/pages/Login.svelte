@@ -12,7 +12,7 @@
     loading = true;
     try {
       const data = await api.login(username, password);
-      currentUser.set({ username: data.username, role: data.role });
+      currentUser.set({ id: data.id, username: data.username, display_name: data.display_name, org_id: data.org_id, permissions: data.permissions });
       isAuthenticated.set(true);
       showToast('登录成功', 'success');
       navigate('dashboard');

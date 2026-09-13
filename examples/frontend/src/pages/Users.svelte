@@ -8,7 +8,7 @@
   let loading = true;
   let showModal = false;
   let editingUser = null;
-  let form = { username: '', email: '', password: '', role: 'viewer' };
+  let form = { username: '', display_name: '', email: '', password: '' };
 
   onMount(loadUsers);
 
@@ -16,7 +16,7 @@
     loading = true;
     try {
       const data = await api.getUsers();
-      users = data.users || [];
+      users = data.items || [];
     } catch (e) {
       showToast('加载用户失败: ' + e.message, 'error');
     }
@@ -25,25 +25,27 @@
 
   function showAdd() {
     editingUser = null;
-    form = { username: '', email: '', password: '', role: 'viewer' };
+    form = { username: '', display_name: '', email: '', password: '' };
     showModal = true;
   }
 
   function showEdit(user) {
     editingUser = user;
-    form = { username: user.username, email: user.email, password: '', role: user.role };
+    form = { username: user.username, display_name: user.display_name, email: user.email, password: '' };
     showModal = true;
+  }
+
+  function roleLabels(user) {
+    return (user.roles || []).map(r => r.name).join(', ') || '-';
   }
 
   async function handleSave() {
     try {
       if (editingUser) {
-        const updateData = { username: form.username, email: form.email, role: form.role };
-        if (form.password) updateData.password = form.password;
-        await api.updateUser(editingUser.id, updateData);
+        await api.updateUser(editingUser.id, { display_name: form.display_name, email: form.email });
         showToast('用户更新成功', 'success');
       } else {
-        await api.createUser(form);
+        await api.createUser({ username: form.username, password: form.password, display_name: form.display_name, email: form.email, org_id: 0 });
         showToast('用户创建成功', 'success');
       }
       showModal = false;
@@ -94,11 +96,8 @@
               <td class="px-6 py-4 text-sm text-gray-900">{user.username}</td>
               <td class="px-6 py-4 text-sm text-gray-500">{user.email}</td>
               <td class="px-6 py-4">
-                <span class="px-2 py-1 text-xs rounded-full"
-                  class:bg-red-100={user.role === 'admin'} class:text-red-700={user.role === 'admin'}
-                  class:bg-blue-100={user.role === 'editor'} class:text-blue-700={user.role === 'editor'}
-                  class:bg-gray-100={user.role === 'viewer'} class:text-gray-700={user.role === 'viewer'}>
-                  {user.role}
+                <span class="px-2 py-1 text-xs rounded-full bg-gray-100 text-gray-700">
+                  {roleLabels(user)}
                 </span>
               </td>
               <td class="px-6 py-4 text-sm space-x-2">
@@ -121,22 +120,19 @@
         class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" />
     </div>
     <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">姓名</label>
+      <input type="text" bind:value={form.display_name} required
+        class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" />
+    </div>
+    <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">邮箱</label>
       <input type="email" bind:value={form.email} required
         class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" />
     </div>
     <div>
-      <label class="block text-sm font-medium text-gray-700 mb-1">密码{editingUser ? '（留空不修改）' : ''}</label>
+      <label class="block text-sm font-medium text-gray-700 mb-1">密码{editingUser ? '（更新不修改密码）' : ''}</label>
       <input type="password" bind:value={form.password}
         class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" />
-    </div>
-    <div>
-      <label class="block text-sm font-medium text-gray-700 mb-1">角色</label>
-      <select bind:value={form.role} class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
-        <option value="admin">管理员</option>
-        <option value="editor">编辑者</option>
-        <option value="viewer">查看者</option>
-      </select>
     </div>
   </form>
   <div slot="actions">

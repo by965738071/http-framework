@@ -235,8 +235,15 @@ pub const RequireAuthMiddleware = struct {
     }
 };
 
+// 静态中间件实例（单线程服务器安全）。注意：requireRole 每次调用都会覆盖
+// role_mw_instance，所以不同角色的 requireRole(...) 不能同时挂到多个路由组——
+// 后调用的会覆盖前面的 role。需要不同角色门槛时，为每个角色声明独立实例，
+// 或者改用请求级 initFactory 中间件。当前示例未挂载该中间件。
+var role_mw_instance: RequireRoleMiddleware = undefined;
+
 pub fn requireRole(role: Role, services: *AdminServices) framework.Middleware {
-    return framework.Middleware.init(RequireRoleMiddleware, .{ .role = role, .services = services });
+    role_mw_instance = .{ .role = role, .services = services };
+    return framework.Middleware.init(RequireRoleMiddleware, &role_mw_instance);
 }
 
 pub const RequireRoleMiddleware = struct {

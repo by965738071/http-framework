@@ -12,9 +12,11 @@
 //!   ├─ 压缩响应        GET /compress（Accept-Encoding: gzip）
 //!   ├─ 会话            POST /session/login   GET /session/me   POST /session/logout
 //!   ├─ 鉴权            GET /admin/secret（Bearer Token，仅 /admin 前缀受保护）
-//!   ├─ 限流            GET /rate-limit（60 秒窗口，全局 30 次）
+//!   ├─ 限流            GET /rate-limit（60 秒窗口，全局 120 次，/static 与 /app 豁免）
 //!   ├─ ORM            GET/POST /orm/users   GET/PUT/DELETE /orm/users/:id
 //!   ├─ Admin 后台      GET/POST /admin/*（登录 + 用户管理 + 仪表盘 + 日志）
+//!   ├─ 分层业务后端     GET/POST /api/v1/*（组织树 + 用户状态机 + RBAC + 审批流）
+//!                      契约见 examples/API.md，默认账号 admin / admin123
 //!   ├─ WebSocket      GET /ws（echo）      GET /admin/ws（实时通知）
 //!   └─ 中间件管道       ErrorRenderer → RequestId → Compress → Timing
 //!                      → SecurityHeaders → CORS → RateLimit（全局）
@@ -52,8 +54,8 @@
 //!   curl -H "Authorization: Bearer demo-secret-token" http://127.0.0.1:9000/admin/secret
 //!   curl http://127.0.0.1:9000/admin/secret          # → 401
 //!
-//!   # 限流（快速刷 30 次以上会看到 429 + Retry-After）
-//!   for i in $(seq 1 35); do curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9000/rate-limit; done
+//!   # 限流（快速刷 120 次以上会看到 429 + Retry-After）
+//!   for i in $(seq 1 130); do curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9000/rate-limit; done
 //!
 //!   # ORM CRUD（数据持久化在 ./data/users.json）
 //!   curl -X POST -H "Content-Type: application/json" \
@@ -72,6 +74,7 @@ const framework = @import("http_framework");
 const admin = @import("admin");
 const devices = @import("devices");
 const register = @import("register");
+const app = @import("app");
 
 // ────────────────────────────────────────────────────────────────────────────
 // 全局状态
@@ -82,6 +85,11 @@ const register = @import("register");
 // 全局变量已移除（架构缺陷 #2 修复）：SessionManager / Logger / ORM Store
 // 现在通过 framework.Services 服务容器注入，handler 用 ctx.service(T) 取回。
 // 这些实例在 main 的栈上创建，生命周期由 main 的 defer 管理。
+//
+// 例外：/ws echo 路由的 hijack_ctx 需要一个进程级稳定地址（回调在 handler
+// 返回后才执行，handler 栈帧已失效，不能传 @ptrCast(res)）。这里用模块级
+// var 持有活动连接计数，地址在整个进程生命周期内稳定。
+var ws_echo_conns: usize = 0;
 
 // ── ORM 模型 ────────────────────────────────────────────────────────────────
 // Model(T, "表名") 会在编译期反射出表结构（id 字段自动成为主键并自增），
@@ -126,7 +134,13 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var logger = try framework.Logger.init(allocator, io, .{
         .min_level = .info,
         .format = .text, // 使用文本格式便于终端阅读
-        .output = .stderr, // 输出到 stderr（终端）
+        .output = .file, // 输出到 stderr（终端）
+        .file = .{
+            .path = "log/http.log",
+            .max_size = 200,
+            .compress = true,
+            .max_backups = 2
+        }
     });
     defer logger.deinit();
     logger.info(null, "examples starting", &.{
@@ -173,6 +187,11 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     const device_store = try devices.DeviceStore.open(allocator, io, "data/devices");
     defer device_store.close() catch {};
 
+    // 5e. 分层业务后端（/api/v1）：model / repo / service / handler / middleware。
+    //     自带幂等 seed，fresh clone 启动即可用 admin/admin123 登录。
+    var app_runtime = try app.App.init(allocator, io, "data/app");
+    defer app_runtime.deinit();
+
     // 5b. 应用级服务容器（修复 #2）：把进程级单例注册进去，
     //     handler 通过 ctx.service(T) 取回，不再依赖全局变量。
     var services = framework.Services.init(allocator);
@@ -181,6 +200,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try services.register(framework.SessionManager, &sessions);
     try services.register(UserStore, store);
     try services.register(admin.AdminServices, &admin_services);
+    try services.register(app.AppServices, app_runtime.services);
     // 注册完毕，封箱：开始服务后任何 register 都会显式失败（防并发 realloc 竞态）。
     services.seal();
 
@@ -220,13 +240,26 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var cors_mw = framework.CorsMiddleware{ .config = .{} };
     try router.use(framework.Middleware.init(framework.CorsMiddleware, &cors_mw));
 
-    // 速率限制：全局 30 次/分钟（per_ip=true 需要 trust_proxy=true，
+    // 速率限制：全局 120 次/分钟（per_ip=true 需要 trust_proxy=true，
     // 否则拿不到对端 IP 会直接跳过——见 rate_limiter 注释）。
+    //
+    // 阈值怎么定的：演示值本来是 30 次/分钟，但挂上 /api/v1 业务 API 后，
+    // 后台前端一次页面访问就是十几个请求，30 次/分钟会把正常业务一起 429。
+    // 原先只能靠把全局阈值抬到 600 来绕（examples/FRICTION.md F-13），
+    // 代价是真正的保护被废掉了。现在 `exclude_paths` 支持段对齐前缀豁免，
+    // 阈值得以回到 120：够一次页面访问，又不至于让 /rate-limit 演示永远打不到。
+    //
+    // 只豁免「不消耗业务配额」的读静态资源/前端页面：
+    //   /static —— 静态文件服务（/static/*）
+    //   /app    —— 业务前端 SPA（index.html + assets，一次加载 3~5 个请求）
+    // 刻意**不**豁免 /admin：它的子树里有 /admin/login，与下面
+    // /api/v1/auth/login 同理——登录入口必须留在限流闸内。
     var rate_mw = framework.RateLimiter.init(allocator, io, .{
         .window_seconds = 60,
-        .max_requests = 30,
+        .max_requests = 120,
         .per_ip = false,
         .identifier_header = null,
+        .exclude_paths = &.{ "/static", "/app" },
     });
     try router.use(framework.Middleware.init(framework.RateLimiter, &rate_mw));
 
@@ -377,6 +410,11 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         try api_device_routes.route(.PUT, "/:id", framework.Handler.initSingleton(devices.DeviceUpdateHandler, &device_update_handler));
         try api_device_routes.route(.DELETE, "/:id", framework.Handler.initSingleton(devices.DeviceDeleteHandler, &device_delete_handler));
     }
+
+    // ── 分层业务后端 API（/api/v1）───────────────────────────────
+    // 组织树 / 用户状态机 / RBAC 权限点 / 审计日志 / 审批流 / WebSocket 通知。
+    // 契约见 examples/API.md，踩坑清单见 examples/FRICTION.md。
+    try app_runtime.mount(&router);
 
     // ── 前端 SPA 静态文件服务 ────────────────────────────────────
 
@@ -938,7 +976,10 @@ const TimingMiddleware = struct {
 // ───────────────────────────────────────────────────────
 
 fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), wsEcho) catch {
+    // hijack_ctx 必须是长期稳定的指针：回调在 processRequest 返回后才执行，
+    // 此时 handler 栈帧已失效。@ptrCast(res) 是反例（use-after-free）。
+    // 这里传模块级 ws_echo_conns 的地址，进程生命周期内稳定。
+    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(&ws_echo_conns), wsEcho) catch {
         try ctx.failWith(.{ .status = .bad_request, .message = "websocket upgrade failed" });
         return;
     };
@@ -951,8 +992,11 @@ fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 /// WebSocket 连接回调：echo 每个收到的消息，直到对方关闭。
+/// hijack_ctx 是 wsEchoHandler 传入的 `&ws_echo_conns`（活动连接计数）。
 fn wsEcho(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    _ = hijack_ctx;
+    const conns: *usize = @ptrCast(@alignCast(hijack_ctx));
+    conns.* += 1;
+    defer conns.* -= 1;
     while (true) {
         var msg = ws.receive() catch |err| {
             // 对方关闭 / 连接断开 → 正常结束。

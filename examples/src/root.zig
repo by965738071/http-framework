@@ -3,6 +3,11 @@ const framework = @import("http_framework");
 const admin = @import("admin");
 const devices = @import("devices");
 const register = @import("register");
+const app = @import("app");
+
+// Layered business backend (mounted at /api/v1) — re-exported for tests.
+pub const app_core = app.core;
+pub const app_model = app.model;
 
 // Re-export admin declarations for testing
 pub const Role = admin.Role;

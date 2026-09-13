@@ -28,6 +28,9 @@ pub const http_compress = @import("http_compress");
 pub const http_logging = @import("http_logging");
 pub const orm = @import("http_orm");
 pub const http_websocket = @import("http_websocket");
+/// 离线测试 harness（FRICTION F-06）。addon，不是 core：`Context` 的公开
+/// API 未作任何改动，harness 只用已有的 `Next` / `Response` / `Sink` 接缝驱动。
+pub const testing = @import("http_testing");
 
 // ── http_protocol ──────────────────────────────────────────────
 pub const Request = http_protocol.Request;

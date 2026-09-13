@@ -159,6 +159,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Addon: http_testing — 离线驱动「中间件 + handler」的测试 harness
+    // （FRICTION F-06）。只依赖 http_app / http_protocol：能力做成 addon，
+    // core 里一行测试专用代码都不加（架构铁律：core 只做最小 HTTP server）。
+    const http_testing = b.addModule("http_testing", .{
+        .root_source_file = b.path("src/http_testing/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+        },
+    });
+
     // Addon: http_orm — JSON 文件存储 ORM（零外部依赖，作为独立 addon 挂在伞形模块下）
     const http_orm = b.addModule("http_orm", .{
         .root_source_file = b.path("src/http_orm/root.zig"),
@@ -196,6 +209,7 @@ pub fn build(b: *std.Build) void {
         http_logging,
         http_orm,
         http_websocket,
+        http_testing,
     }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
@@ -217,6 +231,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http_logging", .module = http_logging },
         .{ .name = "http_orm", .module = http_orm },
         .{ .name = "http_websocket", .module = http_websocket },
+        .{ .name = "http_testing", .module = http_testing },
     };
 
     const mod = b.addModule("http_framework", .{

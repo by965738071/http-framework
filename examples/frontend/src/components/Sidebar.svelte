@@ -21,7 +21,7 @@
   <div class="p-4 border-b border-gray-700">
     <h2 class="text-xl font-bold">设备管理系统</h2>
     {#if $currentUser}
-      <p class="text-sm text-gray-400 mt-1">{$currentUser.username} ({$currentUser.role})</p>
+      <p class="text-sm text-gray-400 mt-1">{$currentUser.display_name || $currentUser.username}</p>
     {/if}
   </div>
   <nav class="flex-1 p-4 space-y-2">

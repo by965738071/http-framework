@@ -9,7 +9,7 @@
   onMount(async () => {
     try {
       const [userStats, devices] = await Promise.all([
-        api.getUsers ? Promise.resolve({ total_users: 0, admins: 0 }) : fetch('/admin/dashboard', { credentials: 'same-origin' }).then(r => r.json()),
+        api.getUsers().then(u => ({ total_users: u.total, admins: 0 })).catch(() => ({ total_users: 0, admins: 0 })),
         api.getDevices().catch(() => ({ total: 0, devices: [] }))
       ]);
       

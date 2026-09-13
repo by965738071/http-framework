@@ -51,6 +51,9 @@ pub const RequestId = http_app.RequestId;
 /// 跨平台实现，不依赖 libc：
 /// - 写 stderr/stdout 走 std.Io.File（std.Io 自带各平台后端）。
 /// - 时间戳用 std.Io.Timestamp.realtime（Unix epoch 纳秒）。
+///   - `text` 格式渲染为带时区的可读 ISO 8601 UTC 时间 `YYYY-MM-DDTHH:MM:SSZ`
+///     （formatUtcTimestamp，纯 std.time.epoch 计算，无 libc）。
+///   - `json` 格式保留数值 `"ts"`（Unix 秒，便于机器解析/排序）。
 /// 日志级别（有序：debug < info < warn < err < fatal）
 pub const Level = enum(u3) {
     debug = 0,
@@ -191,6 +194,7 @@ pub const Logger = struct {
     /// 文件模式写路径串行化（防止轮转与写入并发竞争）
     mutex: std.Io.Mutex = .init,
     /// 文件模式持有的文件句柄
+    zio_file :@import("zio").File,
     file: std.Io.File,
     /// 当前文件大小（= 下一个写入偏移），用于追加与轮转判断
     file_offset: u64,
@@ -213,15 +217,13 @@ pub const Logger = struct {
             .file = .{ .handle = undefined, .flags = .{ .nonblocking = false } },
             .file_offset = 0,
             .owned_path = null,
+            .zio_file = @import("zio").File
         };
 
         if (config.output == .file) {
             const fc = config.file orelse return error.MissingFileOutputConfig;
             self.owned_path = try allocator.dupe(u8, fc.path);
-            self.openLogFile() catch {
-                // 打开失败则退回 stderr，避免日志静默丢失
-                self.config.output = .stderr;
-            };
+            try self.openLogFile();
         }
         return self;
     }
@@ -244,7 +246,7 @@ pub const Logger = struct {
         const path = self.owned_path orelse return error.MissingFileOutputConfig;
         const cwd = std.Io.Dir.cwd();
         if (std.fs.path.dirname(path)) |dir| {
-            if (dir.len > 0) cwd.createDirPath(self.io, dir) catch {};
+            if (dir.len > 0) try cwd.createDirPath(self.io, dir);
         }
         self.file = try cwd.createFile(self.io, path, .{ .truncate = false });
         // 用路径 stat 而非已打开的写句柄 stat：Windows 上以写模式打开的
@@ -531,6 +533,26 @@ pub const Logger = struct {
 
 // ── 格式化 ─────────────────────────────────────────────────────
 
+/// 把 Unix epoch 秒格式化成带时区的 ISO 8601 UTC 时间 `YYYY-MM-DDTHH:MM:SSZ`
+/// （纯 std.time.epoch 实现，不依赖 libc，跨平台）。strftime 那套只有
+/// libc 有，这里手动算年月日。`T` 为日期/时间分隔符，`Z` 表示 UTC 时区
+/// （零偏移）。返回 length 恒为 20 的切片。
+fn formatUtcTimestamp(ts: i64, buf: *[20]u8) []const u8 {
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year,
+        md.month.numeric(),
+        @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+    return buf;
+}
+
 fn formatJson(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
     try writer.writeAll("{");
 
@@ -565,7 +587,8 @@ fn formatJson(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Contex
 fn formatText(writer: *std.Io.Writer, ts: i64, level: Level, ctx: ?*const Context, msg: []const u8, fields: []const Field) !void {
     // 转义控制字符（防日志注入）：msg/path 等用户可控字段可能含 \r\n，
     // 未转义会伪造日志行。
-    try writer.print("{d} {s} ", .{ ts, level.name() });
+    var ts_buf: [20]u8 = undefined;
+    try writer.print("{s} {s} ", .{ formatUtcTimestamp(ts, &ts_buf), level.name() });
     try writeTextEscaped(writer, msg);
 
     if (ctx) |c| {

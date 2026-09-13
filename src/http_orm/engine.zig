@@ -379,6 +379,16 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             var unique_field_names = std.ArrayList([]const u8).empty;
             defer unique_field_names.deinit(self.allocator);
 
+            // 联合唯一约束：组员字段名切片来自编译期 schema（静态存储），
+            // 可以安全地存进这个 ArrayList 留到第二趟用。
+            var group_sets = std.ArrayList(std.StringHashMap(void)).empty;
+            defer {
+                for (group_sets.items) |*m| m.deinit();
+                group_sets.deinit(self.allocator);
+            }
+            var group_names = std.ArrayList([]const []const u8).empty;
+            defer group_names.deinit(self.allocator);
+
             if (query.update_fields != null) {
                 for (updating_fields) |field_name| {
                     const fd = schema.field(field_name) orelse continue;
@@ -391,6 +401,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         for (matched_indices.items) |mi| {
                             if (mi == idx) continue :outer;
                         }
+                        if (query_mod.isFieldNull(T, row, field_name)) continue;
                         // 使用 Opt 版本：field_name 来自运行时 update_fields（可能是用户
                         // JSON key）。旧用 getFieldValue 在字段不存在时 @panic → 远程 abort。
                         const fv = query_mod.getFieldValueOpt(T, row, field_name) orelse continue;
@@ -398,6 +409,14 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         try set.put(key, {});
                     }
                     try unique_sets.append(self.allocator, set);
+                }
+                for (schema.indexes) |idx| {
+                    if (!idx.unique) continue;
+                    if (!groupTouched(idx.fields, updating_fields)) continue;
+                    try group_names.append(self.allocator, idx.fields);
+                    var set = try self.buildGroupSet(self.allocator, key_alloc, matched_indices.items, idx.fields);
+                    errdefer set.deinit(); // append OOM 时上面的 defer 看不到这个 set
+                    try group_sets.append(self.allocator, set);
                 }
             }
 
@@ -420,6 +439,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                     setFieldByIdentifier(T, &updated, "id", orig_id);
                     // Check unique constraints against the pre-built sets.
                     for (unique_field_names.items, 0..) |ufn, ui| {
+                        if (query_mod.isFieldNull(T, updated, ufn)) continue;
                         const new_val = query_mod.getFieldValueOpt(T, updated, ufn) orelse continue;
                         const key = try fieldValuesKey(key_alloc, new_val);
                         if (unique_sets.items[ui].contains(key)) {
@@ -429,6 +449,15 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         // Add the new value to the set so subsequent matched
                         // rows can't collide with this row's new value either.
                         try unique_sets.items[ui].put(key, {});
+                    }
+                    // 联合唯一：整组取值不得与集合里任何一行相同。
+                    for (group_names.items, 0..) |names, gi| {
+                        if (groupHasNull(updated, names)) continue;
+                        const key = try groupKey(key_alloc, updated, names);
+                        if (group_sets.items[gi].contains(key)) {
+                            return error.UniqueViolation;
+                        }
+                        try group_sets.items[gi].put(key, {});
                     }
                 } else {
                     // 整行替换路径：同样必须做唯一约束校验（H2），排除自身 id。
@@ -639,18 +668,98 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
         }
 
-        /// 校验唯一约束：row 的 unique 字段不得与（除 except_id 外）其它行冲突。
+        /// 校验唯一约束：row 的 unique 字段 / unique index 组合不得与
+        /// （除 except_id 外）其它行冲突。F-01：原先只遍历 `constraints.unique`
+        /// 字段，而 `Model()` 生成的 schema 里没有任何字段标 unique —— 唯一约束
+        /// 对所有非 id 字段完全失效。这里同时覆盖单字段与联合两种声明。
         fn checkUnique(self: *const Self, row: T, except_id: ?u64) !void {
             for (schema.fields) |f| {
                 if (!f.constraints.unique) continue;
+                if (query_mod.isFieldNull(T, row, f.name)) continue;
                 const v = query_mod.getFieldValue(T, row, f.name);
                 for (self.rows.items) |other| {
                     if (except_id != null and getFieldId(T, other) == except_id.?) continue;
+                    if (query_mod.isFieldNull(T, other, f.name)) continue;
                     if (fieldValuesEqual(v, query_mod.getFieldValue(T, other, f.name))) {
                         return error.UniqueViolation;
                     }
                 }
             }
+            for (schema.indexes) |idx| {
+                if (!idx.unique) continue;
+                if (groupHasNull(row, idx.fields)) continue;
+                for (self.rows.items) |other| {
+                    if (except_id != null and getFieldId(T, other) == except_id.?) continue;
+                    if (groupHasNull(other, idx.fields)) continue;
+                    if (groupEquals(row, other, idx.fields)) return error.UniqueViolation;
+                }
+            }
+        }
+
+        /// 一组字段的组合值是否完全相同。字段名不存在 → 视为不相等（不外泄、
+        /// 不 panic；schema 是编译期常量，名字只可能在手写 schema 时写错）。
+        fn groupEquals(a: T, b: T, names: []const []const u8) bool {
+            for (names) |n| {
+                const va = query_mod.getFieldValueOpt(T, a, n) orelse return false;
+                const vb = query_mod.getFieldValueOpt(T, b, n) orelse return false;
+                if (!fieldValuesEqual(va, vb)) return false;
+            }
+            return names.len > 0;
+        }
+
+        /// 组内任一字段为 NULL → 该行不参与联合唯一比较（SQL 语义）。
+        fn groupHasNull(row: T, names: []const []const u8) bool {
+            for (names) |n| {
+                if (query_mod.isFieldNull(T, row, n)) return true;
+            }
+            return false;
+        }
+
+        /// 组内是否有字段被本次 update 触及。没触及任何组员时组合值必然不变，
+        /// 不需要建集合也不需要校验。
+        fn groupTouched(names: []const []const u8, updating: []const []const u8) bool {
+            for (names) |n| {
+                for (updating) |u| {
+                    if (std.mem.eql(u8, n, u)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// 一组字段的组合值 → 可比较的字符串键。用 0x1f 分隔：不分隔的话
+        /// ("ab","c") 与 ("a","bc") 会撞出同一个键。
+        fn groupKey(allocator: std.mem.Allocator, row: T, names: []const []const u8) ![]u8 {
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(allocator);
+            for (names) |n| {
+                const fv = query_mod.getFieldValueOpt(T, row, n) orelse continue;
+                const part = try fieldValuesKey(allocator, fv);
+                defer allocator.free(part);
+                try buf.append(allocator, 0x1f);
+                try buf.appendSlice(allocator, part);
+            }
+            return buf.toOwnedSlice(allocator);
+        }
+
+        /// 建「不在 matched 里的行」在给定字段组上的取值集合，供 update 做 O(1) 查重。
+        fn buildGroupSet(
+            self: *const Self,
+            set_alloc: std.mem.Allocator,
+            key_alloc: std.mem.Allocator,
+            matched: []const usize,
+            names: []const []const u8,
+        ) !std.StringHashMap(void) {
+            var set = std.StringHashMap(void).init(set_alloc);
+            errdefer set.deinit();
+            outer: for (self.rows.items, 0..) |row, idx| {
+                for (matched) |mi| {
+                    if (mi == idx) continue :outer;
+                }
+                if (groupHasNull(row, names)) continue;
+                const key = try groupKey(key_alloc, row, names);
+                try set.put(key, {});
+            }
+            return set;
         }
 
         /// 插入时：对设置了 default_value 且当前为零值的字段填入默认值。

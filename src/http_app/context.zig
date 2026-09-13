@@ -114,6 +114,10 @@ pub const RequestState = struct {
     /// 已缓冲的请求体（fix.md §四.7：Request 不可变，body 缓存移到 State）。
     /// readBody 首次调用后缓存于此，后续调用直接返回。
     body_buffer: ?[]const u8 = null,
+    /// readBody 遇到 BodyTooLarge 时置位。ConnectionRunner 在 flush 前检查
+    /// 此 flag，自动置 res.keep_alive=false——避免使用者忘记关连接导致
+    /// chunked 残留字节污染下一个请求（请求走私）。
+    body_too_large: bool = false,
     /// 连接劫持钩子（WebSocket 升级等）。handler 设置后 ConnectionRunner
     /// 跳过常规响应并把裸连接交给 hijack.run。
     hijack: ?Hijack = null,
@@ -231,7 +235,13 @@ pub const Context = struct {
     /// 而非 ctx.request.readBody()（Request 已不可变，不再提供 readBody）。
     pub fn readBody(self: *Context, allocator: std.mem.Allocator, limit: u64) ![]const u8 {
         if (self.state.body_buffer) |buf| return buf;
-        const buf = try self.request.readBodyInto(allocator, limit);
+        const buf = self.request.readBodyInto(allocator, limit) catch |err| {
+            // BodyTooLarge 时标记，让 ConnectionRunner 自动关连接——
+            // chunked 超限的残留 body std 不排空，复用连接会走私。
+            // 使用者无需在每个 handler 里记得 res.keep_alive=false。
+            if (err == error.BodyTooLarge) self.state.body_too_large = true;
+            return err;
+        };
         self.state.body_buffer = buf;
         return buf;
     }
@@ -562,6 +572,43 @@ test "Context.peerIpString 格式化内核对端 IP（H3  plumbing）" {
     // 无对端地址 → null
     ctx.peer_ip = null;
     try std.testing.expectEqual(@as(?[]const u8, null), ctx.peerIpString(&buf));
+}
+
+test "Context.readBody 超限置 body_too_large（413 自动关连接）" {
+    // 模拟 CL 超限：content_length=1000，limit=100。readBodyInto 在建
+    // reader 前判出（streaming 指针不解引用），故 undefined 安全。
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+
+    var req = Request{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "POST / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = 1000,
+        .transfer_encoding = .none,
+        .body = .{ .streaming = undefined },
+    };
+    const cfg = RequestConfig{};
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    // 超限时 readBody 返回 BodyTooLarge
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(arena.allocator(), 100));
+    // state.body_too_large 被置位——ConnectionRunner 据此自动关连接
+    try std.testing.expect(state.body_too_large);
 }
 
 test {

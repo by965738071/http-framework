@@ -56,6 +56,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Business application module: layered backend (model / repo / service /
+    // handler / middleware) mounted under /api/v1. See src/app/app.zig.
+    const app_mod = b.addModule("app", .{
+        .root_source_file = b.path("src/app/app.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+        },
+    });
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -81,6 +91,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "admin", .module = admin_mod },
             .{ .name = "devices", .module = devices_mod },
             .{ .name = "register", .module = register_mod },
+            .{ .name = "app", .module = app_mod },
         },
     });
 
@@ -120,6 +131,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "admin", .module = admin_mod },
                 .{ .name = "devices", .module = devices_mod },
                 .{ .name = "register", .module = register_mod },
+                .{ .name = "app", .module = app_mod },
                 .{ .name = "http_framework", .module = http_framework_mod },
             },
         }),
@@ -165,6 +177,24 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // 单独跑 app 模块的测试：app.zig 里的 service / handler / middleware 只有被
+    // 真正调用才会做语义分析（Zig 的函数体是惰性分析的），挂在 root.zig 下
+    // 仅 `refAllDecls` 不足以让它们参与编译——必须让 app 自己成为测试根。
+    // 注意：测试根要用独立的 module 实例；复用给 exe/mod 当依赖的那个
+    // app_mod，Zig 会复用「作为依赖编译」的产物，测试块不会进去。
+    const app_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/app/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_framework", .module = http_framework_mod },
+        },
+    });
+    const app_tests = b.addTest(.{
+        .root_module = app_test_mod,
+    });
+    const run_app_tests = b.addRunArtifact(app_tests);
+
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
@@ -180,6 +210,7 @@ pub fn build(b: *std.Build) void {
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.

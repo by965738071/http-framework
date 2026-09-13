@@ -29,43 +29,71 @@ const Route = trie_mod.Route;
 /// var v1 = admin.group("/v1");          // 嵌套：/admin/v1/*
 /// ```
 ///
-/// 组级中间件在 dispatch 时**追加在全局中间件之后、handler 之前**执行，
-/// 因此顺序是：全局 mw → 组 mw（外层组先于内层组）→ handler。
-/// 中间件切片存活于 router.arena，随 router 一起消失；中间件**实例**的所有权
-/// 也归 Router（`use` 时登记进 Router.group_middleware，deinit 去重释放）。
+/// ## `use` 是顺序无关的（F-11）
+///
+/// `use` 对**整个组**生效，与它和 `route()` 的先后无关：先注册路由再 `use`，
+/// 中间件照样生效。旧实现在 `route()` 时把 `middleware` 切片快照进 trie，
+/// 于是「先 use 后 route」是唯一正确写法——想给不同路由配不同中间件就只能
+/// 每条路由开一个子组，30 条路由 = 30 个子组 + 30 个中间件实例。
+///
+/// 现在 trie 里只存分组 id（`Route.group`），中间件链推迟到 dispatch 时按
+/// 「祖先链」解析，注册顺序因此不再进入语义。
+///
+/// ## 执行顺序（判定顺序）
+///
+/// ```text
+/// 全局 use()  →  外层组 use()  →  内层组 use()  →  handler
+/// ```
+///
+/// 同组内多次 `use` 仍按调用先后执行（这是唯一保留的顺序语义：一个组内
+/// 「先鉴权还是先记日志」得有确定答案）。路由级中间件当前没有 API——
+/// 需要 per-route 语义时开一个 `group("")` 子组即可（F-09/F-11）。
+///
+/// 因为解析发生在 dispatch 时，对父组 `use` 也会影响**已经创建**的子组，
+/// 这与文档里「作用于本组及其子组」一致；想要隔离就别嵌套，另开一个平级组。
+///
+/// `RouteGroup` 是借用视图（无 deinit）；中间件**实例**的所有权归 Router
+/// （`use` 时登记进 `Router.group_middleware`，deinit 去重释放）。
 pub const RouteGroup = struct {
     router: *Router,
     prefix: []const u8,
-    middleware: []const Middleware,
+    /// 本组在 `Router.groups` 中的下标。
+    id: trie_mod.GroupId,
 
-    /// 给本组追加一个中间件（作用于本组及其子组的所有路由）。
+    /// 给本组追加一个中间件。对本组（含子组）所有路由生效，**与注册顺序无关**。
     pub fn use(self: *RouteGroup, mw: Middleware) !void {
-        const alloc = self.router.arena.allocator();
-        var list = try alloc.alloc(Middleware, self.middleware.len + 1);
-        @memcpy(list[0..self.middleware.len], self.middleware);
-        list[self.middleware.len] = mw;
-        self.middleware = list;
+        try self.router.groups.items[self.id].middleware.append(self.router.allocator, mw);
         // 同时登记进 Router 的组级中间件列表，让 Router 成为它的释放者。
-        // RouteGroup 是借用视图（没有 deinit，切片活在 router.arena 里随
-        // router 一起消失），中间件实例却是调用方的，不登记就永远没人调
-        // T.deinit()。这里只登记所有权，**不影响 dispatch 顺序**（顺序仍由
-        // 上面的 group 切片决定，组级 mw 不会因此变成全局的）。
+        // RouteGroup 是借用视图（没有 deinit），中间件实例却是调用方的，
+        // 不登记就永远没人调 T.deinit()。这里只登记所有权，**不影响 dispatch
+        // 顺序**（顺序由上面的 group 链表决定，组级 mw 不会因此变成全局的）。
         try self.router.group_middleware.append(self.router.allocator, mw);
     }
 
     /// 在本组前缀下注册路由。最终 pattern = 组前缀 + sub_pattern。
     pub fn route(self: *RouteGroup, method: http.Method, sub_pattern: []const u8, handler: Handler) !void {
         const full = try joinPath(self.router.arena.allocator(), self.prefix, sub_pattern);
-        try self.router.trie.insert(method, full, .{ .handler = handler, .middleware = self.middleware });
+        try self.router.trie.insert(method, full, .{ .handler = handler, .group = self.id });
     }
 
-    /// 创建嵌套子组。子组前缀 = 本组前缀 + sub_prefix，继承本组中间件。
+    /// 创建嵌套子组。子组前缀 = 本组前缀 + sub_prefix。
+    ///
+    /// 子组不再拷贝父组中间件，而是在 `Router.groups` 里记住 parent——
+    /// 拷贝会把「创建子组的时刻」固化成顺序语义（父组之后再 use 就进不来）。
     pub fn group(self: *RouteGroup, sub_prefix: []const u8) !RouteGroup {
         const full = try joinPath(self.router.arena.allocator(), self.prefix, sub_prefix);
-        // 拷贝当前中间件切片作为子组的起点（子组 use 时会在其上追加，不影响本组）。
-        const inherited = try self.router.arena.allocator().dupe(Middleware, self.middleware);
-        return .{ .router = self.router, .prefix = full, .middleware = inherited };
+        return self.router.newGroup(self.id, full);
     }
+};
+
+/// 一个已注册的路由分组：父组 + 前缀 + 组级中间件。
+///
+/// 中间件存在 `ArrayList` 而不是切片：`use` 会持续追加，且追加必须对
+/// 已注册的路由可见（F-11）。
+const Group = struct {
+    parent: ?trie_mod.GroupId,
+    prefix: []const u8,
+    middleware: std.ArrayList(Middleware) = .empty,
 };
 
 /// 路径段数硬上限。trie 按段递归，段数过多会击穿协程栈。
@@ -93,9 +121,24 @@ fn joinPath(alloc: std.mem.Allocator, prefix: []const u8, sub: []const u8) ![]co
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ p, s });
 }
 
+/// 路径前缀判定，**按 `/` 段对齐**：`/health` 命中 `/health` 与 `/health/live`，
+/// 不命中 `/healthz`。纯字节前缀会把一个组的中间件（CORS、统一错误格式）
+/// 泄漏到拼写相近但毫无关系的 URL 上。
+/// 空前缀 / 仅 `/` 视为匹配一切（对应 `group("")` 的根组写法）。
+fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
+    const p = std.mem.trimEnd(u8, prefix, "/");
+    if (p.len == 0) return true;
+    if (!std.mem.startsWith(u8, path, p)) return false;
+    if (path.len == p.len) return true;
+    return path[p.len] == '/';
+}
+
 pub const Router = struct {
     trie: Trie,
     global_middleware: std.ArrayList(Middleware) = .empty,
+    /// 所有路由分组（下标即 `GroupId`）。dispatch 时按 parent 链解析出
+    /// 「外层 → 内层」的中间件顺序；404/405 时按这里的 prefix 做最长前缀匹配。
+    groups: std.ArrayList(Group) = .empty,
     /// 组级中间件的所有权登记处（**只用于释放**，不参与 dispatch 顺序）。
     /// 组级中间件经由 RouteGroup.use 登记进来，生命周期与 Router 相同。
     group_middleware: std.ArrayList(Middleware) = .empty,
@@ -129,6 +172,9 @@ pub const Router = struct {
         Middleware.deinitAll(self.group_middleware.items, self.global_middleware.items);
         self.global_middleware.deinit(self.allocator);
         self.group_middleware.deinit(self.allocator);
+        // 组自身只持有中间件**值**的容器，实例已由上面的 deinitAll 释放。
+        for (self.groups.items) |*g| g.middleware.deinit(self.allocator);
+        self.groups.deinit(self.allocator);
         if (self.not_found) |h| {
             // 已由 trie 释放过（同一 handler 兼作路由与 404）→ 跳过，避免双重释放。
             if (!not_found_owned_by_trie) h.deinit();
@@ -146,7 +192,7 @@ pub const Router = struct {
         try self.global_middleware.append(self.allocator, mw);
     }
 
-    /// 创建一个路由分组（共享前缀 + 组级中间件，修复 #4）。
+    /// 创建一个顶层路由分组（共享前缀 + 组级中间件，修复 #4）。
     /// 组级中间件只作用于该组（及其子组）下注册的路由。
     ///
     /// prefix 拷进 router.arena 而不是借用调用方的切片：分组往往在路由注册
@@ -155,7 +201,14 @@ pub const Router = struct {
     /// 与 RouteGroup.group 一致，复制可能失败，所以返回 error union。
     pub fn group(self: *Router, prefix: []const u8) !RouteGroup {
         const owned = try self.arena.allocator().dupe(u8, prefix);
-        return .{ .router = self, .prefix = owned, .middleware = &.{} };
+        return self.newGroup(null, owned);
+    }
+
+    /// 登记一个新分组（parent 为 null 即顶层组），返回它的借用视图。
+    fn newGroup(self: *Router, parent: ?trie_mod.GroupId, prefix: []const u8) !RouteGroup {
+        try self.groups.append(self.allocator, .{ .parent = parent, .prefix = prefix });
+        const id: trie_mod.GroupId = @intCast(self.groups.items.len - 1);
+        return .{ .router = self, .prefix = prefix, .id = id };
     }
 
     /// 设置 404 handler。handler 的所有权归 Router（deinit 时释放）。
@@ -177,36 +230,35 @@ pub const Router = struct {
 
     /// 分发请求
     ///
-    /// 三种结果都经过全局中间件管道，保证 404/405 响应也带 X-Request-Id、
-    /// 日志上下文、计时头等（回应 fix.md §三：404 不走中间件）。
+    /// 三种结果（命中 / 405 / 404）都经过中间件管道，保证 404/405 响应也带
+    /// X-Request-Id、日志上下文、计时头等（回应 fix.md §三：404 不走中间件）。
+    ///
+    /// 404 / 405 还会额外走**最长前缀匹配的组**的中间件（F-12），所以挂在组上
+    /// 的「统一 JSON 错误体 / CORS」也能生效；规则见 `groupForPath`。
     pub fn dispatch(self: *const Router, ctx: *Context, res: *Response) !bool {
         const method = @as(http.Method, ctx.request.method);
 
         // 路径段数上限：matchNode 按段递归（非尾递归），超长路径（如 /a/a/.../a
         // 或 //////...）会击穿协程栈 → 远程 DoS。命中上限时按 404 处理（回应审查 C1）。
-        if (tooManyPathSegments(ctx.request.path)) {
-            const nf = self.not_found orelse Handler.fromFn(defaultNotFoundHandler);
-            const next = http_app.Next.root(self.global_middleware.items, nf);
-            try next.call(ctx, res);
-            return true;
-        }
+        const result: Trie.MatchResult = if (tooManyPathSegments(ctx.request.path)) .{} else blk: {
+            var r = self.trie.match(method, ctx.request.path, ctx.state, ctx.arena);
 
-        var result = self.trie.match(method, ctx.request.path, ctx.state, ctx.arena);
+            // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
+            // std.http 在 HEAD 请求下会自动抑制 body，所以直接跑 GET handler 即可。
+            if (r.route == null and method == .HEAD) {
+                // P2-6：第一次 HEAD 匹配可能在 param 节点写过 path_params（即使未命中
+                // handler）。回退前清空，否则 GET 重试可能叠加上一轮的残留参数。
+                ctx.state.path_params.clear();
+                const get_result = self.trie.match(.GET, ctx.request.path, ctx.state, ctx.arena);
+                if (get_result.route != null) r = get_result;
+            }
+            break :blk r;
+        };
 
-        // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
-        // std.http 在 HEAD 请求下会自动抑制 body，所以直接跑 GET handler 即可。
-        if (result.route == null and method == .HEAD) {
-            // P2-6：第一次 HEAD 匹配可能在 param 节点写过 path_params（即使未命中
-            // handler）。回退前清空，否则 GET 重试可能叠加上一轮的残留参数。
-            ctx.state.path_params.clear();
-            const get_result = self.trie.match(.GET, ctx.request.path, ctx.state, ctx.arena);
-            if (get_result.route != null) result = get_result;
-        }
-
-        // 决定最终要执行的 handler 与组级中间件（命中 / 405 / 404 / 自定义）。
-        var group_mw: []const Middleware = &.{};
+        // 决定最终要执行的 handler，以及「这条请求归哪个组管」。
+        var route_group: trie_mod.GroupId = trie_mod.NO_GROUP;
         const handler: Handler = if (result.route) |r| blk: {
-            group_mw = r.middleware;
+            route_group = r.group;
             break :blk r.handler;
         } else if (result.pattern_matched) blk: {
             // 把 trie 计算出的 allowed_methods 拼成 Allow 头值（去重），存进 state，
@@ -238,24 +290,91 @@ pub const Router = struct {
             break :blk Handler.fromFn(methodNotAllowedHandler);
         } else if (self.not_found) |nf| nf else Handler.fromFn(defaultNotFoundHandler);
 
+        // 404 / 405（F-12）：没有具体路由可参照，退化为「最长前缀匹配的组」。
+        // 规则见 groupForPath 的注释。命中路由时不走这里——路由自己的组已经明确。
+        if (result.route == null and route_group == trie_mod.NO_GROUP) {
+            route_group = self.groupForPath(ctx.request.path);
+        }
+
         ctx.state.route_pattern = result.pattern;
 
-        // 管道顺序：全局中间件 → 组级中间件 → handler（修复 #4）。
-        // 全局 mw 切片稳定；组级 mw 来自 trie（注册时已拷贝到 trie arena）也稳定。
-        // 无组级中间件时直接用全局切片，避免分配（热路径）。
-        if (group_mw.len == 0) {
+        // 组级中间件链 = 该组及其所有祖先的 use()，按「外层 → 内层」排列。
+        // 分配在请求 arena 上，随请求一起回收。
+        const chain = try self.groupChain(ctx.arena, route_group);
+        var group_total: usize = 0;
+        for (chain) |gid| group_total += self.groups.items[gid].middleware.items.len;
+
+        // 管道顺序：全局中间件 → 外层组 → 内层组 → handler（修复 #4）。
+        // 无组级中间件时直接用全局切片，避免分配（热路径，也是最常见的情形）。
+        if (group_total == 0) {
             const next = http_app.Next.root(self.global_middleware.items, handler);
             try next.call(ctx, res);
         } else {
             // 拼接全局 + 组级中间件到请求 arena。
-            const total = self.global_middleware.items.len + group_mw.len;
+            const total = self.global_middleware.items.len + group_total;
             var combined = try ctx.arena.alloc(Middleware, total);
             @memcpy(combined[0..self.global_middleware.items.len], self.global_middleware.items);
-            @memcpy(combined[self.global_middleware.items.len..], group_mw);
+            var w = self.global_middleware.items.len;
+            for (chain) |gid| {
+                const mws = self.groups.items[gid].middleware.items;
+                @memcpy(combined[w..][0..mws.len], mws);
+                w += mws.len;
+            }
             const next = http_app.Next.root(combined, handler);
             try next.call(ctx, res);
         }
         return true;
+    }
+
+    /// 从 `group` 向上走到根，返回「外层在前」的分组 id 链（分配在 `alloc` 上）。
+    ///
+    /// 为什么要先自底向上收集再反向：中间件必须是外层先执行——鉴权要在业务
+    /// 守卫之前、CORS 要在鉴权之前。若按下游顺序直接追加，鉴权类中间件会
+    /// 跑到 CORS 之后，预检请求直接被 401 挡掉。
+    fn groupChain(self: *const Router, alloc: std.mem.Allocator, leaf: trie_mod.GroupId) ![]trie_mod.GroupId {
+        if (leaf == trie_mod.NO_GROUP) return &.{};
+        var depth: usize = 0;
+        var cur: trie_mod.GroupId = leaf;
+        while (cur != trie_mod.NO_GROUP) : (depth += 1) {
+            cur = self.groups.items[cur].parent orelse trie_mod.NO_GROUP;
+        }
+        const chain = try alloc.alloc(trie_mod.GroupId, depth);
+        cur = leaf;
+        var i: usize = depth;
+        while (cur != trie_mod.NO_GROUP) {
+            i -= 1;
+            chain[i] = cur;
+            cur = self.groups.items[cur].parent orelse trie_mod.NO_GROUP;
+        }
+        return chain;
+    }
+
+    /// 404 / 405 时决定「哪个组的中间件算数」：**路径前缀最长匹配的组**。
+    ///
+    /// 为什么是这条规则：
+    /// - **405**：URL 已经在 trie 里匹配到了节点（只是 method 不对），请求
+    ///   确实落在这个 URL 空间里，用同一前缀的组最贴近用户预期。
+    /// - **404**：请求落进了某个组的 URL 空间但没命中任何路由，同理。
+    /// - 前缀**段对齐**（`/health` 不匹配 `/healthz`）：否则一个组的中间件会
+    ///   泄漏到拼写相近但完全无关的 URL 上。
+    ///
+    /// 平局（同长度前缀，典型场景是 `group("")` 造出的同前缀子组）取
+    /// **最先注册**的那个：`group("")` 子组是「为单条路由挂守卫」的写法，
+    /// 让 404 也去跑它的守卫会得到 401/403 而不是 404——而最先注册的往往是
+    /// 承载「统一错误格式 / CORS」这类全组语义的父组。
+    ///
+    /// 一个都没匹配上就返回 NO_GROUP，此时只跑全局中间件（框架默认格式）。
+    fn groupForPath(self: *const Router, path: []const u8) trie_mod.GroupId {
+        var best: trie_mod.GroupId = trie_mod.NO_GROUP;
+        var best_len: usize = 0;
+        for (self.groups.items, 0..) |g, i| {
+            // 严格长于当前最优 → 平局时保留先注册者（下标更小）。
+            if (g.prefix.len <= best_len) continue;
+            if (!pathHasPrefix(path, g.prefix)) continue;
+            best = @intCast(i);
+            best_len = g.prefix.len;
+        }
+        return best;
     }
 
     /// handler 是否已被 `route()` 注册（即由 trie 托管、会由 trie 释放）。
@@ -450,6 +569,10 @@ fn capturingSink(writer: *std.Io.Writer) @import("http_protocol").Sink {
 }
 
 fn dispatchPath(router: *Router, allocator: std.mem.Allocator, path: []const u8, buf: []u8) ![]const u8 {
+    return dispatchRequest(router, allocator, .GET, path, buf);
+}
+
+fn dispatchRequest(router: *Router, allocator: std.mem.Allocator, method: http.Method, path: []const u8, buf: []u8) ![]const u8 {
     // 用临时 arena 作为请求级分配器（dispatch 会在 ctx.arena 上拼接中间件切片）。
     var req_arena = std.heap.ArenaAllocator.init(allocator);
     defer req_arena.deinit();
@@ -459,9 +582,9 @@ fn dispatchPath(router: *Router, allocator: std.mem.Allocator, path: []const u8,
     defer state.deinit();
     const cfg = http_app.RequestConfig{};
     var head_buf: [128]u8 = undefined;
-    const head = try std.fmt.bufPrint(&head_buf, "GET {s} HTTP/1.1\r\n\r\n", .{path});
+    const head = try std.fmt.bufPrint(&head_buf, "{s} {s} HTTP/1.1\r\n\r\n", .{ @tagName(method), path });
     var req = @import("http_protocol").Request{
-        .method = .GET,
+        .method = method,
         .target = path,
         .path = path,
         .query = "",
@@ -536,6 +659,260 @@ test "RouteGroup: 嵌套子组继承前缀与中间件" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "outer") != null);
 }
+
+// ── F-11：组级 use 与注册顺序无关 ──────────────────────────────────────
+
+/// 执行轨迹记录器：固定容量、无分配（中间件里用 ctx.arena 记录的话，
+/// 释放方就得是 arena，与测试的 allocator 对不上）。
+const Trace = struct {
+    items: [16]u8 = @splat(0),
+    len: usize = 0,
+
+    fn push(self: *@This(), tag: u8) void {
+        if (self.len == self.items.len) return;
+        self.items[self.len] = tag;
+        self.len += 1;
+    }
+
+    fn slice(self: *const @This()) []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+const TraceMiddleware = struct {
+    tag: u8,
+    trace: *Trace,
+
+    pub fn process(self: *@This(), ctx: *Context, res: *Response, next: http_app.Next) !void {
+        self.trace.push(self.tag);
+        return next.call(ctx, res);
+    }
+};
+
+test "F-11: 先 route 后 use，中间件仍然生效（顺序无关）" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    var g = try router.group("/api");
+    // 修复前：use 在 route 之后 → 中间件被永久漏掉（route 时已快照切片）。
+    try g.route(.GET, "/ping", h);
+    var late = MarkerMiddleware{ .value = "late" };
+    try g.use(Middleware.init(MarkerMiddleware, &late));
+
+    var buf: [512]u8 = undefined;
+    const resp = try dispatchPath(&router, allocator, "/api/ping", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Group: late") != null);
+}
+
+test "F-11: 先建子组后给父组 use，子组路由也生效" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    var api = try router.group("/api");
+    var v1 = try api.group("/v1");
+    try v1.route(.GET, "/ping", h);
+    // 父组的 use 晚于子组创建、晚于路由注册
+    var late = MarkerMiddleware{ .value = "parent" };
+    try api.use(Middleware.init(MarkerMiddleware, &late));
+
+    var buf: [512]u8 = undefined;
+    const resp = try dispatchPath(&router, allocator, "/api/v1/ping", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Group: parent") != null);
+}
+
+test "F-11: 中间件执行顺序 = 全局 → 外层组 → 内层组" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            _ = res;
+        }
+    }.f);
+
+    var trace = Trace{};
+    var g_mw = TraceMiddleware{ .tag = 'G', .trace = &trace };
+    var o_mw = TraceMiddleware{ .tag = 'O', .trace = &trace };
+    var i_mw = TraceMiddleware{ .tag = 'I', .trace = &trace };
+
+    try router.use(Middleware.init(TraceMiddleware, &g_mw));
+    var api = try router.group("/api");
+    try api.use(Middleware.init(TraceMiddleware, &o_mw));
+    var v1 = try api.group("/v1");
+    try v1.use(Middleware.init(TraceMiddleware, &i_mw));
+    try v1.route(.GET, "/ping", h);
+
+    var buf: [512]u8 = undefined;
+    _ = try dispatchPath(&router, allocator, "/api/v1/ping", &buf);
+    try std.testing.expectEqualStrings("GOI", trace.slice());
+}
+
+test "F-11: 同组内多次 use 保持调用先后" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            _ = res;
+        }
+    }.f);
+
+    var trace = Trace{};
+    var a_mw = TraceMiddleware{ .tag = 'A', .trace = &trace };
+    var b_mw = TraceMiddleware{ .tag = 'B', .trace = &trace };
+
+    var g = try router.group("/api");
+    try g.use(Middleware.init(TraceMiddleware, &a_mw));
+    try g.use(Middleware.init(TraceMiddleware, &b_mw));
+    try g.route(.GET, "/ping", h);
+
+    var buf: [512]u8 = undefined;
+    _ = try dispatchPath(&router, allocator, "/api/ping", &buf);
+    try std.testing.expectEqualStrings("AB", trace.slice());
+}
+
+// ── F-12：404 / 405 走组级中间件 ──────────────────────────────────────
+
+test "F-12: 404 走最长前缀匹配组的中间件" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    var api_mw = MarkerMiddleware{ .value = "api" };
+    var api = try router.group("/api");
+    try api.use(Middleware.init(MarkerMiddleware, &api_mw));
+
+    var v1_mw = MarkerMiddleware{ .value = "v1" };
+    var v1 = try api.group("/v1");
+    try v1.use(Middleware.init(MarkerMiddleware, &v1_mw));
+    try v1.route(.GET, "/ping", h);
+
+    // /api/v1/nope → 最长前缀是 /api/v1。选中它的同时也带上祖先 /api：
+    // 404 与命中路由走同一套「外层 → 内层」链，否则会漏掉挂在外层组的 CORS。
+    var buf: [512]u8 = undefined;
+    const r1 = try dispatchPath(&router, allocator, "/api/v1/nope", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "404") != null);
+    const i_api = std.mem.indexOf(u8, r1, "X-Group: api").?;
+    const i_v1 = std.mem.indexOf(u8, r1, "X-Group: v1").?;
+    try std.testing.expect(i_api < i_v1);
+
+    // /api/nope → 最长前缀是 /api → 带 api 标记
+    var buf2: [512]u8 = undefined;
+    const r2 = try dispatchPath(&router, allocator, "/api/nope", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "X-Group: api") != null);
+
+    // /other → 不属于任何组 → 只有全局中间件（无标记），仍是框架默认 404
+    var buf3: [512]u8 = undefined;
+    const r3 = try dispatchPath(&router, allocator, "/other", &buf3);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "X-Group") == null);
+}
+
+test "F-12: 404 的组前缀按段对齐（/health 不匹配 /healthz）" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    var mw = MarkerMiddleware{ .value = "health" };
+    var g = try router.group("/health");
+    try g.use(Middleware.init(MarkerMiddleware, &mw));
+    try g.route(.GET, "/", h);
+
+    var buf: [512]u8 = undefined;
+    const r = try dispatchPath(&router, allocator, "/healthz", &buf);
+    // 段不对齐的话 /healthz 会继承 /health 的中间件，把无关 URL 拉进组语义
+    try std.testing.expect(std.mem.indexOf(u8, r, "X-Group") == null);
+}
+
+test "F-12: 405 走最长前缀匹配组的中间件" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    var mw = MarkerMiddleware{ .value = "v1" };
+    var g = try router.group("/api/v1");
+    try g.use(Middleware.init(MarkerMiddleware, &mw));
+    try g.route(.GET, "/ping", h);
+
+    var buf: [512]u8 = undefined;
+    const resp = try dispatchRequest(&router, allocator, .POST, "/api/v1/ping", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "405") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Group: v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Allow") != null);
+}
+
+test "F-12: 同前缀平局取最先注册的组（group(\"\") 子组不抢 404）" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    // 父组：全组语义（统一错误格式）
+    var parent_mw = MarkerMiddleware{ .value = "parent" };
+    var api = try router.group("/api/v1");
+    try api.use(Middleware.init(MarkerMiddleware, &parent_mw));
+
+    // 子组：为单条路由挂的守卫（examples 的 App.route 就是这个写法）
+    var guard_mw = MarkerMiddleware{ .value = "guard" };
+    var sub = try api.group("");
+    try sub.use(Middleware.init(MarkerMiddleware, &guard_mw));
+    try sub.route(.GET, "/users", h);
+
+    // 命中 /api/v1/users → 父子都跑（parent 先）
+    var buf: [512]u8 = undefined;
+    const hit = try dispatchPath(&router, allocator, "/api/v1/users", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, hit, "X-Group: parent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hit, "X-Group: guard") != null);
+
+    // 404 在 /api/v1 下：若选中 guard 子组，404 会被守卫改成 401/403。
+    // 平局取先注册者 = 父组 → 只有 parent。
+    var buf2: [512]u8 = undefined;
+    const miss = try dispatchPath(&router, allocator, "/api/v1/nope", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "X-Group: parent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "X-Group: guard") == null);
+}
+
 /// 回归探针：factory handler 的 FactoryCtx 由 initFactory 分配、Handler.deinit
 /// 释放，所以「deinit 了几次」等价于「FactoryCtx 被 free 了几次」。
 const ProbeHandler = struct {

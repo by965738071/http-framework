@@ -8,15 +8,23 @@
 const std = @import("std");
 const http = std.http;
 const Handler = @import("http_app").Handler;
-const Middleware = @import("http_app").Middleware;
 const RequestState = @import("http_app").RequestState;
 
-/// 一条已注册的路由：handler + 该路由专属的中间件切片（来自 RouteGroup）。
-/// middleware 切片在注册时拷贝到 trie arena，生命周期与 trie 绑定，dispatch
-/// 只读，无需每请求重建。
+/// 路由分组的标识 = `Router.groups` 里的下标。
+///
+/// trie 只存 id、**不存中间件切片**：中间件是注册期可变的东西（组级 `use`
+/// 可以在 `route()` 之后追加，见 router.zig），在 insert 时快照就等于把
+/// 「注册顺序」写进语义里。存 id 让中间件链推迟到 dispatch 时才解析，
+/// 从而做到顺序无关。
+pub const GroupId = u32;
+
+/// 不属于任何分组（直接用 `Router.route` 注册）。
+pub const NO_GROUP: GroupId = std.math.maxInt(GroupId);
+
+/// 一条已注册的路由：handler + 它所属分组的 id。
 pub const Route = struct {
     handler: Handler,
-    middleware: []const Middleware = &.{},
+    group: GroupId = NO_GROUP,
 };
 
 /// 单个 pattern 里参数段（`:param` / `*catch_all`）的个数上限。
@@ -71,7 +79,6 @@ pub const Trie = struct {
     }
 
     /// 注册路由。pattern 用 `:param` / `*catch_all` 语法。
-    /// route.middleware 会被拷贝到 trie arena（生命周期与 trie 绑定）。
     pub fn insert(self: *Trie, method: http.Method, pattern: []const u8, route: Route) !void {
         // 先整段校验、确认 pattern 合法，再动 trie。校验与建节点交错会把
         // 非法 pattern 的前半段留在树里（见 validatePattern 的说明）。
@@ -106,12 +113,7 @@ pub const Trie = struct {
         if (!already_registered) {
             try self.registered.append(self.allocator, route.handler);
         }
-        // 拷贝中间件切片到 trie arena，避免悬空（调用方的切片可能是栈上临时的）。
-        const mw_copy = if (route.middleware.len > 0)
-            try alloc.dupe(Middleware, route.middleware)
-        else
-            &[_]Middleware{};
-        node.handlers.put(method, .{ .handler = route.handler, .middleware = mw_copy });
+        node.handlers.put(method, route);
         node.has_any_handler = true;
         // P2-3：只在首次记录 pattern。同一节点上不同方法共享相同路径结构，
         // 但 :param 命名可能写法不同（/users/:id vs /users/:uid）。固定用首次，

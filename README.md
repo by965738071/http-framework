@@ -40,7 +40,7 @@ json response                 ~5.3M ops/s    ~189 ns/op
 | 模式 | 工厂函数 | 生命周期 | 每次请求分配 |
 |------|---------|---------|------------|
 | `fromFn` (纯函数) | — | 无状态，全局共享 | 零 |
-| `initSingleton` (单例) | — | main 创建，程序退出销毁 | 零 |
+| `initSingleton` (单例) | — | main 创建并持有，框架不销毁 | 零 |
 | `initFactory` (请求级) | `init(allocator) !*T` | 每请求 create/destroy 配对 | 1 次 create + 1 次 destroy |
 
 ## 核心功能
@@ -49,11 +49,13 @@ json response                 ~5.3M ops/s    ~189 ns/op
 - **三种处理器模式** — 纯函数（零分配）、单例（零分配）、请求级（每请求创建/销毁）
 - **radix-trie 动态路由** — `/users/:id` 路径参数、通配符 `/static/*`、路由分组（组级中间件）、HEAD 自动回退到 GET、405 带 `Allow`、自定义 404
 - **中间件管道** — 经典 `process(ctx, res, next)` 模型（非 threadlocal），`next.call` 后置逻辑、缓冲模式响应修改
-- **应用级服务容器** — `ctx.service(T)` 取回进程级单例（SessionManager/Logger/ORM 等），脱离全局变量
-- **统一错误处理** — `AppError`（状态码 + 消息）经 `ErrorRenderer` 渲染；无 ErrorRenderer 时框架自动兜底 500
+- **应用级服务容器** — `Services.init/register` 注册进程级单例（SessionManager/Logger/ORM 等），
+  `server.setServices(&services)` 装配，handler 里用 `ctx.service(T)` 取回，脱离全局变量；
+  启动阶段注册完成后建议调 `services.seal()` 封箱，此后 `register` 返回 `error.ServicesSealed`
+- **统一错误处理** — `AppError`（状态码 + 消息）经 `ErrorRenderer` 渲染；无 ErrorRenderer 时框架自动兜底用 AppError 的状态码渲染（不再静默 500）
 - **WebSocket** — RFC 6455 握手 + 帧编解码 + 连接劫持（`wsUpgrade` 一步升级，可运行的服务端路由）、分片拼合、ping/pong（帧长上限防 DoS）
 - **静态文件服务** — 路径遍历防护、ETag/Last-Modified 条件请求、304、HEAD、目录 index.html、大文件流式 + gzip
-- **HTTP keep-alive** — 连接循环 + 优雅关闭（zio.Signal 处理 SIGINT）；Connection 头按 token 列表解析
+- **HTTP keep-alive** — 连接循环 + 优雅关闭（zio.Signal 同时处理 SIGINT 与 SIGTERM）；Connection 头按 token 列表解析
 - **内置 ORM** — JSON 文件持久化，编译期反射表结构，CRUD、查询、排序、分页
 - **安全与扩展** — Auth（Bearer/Basic/API Key）、CORS（预检/Vary）、CSRF（双提交）、Security Headers、Session（Path=/、Secure 可配）、Multipart、响应压缩（q 值协商）、结构化日志、限流（Retry-After/X-RateLimit-*）
 - **可替换后端** — 框架核心只依赖 `std.Io`；运行时绑定代码隔离在 `zio_server.zig`，换库不动核心
@@ -109,7 +111,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try router.route(.GET, "/users/:id", framework.Handler.fromFn(userHandler));
     router.notFoundHandler(framework.Handler.fromFn(notFoundHandler));
 
-    // 3. 组装并运行（内部阻塞 accept + zio.Signal 处理 SIGINT 优雅关闭）
+    // 3. 组装并运行（内部阻塞 accept + zio.Signal 处理 SIGINT/SIGTERM 优雅关闭）
     var server = try framework.Server.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
@@ -122,7 +124,7 @@ fn helloHandler(_: *framework.Context, res: *framework.Response) !void {
 
 fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const id = ctx.param("id") orelse {
-        try ctx.failWith(res, framework.AppError.badRequest("missing :id"));
+        try ctx.failWith(framework.AppError.badRequest("missing :id"));
         return;
     };
     try res.json(.{ .user_id = id });
@@ -135,7 +137,11 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 ```
 
 > 入口不再需要手写 allocator/`std.Io.Threaded`/`installSignalHandlers`——`runZio` 封装了
-> 运行时启动，信号关机内置在 `server.run()`（等 SIGINT → 取消 accept → drain 在途连接）。
+> 运行时启动，信号关机内置在 `server.run()`（等 SIGINT 或 SIGTERM → 取消 accept → drain 在途连接）。
+
+> **三项配置目前是死开关**（能设置、不报错，但不改变行为，`server.setup()` 只打一行 warn）：
+> `body.lazy_read_size`、`network.idle_timeout_ns`（keep-alive 空闲实际由 `network.read_timeout_ns`
+> 约束）、`http.access_log_enabled`（要访问日志请注册 `LoggingHook`/`LoggingMiddleware`）。
 
 接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_framework")`。
 
@@ -144,7 +150,7 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 | 模式 | 工厂函数 | 生命周期 | 分配开销 | 适用场景 |
 |------|---------|---------|---------|---------|
 | **纯函数** | `fromFn` | 无状态，全局共享 | 零 | 简单的请求处理、404 |
-| **单例** | `initSingleton(T, ptr)` | main 创建，程序退出销毁 | 仅启动时一次 | 全局配置、计数器、静态文件服务 |
+| **单例** | `initSingleton(T, ptr)` | main 创建并持有，框架不销毁（只存指针） | 仅启动时一次 | 全局配置、计数器、静态文件服务 |
 | **请求级** | `initFactory(T, alloc)` | 每次请求 create/destroy | 每次 1 次 create + 1 次 destroy | 请求隔离状态、上下文数据 |
 
 > **`initFactory` 的 deinit 规则**：`deinit()` 只释放实例**内部**字段（如 `allocator.free`），
@@ -220,10 +226,12 @@ try ctx.formDecoded("name", 1<<20); // 读 body 后取表单字段并解码（ur
 ctx.header("Content-Type");      // 请求头
 ctx.request.getCookie("sid");    // Cookie
 ctx.request.getHeader("X-Id");   // 请求头（Request 不可变）
-ctx.readBody(allocator, limit);  // 请求体（首次读入后缓存；支持 Content-Length 与 chunked）
+ctx.readBody(ctx.arena, limit);  // 请求体（首次读入后缓存；支持 Content-Length 与 chunked）
+                                 // allocator 应传 ctx.arena：缓存由 RequestState 持有，
+                                 // 传非 arena 分配器需自行回收，配 parseJson 时更是必须（见下）
 ctx.service(T);                  // 取应用级服务单例（SessionManager/Logger 等）
 ctx.arena;                       // 请求级 arena（请求结束自动回收，无需 free）
-ctx.failWith(res, app_err);      // 抛 AppError（ErrorRenderer 负责渲染）
+ctx.failWith(app_err);           // 抛 AppError（ErrorRenderer 或框架兜底渲染）
 ctx.getUserData(T);              // 取中间件通讯槽（按类型索引）
 ctx.setUserData(T, ptr);         // 设中间件通讯槽
 ```
@@ -233,10 +241,10 @@ JSON 反序列化是 addon，用自由函数：
 ```zig
 const LoginRequest = struct { username: []const u8, password: []const u8 };
 const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
-    try ctx.failWith(res, framework.AppError.badRequest("failed to read body"));
+    try ctx.failWith(framework.AppError.badRequest("failed to read body"));
     return;
 }) catch {
-    try ctx.failWith(res, framework.AppError.badRequest("invalid JSON body"));
+    try ctx.failWith(framework.AppError.badRequest("invalid JSON body"));
     return;
 };
 ```
@@ -325,14 +333,15 @@ try router.use(framework.Middleware.init(framework.AuthMiddleware, &auth));
 `AppError` = (HTTP 状态码, 消息)，`ErrorRenderer`（管道最外层）把 handler 抛出的错误转成响应：
 
 ```zig
-// handler 里直接用：
-try ctx.failWith(res, framework.AppError.notFound("user not found"));   // 404
-try ctx.failWith(res, framework.AppError.unauthorized("bad token"));    // 401
-try ctx.failWith(res, framework.AppError.forbidden("no access"));       // 403
-try ctx.failWith(res, framework.AppError.badRequest("bad input"));      // 400
-try ctx.failWith(res, framework.AppError.conflict("already exists"));   // 409
-try ctx.failWith(res, framework.AppError.tooManyRequests("slow down")); // 429
-// failWith 返回 error.AppError，会自动 return，无需再写 return
+// handler 里直接用（failWith 只有 1 个参数，返回 error.AppError，配合 try 自动 return）：
+try ctx.failWith(framework.AppError.notFound("user not found"));   // 404
+try ctx.failWith(framework.AppError.unauthorized("bad token"));    // 401
+try ctx.failWith(framework.AppError.forbidden("no access"));       // 403
+try ctx.failWith(framework.AppError.badRequest("bad input"));      // 400
+try ctx.failWith(framework.AppError.conflict("already exists"));   // 409
+try ctx.failWith(framework.AppError.tooManyRequests("slow down")); // 429
+// failWith 只是把 AppError 存进 user_data 槽并返回 error.AppError，
+// 渲染由 ErrorRenderer 完成；没有 ErrorRenderer 时框架兜底用 AppError 的状态码渲染
 ```
 
 ### 会话 (Session)
@@ -348,7 +357,9 @@ defer sessions.deinit();
 
 const session_id = try sessions.getOrCreate(ctx, res);   // 无 cookie 就新建并写 Set-Cookie
 try sessions.setData(session_id, "username", body.username);
-const data = sessions.getData(session_id) orelse ...;    // data.get("username")
+// 读单个键：getValue(session_id, key, allocator)，返回独立拷贝（用 ctx.arena 即可随请求回收）
+const username = (try sessions.getValue(session_id, "username", ctx.arena)) orelse "anonymous";
+// 需要遍历全部键值时没有 getData：框架刻意不越过锁把内部 map 交出来，按 key 取值
 // 登出：res.setCookieFull(.{ .name = "sid", .value = "deleted", .max_age = 0 })
 ```
 
@@ -359,9 +370,14 @@ RFC 6455 实现（帧编解码 + 握手 + 连接级读写 + **连接劫持**）�
 结束后写 101 握手响应、构造 `WebSocket` 并调用你的回调接管连接。
 
 ```zig
+// 劫持上下文：必须是**长期稳定**的地址（进程级变量 / 服务容器），
+// 因为它在 handler 返回之后、hijack 回调里才被解引用。
+// 不要传 `@ptrCast(res)`：res 在 handler 返回后即失效 → use-after-free。
+var ws_conns: usize = 0;
+
 fn wsRoute(ctx: *framework.Context, res: *framework.Response) !void {
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(res), onWs) catch {
-        try ctx.failWith(res, .{ .status = .bad_request, .message = "upgrade failed" });
+    const upgraded = framework.wsUpgrade(ctx, res, &ws_conns, onWs) catch {
+        try ctx.failWith(framework.AppError.badRequest("upgrade failed"));
         return;
     };
     if (!upgraded) return; // 非法升级请求（wsUpgrade 已写好 426/错误响应）
@@ -370,7 +386,8 @@ fn wsRoute(ctx: *framework.Context, res: *framework.Response) !void {
 
 // 连接回调：拿到已建好的 *WebSocket，跑 receive/send 循环，返回即关连接。
 fn onWs(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    _ = hijack_ctx;
+    const conns: *usize = @ptrCast(@alignCast(hijack_ctx));
+    conns.* += 1;
     while (true) {
         var msg = ws.receive() catch |err| {
             if (err == error.ConnectionClosed or err == error.EndOfStream) return;
@@ -383,7 +400,9 @@ fn onWs(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
 ```
 
 注册路由：`try router.route(.GET, "/ws", framework.Handler.fromFn(wsRoute));`
-（可运行的完整 echo 示例见 `examples/src/main.zig` 的 `/ws` 路由。）
+（可运行的完整 echo 示例见 `examples/src/main.zig` 的 `/ws` 路由，传模块级
+`&ws_echo_conns` 作为稳定 hijack_ctx；`examples/src/admin.zig` 的
+`wsNotificationsHandler` 则传服务容器指针，两者都是正例。）
 
 底层 API 也可单独使用：`framework.wsComputeAcceptKey`（计算 Accept）、
 `framework.WebSocket.initServer/initClient`（连接级读写）、`framework.wsEncodeFrame/wsDecodeFrame`（单帧编解码）。
@@ -439,9 +458,11 @@ defer store.close() catch {};
 const id = try store.insert(.{ .id = 0, .name = "alice", .email = "alice@example.com" });
 try store.flush(); // 改动只在内存，需显式 flush() 写回 JSON 文件
 
-const rows = try store.all();                       // 全部行（用 store.allocator.free 释放）
-defer store.allocator.free(rows);
-const user = try store.findById(id);                // 按主键查找
+// 读系列方法都要先传 allocator：行内字符串字段会被深拷贝进它
+const rows = try store.all(allocator);                       // 全部行
+defer store.freeRows(allocator, rows);                       // 用同一个 allocator 释放
+const user = try store.findById(allocator, id);              // 按主键查找，找不到为 null
+defer if (user) |u| store.freeRow(allocator, u);
 const updated = try store.updateById(id, .{ .id = id, .name = "a2", .email = "a2@x.com" });
 const deleted = try store.deleteById(id);
 ```
@@ -452,7 +473,12 @@ const deleted = try store.deleteById(id);
 var qb = framework.orm.Query(User).init(allocator);
 defer qb.deinit();
 _ = qb.where(.Eq, "name", .{ .string = "alice" }).orderBy("id", .Asc).limit(10).offset(0);
-const matches = try store.findAll(&qb);  // 或 findOne / count / paginate(page, per_page)
+const matches = try store.findAll(allocator, &qb);   // 读方法统一先传 allocator
+defer store.freeRows(allocator, matches);
+const one = try store.findOne(allocator, &qb);       // ?T，同样先传 allocator
+const total = try store.count(&qb);                  // count 不返回行，无需 allocator
+const page = try store.paginate(allocator, 0, 20);   // 分页（按 id 升序），page 从 0 开始
+defer store.freeRows(allocator, page);
 ```
 
 ## 示例

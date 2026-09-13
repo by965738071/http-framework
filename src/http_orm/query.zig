@@ -546,6 +546,28 @@ pub fn getFieldValueOpt(comptime T: type, instance: T, field_name: []const u8) ?
     return null;
 }
 
+/// 判断字段当前是否为 NULL。
+///
+/// 只有 `?T` 字段且值为 `null` 才算 NULL；非 optional 字段的 `0` / `""` / `false`
+/// 都是**真实值**，不能当 NULL 看。唯一约束需要这个区分：SQL 里 NULL 不参与
+/// UNIQUE 比较（多行 NULL 合法），而 `toFieldValue(null)` 与 `toFieldValue(0 / "")`
+/// 产出的 FieldValue 完全相同，光看 FieldValue 无法回推 null 与否，只能回看原字段。
+pub fn isFieldNull(comptime T: type, instance: T, field_name: []const u8) bool {
+    const struct_info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (struct_info.field_names, struct_info.field_types) |fname, ftype| {
+        if (std.mem.eql(u8, fname, field_name)) {
+            if (comptime @typeInfo(ftype) == .optional) {
+                return @field(instance, fname) == null;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
 /// 将任意值转换为 FieldValue
 pub fn toFieldValue(value: anytype) FieldValue {
     const T = @TypeOf(value);
