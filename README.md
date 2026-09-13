@@ -270,6 +270,16 @@ res.stream(buffer, .{ .content_type = "text/plain" }); // 流式响应
 中间件实现 `process(ctx, res, next) !void`，用 `Middleware.init` 包装后挂到 `router.use()`。
 可以 `next.call` 之前做前置逻辑、之后做后置逻辑：
 
+> **所有权约束（重要）**：`Middleware.init` 只有在 `T` 声明了 `deinit` 时才自动注册销毁
+> 钩子；一旦 `router.use()` / `Pipeline.add()` 注册成功，**实例所有权即移交框架**——
+> `router.deinit()` / `Pipeline.deinit()` 通过 `deinitAll` 统一释放（按值去重，
+> 同一实例只会 `deinit` 一次）。注册后的实例**不要**再手动调 `T.deinit()`：
+> 两边都会释放同一份资源 → double-free（实测症状如 debug 下
+> `panic: incorrect alignment` + 栈指向 destroy 钩子二次触发）。
+> 收尾顺序统一交给 main：`server.deinit` → `router.deinit` → 业务资源。
+> 类型没有 `deinit` 的中间件不受此约束，但建议照此约定，避免日后补上 `deinit`
+> 时埋下隐蔽的双重释放。`examples/src/main.zig` 中的中间件均为正例。
+
 ```zig
 const TimingMiddleware = struct {
     pub fn process(self: *@This(), ctx: *framework.Context, res: *framework.Response, next: framework.Next) !void {

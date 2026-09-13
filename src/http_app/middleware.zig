@@ -70,6 +70,15 @@ pub const Middleware = struct {
     destroy: ?*const fn (*anyopaque) void = null,
 
     /// 从实现了 `process(ctx, res, next)` 方法的类型创建中间件。
+    ///
+    /// **所有权转移**：若 `T` 声明了 `deinit`，则 `Router.use()` / `Pipeline.add()`
+    /// 后实例所有权即移交框架——`Router.deinit()` / `Pipeline.deinit()` 会通过
+    /// destroy 钩子统一释放（按值去重，同一值只调一次）。
+    /// 调用方在 `use` / `add` 之后 **不得**再手动调 `T.deinit()`，否则
+    /// `Router.deinit` 会对同一实例调两次 deinit → double-free。
+    ///
+    /// `T` 无 `deinit` 时可忽略此约束，但建议同样遵循「注册后不再手动释放」
+    /// 的约定，以免未来给 T 补上 deinit 时产生隐蔽的 double-free。
     pub fn init(comptime T: type, ptr: *T) Middleware {
         const processFn = struct {
             fn call(any: *anyopaque, ctx: *Context, res: *Response, next: Next) anyerror!void {
@@ -90,7 +99,18 @@ pub const Middleware = struct {
         };
     }
 
-    pub fn deinit(self: Middleware) void {
+    /// 释放单个中间件实例。
+    ///
+    /// **故意不开放**（文件私有）：这不是正常的调用路径——正常路径是
+    /// `Router.deinit()` / `Pipeline.deinit()` 里的 `deinitAll`（带按值去重）。
+    /// 外部没有「注销单个中间件」的 API，对外开放只会让应用侧多出
+    /// `Middleware.deinit()` + `Router.deinit()` 双释放这条翻车路径；
+    /// 藏起来后这行代码直接编译报错。
+    ///
+    /// 注意：这只堵住「调包装的 deinit」一条口子。用户仍可对持有实例调用
+    /// `T.deinit()`（destroy 钩子执行的也是 `T.deinit()`）——那条路只能靠
+    /// 「注册后所有权归框架」的契约约定，见 `init` 的文档注释。
+    fn deinit(self: Middleware) void {
         if (self.destroy) |d| d(self.ptr);
     }
 
