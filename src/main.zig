@@ -40,12 +40,12 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try router.route(.GET, "/health", framework.Handler.fromFn(healthHandler));
 
     var api_handler = ApiHandler{};
-    try router.route(.GET, "/api", framework.Handler.initSingleton(ApiHandler, &api_handler));
+    try router.route(.GET, "/api", framework.Handler.initSingleton(&api_handler));
     try router.route(.POST, "/login", framework.Handler.fromFn(loginHandler));
     try router.route(.POST, "/upload", framework.Handler.fromFn(uploadHandler));
 
     var static_server = framework.StaticFileServer.init(allocator, io, "./public", "/static");
-    try router.route(.GET, "/static/*", framework.Handler.initSingleton(framework.StaticFileServer, &static_server));
+    try router.route(.GET, "/static/*", framework.Handler.initSingleton(&static_server));
 
     // 3. 日志器（文件输出，O_APPEND 内核原子追加，无需每请求 stat）
     var logger = try framework.Logger.init(allocator, io, .{

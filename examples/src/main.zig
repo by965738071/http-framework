@@ -282,7 +282,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // 单例 handler（跨请求持有状态，见 ApiHandler 定义）
     var api_handler = ApiHandler{ .request_count = 0 };
-    try router.route(.GET, "/api", framework.Handler.initSingleton(ApiHandler, &api_handler));
+    try router.route(.GET, "/api", framework.Handler.initSingleton(&api_handler));
 
     // factory handler（每个请求创建/销毁实例）。
     // 所有权契约：Handler 一旦注册进 Router，FactoryCtx 的释放责任就移交
@@ -305,7 +305,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // ── 静态文件服务 ──────────────────────────────────────────
 
     var static_server = framework.StaticFileServer.init(allocator, io, "./public", "/static");
-    try router.route(.GET, "/static/*", framework.Handler.initSingleton(framework.StaticFileServer, &static_server));
+    try router.route(.GET, "/static/*", framework.Handler.initSingleton(&static_server));
 
     // ── 压缩响应演示 ──────────────────────────────────────────
 
@@ -352,10 +352,10 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         std.log.info("Registering admin routes...", .{});
 
         // 登录/登出（无需认证）
-        try admin_routes.route(.GET, "/", framework.Handler.initSingleton(admin.LoginPageHandler, &login_page_handler));
-        try admin_routes.route(.GET, "/login", framework.Handler.initSingleton(admin.LoginPageHandler, &login_page_handler));
-        try admin_routes.route(.POST, "/login", framework.Handler.initSingleton(admin.LoginApiHandler, &login_api_handler));
-        try admin_routes.route(.POST, "/logout", framework.Handler.initSingleton(admin.LogoutHandler, &logout_handler));
+        try admin_routes.route(.GET, "/", framework.Handler.initSingleton(&login_page_handler));
+        try admin_routes.route(.GET, "/login", framework.Handler.initSingleton(&login_page_handler));
+        try admin_routes.route(.POST, "/login", framework.Handler.initSingleton(&login_api_handler));
+        try admin_routes.route(.POST, "/logout", framework.Handler.initSingleton(&logout_handler));
 
         // Bearer Token 演示：/admin/secret 用 AuthMiddleware（Authorization: Bearer ...）保护，
         // 与后台 UI 的 session 鉴权互不相关，仅作为 Bearer 认证示例。
@@ -376,27 +376,27 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
             var admin_session_routes = try admin_routes.group("");
             try admin_session_routes.use(admin.requireAuth(&admin_services));
 
-            try admin_session_routes.route(.GET, "/me", framework.Handler.initSingleton(admin.MeHandler, &me_handler));
-            try admin_session_routes.route(.GET, "/dashboard", framework.Handler.initSingleton(admin.DashboardHandler, &dashboard_handler));
-            try admin_session_routes.route(.GET, "/users", framework.Handler.initSingleton(admin.UserListHandler, &user_list_handler));
-            try admin_session_routes.route(.POST, "/users", framework.Handler.initSingleton(admin.UserCreateHandler, &user_create_handler));
-            try admin_session_routes.route(.GET, "/users/:id", framework.Handler.initSingleton(admin.UserGetHandler, &user_get_handler));
-            try admin_session_routes.route(.PUT, "/users/:id", framework.Handler.initSingleton(admin.UserUpdateHandler, &user_update_handler));
-            try admin_session_routes.route(.DELETE, "/users/:id", framework.Handler.initSingleton(admin.UserDeleteHandler, &user_delete_handler));
-            try admin_session_routes.route(.GET, "/logs", framework.Handler.initSingleton(admin.LogListHandler, &log_list_handler));
-            try admin_session_routes.route(.POST, "/logs/clear", framework.Handler.initSingleton(admin.LogClearHandler, &log_clear_handler));
-            try admin_session_routes.route(.GET, "/settings", framework.Handler.initSingleton(admin.SettingsHandler, &settings_handler));
-            try admin_session_routes.route(.GET, "/ws", framework.Handler.initSingleton(admin.WsNotificationsHandler, &ws_notifications_handler));
+            try admin_session_routes.route(.GET, "/me", framework.Handler.initSingleton(&me_handler));
+            try admin_session_routes.route(.GET, "/dashboard", framework.Handler.initSingleton(&dashboard_handler));
+            try admin_session_routes.route(.GET, "/users", framework.Handler.initSingleton(&user_list_handler));
+            try admin_session_routes.route(.POST, "/users", framework.Handler.initSingleton(&user_create_handler));
+            try admin_session_routes.route(.GET, "/users/:id", framework.Handler.initSingleton(&user_get_handler));
+            try admin_session_routes.route(.PUT, "/users/:id", framework.Handler.initSingleton(&user_update_handler));
+            try admin_session_routes.route(.DELETE, "/users/:id", framework.Handler.initSingleton(&user_delete_handler));
+            try admin_session_routes.route(.GET, "/logs", framework.Handler.initSingleton(&log_list_handler));
+            try admin_session_routes.route(.POST, "/logs/clear", framework.Handler.initSingleton(&log_clear_handler));
+            try admin_session_routes.route(.GET, "/settings", framework.Handler.initSingleton(&settings_handler));
+            try admin_session_routes.route(.GET, "/ws", framework.Handler.initSingleton(&ws_notifications_handler));
         }
 
         // 静态文件（Admin UI）- 使用 /* 来捕获所有其他路径
-        try admin_routes.route(.GET, "/*", framework.Handler.initSingleton(framework.StaticFileServer, &admin_static));
+        try admin_routes.route(.GET, "/*", framework.Handler.initSingleton(&admin_static));
         std.log.info("Admin routes registered successfully", .{});
     }
 
     // ── 用户注册（无需认证）─────────────────────────────────────
 
-    try router.route(.POST, "/api/register", framework.Handler.initSingleton(register.RegisterHandler, &register_handler));
+    try router.route(.POST, "/api/register", framework.Handler.initSingleton(&register_handler));
 
     // ── 设备管理 API（需要认证）─────────────────────────────────
     // 使用 admin 的 session 鉴权（复用 admin_services 的 RequireAuthMiddleware）
@@ -404,11 +404,11 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         var api_device_routes = try router.group("/api/devices");
         try api_device_routes.use(admin.requireAuth(&admin_services));
 
-        try api_device_routes.route(.GET, "", framework.Handler.initSingleton(devices.DeviceListHandler, &device_list_handler));
-        try api_device_routes.route(.POST, "", framework.Handler.initSingleton(devices.DeviceCreateHandler, &device_create_handler));
-        try api_device_routes.route(.GET, "/:id", framework.Handler.initSingleton(devices.DeviceGetHandler, &device_get_handler));
-        try api_device_routes.route(.PUT, "/:id", framework.Handler.initSingleton(devices.DeviceUpdateHandler, &device_update_handler));
-        try api_device_routes.route(.DELETE, "/:id", framework.Handler.initSingleton(devices.DeviceDeleteHandler, &device_delete_handler));
+        try api_device_routes.route(.GET, "", framework.Handler.initSingleton(&device_list_handler));
+        try api_device_routes.route(.POST, "", framework.Handler.initSingleton(&device_create_handler));
+        try api_device_routes.route(.GET, "/:id", framework.Handler.initSingleton(&device_get_handler));
+        try api_device_routes.route(.PUT, "/:id", framework.Handler.initSingleton(&device_update_handler));
+        try api_device_routes.route(.DELETE, "/:id", framework.Handler.initSingleton(&device_delete_handler));
     }
 
     // ── 分层业务后端 API（/api/v1）───────────────────────────────
@@ -419,7 +419,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // ── 前端 SPA 静态文件服务 ────────────────────────────────────
 
     var app_static = framework.StaticFileServer.init(allocator, io, "./public/app", "/app");
-    try router.route(.GET, "/app/*", framework.Handler.initSingleton(framework.StaticFileServer, &app_static));
+    try router.route(.GET, "/app/*", framework.Handler.initSingleton(&app_static));
 
     // ── ORM CRUD ───────────────────────────────────────────────
 

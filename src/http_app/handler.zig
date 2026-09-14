@@ -47,8 +47,18 @@ pub const Handler = union(enum) {
         return .{ .func = func };
     }
 
-    /// **单例处理器** — ptr 指向全局稳定实例，T 有 handle 方法
-    pub fn initSingleton(comptime T: type, ptr: *T) Handler {
+    /// **单例处理器** — ptr 指向全局稳定实例；处理类型从实参指针自动推导
+    /// （调用点不再需要把类型写两遍）。T 必须有 `handle(ctx, res)` 方法。
+    pub fn initSingleton(ptr: anytype) Handler {
+        const Ptr = @TypeOf(ptr);
+        const info = @typeInfo(Ptr);
+        // 只接受可变的单元素指针：用 `Ptr == *child` 一个判据同时拒绝
+        // *const T（会把 const 洗掉）、[*]T/[]T 等非 one 指针——
+        // 0.17 的 Pointer 元类型已没有 is_const 字段。
+        if (info != .pointer or info.pointer.size != .one or Ptr != *info.pointer.child) {
+            @compileError("initSingleton expects a mutable single-item pointer (e.g. &handler_instance), got " ++ @typeName(Ptr));
+        }
+        const T = info.pointer.child;
         const callFn = struct {
             fn call(any: *anyopaque, ctx: *Context, res: *Response) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(any));
@@ -225,7 +235,7 @@ test "Handler.initSingleton dispatches to instance handle method" {
         .io = undefined,
     };
 
-    const handler = Handler.initSingleton(T, &instance);
+    const handler = Handler.initSingleton(&instance);
     try handler.dispatch(&ctx, &res);
     handler.deinit();
 

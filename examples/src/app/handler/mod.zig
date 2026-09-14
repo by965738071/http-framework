@@ -20,7 +20,7 @@ pub const approval_handler = @import("approval_handler.zig");
 pub const misc_handler = @import("misc_handler.zig");
 
 /// 把「纯函数 handler」包成单例 handler 结构体，供
-/// `framework.Handler.initSingleton(T, ptr)` 使用。
+/// `framework.Handler.initSingleton(ptr)` 使用（类型从 ptr 自动推导）。
 ///
 /// 框架要求每个路由一个实现了 `handle(ctx, res)` 的类型实例，用 comptime
 /// 生成可以省掉几十个手写的 wrapper struct。

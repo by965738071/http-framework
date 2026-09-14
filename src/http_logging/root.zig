@@ -194,7 +194,6 @@ pub const Logger = struct {
     /// 文件模式写路径串行化（防止轮转与写入并发竞争）
     mutex: std.Io.Mutex = .init,
     /// 文件模式持有的文件句柄
-    zio_file :@import("zio").File,
     file: std.Io.File,
     /// 当前文件大小（= 下一个写入偏移），用于追加与轮转判断
     file_offset: u64,
@@ -217,7 +216,6 @@ pub const Logger = struct {
             .file = .{ .handle = undefined, .flags = .{ .nonblocking = false } },
             .file_offset = 0,
             .owned_path = null,
-            .zio_file = @import("zio").File
         };
 
         if (config.output == .file) {

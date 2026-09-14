@@ -90,7 +90,7 @@ pub const App = struct {
                 }
             }.destroy,
         });
-        return framework.Handler.initSingleton(T, ptr);
+        return framework.Handler.initSingleton(ptr);
     }
 
     /// 生成一个权限点守卫中间件实例。
