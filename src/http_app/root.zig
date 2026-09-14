@@ -30,6 +30,8 @@ pub const RequestIdMiddleware = @import("request_id.zig").RequestIdMiddleware;
 pub const REQUEST_ID_HEADER = @import("request_id.zig").REQUEST_ID_HEADER;
 
 pub const Config = @import("config.zig").Config;
+pub const applyEnv = @import("config.zig").applyEnv;
+pub const EnvError = @import("config.zig").EnvError;
 pub const NetworkConfig = @import("config.zig").NetworkConfig;
 pub const HttpConfig = @import("config.zig").HttpConfig;
 pub const BodyConfig = @import("config.zig").BodyConfig;

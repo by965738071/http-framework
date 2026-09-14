@@ -143,7 +143,50 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 > `body.lazy_read_size`、`network.idle_timeout_ns`（keep-alive 空闲实际由 `network.read_timeout_ns`
 > 约束）、`http.access_log_enabled`（要访问日志请注册 `LoggingHook`/`LoggingMiddleware`）。
 
-接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_framework")`。
+接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_module")`。
+
+## 配置加载（环境变量 / 应用配置扩展点）
+
+`Config` 支持「comptime 默认值 + 运行时覆盖」两级。部署时改端口/地址不用重新编译：
+
+```zig
+var server_cfg: framework.Config = .{}; // env 只在 main 里可得，自行中转给 appMain
+
+pub fn main(init: std.process.Init) !void {
+    // APP_PORT=8080 APP_ADDRESS=127.0.0.1 APP_SIZE_LIMIT=67108864 ……
+    server_cfg = try framework.Config.fromEnv(init.arena.allocator(), init.environ_map, "APP_");
+    // …… framework.runZio(allocator, appMain);
+}
+```
+
+- 键名 = `prefix` + 大写字段名（取叶子字段，不带层级前缀）：`APP_PORT`、`APP_ADDRESS`、
+  `APP_SERVER_NAME`、`APP_SIZE_LIMIT`、`APP_MAX_CONNECTIONS`、`APP_READ_TIMEOUT_NS` ……
+  覆盖 network/http/body/pool 全部叶子字段；未设置的保持默认值。
+- 0.16+ 环境变量非全局：把 `main(init: std.process.Init)` 里的 `init.environ_map` 传进来。
+- `allocator` 推荐进程级 arena（address/server_name 等字符串值由它持有）。
+- bool 接受 `1/true/yes/on`（大小写不敏感）；非法值报错并在启动日志里指出是哪个键。
+
+**应用自己的配置字段**：框架 Config 不预留万能槽，用组合 + 同一个加载器承接
+（回应 issue：配置入口分裂）：
+
+```zig
+const AppConfig = struct {
+    server: framework.Config = .{},      // 框架配置
+    data_dir: ?[]const u8 = null,        // 应用自有字段
+    db_path: []const u8 = "./db.sqlite",
+};
+
+var app = AppConfig{};
+try framework.applyEnv(AppConfig, &app, arena, init.environ_map, "APP_");
+// APP_PORT=8080 → app.server.network.port；APP_DB_PATH=/srv/db.sqlite → app.db_path
+```
+
+`applyEnv` 支持整数 / `bool` / `[]const u8` / `?[]const u8` / 嵌套 struct，其余字段类型
+comptime 报错。
+
+需要**配置文件**而非 env 时不用新增框架入口：`Config` 是纯数据类型，
+`std.json.parseFromSlice(framework.Config, gpa, text, .{ .ignore_unknown_fields = true })`
+可直接吃 JSON；文件位置/格式/热重载策略归应用决策。
 
 ## 三种 Handler 模式
 
@@ -337,6 +380,33 @@ try router.use(framework.Middleware.init(framework.AuthMiddleware, &auth));
 // 校验通过后，handler 用 ctx.getUserData(framework.AuthInfo) 取身份信息
 //（strategy / token / username / api_key / roles）
 ```
+
+**session / DB 类登录态用 `resolver`**（带状态身份解析器）。`custom_auth` 是无捕获的裸函数
+指针（`fn (*Context) bool`），接不了 SessionManager/DB，也区分不了 401/403；`resolver` 把
+状态、身份、错误语义都补齐：
+
+```zig
+const SessionStore = struct {
+    // 返回 null = 未登录（框架发 401）；返回 error = 故障（ErrorRenderer 渲染 500，
+    // 不会被误渲染成 401）；返回 Identity = 认证成功。
+    fn resolve(self: *SessionStore, ctx: *framework.Context) !?framework.Identity {
+        const sid = ctx.request.getCookie("sid") orelse return null;
+        const sess = self.lookup(sid) orelse return null;
+        return .{ .user_id = sess.user_id, .roles = &.{"user"}, .extra = sess };
+    }
+};
+
+var store = SessionStore{ ... };
+var auth = framework.AuthMiddleware{ .config = .{
+    .resolver = .{ .self = &store, .resolve = SessionStore.resolve },
+    .required_roles = &.{"admin"}, // 角色不命中 → 403；留空则只验登录
+} };
+try router.use(framework.Middleware.init(framework.AuthMiddleware, &auth));
+// 命中后 handler：ctx.getUserData(framework.Identity).?.user_id / .extra
+// 同时 framework.AuthInfo 会被填上 strategy=.identity 与 roles。
+```
+
+resolver 优先于 custom/bearer/basic/api_key 尝试；返回 null 时继续走其余已启用策略。
 
 ### 错误处理 (AppError)
 
