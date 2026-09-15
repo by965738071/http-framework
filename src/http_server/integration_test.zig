@@ -176,6 +176,14 @@ const EventRecorder = struct {
     }
 };
 
+/// 中间件实例必须是静态生命周期：`router.use` 存的是实例指针，写成
+/// `buildRouter` 局部变量会在 return 后悬垂（此前 ErrorRenderer 是 0 字节空
+/// 结构、process 从不解引用实例内存所以无恙；它有字段后会读 self → segfault）。
+var err_renderer = http_app.ErrorRenderer{};
+var rid_mw = http_app.RequestIdMiddleware{};
+var timing_mw = TimingMiddleware{};
+var tag_mw = TagMiddleware{};
+
 /// 构建一个带完整中间件管道的 Router（request-id + timing + tag + error-renderer）。
 fn buildRouter(allocator: std.mem.Allocator, io: std.Io) !http_router.Router {
     var router = try http_router.Router.init(allocator);
@@ -184,16 +192,12 @@ fn buildRouter(allocator: std.mem.Allocator, io: std.Io) !http_router.Router {
     try router.route(.POST, "/echo", Handler.fromFn(helloHandler));
 
     // ErrorRenderer 最外层
-    var err_renderer = http_app.ErrorRenderer{};
     try router.use(Middleware.init(http_app.ErrorRenderer, &err_renderer));
     // RequestId
-    var rid_mw = http_app.RequestIdMiddleware{};
     try router.use(Middleware.init(http_app.RequestIdMiddleware, &rid_mw));
     // Timing
-    var timing_mw = TimingMiddleware{};
     try router.use(Middleware.init(TimingMiddleware, &timing_mw));
     // Tag
-    var tag_mw = TagMiddleware{};
     try router.use(Middleware.init(TagMiddleware, &tag_mw));
     _ = io;
     return router;
@@ -358,8 +362,8 @@ test "中间件管道顺序：外层先于内层 setBuffered，handler 后外层
     defer router.deinit();
     try router.route(.GET, "/", Handler.fromFn(helloHandler));
 
-    var tag_mw = TagMiddleware{};
-    try router.use(Middleware.init(TagMiddleware, &tag_mw));
+    var local_tag = TagMiddleware{};
+    try router.use(Middleware.init(TagMiddleware, &local_tag));
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

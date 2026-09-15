@@ -529,8 +529,12 @@ test "ErrorRenderer：渲染 AppError 的状态码与消息（不是一律 500�
     try h.run(&.{Middleware.init(http_app.ErrorRenderer, &renderer)}, Handler.fromFn(failForbidden));
 
     try std.testing.expectEqual(@as(u16, 403), h.statusCode());
-    try std.testing.expectEqualStrings("no access", h.body());
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", h.header("content-type").?);
+    // Issue 4：默认渲染为 JSON 包络，非纯文本。
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":{\"code\":\"forbidden\",\"message\":\"no access\"}}",
+        h.body(),
+    );
+    try std.testing.expectEqualStrings("application/json", h.header("content-type").?);
 }
 
 

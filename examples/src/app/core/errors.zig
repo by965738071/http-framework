@@ -1,9 +1,10 @@
 //! 统一业务错误类型。
 //!
 //! 框架自带的 `framework.AppError`（src/http_app/error.zig）只有
-//! `status + message`，且 `toResponse` 写的是 `text/plain`——前后端契约需要
-//! 稳定的 `code`（机器可读）+ `message`（人可读）+ `details`（可选结构化信息），
-//! 所以业务层自己定义一套，由 `middleware/error_json.zig` 统一渲染成 JSON。
+//! `status + message`（默认渲染是 JSON 包络，但 code 只能由状态码派生），
+//! 而前后端契约需要稳定的 `code`（机器可读）+ `message`（人可读）+
+//! `details`（可选结构化信息），所以业务层自己定义一套，由
+//! `middleware/error_json.zig` 统一渲染成 JSON。
 
 const std = @import("std");
 const framework = @import("http_framework");
