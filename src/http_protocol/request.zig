@@ -40,6 +40,13 @@ pub const Request = struct {
     body: Body,
     trust_proxy: bool = false,
 
+    /// 方法不允许 body（GET/HEAD/DELETE/TRACE/OPTIONS，std requestHasBody 口径）
+    /// 却携带 Content-Length > 0 时的字节数。init 按「收下但忽略」处理（body 恒为
+    /// .none），此字段告知 ConnectionRunner：响应发完且连接继续复用时，需从连接
+    /// 上排空这些字节，否则下一个 receiveHead 会把它们误解析成新请求（Issue 5）。
+    /// null = 无需处理。
+    ignored_body_len: ?u64 = null,
+
     pub const Body = union(enum) {
         none,
         buffered: []const u8,
@@ -67,14 +74,20 @@ pub const Request = struct {
         if (head.content_length != null and head.transfer_encoding != .none) {
             return error.ProtocolError;
         }
-        // 不允许 body 的方法（GET/HEAD/DELETE/…，std requestHasBody 的口径）
-        // 携带真实 framing：std 对它们返回恒空的 .ending reader，从不消费那
-        // 些字节，却仍视连接可复用 → body 残留污染下一个请求。CL:0 无字节
-        // 可残留，保持合法。
+        // 不允许 body 的方法（GET/HEAD/DELETE/…，std requestHasBody 的口径）。
+        // RFC 9110 §8.3 承认 DELETE 的 body 可以有语义（ES 风格 DELETE+body 等
+        // 真实客户端在用），旧实现一律 400 与生态冲突（Issue 5）。现按 nginx 式
+        // 宽容处理：收下但忽略——
+        //   - CL>0：置 ignored_body_len 放行（body 仍为 .none），由 ConnectionRunner
+        //     在响应后排空。std 对无 body 方法的成帧是恒空 .ending reader（从不消费
+        //     这些字节），而 receiveHead 只 toss 掉 head 部分——字节留在框架与 Server
+        //     共用的底层 reader 里，框架层排空是正确且唯一可行的位置。
+        //   - chunked：无法预知长度可排空，且本就是 TE.TE 走私面，维持拒收。
+        var ignored_body_len: ?u64 = null;
         if (!head.method.requestHasBody()) {
             if (head.transfer_encoding != .none) return error.ProtocolError;
             if (head.content_length) |len| {
-                if (len > 0) return error.ProtocolError;
+                if (len > 0) ignored_body_len = len;
             }
         }
         // 重复 Content-Type 头：std 的 head.content_type 是后值覆盖，而
@@ -102,8 +115,8 @@ pub const Request = struct {
         const target_rebased = rebase(target, original_head, copy);
 
         // 有 body 的判定与 std 的 reader 语义同口径：方法不允许 body 时
-        // std 根本不会按 CL/TE 消费字节（上面已拒绝非零 framing，只剩 CL:0，
-        // 无内容可读）。
+        // std 根本不会按 CL/TE 消费字节（chunked 已拒；CL>0 走上面的
+        // ignored_body_len 排空路径），body 一律 .none。
         const has_body = head.method.requestHasBody() and
             (head.content_length != null or head.transfer_encoding != .none);
         const body: Body = if (!has_body) .none else .{ .streaming = request };
@@ -119,6 +132,7 @@ pub const Request = struct {
             .content_length = head.content_length,
             .transfer_encoding = head.transfer_encoding,
             .body = body,
+            .ignored_body_len = ignored_body_len,
         };
     }
 
@@ -647,31 +661,45 @@ test "Request.init rejects Content-Length + Transfer-Encoding coexistence" {
     try std.testing.expectError(error.ProtocolError, Request.init(arena.allocator(), &srv));
 }
 
-test "Request.init rejects framing on methods that do not allow a body" {
+test "Request.init 接受无 body 方法携带 CL（标记待排空）但拒 chunked（Issue 5）" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const head_text = "GET /up HTTP/1.1\r\n\r\n";
-    // GET + 非零 CL：std 给的是恒空 .ending reader，body 字节永远无人消费
+    // GET + 非零 CL：放行但 body 视为 .none，标记字节数交给连接层排空（旧行为：400）。
     var get_cl = fakeSrvReq(head_text, .GET, head_text[4..7], null, 5, .none);
-    try std.testing.expectError(error.ProtocolError, Request.init(a, &get_cl));
+    const req_g = try Request.init(a, &get_cl);
+    try std.testing.expect(req_g.body == .none);
+    try std.testing.expectEqual(@as(?u64, 5), req_g.ignored_body_len);
 
-    // GET + chunked：同理
+    // GET + chunked：无法确定排空长度且是 TE.TE 走私面 → 仍拒收。
     var get_te = fakeSrvReq(head_text, .GET, head_text[4..7], null, null, .chunked);
     try std.testing.expectError(error.ProtocolError, Request.init(a, &get_te));
 
-    // HEAD + 非零 CL
-    var head_cl = fakeSrvReq(head_text, .HEAD, head_text[4..7], null, 5, .none);
-    try std.testing.expectError(error.ProtocolError, Request.init(a, &head_cl));
+    // HEAD + 非零 CL：同样接受并标记。
+    var head_cl = fakeSrvReq(head_text, .HEAD, head_text[4..7], null, 7, .none);
+    const req_h = try Request.init(a, &head_cl);
+    try std.testing.expectEqual(@as(?u64, 7), req_h.ignored_body_len);
 
-    // 但 GET + Content-Length: 0 无字节可残留，保持合法（body 为 .none）
+    // GET + Content-Length: 0：无字节可排空，无需标记。
     var get0 = fakeSrvReq(head_text, .GET, head_text[4..7], null, 0, .none);
     const req0 = try Request.init(a, &get0);
     try std.testing.expect(req0.body == .none);
-    // std 的 requestHasBody 口径：POST/PUT/PATCH/QUERY 才允许 body
+    try std.testing.expectEqual(@as(?u64, null), req0.ignored_body_len);
+
+    // DELETE + CL：RFC 9110 §8.3 承认其 body 语义 → 接受并标记。
     var del = fakeSrvReq(head_text, .DELETE, head_text[4..7], null, 5, .none);
-    try std.testing.expectError(error.ProtocolError, Request.init(a, &del));
+    const req_d = try Request.init(a, &del);
+    try std.testing.expect(req_d.body == .none);
+    try std.testing.expectEqual(@as(?u64, 5), req_d.ignored_body_len);
+
+    // 允许 body 的方法不占此标记（body 正常交给 handler）。
+    const post_head = "POST /up HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    var post = fakeSrvReq(post_head, .POST, post_head[5..8], null, 5, .none);
+    const req_p = try Request.init(a, &post);
+    try std.testing.expectEqual(@as(?u64, null), req_p.ignored_body_len);
+    try std.testing.expect(req_p.body == .streaming);
 }
 
 test "Request.init rejects duplicate Content-Type" {

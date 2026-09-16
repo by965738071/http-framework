@@ -16,6 +16,11 @@ const http_protocol = @import("http_protocol");
 const http_app = @import("http_app");
 const http_router = @import("http_router");
 
+/// 无 body 方法（GET/DELETE/…）携带 Content-Length 时，响应后最多排空这么多字节。
+/// CL 是攻击者可控的：不设上限地「排空后丢弃」会变成带宽放大器（回几个字节、
+/// 陪读任意多字节）。超限不排空，改为响应后直接关连接（Issue 5）。
+const IGNORED_BODY_DRAIN_CAP: u64 = 64 * 1024;
+
 pub const ConnectionRunner = struct {
     /// 汇合点：已建好、已设好超时的读写接口（由后端提供）。
     reader: *std.Io.Reader,
@@ -73,6 +78,10 @@ pub const ConnectionRunner = struct {
             const next_result = result orelse break; // connection closed
             var request = next_result.parsed;
             const http_request = next_result.raw;
+            // Issue 5: 无 body 方法携带 CL 时的待排空字节数。提前快照成栈上标量：
+            // request 里的切片指向请求 arena，arenas.endRequest() 之后只有值拷贝
+            // 字段仍可安全读取。
+            const ignored_body_len = request.ignored_body_len;
 
             _ = self.stats.active_requests.fetchAdd(1, .monotonic);
             var request_failed = false;
@@ -83,7 +92,12 @@ pub const ConnectionRunner = struct {
             const shutting_down = self.stats.shutting_down.load(.monotonic);
             // P2-38：尊重 HttpConfig.keep_alive_enabled——旧代码从不读这个开关，
             // 运维设 false 以为关了 keep-alive 实际仍在复用连接（虚假的控制感）。
-            const response_keep_alive = client_keep_alive and !shutting_down and self.config.http.keep_alive_enabled;
+            var response_keep_alive = client_keep_alive and !shutting_down and self.config.http.keep_alive_enabled;
+            // 待排空 body 超过上限 → 不排空（防带宽放大），降级为关连接；
+            // 在 processRequest 之前降级，响应里才能带上 Connection: close。
+            if (ignored_body_len) |n| {
+                if (n > IGNORED_BODY_DRAIN_CAP) response_keep_alive = false;
+            }
             const hijack = self.processRequest(&request, http_request, &arenas, response_keep_alive) catch |err| blk: {
                 std.log.err("processRequest: {s}", .{@errorName(err)});
                 request_failed = true;
@@ -120,6 +134,19 @@ pub const ConnectionRunner = struct {
             // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
             // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
             if (request_failed or !response_keep_alive) break;
+            // Issue 5: 排空被忽略的 body 字节（无 body 方法携带 CL，见
+            // Request.ignored_body_len）。std 对 requestHasBody()==false 的方法
+            // 返回恒空的 .ending reader，从不消费这些字节；receiveHead 又只 toss
+            // 掉 head——不排空则残留字节会被下一次 receiveHead 当成请求行解析
+            // （走私面）。reader 与 std http.Server 共用同一底层缓冲，这里的精确
+            // 排空重新对齐报文边界。
+            // 失败 = 对端没兑现 CL 承诺，连接状态不可信，直接断开。
+            if (ignored_body_len) |n| {
+                self.reader.discardAll64(n) catch |err| {
+                    std.log.warn("drain ignored body failed: {s}", .{@errorName(err)});
+                    break;
+                };
+            }
             // 真正的空闲等待发生在下一次 conn_loop.next() 的阻塞读里，
             // 由 reader 的 read_timeout_ns 约束。旧代码在 next() 前采样 idle_start、
             // 在处理完后算差，实际测的是“读+处理”总耗时，既无法在真正空闲时

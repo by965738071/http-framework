@@ -129,6 +129,11 @@ fn helloHandler(_: *Context, res: *Response) !void {
     try res.statusCode(.ok).text("Hello, World!");
 }
 
+// Issue 5：handler 完全不读 body（框架已把 body 置为 .none），只回固定文本。
+fn deleteFavHandler(_: *Context, res: *Response) !void {
+    try res.statusCode(.ok).text("deleted");
+}
+
 // 用 failWith 抛出带状态码的 AppError，验证 ErrorRenderer 能从 ctx.state
 // 提取并正确渲染（fix.md §一.3 的端到端验证）。
 fn boomHandler(ctx: *Context, _: *Response) !void {
@@ -642,4 +647,57 @@ test "Cookie 值含分号被拒绝（属性注入防护）" {
         error.InvalidCookieValue,
         res.setCookie("sid", "abc; Domain=evil.example"),
     );
+}
+
+// ── Issue 5：无 body 方法携带 CL → 收下但忽略，响应后排空 ──────────────
+
+test "Issue 5: DELETE 携带 body 被接受，响应后排空、keep-alive 继续" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.DELETE, "/fav", Handler.fromFn(deleteFavHandler));
+    try router.route(.GET, "/", Handler.fromFn(helloHandler));
+
+    // 流水线：DELETE + 5 字节 body + 紧跟一个 GET。若残留 body 未被排空，
+    // "helloGET / HTTP/1.1" 会被当成下一个请求行 → 400 + 关连接（旧行为）。
+    var out: [8192]u8 = undefined;
+    const written = runConnection(
+        allocator,
+        &router,
+        "DELETE /fav HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello" ++
+            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        &out,
+    );
+
+    // 两个响应都是 200，没有 400；第一个（DELETE）在前，第二个（GET）在后。
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, written, " 400 ") == null);
+    const del_pos = std.mem.indexOf(u8, written, "deleted") orelse return error.TestExpectedEqual;
+    const hello_pos = std.mem.indexOf(u8, written, "Hello, World!") orelse return error.TestExpectedEqual;
+    try std.testing.expect(del_pos < hello_pos);
+}
+
+test "Issue 5: 超限 CL → 不排空，响应带 Connection: close 后断开" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.DELETE, "/fav", Handler.fromFn(deleteFavHandler));
+    try router.route(.GET, "/", Handler.fromFn(helloHandler));
+
+    // CL=70000 > IGNORED_BODY_DRAIN_CAP(64KB)：只回一个响应并显式关连接；
+    // 后面的 GET 字节不会被读取（不排空 = 不做带宽放大器）。
+    var out: [8192]u8 = undefined;
+    const written = runConnection(
+        allocator,
+        &router,
+        "DELETE /fav HTTP/1.1\r\nHost: t\r\nContent-Length: 70000\r\n\r\nhello" ++
+            "GET / HTTP/1.1\r\nHost: t\r\n\r\n",
+        &out,
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), extractStatus(written));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "HTTP/1.1 200"));
+    // std 写出的是固定小写 `connection: close`（Server.zig writeHead），精确匹配。
+    try std.testing.expect(std.mem.indexOf(u8, written, "connection: close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hello, World!") == null);
 }

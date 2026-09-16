@@ -292,6 +292,13 @@ const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena
 };
 ```
 
+> **无 body 方法携带请求体**（GET/HEAD/DELETE/TRACE/OPTIONS + `Content-Length: n`，n>0）：
+> 按 nginx 式宽容处理——**收下但忽略**，handler 看到的 `body` 恒为 `.none`，框架在响应
+> 发完后从连接上排空这 n 个字节，keep-alive 正常继续（兼容 Elasticsearch 风格的
+> DELETE+body）。两个例外：携带 `Transfer-Encoding`（chunked 无法预知长度，是走私面）
+> 仍直接 400；`Content-Length` 超过 64KB 时不排空（防带宽放大），响应带
+> `Connection: close` 后关连接。
+
 ### 响应构建 (Response)
 
 ```zig
