@@ -105,8 +105,8 @@ fn userHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 /// 对用户控制的文本做最小 HTML 转义，防止反射型 XSS。
 fn escapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = try std.ArrayList(u8).initCapacity(allocator, s.len);
+    errdefer out.deinit(allocator);
     for (s) |c| {
         switch (c) {
             '&' => try out.appendSlice(allocator, "&amp;"),

@@ -258,7 +258,7 @@ pub fn QueryBuilder(comptime T: type) type {
             for (self.conditions.items) |cond| {
                 // 未知字段（where 字段名可能来自外部输入）→ 该条件不匹配。
                 const matches_cond = if (getFieldValueOpt(T, row, cond.field)) |fv|
-                    evaluateCondition(row, cond, fv)
+                    evaluateCondition(T, row, cond, fv)
                 else
                     false;
 
@@ -364,7 +364,7 @@ fn normalizeFieldValue(v: FieldValue) FieldValue {
 
 /// 评估单个条件
 /// 只有 optional 字段且值为 null 才算 NULL；零值（0/""/false）是真实数据。
-fn evaluateCondition(instance: T, cond: WhereCondition, field_value: FieldValue) bool {
+fn evaluateCondition(comptime T: type, instance: T, cond: WhereCondition, field_value: FieldValue) bool {
     if (cond.operator == .IsNull) {
         return isFieldNull(T, instance, cond.field);
     }
@@ -1148,27 +1148,27 @@ test "QueryBuilder matches with Gt/Lt/Lte/Gte operators" {
 }
 
 test "QueryBuilder matches with IsNull and IsNotNull" {
-    const User = struct { id: u64, name: []const u8, age: u32, active: bool = true };
+    const User = struct { id: ?u64, name: ?[]const u8, age: u32, active: bool = true };
     const allocator = std.testing.allocator;
 
-    // IsNull on integer (0 is null)
+    // IsNull：仅 ?T 字段为 null 才算 NULL
     {
         var qb = QueryBuilder(User).init(allocator);
         defer qb.deinit();
         _ = qb.where(.IsNull, "id", .{ .integer = 0 });
-        const user = User{ .id = 0, .name = "A", .age = 25 };
+        const user = User{ .id = null, .name = "A", .age = 25 };
         try std.testing.expect(qb.matches(user));
         const user2 = User{ .id = 1, .name = "B", .age = 30 };
         try std.testing.expect(!qb.matches(user2));
     }
-    // IsNotNull on string (empty is null)
+    // IsNotNull：非 null 才成立
     {
         var qb = QueryBuilder(User).init(allocator);
         defer qb.deinit();
         _ = qb.where(.IsNotNull, "name", .{ .string = "" });
         const user = User{ .id = 1, .name = "Alice", .age = 25 };
         try std.testing.expect(qb.matches(user));
-        const user2 = User{ .id = 2, .name = "", .age = 30 };
+        const user2 = User{ .id = 2, .name = null, .age = 30 };
         try std.testing.expect(!qb.matches(user2));
     }
 }
@@ -1481,101 +1481,117 @@ test "compareValues mismatched types returns eq" {
 // evaluateCondition tests
 // =========================================================================
 
+/// 测试用行：id/name 为 optional，用于验证 IsNull 语义（仅 ?T && null 才算 NULL）。
+const TestRow = struct {
+    id: ?i64 = null,
+    name: ?[]const u8 = null,
+    price: f64 = 0,
+    active: bool = false,
+};
+
 test "evaluateCondition Eq integer" {
     const cond = WhereCondition{ .field = "id", .operator = .Eq, .value = .{ .integer = 42 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 42 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 43 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 42 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 43 }));
 }
 
 test "evaluateCondition Neq integer" {
     const cond = WhereCondition{ .field = "id", .operator = .Neq, .value = .{ .integer = 42 } };
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 42 }));
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 43 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 42 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 43 }));
 }
 
 test "evaluateCondition Gt integer" {
     const cond = WhereCondition{ .field = "age", .operator = .Gt, .value = .{ .integer = 18 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 18 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 10 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 25 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 18 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 10 }));
 }
 
 test "evaluateCondition Lt integer" {
     const cond = WhereCondition{ .field = "age", .operator = .Lt, .value = .{ .integer = 30 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 30 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 35 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 25 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 30 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 35 }));
 }
 
 test "evaluateCondition Gte integer" {
     const cond = WhereCondition{ .field = "age", .operator = .Gte, .value = .{ .integer = 18 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 18 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 17 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 25 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 18 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 17 }));
 }
 
 test "evaluateCondition Lte integer" {
     const cond = WhereCondition{ .field = "age", .operator = .Lte, .value = .{ .integer = 30 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 25 }));
-    try std.testing.expect(evaluateCondition(cond, .{ .integer = 30 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .integer = 31 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 25 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .integer = 30 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .integer = 31 }));
 }
 
 test "evaluateCondition Like string" {
     const cond = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "Ali" } };
-    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .string = "Bob" }));
 }
 
 test "evaluateCondition Eq string" {
     const cond = WhereCondition{ .field = "name", .operator = .Eq, .value = .{ .string = "Alice" } };
-    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .string = "Bob" }));
 }
 
 test "evaluateCondition Neq string" {
     const cond = WhereCondition{ .field = "name", .operator = .Neq, .value = .{ .string = "Alice" } };
-    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Alice" }));
-    try std.testing.expect(evaluateCondition(cond, .{ .string = "Bob" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .string = "Alice" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .string = "Bob" }));
 }
 
 test "evaluateCondition IsNull" {
-    // integer 0 is null
+    // ?i64 id 字段为 null → IsNull 成立
     try std.testing.expect(evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
         .{ .integer = 0 },
     ));
     try std.testing.expect(!evaluateCondition(
+        TestRow, TestRow{ .id = 1, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
         .{ .integer = 1 },
     ));
-    // empty string is null
+    // ?[]const u8 name 字段为 null → IsNull 成立；非 null 时不成立
     try std.testing.expect(evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
         .{ .string = "" },
     ));
     try std.testing.expect(!evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = "hello" },
         WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
         .{ .string = "hello" },
     ));
 }
 
 test "evaluateCondition IsNotNull" {
-    // integer 0 is null, so IsNotNull should return false
+    // 字段为 null → IsNotNull 不成立；非 null（id=1）成立
     try std.testing.expect(!evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
         .{ .integer = 0 },
     ));
     try std.testing.expect(evaluateCondition(
+        TestRow, TestRow{ .id = 1, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
         .{ .integer = 1 },
     ));
-    // empty string is null
+    // name 为 null → IsNotNull 不成立；非 null 成立
     try std.testing.expect(!evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
         .{ .string = "" },
     ));
     try std.testing.expect(evaluateCondition(
+        TestRow, TestRow{ .id = null, .name = "hello" },
         WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
         .{ .string = "hello" },
     ));
@@ -1583,56 +1599,56 @@ test "evaluateCondition IsNotNull" {
 
 test "evaluateCondition Eq float" {
     const cond = WhereCondition{ .field = "price", .operator = .Eq, .value = .{ .float = 9.99 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .float = 9.99 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .float = 10.0 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .float = 9.99 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .float = 10.0 }));
 }
 
 test "evaluateCondition Gt float" {
     const cond = WhereCondition{ .field = "price", .operator = .Gt, .value = .{ .float = 10.0 } };
-    try std.testing.expect(evaluateCondition(cond, .{ .float = 15.0 }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .float = 5.0 }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .float = 15.0 }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .float = 5.0 }));
 }
 
 test "evaluateCondition Eq bool" {
     const cond = WhereCondition{ .field = "active", .operator = .Eq, .value = .{ .boolean = true } };
-    try std.testing.expect(evaluateCondition(cond, .{ .boolean = true }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .boolean = false }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .boolean = true }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .boolean = false }));
 }
 
 test "evaluateCondition Neq bool" {
     const cond = WhereCondition{ .field = "active", .operator = .Neq, .value = .{ .boolean = true } };
-    try std.testing.expect(!evaluateCondition(cond, .{ .boolean = true }));
-    try std.testing.expect(evaluateCondition(cond, .{ .boolean = false }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .boolean = true }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .boolean = false }));
 }
 
 test "evaluateCondition mismatched types returns false" {
     const cond = WhereCondition{ .field = "id", .operator = .Eq, .value = .{ .integer = 42 } };
-    try std.testing.expect(!evaluateCondition(cond, .{ .string = "42" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .string = "42" }));
 }
 
 test "evaluateCondition Gt/Lt/Lte/Gte on bool returns false" {
     const gt_cond = WhereCondition{ .field = "active", .operator = .Gt, .value = .{ .boolean = false } };
-    try std.testing.expect(!evaluateCondition(gt_cond, .{ .boolean = true }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, gt_cond, .{ .boolean = true }));
     const lt_cond = WhereCondition{ .field = "active", .operator = .Lt, .value = .{ .boolean = false } };
-    try std.testing.expect(!evaluateCondition(lt_cond, .{ .boolean = false }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, lt_cond, .{ .boolean = false }));
 }
 
 test "Like supports % and _ wildcards (case-insensitive)" {
     const cond = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "ali%" } };
-    try std.testing.expect(evaluateCondition(cond, .{ .string = "Alice" }));
-    try std.testing.expect(evaluateCondition(cond, .{ .string = "ALISON" }));
-    try std.testing.expect(!evaluateCondition(cond, .{ .string = "Bob" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .string = "Alice" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond, .{ .string = "ALISON" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond, .{ .string = "Bob" }));
 
     const cond2 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "A_i%" } };
-    try std.testing.expect(evaluateCondition(cond2, .{ .string = "Alice" }));
-    try std.testing.expect(!evaluateCondition(cond2, .{ .string = "Alyce" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond2, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond2, .{ .string = "Alyce" }));
 
     const cond3 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "%ice" } };
-    try std.testing.expect(evaluateCondition(cond3, .{ .string = "Alice" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond3, .{ .string = "Alice" }));
 
     const cond4 = WhereCondition{ .field = "name", .operator = .Like, .value = .{ .string = "%li%" } };
-    try std.testing.expect(evaluateCondition(cond4, .{ .string = "Alice" }));
-    try std.testing.expect(!evaluateCondition(cond4, .{ .string = "Bob" }));
+    try std.testing.expect(evaluateCondition(TestRow, .{}, cond4, .{ .string = "Alice" }));
+    try std.testing.expect(!evaluateCondition(TestRow, .{}, cond4, .{ .string = "Bob" }));
 }
 
 test "compareValues float ordering no overflow" {
