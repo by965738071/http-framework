@@ -258,7 +258,7 @@ pub fn QueryBuilder(comptime T: type) type {
             for (self.conditions.items) |cond| {
                 // 未知字段（where 字段名可能来自外部输入）→ 该条件不匹配。
                 const matches_cond = if (getFieldValueOpt(T, row, cond.field)) |fv|
-                    evaluateCondition(cond, fv)
+                    evaluateCondition(row, cond, fv)
                 else
                     false;
 
@@ -352,13 +352,24 @@ fn compareValues(a_raw: FieldValue, b_raw: FieldValue) std.math.Order {
     };
 }
 
+/// 把 .datetime 归一成 .integer、.text/.json_text 归一成 .string，
+/// 便于 evaluateCondition 只需处理 4 种基础 tag。
+fn normalizeFieldValue(v: FieldValue) FieldValue {
+    return switch (v) {
+        .datetime => |x| .{ .integer = x },
+        .text, .json_text => |x| .{ .string = x },
+        else => v,
+    };
+}
+
 /// 评估单个条件
-fn evaluateCondition(cond: WhereCondition, field_value: FieldValue) bool {
+/// 只有 optional 字段且值为 null 才算 NULL；零值（0/""/false）是真实数据。
+fn evaluateCondition(instance: T, cond: WhereCondition, field_value: FieldValue) bool {
     if (cond.operator == .IsNull) {
-        return isNullValue(field_value);
+        return isFieldNull(T, instance, cond.field);
     }
     if (cond.operator == .IsNotNull) {
-        return !isNullValue(field_value);
+        return !isFieldNull(T, instance, cond.field);
     }
 
     // 归一化：字段值与条件值都把 .datetime 视作整数、.text/.json_text 视作字符串。
@@ -388,28 +399,6 @@ fn evaluateCondition(cond: WhereCondition, field_value: FieldValue) bool {
             else => false,
         },
         else => false,
-    };
-}
-
-/// 把 .datetime 归一成 .integer、.text/.json_text 归一成 .string，
-/// 便于 evaluateCondition 只需处理 4 种基础 tag。
-fn normalizeFieldValue(v: FieldValue) FieldValue {
-    return switch (v) {
-        .datetime => |x| .{ .integer = x },
-        .text, .json_text => |x| .{ .string = x },
-        else => v,
-    };
-}
-
-fn isNullValue(v: FieldValue) bool {
-    return switch (v) {
-        .integer => |x| x == 0,
-        .string => |x| x.len == 0,
-        .float => |x| x == 0.0,
-        .boolean => |x| !x,
-        .json_text => |x| x.len == 0,
-        .text => |x| x.len == 0,
-        .datetime => |x| x == 0,
     };
 }
 
