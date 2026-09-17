@@ -215,6 +215,20 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    // 显式运行集成测试（http_server/integration_test.zig）。
+    const integration_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/http_server/integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http_protocol", .module = http_protocol },
+            .{ .name = "http_app", .module = http_app },
+            .{ .name = "http_router", .module = http_router },
+        },
+    });
+    const integration_tests = b.addTest(.{ .root_module = integration_test_mod });
+    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
     // ── http_framework：伞形聚合模块 ──────────────────────────
     const umbrella_imports: []const std.Build.Module.Import = &.{
         .{ .name = "http_protocol", .module = http_protocol },

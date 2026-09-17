@@ -112,6 +112,16 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         }
 
         fn tableFilePath(self: *const Self) ![]const u8 {
+            // 防止路径穿越：table_name 不得包含路径分隔符或 `..` 段。
+            if (std.mem.indexOfScalar(u8, self.table_name, '/') != null) return error.InvalidTableName;
+            if (std.mem.indexOfScalar(u8, self.table_name, '\\') != null) return error.InvalidTableName;
+            if (std.mem.indexOfScalar(u8, self.table_name, '.') != null) {
+                var it = std.mem.splitScalar(u8, self.table_name, '.');
+                while (it.next()) |part| {
+                    if (std.mem.eql(u8, part, "")) continue;
+                    if (std.mem.eql(u8, part, "..")) return error.InvalidTableName;
+                }
+            }
             return std.fmt.allocPrint(self.allocator, "{s}/{s}.json", .{ self.data_dir, self.table_name });
         }
 

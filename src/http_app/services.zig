@@ -26,23 +26,15 @@ pub const Services = struct {
     pub const Error = error{ OutOfMemory, ServicesSealed };
 
     const Entry = struct {
-        /// 类型对应的编译期唯一哨兵指针地址（只需指针相等，免字符串比较）。
-        key: *const anyopaque,
+        /// 类型对应的编译期唯一字符串键（用 @typeName 生成）。
+        key: []const u8,
         ptr: *anyopaque,
     };
 
-    /// 为类型 T 生成编译期唯一的哨兵指针（每个 T 对应一个独立的静态地址）。
-    /// 用作类型键比 @typeName 字符串更快（指针相等而非逐字节比较）。
-    /// Tag 里嵌入 `const _t = T` 让不同 T 得到不同的泛型实例，实践中不会串键；
-    /// 但语言规范不保证地址必然互异（理论上存在链接器折叠 identical 全局的
-    /// 可能），故只用于非安全敏感的索引，鉴权等场景勿依赖它做唯一性证明。
-    fn typeKey(comptime T: type) *const anyopaque {
-        // 把 T 嵌入 Tag 使每个 T 得到独立的静态 sentinel（防止编译器合并实例）。
-        const Tag = struct {
-            const _t = T;
-            var sentinel: u8 = 0;
-        };
-        return &Tag.sentinel;
+    /// 为类型 T 生成编译期唯一的字符串键。
+    /// 虽然比指针相等略慢，但可避免链接期符号折叠导致的类型键冲突。
+    fn typeKey(comptime T: type) []const u8 {
+        return @typeName(T);
     }
 
     pub fn init(allocator: std.mem.Allocator) Services {
@@ -67,7 +59,7 @@ pub const Services = struct {
         if (self.sealed) return error.ServicesSealed;
         const key = typeKey(T);
         for (self.entries.items) |*e| {
-            if (e.key == key) {
+            if (std.mem.eql(u8, e.key, key)) {
                 e.ptr = @ptrCast(ptr);
                 return;
             }
@@ -79,7 +71,7 @@ pub const Services = struct {
     pub fn get(self: *const Services, comptime T: type) ?*T {
         const key = typeKey(T);
         for (self.entries.items) |e| {
-            if (e.key == key) {
+            if (std.mem.eql(u8, e.key, key)) {
                 return @ptrCast(@alignCast(e.ptr));
             }
         }
