@@ -143,6 +143,25 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // 极简示例：展示最基本的 hello world 用法
+    const hello_exe = b.addExecutable(.{
+        .name = "hello",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("hello.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "http_framework", .module = http_framework_mod },
+            },
+        }),
+    });
+    b.installArtifact(hello_exe);
+
+    const hello_step = b.step("hello", "Run the hello world example");
+    const hello_run = b.addRunArtifact(hello_exe);
+    hello_step.dependOn(&hello_run.step);
+    hello_run.step.dependOn(b.getInstallStep());
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
