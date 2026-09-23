@@ -264,8 +264,12 @@ pub const Logger = struct {
     }
 
     /// 给已打开的文件描述符设置 O_APPEND（POSIX）。成功返回 true。
-    /// 非 POSIX 平台或 fcntl 失败返回 false（调用方退回 pwrite 路径）。
+    /// 非 POSIX 平台、未链接 libc（`std.c.fcntl` 不可用）或 fcntl 失败时
+    /// 返回 false（调用方退回 pwrite 路径）。
     fn enableAppendMode(handle: std.posix.fd_t) bool {
+        // std.c.fcntl 是 libc extern 符号；没链接 libc 时直接走兼容路径，
+        // 保证框架在无 libc 目标上也能编译/运行。
+        if (!builtin.link_libc) return false;
         switch (builtin.os.tag) {
             .windows, .wasi => return false,
             else => {
@@ -319,12 +323,21 @@ pub const Logger = struct {
                     // 避免写入被其它 open 复用的 fd（日志字节落进错误文件）。
                     std.Io.File.stderr().writeStreamingAll(self.io, written) catch {};
                 } else {
-                    // 写前以 stat 校准 file_offset（append 与兼容路径统一），避免
-                    // 外部 truncate 后偏移陈旧导致轮转判断过早/过晚（跨进程场景）。
-                    if (self.owned_path) |p| {
-                        if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
-                            self.file_offset = st.size;
-                        } else |_| {}
+                    // 偏移校准：兼容路径（pwrite）每次写入都需要精确 file_offset，
+                    // 不可省略；O_APPEND 快路径由内核原子追加，file_offset 只影响
+                    // 轮转判断——因此仅在接近 max_size 时才 stat 一次，纠正外部
+                    // truncate/append（跨进程）导致的陈旧偏移，热路径每行省一次
+                    // 系统调用与持锁时间（#17）。
+                    const near_rotate = if (self.config.file) |fc|
+                        self.file_offset + written.len >= fc.max_size
+                    else
+                        false;
+                    if (!self.append_mode or near_rotate) {
+                        if (self.owned_path) |p| {
+                            if (std.Io.Dir.cwd().statFile(self.io, p, .{})) |st| {
+                                self.file_offset = st.size;
+                            } else |_| {}
+                        }
                     }
                     if (self.append_mode) {
                         // O_APPEND 快路径：内核保证每次 write 原子追加到 EOF，

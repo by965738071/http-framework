@@ -257,8 +257,16 @@ pub fn QueryBuilder(comptime T: type) type {
 
             for (self.conditions.items) |cond| {
                 // 未知字段（where 字段名可能来自外部输入）→ 该条件不匹配。
+                // SQL 三值逻辑：比较类操作符（Eq/Neq/Gt/Lt/In/Like…）遇 NULL 字段
+                // 恒不匹配——getFieldValueOpt 会把 optional=null 折叠成零值（无法在
+                // FieldValue 层区分，见 #16），故这里先用 isFieldNull 短路，避免
+                // `WHERE id = 0` 误匹配 id 为 NULL 的行。
+                const null_row = isFieldNull(T, row, cond.field);
                 const matches_cond = if (getFieldValueOpt(T, row, cond.field)) |fv|
-                    evaluateCondition(T, row, cond, fv)
+                    if (null_row and cond.operator != .IsNull and cond.operator != .IsNotNull)
+                        false
+                    else
+                        evaluateCondition(T, row, cond, fv)
                 else
                     false;
 
@@ -1550,23 +1558,27 @@ test "evaluateCondition Neq string" {
 test "evaluateCondition IsNull" {
     // ?i64 id 字段为 null → IsNull 成立
     try std.testing.expect(evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = null },
+        TestRow,
+        TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
         .{ .integer = 0 },
     ));
     try std.testing.expect(!evaluateCondition(
-        TestRow, TestRow{ .id = 1, .name = null },
+        TestRow,
+        TestRow{ .id = 1, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNull, .value = .{ .integer = 0 } },
         .{ .integer = 1 },
     ));
     // ?[]const u8 name 字段为 null → IsNull 成立；非 null 时不成立
     try std.testing.expect(evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = null },
+        TestRow,
+        TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
         .{ .string = "" },
     ));
     try std.testing.expect(!evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = "hello" },
+        TestRow,
+        TestRow{ .id = null, .name = "hello" },
         WhereCondition{ .field = "name", .operator = .IsNull, .value = .{ .string = "" } },
         .{ .string = "hello" },
     ));
@@ -1575,26 +1587,68 @@ test "evaluateCondition IsNull" {
 test "evaluateCondition IsNotNull" {
     // 字段为 null → IsNotNull 不成立；非 null（id=1）成立
     try std.testing.expect(!evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = null },
+        TestRow,
+        TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
         .{ .integer = 0 },
     ));
     try std.testing.expect(evaluateCondition(
-        TestRow, TestRow{ .id = 1, .name = null },
+        TestRow,
+        TestRow{ .id = 1, .name = null },
         WhereCondition{ .field = "id", .operator = .IsNotNull, .value = .{ .integer = 0 } },
         .{ .integer = 1 },
     ));
     // name 为 null → IsNotNull 不成立；非 null 成立
     try std.testing.expect(!evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = null },
+        TestRow,
+        TestRow{ .id = null, .name = null },
         WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
         .{ .string = "" },
     ));
     try std.testing.expect(evaluateCondition(
-        TestRow, TestRow{ .id = null, .name = "hello" },
+        TestRow,
+        TestRow{ .id = null, .name = "hello" },
         WhereCondition{ .field = "name", .operator = .IsNotNull, .value = .{ .string = "" } },
         .{ .string = "hello" },
     ));
+}
+
+test "matches: NULL 字段不参与比较操作符（#16 回归）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // id=null 会被 toFieldValue 折叠成 .integer=0——matches 必须先用 isFieldNull
+    // 短路，否则 `WHERE id = 0` 会误匹配 NULL 行。
+    var eq = QueryBuilder(TestRow).init(a);
+    defer eq.deinit();
+    _ = eq.where(.Eq, "id", .{ .integer = 0 });
+    try eq.checkBuildError();
+    try std.testing.expect(!eq.matches(.{ .id = null }));
+    try std.testing.expect(eq.matches(.{ .id = 0 }));
+
+    // SQL: NULL != 0 是 UNKNOWN，同样不匹配；非 NULL 正常比较。
+    var neq = QueryBuilder(TestRow).init(a);
+    defer neq.deinit();
+    _ = neq.where(.Neq, "id", .{ .integer = 0 });
+    try neq.checkBuildError();
+    try std.testing.expect(!neq.matches(.{ .id = null }));
+    try std.testing.expect(neq.matches(.{ .id = 1 }));
+
+    // IsNull/IsNotNull 不受短路影响。
+    var isnull = QueryBuilder(TestRow).init(a);
+    defer isnull.deinit();
+    _ = isnull.where(.IsNull, "id", .{ .integer = 0 });
+    try isnull.checkBuildError();
+    try std.testing.expect(isnull.matches(.{ .id = null }));
+    try std.testing.expect(!isnull.matches(.{ .id = 5 }));
+
+    // 非 optional 字段（price）的零值是真实数据：Eq 0.0 应匹配。
+    var peq = QueryBuilder(TestRow).init(a);
+    defer peq.deinit();
+    _ = peq.where(.Eq, "price", .{ .float = 0.0 });
+    try peq.checkBuildError();
+    try std.testing.expect(peq.matches(.{ .price = 0.0 }));
 }
 
 test "evaluateCondition Eq float" {

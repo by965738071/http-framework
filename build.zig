@@ -126,6 +126,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // Addon: http_logging — 结构化日志（依赖 http_app, http_protocol）
+    // libc 不再是强制依赖：仅 `-Dlibc=true` 时链接，用于在 POSIX 上启用
+    // http_logging 的 O_APPEND fcntl 快路径；不链接时由代码内 comptime 守卫
+    // 退回 stat+pwrite 兼容路径（Windows 本就走该路径）。
+    const link_libc = b.option(bool, "libc", "Link libc (enables http_logging O_APPEND fast path on POSIX)") orelse false;
     const http_logging = b.addModule("http_logging", .{
         .root_source_file = b.path("src/http_logging/root.zig"),
         .target = target,
@@ -134,7 +138,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "http_protocol", .module = http_protocol },
             .{ .name = "http_app", .module = http_app },
         },
-        .link_libc = true,
+        .link_libc = link_libc,
     });
 
     // Addon: http_codec — JSON body 解析（依赖 http_app, http_protocol）

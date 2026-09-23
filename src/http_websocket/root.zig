@@ -19,13 +19,14 @@
 //!
 //! 依赖 `http_app`（Context）和 `http_protocol`（Response）。
 //!
-//! 握手流程由 handler 调用 `handshake(ctx, res)`：只校验请求头并设置 101 +
-//! 握手响应头（不发送响应）。实际响应发送和连接"劫持"由 ConnectionRunner
-//! 在外层完成——这避免了让 `Response`/`Sink` 抽象承担"HTTP 之后转 WS"的职责。
+//! 推荐用 `upgrade(ctx, res, hijack_ctx, handlerFn)` 一步完成：共享校验 + 注册
+//! 连接劫持。ConnectionRunner 在 dispatch 结束后把裸 reader/writer 交给回调，
+//! 由回调直写 101 并跑帧循环。
 //!
-//! 握手成功后，调用方持有底层 stream 的 reader/writer，用
-//! `WebSocket.initServer(reader, writer, allocator)` 构造连接对象即可开始
-//! 帧读写。
+//! `handshake(ctx, res)` 只校验请求头并把 101 + 握手响应头写进 `res`，
+//! **不接管连接**——除非你要自行完成“发送响应 + 接管 stream”，否则不要只调
+//! 它（客户端会收到 101 却等不到 WS 帧）。内部与 `upgrade()` 共用同一套
+//! 校验（`validateUpgradeRequest`）。
 //!
 //! # 设计取舍
 //!

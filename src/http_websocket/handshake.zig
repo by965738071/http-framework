@@ -75,42 +75,36 @@ fn isOriginAllowed(ctx: *Context) bool {
     return false;
 }
 
-/// 校验 WebSocket 握手请求并设置 101 响应头。
-///
-/// 成功时：
-/// - 设置 `res.status = .switching_protocols`
-/// - 添加 `Upgrade: websocket` / `Connection: Upgrade` / `Sec-WebSocket-Accept` 头
-/// - 返回 true
-///
-/// 失败时（缺头或非升级请求）返回 false，不修改响应——调用方应自行发送错误。
-///
-/// 注意：响应并未发送，只设置了状态和头。调用方负责发送响应（通常通过
-/// `res.flush()` 或直接走框架的发送路径）并在发送后"劫持"底层 stream。
-pub fn handshake(ctx: *Context, res: *Response) !bool {
+/// 共享的升级请求校验（RFC 6455 §4.1/§4.2.1）：method / Upgrade / Connection /
+/// Sec-WebSocket-Key（存在、唯一、合法）/ Origin 白名单 / 版本 13。
+/// `handshake()` 与 `upgrade()` 共用，消除两处逐段复制的校验逻辑漂移风险（#18）。
+/// 失败返回 null（按需写回 403/426）；成功返回 client 的 Sec-WebSocket-Key
+/// （借用，生命周期 = 请求头缓冲）。
+fn validateUpgradeRequest(ctx: *Context, res: *Response) !?[]const u8 {
     // RFC §4.1: WebSocket 握手请求必须是 GET。
-    if (ctx.request.method != .GET) return false;
+    if (ctx.request.method != .GET) return null;
 
     // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
-    const upgrade_hdr = ctx.header("upgrade") orelse return false;
-    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
+    const upgrade_hdr = ctx.header("upgrade") orelse return null;
+    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return null;
 
     // 校验 Connection 头包含 "upgrade" token。
     // Connection 头可能是 "keep-alive, Upgrade" 形式，所以用 contains 而非 eql。
-    const connection_hdr = ctx.header("connection") orelse return false;
-    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
+    const connection_hdr = ctx.header("connection") orelse return null;
+    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return null;
 
     // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。
     // P2-19：不能只校验存在——RFC 6455 §4.1 要求客户端发 16 字节随机值的 base64。
     // 长度必为 24 且以 "==" 结尾，并能合法 base64 解码为 16 字节。
-    const key = ctx.header("sec-websocket-key") orelse return false;
+    const key = ctx.header("sec-websocket-key") orelse return null;
     // RFC §4.1: 重复的 Sec-WebSocket-Key 头必须拒绝（RFC 要求，不能静默取第一个）。
-    if (countHeader(ctx, "sec-websocket-key") != 1) return false;
-    if (!isValidWebSocketKey(key)) return false;
+    if (countHeader(ctx, "sec-websocket-key") != 1) return null;
+    if (!isValidWebSocketKey(key)) return null;
 
     // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
     if (!isOriginAllowed(ctx)) {
         _ = res.statusCode(.forbidden);
-        return false;
+        return null;
     }
 
     // 校验 Sec-WebSocket-Version（RFC 6455 §4.2.1）：本实现仅支持版本 13。
@@ -118,12 +112,31 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
     // 让客户端知道服务端期望的版本。
     const version = ctx.header("sec-websocket-version") orelse {
         setUnsupportedVersion(res) catch {};
-        return false;
+        return null;
     };
     if (!containsTokenIgnoreCase(version, "13")) {
         try setUnsupportedVersion(res);
-        return false;
+        return null;
     }
+
+    return key;
+}
+
+/// 校验 WebSocket 握手请求并设置 101 响应头。
+///
+/// 成功时：
+/// - 设置 `res.status = .switching_protocols`
+/// - 添加 `Upgrade: websocket` / `Connection: Upgrade` / `Sec-WebSocket-Accept` 头
+/// - 返回 true
+///
+/// 失败时（缺头或非升级请求）返回 false——Origin/版本不符已按 RFC 写回 403/426，
+/// 其余缺头/非升级场景不动响应，调用方应自行发送错误。
+///
+/// 注意：本函数只完成 HTTP 层的握手头设置，**不接管连接**。需要真正的协议
+/// 切换请用 `upgrade()`；只有确定要自行发送响应并接管裸 stream 时才单独调用
+/// 本函数——否则客户端会收到 101 却等不到 WebSocket 帧（半升级）。
+pub fn handshake(ctx: *Context, res: *Response) !bool {
+    const key = try validateUpgradeRequest(ctx, res) orelse return false;
 
     // 计算 Accept-Key 并设置响应
     var accept_buf: [ACCEPT_KEY_LEN]u8 = undefined;
@@ -212,35 +225,9 @@ pub fn upgrade(
     hijack_ctx: *anyopaque,
     comptime handlerFn: fn (ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void,
 ) !bool {
-    // RFC §4.1: WebSocket 握手请求必须是 GET。
-    if (ctx.request.method != .GET) return false;
-
-    // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
-    const upgrade_hdr = ctx.header("upgrade") orelse return false;
-    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return false;
-
-    const connection_hdr = ctx.header("connection") orelse return false;
-    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return false;
-
-    const key = ctx.header("sec-websocket-key") orelse return false;
-    // RFC §4.1: 重复的 Sec-WebSocket-Key 头必须拒绝（与 handshake() 行为一致）。
-    if (countHeader(ctx, "sec-websocket-key") != 1) return false;
-    if (!isValidWebSocketKey(key)) return false;
-
-    // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
-    if (!isOriginAllowed(ctx)) {
-        _ = res.statusCode(.forbidden);
-        return false;
-    }
-
-    const version = ctx.header("sec-websocket-version") orelse {
-        setUnsupportedVersion(res) catch {};
-        return false;
-    };
-    if (!containsTokenIgnoreCase(version, "13")) {
-        try setUnsupportedVersion(res);
-        return false;
-    }
+    // 校验逻辑与 handshake() 共用 validateUpgradeRequest（#18 去重）：
+    // 非法请求已按需写回 403/426，这里直接返回 false。
+    const key = try validateUpgradeRequest(ctx, res) orelse return false;
 
     // 把 client key 拷到请求 arena（handshake 响应写阶段在 dispatch 后，target/head 可能失效）。
     const key_owned = try ctx.arena.dupe(u8, key);

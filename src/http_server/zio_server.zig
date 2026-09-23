@@ -49,7 +49,7 @@ const Listener = struct {
         // 服务能正常启动却永不接受任何连接，且无任何日志。启动时显式报错
         // 好过静默瘫痪。
         if (config.max_connections == 0) return error.MaxConnectionsZero;
-        const address = try zio.net.IpAddress.parseIp4(config.address, config.port);
+        const address = try zio.net.IpAddress.parseIp(config.address, config.port);
         const server = try address.listen(.{
             .kernel_backlog = config.tcp_backlog,
             .reuse_address = config.reuse_address,
@@ -215,9 +215,9 @@ pub const Server = struct {
         accept_group.wait() catch {};
     }
 
-    /// 等所有活跃连接结束，最多等 drain_timeout_ns（兜底）。
+    /// 等所有活跃连接结束，最多等 config.network.drain_timeout_ns（兜底）。
     fn drain(self: *Server) void {
-        const drain_timeout_ns: u64 = 30 * std.time.ns_per_s;
+        const drain_timeout_ns: u64 = self.config.network.drain_timeout_ns;
         // 用单调时钟（.awake）而不是墙钟（.real）：NTP 校正/手工改时间会让
         // 墙钟差值变成负数或巨大值 —— 前者让 drain 卡满 30s，后者让它立刻放弃。
         const start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;

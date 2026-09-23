@@ -147,6 +147,9 @@ pub const NetworkConfig = struct {
     read_timeout_ns: u64 = 30_000_000_000,
     /// 单次写超时（纳秒）。zio 原生 per-operation timeout。
     write_timeout_ns: u64 = 30_000_000_000,
+    /// 优雅关机等待在途连接结束的上限（纳秒）。超时后强制 cancel 剩余连接。
+    /// 部署时与容器 `terminationGracePeriodSeconds` 对齐（后者先 SIGKILL）。
+    drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
 };
 
 pub const HttpConfig = struct {
@@ -197,6 +200,7 @@ test "Config defaults are sensible" {
     try std.testing.expectEqual(@as(u64, 60_000_000_000), cfg.network.idle_timeout_ns);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.read_timeout_ns);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.write_timeout_ns);
+    try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.drain_timeout_ns);
 }
 
 test "Config.fromEnv overrides leaf fields (flat keys)" {
@@ -212,6 +216,7 @@ test "Config.fromEnv overrides leaf fields (flat keys)" {
     try map.put("APP_SIZE_LIMIT", "1024");
     try map.put("APP_REUSE_ADDRESS", "true");
     try map.put("APP_MAX_CONNECTIONS", "64");
+    try map.put("APP_DRAIN_TIMEOUT_NS", "5000000000");
 
     const cfg = try Config.fromEnv(a, &map, "APP_");
     try std.testing.expectEqualStrings("127.0.0.1", cfg.network.address);
@@ -220,6 +225,7 @@ test "Config.fromEnv overrides leaf fields (flat keys)" {
     try std.testing.expectEqual(@as(u64, 1024), cfg.body.size_limit);
     try std.testing.expect(cfg.network.reuse_address);
     try std.testing.expectEqual(@as(u32, 64), cfg.network.max_connections);
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), cfg.network.drain_timeout_ns);
     // 未设置的字段保持默认
     try std.testing.expectEqual(@as(u64, 60_000_000_000), cfg.network.idle_timeout_ns);
     try std.testing.expectEqual(@as(usize, 16 * 1024), cfg.pool.request_arena_retain_bytes);
