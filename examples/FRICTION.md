@@ -25,6 +25,7 @@
 | 编号 | 状态 | 见 |
 |---|---|---|
 | F-01 | ✅ 已解决 | 唯一约束 → `orm.ModelWith`，service 层 TOCTOU 写法已删 |
+| F-02 | ✅ 已解决 | `JsonStore.findAllBy(gpa, field, value)` / `countAll()`（`engine.zig:621/629`） |
 | F-11 | ✅ 已解决 | 组级 `use` 顺序无关；但 examples 的 `group("")` 写法**保留**（原因见该条） |
 | F-12 | ⚠️ 部分解决 | 中间件链修好了，**响应体**没修 → 剩余部分记在 F-NEW-6 |
 | F-13 | ✅ 已解决 | `RateLimitConfig.exclude_paths`，阈值 600 → 120 |
@@ -71,7 +72,11 @@
   `src/root.zig:146-148` 导出了 `TableSchema / FieldDef / FieldType`），逐个字段手写 `FieldDef`
   并把 `constraints.unique = true`。8 张表全手写不现实，故未采用。
 
-### F-02 没有 `findAllBy` / `countAll`
+### F-02 没有 `findAllBy` / `countAll`  ✅ 已解决
+
+> **2026-09-23 已解决。** `JsonStore` 新增 `findAllBy(gpa, field, value) ![]T`（按字段批量查，等价
+> `findBy` 的 Equals 条件但返回全部匹配行）和 `countAll() !usize`（O(1) 全表计数，不再需要
+> `all()` 全表深拷贝后取 `.len`）。repo 层的 `all()` + 内存过滤套路可以逐步换成这两个方法。
 
 - **分类**：缺失能力
 - **现象**：只想「按 org_id 取该组织下的用户」或「数一下有多少条」，框架只给了

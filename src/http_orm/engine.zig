@@ -616,6 +616,22 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             return self.findOne(gpa, &qb);
         }
 
+        /// 按任意字段查找所有匹配行（Equals），无需手搭 QueryBuilder。
+        /// 行内字符串由 `gpa` 拥有（见 findAll 的所有权说明）。
+        pub fn findAllBy(self: *Self, gpa: std.mem.Allocator, comptime field: []const u8, value: anytype) ![]T {
+            var qb = QueryBuilder(T).init(self.allocator);
+            defer qb.deinit();
+            _ = qb.where(.Eq, field, query_mod.toFieldValue(value));
+            return self.findAll(gpa, &qb);
+        }
+
+        /// 全表行数（O(1)，不深拷贝行、无需构造 QueryBuilder）。
+        pub fn countAll(self: *Self) !usize {
+            try self.lock();
+            defer self.unlock();
+            return self.rows.items.len;
+        }
+
         /// 按主键更新整行（id 自动保留）。返回是否更新到记录。
         pub fn updateById(self: *Self, id: u64, data: T) !bool {
             var qb = QueryBuilder(T).init(self.allocator);
@@ -2154,6 +2170,47 @@ test "findBy finds by arbitrary field" {
     try std.testing.expectEqualStrings("Alice", f.?.name);
     const none = try store.findBy(allocator, "email", "nobody@x.com");
     try std.testing.expect(none == null);
+}
+
+test "findAllBy returns all matching rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "a", .email = "org1@x.com" });
+    _ = try store.insert(.{ .id = 0, .name = "b", .email = "org2@x.com" });
+    _ = try store.insert(.{ .id = 0, .name = "c", .email = "org1@x.com" });
+
+    const rows = try store.findAllBy(allocator, "email", "org1@x.com");
+    defer store.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+
+    const none = try store.findAllBy(allocator, "email", "none@x.com");
+    defer store.freeRows(allocator, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "countAll counts rows without query builder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), try store.countAll());
+    const id1 = try store.insert(.{ .id = 0, .name = "a", .email = "a@x.com" });
+    _ = try store.insert(.{ .id = 0, .name = "b", .email = "b@x.com" });
+    try std.testing.expectEqual(@as(usize, 2), try store.countAll());
+    _ = try store.deleteById(id1);
+    try std.testing.expectEqual(@as(usize, 1), try store.countAll());
 }
 
 test "paginate returns id-ordered pages" {

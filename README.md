@@ -566,6 +566,11 @@ const one = try store.findOne(allocator, &qb);       // ?T，同样先传 alloca
 const total = try store.count(&qb);                  // count 不返回行，无需 allocator
 const page = try store.paginate(allocator, 0, 20);   // 分页（按 id 升序），page 从 0 开始
 defer store.freeRows(allocator, page);
+
+// 单字段等值查询的便捷方法，免去手搭 QueryBuilder：
+const by_field = try store.findAllBy(allocator, "name", "alice"); // 按字段取所有匹配行
+defer store.freeRows(allocator, by_field);
+const n = try store.countAll();                      // 全表行数，O(1)
 ```
 
 ## 示例

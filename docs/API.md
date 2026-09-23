@@ -793,11 +793,13 @@ defer store.close() catch {};                                        // :99（cl
 | `findOne` | 316 | `fn(*Self, gpa, query) !?T` |
 | `findById` | 332 | `fn(*Self, gpa, id: u64) !?T` |
 | `findBy` | 573 | `fn(*Self, gpa, comptime field: []const u8, value: anytype) !?T` |
+| `findAllBy` | 621 | `fn(*Self, gpa, comptime field: []const u8, value: anytype) ![]T`（按字段批量查，免搭 Query） |
 | `update` | 342 | `fn(*Self, query) !usize` |
 | `updateById` | 581 | `fn(*Self, id: u64, data: T) !bool` |
 | `delete` | 462 | `fn(*Self, query) !usize` |
 | `deleteById` | 591 | `fn(*Self, id: u64) !bool` |
 | `count` | 511 | `fn(*Self, query) !usize` |
+| `countAll` | 629 | `fn(*Self) !usize`（全表行数，O(1)，免搭 Query） |
 | `all` | 525 | `fn(*Self, gpa) ![]T` |
 | `freeRows` / `freeRow` | 543 / 550 | `fn(*Self, gpa, rows)`（**必须配 `defer`**） |
 | `truncate` | 555 | `!void` |

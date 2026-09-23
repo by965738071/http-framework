@@ -141,7 +141,8 @@ pub const NetworkConfig = struct {
     /// 同时存活的连接上限（背压）。达到后新连接在 accept 前挂起，
     /// 直到有连接结束释放名额。zio 下一个连接只占一个轻量协程，可设很高。
     max_connections: u32 = 1024,
-    /// keep-alive 空闲超时（纳秒）。超过此时间无新请求则关闭连接。
+    /// keep-alive 空闲超时（纳秒）。planned, not yet effective：当前未生效，
+    /// keep-alive 空闲实际由 `read_timeout_ns` 约束；设成非默认值只会触发启动警告。
     idle_timeout_ns: u64 = 60_000_000_000,
     /// 单次读超时（纳秒）。zio 原生 per-operation timeout（防慢攻击）。
     read_timeout_ns: u64 = 30_000_000_000,
@@ -157,12 +158,16 @@ pub const HttpConfig = struct {
     keep_alive_enabled: bool = true,
     read_buffer_size: usize = 16384,
     write_buffer_size: usize = 8192,
+    /// 访问日志开关。planned, not yet effective：设了不生效；
+    /// 需要访问日志请注册 `LoggingHook`/`LoggingMiddleware`。
     access_log_enabled: bool = false,
     data_dir: ?[]const u8 = null,
 };
 
 pub const BodyConfig = struct {
     size_limit: u64 = 10 * 1024 * 1024,
+    /// 请求体延迟读取阈值（字节）。planned, not yet effective：请求体始终整读，
+    /// 设成非默认值只会触发启动警告。
     lazy_read_size: u64 = 0,
     trust_proxy_headers: bool = false,
 };
