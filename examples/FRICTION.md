@@ -26,6 +26,7 @@
 |---|---|---|
 | F-01 | ✅ 已解决 | 唯一约束 → `orm.ModelWith`，service 层 TOCTOU 写法已删 |
 | F-02 | ✅ 已解决 | `JsonStore.findAllBy(gpa, field, value)` / `countAll()`（`engine.zig:621/629`） |
+| F-20 | ✅ 已解决 | `wsUpgrade` 类型化（调用点编译期校验）+ `Context.hijackWith`；examples 去掉 @ptrCast |
 | F-11 | ✅ 已解决 | 组级 `use` 顺序无关；但 examples 的 `group("")` 写法**保留**（原因见该条） |
 | F-12 | ⚠️ 部分解决 | 中间件链修好了，**响应体**没修 → 剩余部分记在 F-NEW-6 |
 | F-13 | ✅ 已解决 | `RateLimitConfig.exclude_paths`，阈值 600 → 120 |
@@ -363,7 +364,13 @@
 - **我的绕过**：repo 层把「全表 + 内存过滤」做成统一套路，只在 `deleteXxxByXxx`
   这类必须走 ORM 的地方才手写 QueryBuilder（`rbac_repo.zig:101-141`）。
 
-### F-20 `wsUpgrade` 的 `hijack_ctx` 是 `*anyopaque`
+### F-20 `wsUpgrade` 的 `hijack_ctx` 是 `*anyopaque`  ✅ 已解决
+
+> **2026-09-23 已解决。** 按建议改法落地：`upgrade(ctx, res, hijack_ctx: anytype, handlerFn)`
+> 类型由调用点推断，`handlerFn` 尾参类型编译期校验；另加 comptime 拦截非法指针形态
+> （`*const T` / `[]T` 直接编译失败）。底层新增 `Context.hijackWith(T, ptr, run)` 类型安全入口，
+> 原 `Context.hijack` 降为底层 API 并加双重注册断言。栈地址仍需文档约束（生命周期不变量
+> 寫在 `hijackWith` 注释），examples 三处调用点已全部去掉 `@ptrCast`。
 
 - **分类**：API 不顺手（易致 UAF）
 - **现象**：回调在 handler 返回之后才执行，参数却是裸 `*anyopaque`，

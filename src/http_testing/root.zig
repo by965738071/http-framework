@@ -300,7 +300,7 @@ pub const Harness = struct {
     pub fn status(self: *Harness) ?http.Status {
         const code = self.statusCode();
         if (code == 0) return null;
-        return @as(http.Status, @enumFromInt(code));
+        return @as(http.Status, @fromBackingInt(@intCast(code)));
     }
 
     /// 取响应头（大小写不敏感）。读的是 wire 而不是 `res.headers`：
@@ -537,8 +537,6 @@ test "ErrorRenderer：渲染 AppError 的状态码与消息（不是一律 500�
     try std.testing.expectEqualStrings("application/json", h.header("content-type").?);
 }
 
-
-
 test "ErrorRenderer：响应已发送时不覆盖 handler 写的内容" {
     const h = try Harness.init(std.testing.allocator);
     defer h.deinit();
@@ -608,4 +606,6 @@ test "中间件链：缓冲模式下 handler 之后追加的头能上 wire" {
 
 test {
     std.testing.refAllDecls(@This());
+    // 组合语义用例放在 combo_test.zig（跨中间件 user_data 传播 + 错误改写）。
+    _ = @import("combo_test.zig");
 }

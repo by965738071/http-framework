@@ -131,6 +131,76 @@ pub const Config = struct {
         try applyEnv(Config, &cfg, allocator, environ, prefix);
         return cfg;
     }
+
+    /// 启动期配置校验（由 Server.setup() 调用）。死开关比没有配置更危险（P2-38），
+    /// 故分两级：
+    ///   - 取值越界（端口/timeout/buffer 为 0 等）→ 逐条 warn 原因，最后返回
+    ///     error.InvalidConfig 拒绝启动（逐条用 warn 而非 err：进程本就会以返回错
+    ///     误退出，且 Zig 测试 runner 会把 err 日志判为测试失败）；
+    ///   - “planned, not yet effective” 死开关 → 默认只 warn；
+    ///     `http.strict_config=true` 升级为 fail fast（CI 推荐开 strict）。
+    /// 新增配置字段时应在此登记规则——“能被校验”才算被声明为生效开关。
+    pub fn validate(self: *const Config) !void {
+        var ok = true;
+        const n = self.network;
+        const h = self.http;
+        if (n.port == 0) {
+            std.log.warn("config: network.port 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (n.tcp_backlog == 0) {
+            std.log.warn("config: network.tcp_backlog 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (n.max_connections == 0) {
+            std.log.warn("config: network.max_connections 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (n.read_timeout_ns == 0) {
+            std.log.warn("config: network.read_timeout_ns 不能为 0（会失去慢攻击防护，拒绝启动）", .{});
+            ok = false;
+        }
+        if (n.write_timeout_ns == 0) {
+            std.log.warn("config: network.write_timeout_ns 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (n.drain_timeout_ns == 0) {
+            std.log.warn("config: network.drain_timeout_ns 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (h.read_buffer_size == 0) {
+            std.log.warn("config: http.read_buffer_size 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (h.write_buffer_size == 0) {
+            std.log.warn("config: http.write_buffer_size 不能为 0（拒绝启动）", .{});
+            ok = false;
+        }
+        if (self.body.size_limit == 0) {
+            std.log.warn("config: body.size_limit 不能为 0（会拒绝所有请求体，几乎必然是配错，拒绝启动）", .{});
+            ok = false;
+        }
+
+        // 死开关（planned, not yet effective；现状见 docs/API.md §2.4）：仅非默认值才提醒。
+        var dead: usize = 0;
+        if (self.body.lazy_read_size != 0) {
+            std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
+            dead += 1;
+        }
+        if (n.idle_timeout_ns != 60_000_000_000) { // 默认值 = NetworkConfig.idle_timeout_ns 默认值
+            std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
+            dead += 1;
+        }
+        if (h.access_log_enabled) {
+            std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
+            dead += 1;
+        }
+        if (h.strict_config and dead > 0) {
+            std.log.warn("config: strict_config=true，{d} 个未实现配置项视为启动失败", .{dead});
+            ok = false;
+        }
+        if (!ok) return error.InvalidConfig;
+    }
 };
 
 pub const NetworkConfig = struct {
@@ -161,6 +231,9 @@ pub const HttpConfig = struct {
     /// 访问日志开关。planned, not yet effective：设了不生效；
     /// 需要访问日志请注册 `LoggingHook`/`LoggingMiddleware`。
     access_log_enabled: bool = false,
+    /// 启动期把“未实现配置项”的警告升级为启动失败（配合 `Config.validate()`）。
+    /// CI / 预发环境推荐 true；生产默认 false（只警告不阻断）。
+    strict_config: bool = false,
     data_dir: ?[]const u8 = null,
 };
 
@@ -294,6 +367,31 @@ test "Config can be partially overridden (profile diff)" {
     try std.testing.expectEqualStrings("MyApp", cfg.http.server_name);
     // body/pool still default
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), cfg.body.size_limit);
+}
+
+test "Config.validate: 默认配置通过" {
+    const cfg = Config{};
+    try cfg.validate();
+}
+
+// 逐条原因用 warn 级别（见 Config.validate 注释），测试无需屏蔽日志。
+test "Config.validate: 越界取值拒绝启动" {
+    var cfg = Config{};
+    cfg.network.port = 0;
+    try std.testing.expectError(error.InvalidConfig, cfg.validate());
+
+    var cfg2 = Config{};
+    cfg2.http.read_buffer_size = 0;
+    try std.testing.expectError(error.InvalidConfig, cfg2.validate());
+}
+
+test "Config.validate: kill switch only warns unless strict" {
+    var cfg = Config{};
+    cfg.http.access_log_enabled = true; // 已知的死开关
+    try cfg.validate(); // 非 strict：只 warn，启动继续
+
+    cfg.http.strict_config = true;
+    try std.testing.expectError(error.InvalidConfig, cfg.validate());
 }
 
 test {

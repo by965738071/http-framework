@@ -135,12 +135,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         .min_level = .info,
         .format = .text, // 使用文本格式便于终端阅读
         .output = .file, // 输出到 stderr（终端）
-        .file = .{
-            .path = "log/http.log",
-            .max_size = 200,
-            .compress = true,
-            .max_backups = 2
-        }
+        .file = .{ .path = "log/http.log", .max_size = 200, .compress = true, .max_backups = 2 },
     });
     defer logger.deinit();
     logger.info(null, "examples starting", &.{
@@ -977,9 +972,9 @@ const TimingMiddleware = struct {
 
 fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // hijack_ctx 必须是长期稳定的指针：回调在 processRequest 返回后才执行，
-    // 此时 handler 栈帧已失效。@ptrCast(res) 是反例（use-after-free）。
-    // 这里传模块级 ws_echo_conns 的地址，进程生命周期内稳定。
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(&ws_echo_conns), wsEcho) catch {
+    // 此时 handler 栈帧已失效（传 handler 栈上地址 = UAF）。
+    // 类型由编译器校验（F-20）：这里传模块级 &ws_echo_conns，回调签名自动推断为 *usize。
+    const upgraded = framework.wsUpgrade(ctx, res, &ws_echo_conns, wsEcho) catch {
         try ctx.failWith(.{ .status = .bad_request, .message = "websocket upgrade failed" });
         return;
     };
@@ -992,9 +987,8 @@ fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 /// WebSocket 连接回调：echo 每个收到的消息，直到对方关闭。
-/// hijack_ctx 是 wsEchoHandler 传入的 `&ws_echo_conns`（活动连接计数）。
-fn wsEcho(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    const conns: *usize = @ptrCast(@alignCast(hijack_ctx));
+/// conns 是 wsEchoHandler 传入的 `&ws_echo_conns`（活动连接计数），类型编译期推断。
+fn wsEcho(ws: *framework.WebSocket, conns: *usize) anyerror!void {
     conns.* += 1;
     defer conns.* -= 1;
     while (true) {

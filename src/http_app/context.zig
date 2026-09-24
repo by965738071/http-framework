@@ -306,7 +306,9 @@ pub const Context = struct {
         try self.state.setUserData(T, ptr);
     }
 
-    /// 注册连接劫持钩子（WebSocket 升级等）。
+    /// 注册连接劫持钩子（WebSocket 升级等）——底层入口。
+    /// 用户代码应优先用 `hijackWith`：本入口要手传 `*anyopaque`，
+    /// 指针类型与回调内 `@ptrCast` 不一致就是运行时 UAF，编译器拦不住（F-20）。
     /// handler 调用后应直接 return：ConnectionRunner 会跳过常规响应，
     /// 在 dispatch 结束后把裸 reader/writer 交给 `run` 回调。
     /// 注意：劫持后该请求不再经过 Response，不要再写响应体。
@@ -317,7 +319,46 @@ pub const Context = struct {
         writer: *std.Io.Writer,
         allocator: std.mem.Allocator,
     ) anyerror!void) void {
+        // 重复注册 = bug：先注册的回调会被静默丢弃，永远得不到执行。
+        std.debug.assert(self.state.hijack == null);
         self.state.hijack = .{ .ctx = hijack_ctx, .run = run };
+    }
+
+    /// 类型安全的劫持入口（推荐，替代 `hijack` 的 `*anyopaque`，F-20）。
+    /// `run` 首参直接是 `*T`，类型在调用点由编译器校验；传错类型是编译错误，
+    /// 不再是运行时 `@ptrCast` 崩溃。
+    ///
+    /// **生命周期不变量**：`ptr` 必须在连接存活期内有效。合法来源：
+    ///   1. 进程级稳定地址（singleton handler、模块级变量）；
+    ///   2. 请求 arena 内存——请求 arena 在 `run` 执行前不会 reset
+    ///      （run 在本请求 keep-alive 迭代内、endRequest 之前被调用），
+    ///      run 返回后 arena 即 reset，指针失效。
+    /// 传 handler 栈上地址 = UAF，不变量 1/2 都不满足。
+    pub fn hijackWith(
+        self: *Context,
+        comptime T: type,
+        ptr: *T,
+        comptime run: fn (
+            ptr: *T,
+            io: std.Io,
+            reader: *std.Io.Reader,
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) anyerror!void,
+    ) void {
+        const Erased = struct {
+            fn erased(
+                hctx: *anyopaque,
+                io: std.Io,
+                reader: *std.Io.Reader,
+                writer: *std.Io.Writer,
+                allocator: std.mem.Allocator,
+            ) anyerror!void {
+                const typed: *T = @ptrCast(@alignCast(hctx));
+                return run(typed, io, reader, writer, allocator);
+            }
+        };
+        self.hijack(ptr, &Erased.erased);
     }
 
     /// 便捷方法：发送错误响应（状态码 + 消息文本）。

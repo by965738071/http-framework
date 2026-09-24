@@ -704,12 +704,11 @@ pub const WsNotificationsHandler = struct {
 
 pub fn wsNotificationsHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     // 劫持回调上下文必须是稳定指针——它会在 processRequest 返回后、
-    // hijack.run 执行时才被解引用。@ptrCast(res) 指向栈上 Response，
-    // processRequest 返回后栈帧失效 → use-after-free + type confusion
-    // （把 Response 内存当 AdminServices 读 → 访问 services.notifications
-    // 读到乱码 → 内存损坏，工作线程崩溃，新请求无人处理 → 卡死）。
+    // hijack.run 执行时才被解引用（传 handler 栈上地址 = use-after-free）。
+    // 类型安全（F-20）：不再手传 @ptrCast，这里直传 services 指针，
+    // wsNotifications 尾参类型由编译器推断校验。
     // 传入 services（appMain 栈上的 admin_services 地址，在整个进程生命周期内稳定）。
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(services), wsNotifications) catch |err| {
+    const upgraded = framework.wsUpgrade(ctx, res, services, wsNotifications) catch |err| {
         try ctx.failWith(framework.AppError.badRequest("websocket upgrade failed"));
         return err;
     };
@@ -719,9 +718,7 @@ pub fn wsNotificationsHandler(ctx: *framework.Context, res: *framework.Response,
     }
 }
 
-fn wsNotifications(ws: *framework.WebSocket, raw: *anyopaque) anyerror!void {
-    const services: *AdminServices = @ptrCast(@alignCast(raw));
-
+fn wsNotifications(ws: *framework.WebSocket, services: *AdminServices) anyerror!void {
     // 注册连接
     services.notifications.register(ws);
     defer services.notifications.unregister(ws);

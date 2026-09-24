@@ -139,9 +139,12 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 > 入口不再需要手写 allocator/`std.Io.Threaded`/`installSignalHandlers`——`runZio` 封装了
 > 运行时启动，信号关机内置在 `server.run()`（等 SIGINT 或 SIGTERM → 取消 accept → drain 在途连接）。
 
-> **三项配置目前是死开关**（能设置、不报错，但不改变行为，`server.setup()` 只打一行 warn）：
-> `body.lazy_read_size`、`network.idle_timeout_ns`（keep-alive 空闲实际由 `network.read_timeout_ns`
-> 约束）、`http.access_log_enabled`（要访问日志请注册 `LoggingHook`/`LoggingMiddleware`）。
+> **配置启动期校验**：`server.setup()` 会调 `Config.validate()`——取值越界（端口/超时/
+> buffer 为 0 等）逐条报原因后拒绝启动；“能设置、不报错，但不改变行为”的死开关
+> （`body.lazy_read_size`、`network.idle_timeout_ns`（keep-alive 空闲实际由
+> `network.read_timeout_ns` 约束）、`http.access_log_enabled`（要访问日志请注册
+> `LoggingHook`/`LoggingMiddleware`））默认只打 warn，`http.strict_config=true` 时升级为
+> 启动失败（CI 推荐）。
 
 接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_module")`。
 
@@ -459,7 +462,7 @@ RFC 6455 实现（帧编解码 + 握手 + 连接级读写 + **连接劫持**）�
 ```zig
 // 劫持上下文：必须是**长期稳定**的地址（进程级变量 / 服务容器），
 // 因为它在 handler 返回之后、hijack 回调里才被解引用。
-// 不要传 `@ptrCast(res)`：res 在 handler 返回后即失效 → use-after-free。
+// 指针形态由编译器校验（可变单项指针 *T，F-20）；生命周期仍需自己保证。
 var ws_conns: usize = 0;
 
 fn wsRoute(ctx: *framework.Context, res: *framework.Response) !void {
@@ -472,8 +475,8 @@ fn wsRoute(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 // 连接回调：拿到已建好的 *WebSocket，跑 receive/send 循环，返回即关连接。
-fn onWs(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    const conns: *usize = @ptrCast(@alignCast(hijack_ctx));
+// 尾参类型由 `&ws_conns` 编译期推断为 *usize，不再手写 @ptrCast。
+fn onWs(ws: *framework.WebSocket, conns: *usize) anyerror!void {
     conns.* += 1;
     while (true) {
         var msg = ws.receive() catch |err| {

@@ -217,14 +217,23 @@ fn isValidWebSocketKey(key: []const u8) bool {
 /// 返回 `false`：非合法升级请求（缺头/版本不支持），已写好错误响应（426 等），
 /// handler 直接 return 即可。
 ///
-/// `hijack_ctx` 是用户上下文指针（必须在连接存活期内有效，如 singleton handler
-/// 实例）；`handlerFn` 拿到已建好的 `*WebSocket` 和该上下文。
+/// `hijack_ctx` 是用户上下文**类型化指针**（F-20：不再是 `*anyopaque`，
+/// 类型由调用点推断，传错类型是编译错误）；必须在连接存活期内有效
+/// （进程级地址，或请求 arena 内存——见 `Context.hijackWith` 的生命周期不变量）。
+/// `handlerFn` 拿到已建好的 `*WebSocket` 和该指针，类型自动匹配。
 pub fn upgrade(
     ctx: *Context,
     res: *Response,
-    hijack_ctx: *anyopaque,
-    comptime handlerFn: fn (ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void,
+    hijack_ctx: anytype,
+    comptime handlerFn: fn (ws: *connection.WebSocket, user: @TypeOf(hijack_ctx)) anyerror!void,
 ) !bool {
+    // comptime 拦截非法指针形态（*const T / []T / [*]T），避免类型擦除后运行时 UB。
+    const UserCtx = @TypeOf(hijack_ctx);
+    const ui = @typeInfo(UserCtx);
+    if (ui != .pointer or ui.pointer.size != .one or UserCtx != *ui.pointer.child) {
+        @compileError("wsUpgrade: hijack_ctx must be a mutable single-item pointer (e.g. &state), got " ++ @typeName(UserCtx));
+    }
+
     // 校验逻辑与 handshake() 共用 validateUpgradeRequest（#18 去重）：
     // 非法请求已按需写回 403/426，这里直接返回 false。
     const key = try validateUpgradeRequest(ctx, res) orelse return false;
@@ -236,20 +245,19 @@ pub fn upgrade(
     // 需要把 client key 和用户回调 handlerFn 一起带到回调里——用一个请求 arena
     // 上的 UpgradeCtx 打包（arena 在 hijack.run 执行前不会被 reset，因为 run 在
     // 本请求的 keep-alive 循环迭代内、endRequest 之前就被调用）。
-    const UpgradeCtx = struct { key: []const u8, user_ctx: *anyopaque };
+    const UpgradeCtx = struct { key: []const u8, user: UserCtx };
     const uc = try ctx.arena.create(UpgradeCtx);
-    uc.* = .{ .key = key_owned, .user_ctx = hijack_ctx };
+    uc.* = .{ .key = key_owned, .user = hijack_ctx };
 
     const runFn = struct {
         fn run(
-            hctx: *anyopaque,
+            u: *UpgradeCtx,
             io: std.Io,
             reader: *std.Io.Reader,
             writer: *std.Io.Writer,
             allocator: std.mem.Allocator,
         ) anyerror!void {
             _ = io;
-            const u: *UpgradeCtx = @ptrCast(@alignCast(hctx));
 
             // 1. 写 101 Switching Protocols 握手响应（直写裸 writer，不经 Sink）。
             var accept_buf: [ACCEPT_KEY_LEN]u8 = undefined;
@@ -265,11 +273,11 @@ pub fn upgrade(
 
             // 2. 构造 WebSocket 连接对象，交给用户回调。
             var ws = connection.WebSocket.initServer(reader, writer, allocator);
-            try handlerFn(&ws, u.user_ctx);
+            try handlerFn(&ws, u.user);
         }
     }.run;
 
-    ctx.hijack(@ptrCast(uc), runFn);
+    ctx.hijackWith(UpgradeCtx, uc, runFn);
     return true;
 }
 
@@ -512,8 +520,8 @@ test "upgrade registers hijack and writes 101 + runs handler" {
         var called: bool = false;
         var got: [64]u8 = undefined;
         var got_len: usize = 0;
-        fn onWs(ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-            _ = hijack_ctx;
+        fn onWs(ws: *connection.WebSocket, marker: *u8) anyerror!void {
+            try testing.expectEqual(@as(u8, 42), marker.*);
             called = true;
             var msg = try ws.receive();
             defer msg.deinit();
@@ -524,8 +532,8 @@ test "upgrade registers hijack and writes 101 + runs handler" {
     };
     H.called = false;
 
-    var dummy: u8 = 0;
-    const ok = try upgrade(&ctx, &res, @ptrCast(&dummy), H.onWs);
+    var dummy: u8 = 42;
+    const ok = try upgrade(&ctx, &res, &dummy, H.onWs);
     try testing.expect(ok);
     // upgrade 不直接写响应，而是注册 hijack。
     try testing.expect(state.hijack != null);
@@ -600,14 +608,14 @@ test "upgrade rejects invalid Sec-WebSocket-Key (M14)" {
     defer res.deinit();
 
     const H = struct {
-        fn onWs(ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
+        fn onWs(ws: *connection.WebSocket, marker: *u8) anyerror!void {
             _ = ws;
-            _ = hijack_ctx;
+            _ = marker;
         }
     };
 
     var dummy: u8 = 0;
-    const ok = try upgrade(&ctx, &res, @ptrCast(&dummy), H.onWs);
+    const ok = try upgrade(&ctx, &res, &dummy, H.onWs);
     // 非法 key 必须拒绝升级，不注册 hijack。
     try testing.expect(!ok);
     try testing.expect(state.hijack == null);

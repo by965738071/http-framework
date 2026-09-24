@@ -233,6 +233,29 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{ .root_module = integration_test_mod });
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
+    // ── 公共 API 清单（tools/gen_api.zig，5.2 文档项）──────────────────
+    // `zig build gen-api`         把全模块 pub 符号清单（含行号）打到 stdout；
+    // 刷新已提交的 docs/API_generated.md：
+    //   zig run tools/gen_api.zig -- generate > docs/API_generated.md
+    // `zig build test` 附带 check：任何模块解析失败 → 构建失败。
+    const gen_api_exe = b.addExecutable(.{
+        .name = "gen-api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_api.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    const gen_api_run = b.addRunArtifact(gen_api_exe);
+    gen_api_run.addArg("generate");
+    gen_api_run.stdio = .inherit;
+    const gen_api_step = b.step("gen-api", "Print public API signature inventory (stdout)");
+    gen_api_step.dependOn(&gen_api_run.step);
+
+    const api_check = b.addRunArtifact(gen_api_exe);
+    api_check.addArg("check");
+    test_step.dependOn(&api_check.step);
+
     // ── http_framework：伞形聚合模块 ──────────────────────────
     const umbrella_imports: []const std.Build.Module.Import = &.{
         .{ .name = "http_protocol", .module = http_protocol },

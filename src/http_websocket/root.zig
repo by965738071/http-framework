@@ -19,9 +19,10 @@
 //!
 //! 依赖 `http_app`（Context）和 `http_protocol`（Response）。
 //!
-//! 推荐用 `upgrade(ctx, res, hijack_ctx, handlerFn)` 一步完成：共享校验 + 注册
-//! 连接劫持。ConnectionRunner 在 dispatch 结束后把裸 reader/writer 交给回调，
-//! 由回调直写 101 并跑帧循环。
+//! 推荐用 `upgrade(ctx, res, user_ptr, handlerFn)` 一步完成：共享校验 + 注册
+//! 连接劫持。`user_ptr` 是类型化指针（F-20，不再是 `*anyopaque`），`handlerFn`
+//! 尾参类型由调用点编译期校验。ConnectionRunner 在 dispatch 结束后把裸
+//! reader/writer 交给回调，由回调直写 101 并跑帧循环。
 //!
 //! `handshake(ctx, res)` 只校验请求头并把 101 + 握手响应头写进 `res`，
 //! **不接管连接**——除非你要自行完成“发送响应 + 接管 stream”，否则不要只调

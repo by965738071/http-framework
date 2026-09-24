@@ -75,15 +75,15 @@ pub fn dashboard(svc: *AppServices, ctx: *framework.Context, res: *framework.Res
 
 /// WebSocket 实时通知：连接即注册进广播器，断开自动注销。
 pub fn ws(svc: *AppServices, ctx: *framework.Context, res: *framework.Response) !void {
-    const upgraded = try framework.wsUpgrade(ctx, res, @ptrCast(svc), onWs);
+    // 类型安全劫持（F-20）：直传 svc 指针，onWs 尾参类型由编译器推断校验。
+    const upgraded = try framework.wsUpgrade(ctx, res, svc, onWs);
     if (!upgraded) {
         if (!res.sent) try res.statusCode(.bad_request).text("expected a WebSocket upgrade request");
         return;
     }
 }
 
-fn onWs(conn: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    const svc: *AppServices = @ptrCast(@alignCast(hijack_ctx));
+fn onWs(conn: *framework.WebSocket, svc: *AppServices) anyerror!void {
     svc.notifier.register(conn) catch return;
     defer svc.notifier.unregister(conn);
 

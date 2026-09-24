@@ -17,7 +17,7 @@
   - [2.1 Server 生命周期](#21-server-生命周期)
   - [2.2 优雅关机](#22-优雅关机)
   - [2.3 配置结构](#23-配置结构)
-  - [2.4 三个无效果的配置项](#24-三个无效果的配置项)
+  - [2.4 三个无效果的配置项 + 启动期校验](#24-三个无效果的配置项--启动期校验)
   - [2.5 服务容器（依赖注入）](#25-服务容器依赖注入)
 - [3. 路由](#3-路由)
   - [3.1 Router API](#31-router-api)
@@ -195,20 +195,20 @@ pub const PoolConfig = struct {        // config.zig:48
 
 **没有配置文件加载器**：无 `.env` / `toml` / `json` 读取，配置就是 Zig 编译期字面量。
 
-### 2.4 三个无效果的配置项
+### 2.4 三个无效果的配置项 + 启动期校验
 
-`setup()` 时会打 warn（`src/http_server/zio_server.zig:102-110`）：
+`setup()` 会调 `Config.validate()`（`src/http_app/config.zig`）分两级处理：
+
+1. **取值越界**（port/backlog/max_connections/timeout/buffer/size_limit 为 0）→ 逐条报原因后返回 `error.InvalidConfig`，拒绝启动；
+2. **死开关**（设了不生效）→ 默认逐条 warn；`http.strict_config=true` 时升级为启动失败（CI 推荐）：
 
 ```zig
-if (self.config.body.lazy_read_size != 0)
-    std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
-if (self.config.network.idle_timeout_ns != 60_000_000_000)
-    std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
-if (self.config.http.access_log_enabled)
-    std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
+if (self.config.body.lazy_read_size != 0) // warn: set but not implemented (no effect)
+if (self.config.network.idle_timeout_ns != 60_000_000_000) // warn: keep-alive idle is bounded by read_timeout_ns
+if (self.config.http.access_log_enabled) // warn: register a LoggingHook/LoggingMiddleware for access logs
 ```
 
-即：`body.lazy_read_size`、`network.idle_timeout_ns`、`http.access_log_enabled` 三项设了不生效。访问日志请挂 `LoggingHook` 或 `LoggingMiddleware`（见「[其他能力](#12-其他能力)」）。
+即：`body.lazy_read_size`、`network.idle_timeout_ns`、`http.access_log_enabled` 三项设了不生效。访问日志请挂 `LoggingHook` 或 `LoggingMiddleware`（见「[其他能力](#12-其他能力)」）。新增配置字段需在 `validate()` 登记规则——“能被校验”才算声明为生效开关。
 
 ### 2.5 服务容器（依赖注入）
 
@@ -675,8 +675,8 @@ pub const RequireAuthMiddleware = struct {
 pub fn upgrade(
     ctx: *Context,
     res: *Response,
-    hijack_ctx: *anyopaque,
-    comptime handlerFn: fn (ws: *connection.WebSocket, hijack_ctx: *anyopaque) anyerror!void,
+    hijack_ctx: anytype, // 定型指针（*T），调用点推断，类型编译期校验（F-20）
+    comptime handlerFn: fn (ws: *connection.WebSocket, user: @TypeOf(hijack_ctx)) anyerror!void,
 ) !bool
 ```
 
@@ -687,11 +687,11 @@ pub fn upgrade(
 
 ```zig
 // hijack_ctx 必须是进程级稳定地址：回调在 handler 返回后才执行，
-// 此时 handler 栈帧已失效，不能传 @ptrCast(res)（use-after-free）。
+// 此时 handler 栈帧已失效（use-after-free）。类型由编译器校验（F-20）。
 var ws_echo_conns: usize = 0;
 
 fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const upgraded = framework.wsUpgrade(ctx, res, @ptrCast(&ws_echo_conns), wsEcho) catch {
+    const upgraded = framework.wsUpgrade(ctx, res, &ws_echo_conns, wsEcho) catch {
         try ctx.failWith(.{ .status = .bad_request, .message = "websocket upgrade failed" });
         return;
     };
@@ -701,8 +701,7 @@ fn wsEchoHandler(ctx: *framework.Context, res: *framework.Response) !void {
     }
 }
 
-fn wsEcho(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
-    const conns: *usize = @ptrCast(@alignCast(hijack_ctx));
+fn wsEcho(ws: *framework.WebSocket, conns: *usize) anyerror!void {
     conns.* += 1;
     defer conns.* -= 1;
     while (true) {
@@ -721,7 +720,7 @@ fn wsEcho(ws: *framework.WebSocket, hijack_ctx: *anyopaque) anyerror!void {
 try router.route(.GET, "/ws", framework.Handler.fromFn(wsEchoHandler));
 ```
 
-> ⚠️ **`hijack_ctx` 必须是长期稳定的指针**。历史上 `examples/src/main.zig` 曾传 `@ptrCast(res)`，这是**反例**（`res` 在栈上，回调执行时已失效 → use-after-free）；现已改为传模块级 `&ws_echo_conns`。`examples/src/admin.zig:698-708` 是另一正例，传 `services`（appMain 栈上的长期对象）。任何进程生命周期内稳定的地址都可以。
+> ⚠️ **`hijack_ctx` 必须是长期稳定的指针**。历史上 `examples/src/main.zig` 曾传 `@ptrCast(res)`，这是**反例**（`res` 在栈上，回调执行时已失效 → use-after-free）；F-20 修复后指针形态改由 `upgrade` 的 comptime 校验（必须是可变单项指针 `*T`），栈/堆的生命周期仍需调用方保证：传模块级 `&ws_echo_conns` 或 services 等进程级对象。任何进程生命周期内稳定的地址都可以。
 
 ### 9.2 WebSocket 连接对象
 
@@ -1009,9 +1008,9 @@ server.setLifecycle(.{ .hooks = &hooks });
     违反后果：取不到路径（**静默错误**，`static.zig:55`）。
     正确：`ctx.param("*")`；注册 `"/static/*"`；SPA 兜底路由放在组内**最后**注册。
 
-14. **WebSocket 的 `hijack_ctx` 必须是长期稳定指针**
-    违反后果：use-after-free（`examples/src/main.zig` 历史上曾传 `@ptrCast(res)`，是反例，现已改为传 `&ws_echo_conns`）。
-    正确：传 `services` 这类 appMain 栈上的长期对象（`examples/src/admin.zig:698-708`），或任何进程生命周期内稳定的地址。
+14. **WebSocket 的 `hijack_ctx` 必须是长期稳定指针（类型安全已由 `wsUpgrade` 编译期兜底）**
+    指针形态错误（非单一指针、类型不匹配 handler 第二参）现在会在 `wsUpgrade(ctx, res, user, onWs)` 处 `@compileError` 拦截，不再需要手写 `@ptrCast`。但**生命周期仍靠人保证**：传 `res` 这类请求级对象的指针 → 请求结束即悬挂，违反后果：use-after-free（`examples/src/main.zig` 历史上曾传 `@ptrCast(res)`，是反例，现已改为传 `&ws_echo_conns`）。
+    正确：传 `services` 这类 appMain 栈上的长期对象（`examples/src/admin.zig:698-708`），或任何进程生命周期内稳定的地址；回调用 `fn(ws: *WebSocket, user: *@TypeOf(传入指针))` 签名。
 
 15. **响应头 name 必须是 RFC 9110 token；已发送后不可再写**
     违反后果：前者 `error.InvalidHeaderName`（`response.zig:581`），后者 `error.AlreadyResponded`（`response.zig:453`）。
@@ -1025,9 +1024,14 @@ server.setLifecycle(.{ .hooks = &hooks });
 
 18. **404/405 走全局中间件，但不走组级中间件**（`router.zig:207-239`）。自定义 404 handler 里不要依赖组级中间件写入的状态。
 
-19. **`RateLimiter` 的 `per_ip = true` 依赖 `Config.body.trust_proxy_headers = true`**（`rate_limiter.zig:19`）。否则取不到代理后的真实 IP，限流维度错误。
+19. **`Context` 不再增长：新便利方法写成 addon 自由函数**
+    `Context` 是请求级热路径结构体，字段每加一个，每条请求的构造/拷贝成本 +1。框架收敛策略：`Context` 只保留请求生命周期必需的字段；新能力（解析、渲染、会话便捷操作等）以 `addon` 自由函数形式提供，首参 `ctx: *Context`（如 `http_codec.parseJson(ctx, T)`、`http_app.json(ctx, res, value)`）。
+    违反后果：`Context` 膨胀 → 每请求开销上升、模块边界模糊（业务方法混进框架核心）。
+    正确：新增能力时优先 `src/http_xxx/` 下写 `pub fn xxx(ctx: *Context, ...)`，不要动 `context.zig` 的字段与方法集。
 
-20. **没有程序化关机接口**：无 `server.stop()`，只能靠 SIGINT/SIGTERM（见 [2.2](#22-优雅关机)）。
+20. **`RateLimiter` 的 `per_ip = true` 依赖 `Config.body.trust_proxy_headers = true`**（`rate_limiter.zig:19`）。否则取不到代理后的真实 IP，限流维度错误。
+
+21. **没有程序化关机接口**：无 `server.stop()`，只能靠 SIGINT/SIGTERM（见 [2.2](#22-优雅关机)）。
 
 ---
 
