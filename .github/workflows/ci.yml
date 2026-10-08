@@ -16,7 +16,10 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          # 必须用 0.17.0-dev.* 快照：zio 依赖（zig-0.17 分支）适配的是 dev.2294 时期的
+          # std.Io.VTable（含 processReplacePath）；0.17.0 正式版已删该字段，zio 会编译失败，
+          # examples（runZio 配对）连带受累。升级前先本地验证 zio+examples。
+          version: 0.17.0-dev.2294+71403f299
 
       - name: Build for Ubuntu
         run: zig build
@@ -31,7 +34,8 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          # 同 build job：0.17.0 正式版与 zio 依赖不兼容，见 build job 注释。
+          version: 0.17.0-dev.2294+71403f299
       - name: Run unit & integration tests
         run: zig build test
 
