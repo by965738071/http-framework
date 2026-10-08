@@ -109,16 +109,9 @@ pub const Server = struct {
     }
 
     pub fn setup(self: *Server) !void {
-        // P2-38：对"已设置但未实现"的配置项告警（与 zio 版同一组死开关）。
-        if (self.config.body.lazy_read_size != 0) {
-            std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
-        }
-        if (self.config.network.idle_timeout_ns != 60_000_000_000) {
-            std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
-        }
-        if (self.config.http.access_log_enabled) {
-            std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
-        }
+        // P2-38：配置校验单点入口（对齐 zio 版）：取值越界直接拒绝启动；死开关
+        // 默认 warn、http.strict_config=true 时升级为启动失败。规则见 Config.validate()。
+        try self.config.validate();
         if (comptime is_windows) {
             // 见文件头"运行时模型差异"：Windows 上 std 尚未支持 net 操作的
             // 带超时批处理，read/write_timeout_ns 在本后端 + Windows 上不生效。
