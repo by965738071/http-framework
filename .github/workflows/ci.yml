@@ -16,7 +16,7 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
+          version: 0.17.0
 
       - name: Build for Ubuntu
         run: zig build
@@ -31,8 +31,7 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
-
+          version: 0.17.0
       - name: Run unit & integration tests
         run: zig build test
 
