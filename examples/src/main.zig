@@ -439,7 +439,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     };
 
     // 8. 组装服务器
-    var server = try framework.Server.init(allocator, io, config, &router);
+    var server = try framework.ZioServer.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
     server.setLifecycle(.{ .hooks = &hooks });

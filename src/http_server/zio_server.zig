@@ -16,12 +16,19 @@ const http_app = @import("http_app");
 const http_router = @import("http_router");
 const ConnectionRunner = @import("connection.zig").ConnectionRunner;
 
+/// 本后端的运行时入口 `run`（即 framework.runZio）是否已在当前进程执行过。
+/// 误配护栏：在 std 运行时（runStd）下创建 `ZioServer`，会在 zio 的
+/// socket() 里以 WSAENOTINITIALISED + 大段栈转储失败，病因极难定位；
+/// 这里改为在 init 入口直接给出明确的配对提示（配对规则见 main.zig 头部）。
+var runtime_started: bool = false;
+
 /// 启动 zio 运行时，在其协程上下文中运行 `appFn(io, allocator)`，结束后清理。
 /// 入口（main.zig）只需 `try zioServer.run(gpa, appMain)`，无需直接依赖 zio。
 pub fn run(
     allocator: std.mem.Allocator,
     comptime appFn: fn (std.Io, std.mem.Allocator) anyerror!void,
 ) !void {
+    runtime_started = true;
     // zio 协程默认只提交 256KB 栈。某些 handler/中间件路径会产生较大的栈临时量，
     // 典型如响应压缩：`flate.Compress` 是 ~224KB 的巨型 struct（std 源码注释：
     // "Allocates statically ~224K"），`try flate.Compress.init(...)` 会在栈上
@@ -85,6 +92,11 @@ pub const Server = struct {
         config: http_app.Config,
         router: *const http_router.Router,
     ) !Server {
+        if (!runtime_started) std.debug.panic(
+            "framework.ZioServer (zio backend) must be paired with framework.runZio; " ++
+                "配对规则：runZio ↔ ZioServer，runStd ↔ StdServer（见 main.zig 头部两行切换说明）",
+            .{},
+        );
         return .{
             .io = io,
             .config = config,

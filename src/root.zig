@@ -76,11 +76,16 @@ pub const Trie = http_router.Trie;
 pub const RouteGroup = http_router.RouteGroup;
 
 // ── http_server ──────────────────────────────────────────────
-// ── http_server（默认 zio 后端）────────────────────────
-pub const Server = http_server.Server;
+// ── http_server（默认 zio 后端，另并列 std 后端）──────
+/// zio 运行时（栈协程）版 Server，与 `runZio` 配对。
+pub const ZioServer = http_server.ZioServer;
+/// zig std 运行时（`std.Io.Threaded`）版 Server，API 与 zio 版完全对齐，与 `runStd` 配对。
+pub const StdServer = http_server.StdServer;
 pub const ConnectionRunner = http_server.ConnectionRunner;
 /// 启动 zio 运行时并在其协程上下文中运行 app（io, allocator）。
 pub const runZio = http_server.runZio;
+/// 启动 zig std 运行时（`std.Io.Threaded`）并运行 app（io, allocator）。
+pub const runStd = http_server.runStd;
 
 // ── http_security ─────────────────────────────────────────────
 pub const CsrfMiddleware = http_security.csrf.CsrfMiddleware;

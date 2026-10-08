@@ -1,10 +1,11 @@
 # Zig HTTP Framework
 
-基于 Zig `std.Io` 接口、跑在 [zio](https://github.com/lalinsky/zio) 异步运行时（io_uring / epoll / kqueue / IOCP + 协程）上的高性能、轻量级 HTTP 服务器框架。4 层核心（协议 / 应用 / 路由 / 服务器）+ 一批单向依赖核心的 addon，支持请求级生命周期、radix-trie 路由、中间件管道、WebSocket、静态文件服务及内置 ORM。
+基于 Zig `std.Io` 接口的高性能、轻量级 HTTP 服务器框架，默认跑在 [zio](https://github.com/lalinsky/zio) 异步运行时（io_uring / epoll / kqueue / IOCP + 协程）上，也可切换为 Zig 自带的 `std.Io.Threaded` 后端。4 层核心（协议 / 应用 / 路由 / 服务器）+ 一批单向依赖核心的 addon，支持请求级生命周期、radix-trie 路由、中间件管道、WebSocket、静态文件服务及内置 ORM。
 
 > **架构要点**：框架主体写在标准 `std.Io` 接口上（路由/中间件/handler/会话等后端无关）；与具体
-> 异步运行时绑定的代码（监听/accept/信号/连接读写）集中在 `http_server/zio_server.zig` 一个文件。
-> 目前默认后端是 zio；将来接其他运行时只需新增一个 `xxx_server.zig`，公共逻辑不改。
+> 异步运行时绑定的代码（监听/accept/信号/连接读写）各自集中在一个文件：`http_server/zio_server.zig`
+> （zio 协程后端，默认）与 `http_server/std_server.zig`（Zig 自带 `std.Io.Threaded` 后端）。
+> 两者公开 API 完全对齐，入口换 `framework.runStd` + `framework.StdServer` 即完成切换，公共逻辑不改。
 
 ## 性能
 
@@ -58,12 +59,14 @@ json response                 ~5.3M ops/s    ~189 ns/op
 - **HTTP keep-alive** — 连接循环 + 优雅关闭（zio.Signal 同时处理 SIGINT 与 SIGTERM）；Connection 头按 token 列表解析
 - **内置 ORM** — JSON 文件持久化，编译期反射表结构，CRUD、查询、排序、分页
 - **安全与扩展** — Auth（Bearer/Basic/API Key）、CORS（预检/Vary）、CSRF（双提交）、Security Headers、Session（Path=/、Secure 可配）、Multipart、响应压缩（q 值协商）、结构化日志、限流（Retry-After/X-RateLimit-*）
-- **可替换后端** — 框架核心只依赖 `std.Io`；运行时绑定代码隔离在 `zio_server.zig`，换库不动核心
+- **可替换后端** — 框架核心只依赖 `std.Io`；运行时绑定代码隔离在 `zio_server.zig`/`std_server.zig`，入口两行切换运行时，不动核心（两行必须成对换：`runZio` ↔ `ZioServer`，`runStd` ↔ `StdServer`，错配会在启动时直接给出配对提示）
 
 ## 环境要求
 
-- **Zig**: `0.17.0-dev` 或更新版本（使用 `std.Io` API）
-- **zio**: 异步运行时依赖（在 `build.zig.zon` 里声明，默认指向本地路径）
+- **Zig**: `0.17.0-dev.*`（与 zio 依赖锁定的 `zig-0.17` 分支配套，zio 后端的默认/首选工具链）。
+  std 后端（`runStd`/`StdServer`）已在 `0.17.0-dev.*` 与 `0.18.0-dev.*` 两个工具链上分别验证过
+  编译、测试与运行：在 0.18 工具链上请搭配 std 后端使用（zio 上游尚未适配 0.18）
+- **zio**: 默认后端所需的异步运行时依赖（在 `build.zig.zon` 里声明）；`std_server.zig` 后端只用 Zig 自带的 `std.Io.Threaded`，不依赖 zio
 
 ```bash
 # 开发模式（框架自带示例）
@@ -112,7 +115,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     router.notFoundHandler(framework.Handler.fromFn(notFoundHandler));
 
     // 3. 组装并运行（内部阻塞 accept + zio.Signal 处理 SIGINT/SIGTERM 优雅关闭）
-    var server = try framework.Server.init(allocator, io, config, &router);
+    var server = try framework.ZioServer.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
     try server.run();
@@ -145,6 +148,13 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 > `network.read_timeout_ns` 约束）、`http.access_log_enabled`（要访问日志请注册
 > `LoggingHook`/`LoggingMiddleware`））默认只打 warn，`http.strict_config=true` 时升级为
 > 启动失败（CI 推荐）。
+
+> **切换运行时后端**：入口改两行即可 —— `framework.runZio(gpa, appMain)` →
+> `framework.runStd(gpa, appMain)`，`framework.ZioServer` → `framework.StdServer`，其余组装代码不动。
+> `runStd` 基于 Zig 自带的 `std.Io.Threaded`：每条在途连接约占用一个 OS 线程（zio 是协程），
+> 建议把 `network.max_connections` 调到与真实并发相当而不是照搬 zio 后端的几千；另 Windows 上
+> std 的 net_read/net_write 尚未接入重叠 I/O，per-operation 读写超时不可用（退化为纯阻塞，
+> `setup()` 会打告警），POSIX 上与 zio 版语义对齐。
 
 接线方式参考 `examples/build.zig`：`b.dependency("http_framework", .{...}).module("http_module")`。
 
@@ -634,6 +644,7 @@ http-framework/
 │   ├── http_server/       # ── 第 4 层：组装 ──────────────────
 │   │   ├── connection.zig # 后端无关：ConnectionRunner（纯 HTTP 引擎）
 │   │   ├── zio_server.zig # zio 专属：监听/accept/背压/信号/连接读写/启动（唯一 import zio）
+│   │   ├── std_server.zig # std 专属：基于 std.Io.Threaded 的平行后端（API 与 zio 版对齐）
 │   │   └── integration_test.zig
 │   ├── http_security/     # ── 依赖第 1、2 层的 addon ─────────────
 │   │   ├── auth.zig       #    AuthMiddleware（bearer/basic/api_key/custom）

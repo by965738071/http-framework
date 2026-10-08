@@ -10,6 +10,7 @@
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#zig-0.17",
             .hash = "zio-0.17.0-xHbVVC8rKQC-IaVNQvJWKA_ACKKh6BdQ1PZyS9zqJpq-",
+            //.hash = "zio-0.17.0-xHbVVC8rKQC-IaVNQvJWKA_ACKKh6BdQ1PZyS9zqJpq-",
         },
     },
     .minimum_zig_version = "0.17.0-dev",

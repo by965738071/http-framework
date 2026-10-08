@@ -32,7 +32,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var error_renderer = framework.ErrorRenderer{};
     try router.use(framework.Middleware.init(framework.ErrorRenderer, &error_renderer));
 
-    var server = try framework.Server.init(allocator, io, .{ .network = .{ .port = 9000 } }, &router);
+    var server = try framework.ZioServer.init(allocator, io, .{ .network = .{ .port = 9000 } }, &router);
     defer server.deinit();
     try server.setup();
     try server.run();

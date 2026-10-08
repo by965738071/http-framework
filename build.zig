@@ -19,8 +19,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // zio 异步运行时（io_uring/kqueue/iocp + 协程）。http_server 全面基于 zio
-    // 实现，统一跨平台 API，不再有 std.Io.Threaded 的 poll/信号平台分支。
+    // zio 异步运行时（io_uring/kqueue/iocp + 协程）。http_server 的默认后端
+    // （zio_server.zig）基于它实现；另有平行的 std 后端（std_server.zig，基于
+    // std.Io.Threaded），入口 runZio/runStd + Server/StdServer 两行切换。
     const zio = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
@@ -301,6 +302,24 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
+
+    // ── zio 上游 bug 验证（Windows/IOCP 流式普通文件 I/O）───────
+    // 退出码 0 = 已修复；1 = 未修复；2 = 环境异常。不参与 `zig build test`，
+    // 否则在 zio 修复前会长期弄红测试套件。
+    const streaming_check_mod = b.createModule(.{
+        .root_source_file = b.path("tools/zio_streaming_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zio", .module = zio },
+        },
+    });
+    const streaming_check_exe = b.addExecutable(.{
+        .name = "zio_streaming_check",
+        .root_module = streaming_check_mod,
+    });
+    const check_streaming_step = b.step("check-streaming", "Verify zio streaming plain-file I/O (upstream Windows IOCP/OVERLAPPED bug)");
+    check_streaming_step.dependOn(&b.addRunArtifact(streaming_check_exe).step);
 
     const umbrella_test = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(umbrella_test).step);

@@ -1,25 +1,31 @@
 //! http_framework — 入口示例
 //!
 //! 入口只做两件事：
-//!   1. 通过 framework.runZio 启动运行时（封装了 zio 初始化，入口不直接依赖 zio）；
+//!   1. 启动运行时（默认 `framework.runZio`，封装 zio 初始化，入口不直接依赖 zio）；
 //!   2. 在 appMain(io, allocator) 里做 http_framework 的初始化（路由/中间件/Server）。
+//!
+//! 切换运行时后端只改两行（其余代码不动，两个 Server 公开 API 完全对齐）：
+//!   - `framework.runZio(gpa, appMain)`  → `framework.runStd(gpa, appMain)`
+//!   - `framework.ZioServer.init(...)`  → `framework.StdServer.init(...)`
+//! std 后端基于 `std.Io.Threaded`：一条在途连接≈一个 OS 线程，`max_connections` 建议调到
+//! 与真实并发相当；Windows 上 per-operation 读写超时暂不可用（退化为阻塞，setup 会告警）。
 
 const std = @import("std");
 const framework = @import("http_framework");
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
-    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    var debug_allocator = std.heap.SafeAllocator.init(init.gpa, .{});
     defer {
         // 泄漏时打印报告并以非零码退出，而不是直接 panic——调试期的任何小泄漏
         // 不应表现为无法区分的「Ctrl-C 后崩溃」。
-        if (debug_allocator.deinit() == .leak) {
+        if (debug_allocator.deinit() > 0) {
             std.debug.print("error:memory leak\n", .{});
             std.process.exit(1);
         }
     }
     const allocator = debug_allocator.allocator();
-    try framework.runZio(allocator, appMain);
+    //try framework.runZio(allocator, appMain);
+    try framework.runStd(allocator, appMain);
 }
 
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
@@ -74,8 +80,8 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     var log_hook = framework.LoggingHook{ .logger = &logger };
     const hooks = [_]framework.Hook{framework.Hook.init(framework.LoggingHook, &log_hook)};
 
-    // 6. 组装并运行 Server
-    var server = try framework.Server.init(allocator, io, config, &router);
+    // 6. 组装并运行 Server（与入口配对：runStd ↔ StdServer，runZio ↔ ZioServer）
+    var server = try framework.StdServer.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
     server.setLifecycle(.{ .hooks = &hooks });

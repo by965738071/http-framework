@@ -3,8 +3,8 @@
 > 面向使用者的公开 API 手册。所有 `路径:行号` 引用均相对仓库根目录（`/Users/by/project/zig/wlw/http-framework`），行号基于当前工作树。
 >
 > 三个前提，先记住：
-> - **没有 `App` 类型**，`framework.Server` 就是应用本体。
-> - `io: std.Io` 必须来自 zio 运行时（由 `framework.runZio` 提供），用户代码里只是透传值，不需要自己 import zio。
+> - **没有 `App` 类型**，`framework.ZioServer`（std 后端为 `framework.StdServer`）就是应用本体。
+> - `io: std.Io` 来自所选运行时（`framework.runZio` 或 `framework.runStd` 提供），用户代码里只是透传值，不需要自己 import zio。
 > - 框架**没有模板引擎、没有 sqlite/pg 封装、没有配置文件加载器**（见「[缺少的能力](#15-缺少的能力)」）。
 
 ## 目录
@@ -90,7 +90,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     try router.route(.GET, "/", framework.Handler.fromFn(helloHandler));
     router.notFoundHandler(framework.Handler.fromFn(notFoundHandler));
 
-    var server = try framework.Server.init(allocator, io, config, &router);
+    var server = try framework.ZioServer.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup(); // 建 listener（端口占用在这里失败）
     server.setLifecycle(.{ .hooks = &hooks }); // 可选
@@ -116,7 +116,7 @@ fn notFoundHandler(ctx: *framework.Context, res: *framework.Response) !void {
 ```
 config → logger/sessions/stores（main 栈上，defer 管理） → services 注册 + seal
 → Router.init → 全局中间件（ErrorRenderer 必须第一个） → 路由 → 路由组（use 先于 route）
-→ notFoundHandler → Hook 数组 → Server.init → setup → setLifecycle → setServices → run
+→ notFoundHandler → Hook 数组 → ZioServer.init → setup → setLifecycle → setServices → run
 ```
 
 ---
@@ -125,19 +125,19 @@ config → logger/sessions/stores（main 栈上，defer 管理） → services �
 
 ### 2.1 Server 生命周期
 
-关键符号（`src/http_server/root.zig:15-19` 导出）：
+关键符号（`src/http_server/root.zig:17-25` 导出）：
 
 | API | 位置 | 说明 |
 |---|---|---|
-| `framework.runZio` | `src/http_server/zio_server.zig:21` | `fn(allocator, comptime appFn: fn(std.Io, std.mem.Allocator) anyerror!void) !void`；内部 1MB 提交栈（`:31-36`） |
-| `framework.Server` | `src/http_server/zio_server.zig:66` | = `zio_server.Server` |
-| `Server.init(allocator, io, config, router) !Server` | `zio_server.zig:82` | `io` 必须来自 zio 协程上下文 |
-| `Server.setup() !void` | `zio_server.zig:99` | 建 listener；**必须在 `run` 前调用**；失败时 `deinit` 安全 |
-| `Server.run() !void` | `zio_server.zig:147` | 阻塞主循环 |
-| `Server.setLifecycle(Lifecycle) void` | `zio_server.zig:119` | 请求日志/埋点，见「[生命周期钩子](#13-生命周期钩子)」 |
-| `Server.setServices(*const Services) void` | `zio_server.zig:123` | `ctx.service(T)` 依赖它 |
-| `Server.stats() ServerStats` | `zio_server.zig:127` | `active_connections / total_connections / active_requests / accept_errors / shutting_down` |
-| `Server.deinit() void` | `zio_server.zig:114` | |
+| `framework.runZio` | `src/http_server/zio_server.zig:27` | `fn(allocator, comptime appFn: fn(std.Io, std.mem.Allocator) anyerror!void) !void`；内部 1MB 提交栈（`:39-42`） |
+| `framework.ZioServer` | `src/http_server/zio_server.zig:73` | = `zio_server.Server`；与 `framework.StdServer` 公开 API 完全对齐 |
+| `ZioServer.init(allocator, io, config, router) !ZioServer` | `zio_server.zig:89` | `io` 必须来自 zio 协程上下文（`runZio` 未跑过则启动即 panic 提示配对） |
+| `ZioServer.setup() !void` | `zio_server.zig:112` | 建 listener；**必须在 `run` 前调用**；失败时 `deinit` 安全 |
+| `ZioServer.run() !void` | `zio_server.zig:160` | 阻塞主循环 |
+| `ZioServer.setLifecycle(Lifecycle) void` | `zio_server.zig:132` | 请求日志/埋点，见「[生命周期钩子](#13-生命周期钩子)」 |
+| `ZioServer.setServices(*const Services) void` | `zio_server.zig:136` | `ctx.service(T)` 依赖它 |
+| `ZioServer.stats() ServerStats` | `zio_server.zig:140` | `active_connections / total_connections / active_requests / accept_errors / shutting_down` |
+| `ZioServer.deinit() void` | `zio_server.zig:127` | |
 
 ### 2.2 优雅关机
 
@@ -1089,7 +1089,7 @@ README 中的写法与真实代码不符的条目。**照 README 写会编译失
 ```zig
 try framework.runZio(init.gpa, appMain);
 var router = try framework.Router.init(allocator);
-var server = try framework.Server.init(allocator, io, config, &router);
+var server = try framework.ZioServer.init(allocator, io, config, &router);
 try server.setup();
 server.setLifecycle(.{ .hooks = &hooks });
 server.setServices(&services);
