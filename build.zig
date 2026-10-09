@@ -303,24 +303,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // ── zio 上游 bug 验证（Windows/IOCP 流式普通文件 I/O）───────
-    // 退出码 0 = 已修复；1 = 未修复；2 = 环境异常。不参与 `zig build test`，
-    // 否则在 zio 修复前会长期弄红测试套件。
-    const streaming_check_mod = b.createModule(.{
-        .root_source_file = b.path("tools/zio_streaming_check.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zio", .module = zio },
-        },
-    });
-    const streaming_check_exe = b.addExecutable(.{
-        .name = "zio_streaming_check",
-        .root_module = streaming_check_mod,
-    });
-    const check_streaming_step = b.step("check-streaming", "Verify zio streaming plain-file I/O (upstream Windows IOCP/OVERLAPPED bug)");
-    check_streaming_step.dependOn(&b.addRunArtifact(streaming_check_exe).step);
-
     const umbrella_test = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(umbrella_test).step);
 
