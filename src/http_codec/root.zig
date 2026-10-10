@@ -3,6 +3,9 @@
 //! 提供请求体的高级解析能力：
 //! - `parseJson(T, allocator, bytes)`：把 JSON 字节解析成 typed struct
 //! - `JsonBody(T)`：中间件，预解析 JSON body 到 ctx user_data 槽
+//! - `jsonHandler(T, handler)`：适配器，把 JSON body 自动绑定到 struct 参数
+//! - `queryHandler(T, handler)` / `bindQuery(T, ctx, ..)`：把 query 参数自动
+//!   绑定到 struct 字段（按字段名匹配）
 //!
 //! 设计原则：
 //! - 不在 http_protocol 层引入 std.json 依赖（protocol 层零依赖）
@@ -18,6 +21,7 @@ pub const Context = http_app.Context;
 pub const AppError = http_app.AppError;
 pub const Response = http_protocol.Response;
 pub const Next = http_app.Next;
+pub const Handler = http_app.Handler;
 
 /// 从字节切片解析 JSON，返回分配在 allocator 上的 *T。
 ///
@@ -117,6 +121,170 @@ pub fn JsonBody(comptime T: type) type {
             try ctx.setUserData(T, parsed);
             return next.call(ctx, res);
         }
+    };
+}
+
+// ===========================================================================
+// 参数绑定适配器（jsonHandler / queryHandler / bindQuery）
+// ===========================================================================
+
+/// JSON 参数风格 handler 适配器：先把 `application/json` 请求体解析成 `T`，
+/// 再以 `handler(&body, ctx, res)` 调用业务函数——路由注册处写：
+///
+/// ```zig
+/// const LoginReq = struct { username: []const u8, password: []const u8 };
+/// router.post("/login", framework.jsonHandler(LoginReq, login));
+///
+/// fn login(body: *const LoginReq, ctx: *framework.Context, res: *framework.Response) !void {
+///     // 直接用 body.username / body.password，无需手动 readBody + parseJson
+/// }
+/// ```
+///
+/// 错误路径与 `JsonBody` 同契约：非 JSON Content-Type → 415；空 body /
+/// 非法 JSON → 400（均 `failWith(AppError)` 冒泡，管道应挂 ErrorRenderer）；
+/// 超限 → 413 且 `keep_alive = false`（防请求走私）；OOM 向上传播。
+/// 未知 JSON 字段宽松忽略（`parseJson` 固定行为）。
+pub fn jsonHandler(
+    comptime T: type,
+    comptime handler: fn (*const T, *Context, *Response) anyerror!void,
+    comptime body_limit: ?u64, // null → 1 MiB
+) Handler {
+    const limit = body_limit orelse (1 << 20);
+    const Wrapper = struct {
+        fn call(ctx: *Context, res: *Response) !void {
+            if (ctx.request.content_type) |ct| {
+                if (!isJsonContentType(ct)) {
+                    return ctx.failWith(.{ .status = .unsupported_media_type, .message = "expected application/json" });
+                }
+            }
+            const raw = ctx.readBody(ctx.arena, limit) catch |err| switch (err) {
+                error.BodyTooLarge => {
+                    // 同 JsonBody：413 后关连接，避免 keep-alive 去 drain 超限 body
+                    res.keep_alive = false;
+                    return ctx.failWith(AppError.payloadTooLarge("request body too large"));
+                },
+                else => return err,
+            };
+            if (raw.len == 0) return ctx.failWith(AppError.badRequest("missing JSON body"));
+            const parsed = parseJson(T, ctx.arena, raw) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return ctx.failWith(AppError.badRequest("invalid JSON body"));
+            };
+            return handler(parsed, ctx, res);
+        }
+    };
+    return Handler.fromFn(&Wrapper.call);
+}
+
+/// Query 参数风格 handler 适配器：按字段名从 query string 自动绑定 `T`，
+/// 再 `handler(params, ctx, res)` 调用。配合 `bindQuery` 看支持类型。
+///
+/// ```zig
+/// const Page = struct { page: u32, size: ?u16, keyword: ?[]const u8 };
+/// router.get("/users", framework.queryHandler(Page, list));
+///
+/// fn list(q: Page, ctx: *framework.Context, res: *framework.Response) !void { /* ... */ }
+/// ```
+///
+/// 必填字段缺失 / 值解析失败 → 400（message 带字段名）；OOM 向上传播。
+pub fn queryHandler(
+    comptime T: type,
+    comptime handler: fn (T, *Context, *Response) anyerror!void,
+) Handler {
+    const Wrapper = struct {
+        fn call(ctx: *Context, res: *Response) !void {
+            var failed: []const u8 = "?";
+            const params = bindQuery(T, ctx, &failed) catch |err| switch (err) {
+                error.MissingQuery, error.InvalidQuery => {
+                    const prefix = if (err == error.MissingQuery) "missing" else "invalid";
+                    const msg = std.fmt.allocPrint(ctx.arena, "{s} query parameter '{s}'", .{ prefix, failed }) catch return error.OutOfMemory;
+                    return ctx.failWith(AppError.badRequest(msg));
+                },
+                else => return err,
+            };
+            return handler(params, ctx, res);
+        }
+    };
+    return Handler.fromFn(&Wrapper.call);
+}
+
+/// 从 `ctx` 的 query string 按**字段名**绑定出一个 `T`（不写 handler 也可直接
+/// 用）。支持字段类型：
+/// - `[]const u8`：原样（已经过 percent 解码）
+/// - 任意宽度整数（`std.fmt.parseInt` 十进制）、`f32`/`f64`
+/// - `bool`：`true`/`1` → true，`false`/`0` → false
+/// - `?T`：缺参 → null（即“必填”就是非 optional 字段）
+///
+/// 其它类型（数组、枚举、嵌套 struct 等）→ 编译期报错。
+/// 同名重复 key 取第一个。失败时（若传了 `failed_field`）写入出错字段名，
+/// 供调用方生成 “missing/invalid query parameter 'x'” 类消息；分配失败等
+/// 系统错误原样传播（不吞成 400）。
+pub fn bindQuery(comptime T: type, ctx: *const Context, failed_field: ?*[]const u8) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") {
+        @compileError("bindQuery expects a struct type, got " ++ @typeName(T));
+    }
+    var out: T = undefined;
+    const si = info.@"struct";
+    // 兼容两种 @typeInfo struct 形状：旧版 `.fields` 数组（0.17-dev）与新版
+    // `field_names`/`field_types` 平行数组（0.18-dev，配合 @Struct builtin）。
+    if (@hasField(@TypeOf(si), "field_names")) {
+        inline for (si.field_names, si.field_types) |name, field_type| {
+            try bindOneField(T, name, field_type, ctx, &out, failed_field);
+        }
+    } else {
+        inline for (si.fields) |field| {
+            try bindOneField(T, field.name, field.type, ctx, &out, failed_field);
+        }
+    }
+    return out;
+}
+
+/// 单字段绑定，由 `bindQuery` 的 inline 循环逐字段生成。
+fn bindOneField(
+    comptime T: type,
+    comptime name: []const u8,
+    comptime field_type: type,
+    ctx: *const Context,
+    out: *T,
+    failed_field: ?*[]const u8,
+) !void {
+    const found = ctx.queryDecoded(name) catch |err| {
+        if (failed_field) |ff| ff.* = name;
+        return err;
+    };
+    const raw = found orelse {
+        if (@typeInfo(field_type) == .optional) {
+            @field(out.*, name) = null;
+            return;
+        }
+        if (failed_field) |ff| ff.* = name;
+        return error.MissingQuery;
+    };
+    const inner = switch (@typeInfo(field_type)) {
+        .optional => |o| o.child,
+        else => field_type,
+    };
+    @field(out.*, name) = decodeQueryValue(inner, raw) catch {
+        if (failed_field) |ff| ff.* = name;
+        return error.InvalidQuery;
+    };
+}
+
+/// 单个 query 值的解析；slice 用 `T == []const u8` 直接判型，不做 slice
+/// 元类型自省（0.17 起 slice 在 @typeInfo 里归入 .pointer，字段名不稳）。
+fn decodeQueryValue(comptime T: type, raw: []const u8) error{InvalidQuery}!T {
+    if (T == []const u8) return raw;
+    return switch (@typeInfo(T)) {
+        .bool => if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1"))
+            true
+        else if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0"))
+            false
+        else
+            error.InvalidQuery,
+        .int => std.fmt.parseInt(T, raw, 10) catch error.InvalidQuery,
+        .float => std.fmt.parseFloat(T, raw) catch error.InvalidQuery,
+        else => @compileError("bindQuery: unsupported field type " ++ @typeName(T)),
     };
 }
 
@@ -365,6 +533,149 @@ test "JsonBody: OOM 向上传播，不被吞成 400" {
     try std.testing.expect(env.ctx.getUserData(TestUser) == null);
     try std.testing.expect(env.ctx.getUserData(AppError) == null);
     try std.testing.expectEqual(@as(usize, 0), env.writer.end);
+}
+
+// ── jsonHandler / queryHandler / bindQuery 覆盖测试 ────────────────────
+
+const LoginReq = struct { username: []const u8, password: []const u8 };
+
+const PageQuery = struct { name: []const u8, age: u8, admin: bool, tag: ?u32 };
+
+const BindHandlers = struct {
+    fn login(body: *const LoginReq, ctx: *Context, res: *Response) !void {
+        const msg = std.fmt.allocPrint(ctx.arena, "user={s}", .{body.username}) catch return error.OutOfMemory;
+        try res.text(msg);
+    }
+
+    fn page(q: PageQuery, ctx: *Context, res: *Response) !void {
+        const msg = std.fmt.allocPrint(
+            ctx.arena,
+            "name={s} age={d} admin={any} tag={?d}",
+            .{ q.name, q.age, q.admin, q.tag },
+        ) catch return error.OutOfMemory;
+        try res.text(msg);
+    }
+};
+
+test "jsonHandler: JSON body 自动绑定到 struct 字段" {
+    var env: CodecEnv = .{};
+    env.begin(.{
+        .content_type = "application/json",
+        .body = .{ .buffered = "{\"username\":\"alice\",\"password\":\"s3cret\"}" },
+    });
+    defer env.end();
+
+    const h = jsonHandler(LoginReq, BindHandlers.login, null);
+    try h.dispatch(&env.ctx, &env.res);
+    try std.testing.expect(std.mem.indexOf(u8, env.written(), "user=alice") != null);
+}
+
+test "jsonHandler: 非 JSON Content-Type → AppError(415)" {
+    var env: CodecEnv = .{};
+    env.begin(.{
+        .content_type = "text/plain",
+        .body = .{ .buffered = "{\"username\":\"a\",\"password\":\"b\"}" },
+    });
+    defer env.end();
+
+    const h = jsonHandler(LoginReq, BindHandlers.login, null);
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    const ae = env.ctx.getUserData(AppError).?;
+    try std.testing.expectEqual(@as(@TypeOf(ae.status), .unsupported_media_type), ae.status);
+}
+
+test "jsonHandler: 空 body → AppError(400) missing JSON body" {
+    var env: CodecEnv = .{};
+    env.begin(.{ .content_type = "application/json", .body = .{ .buffered = "" } });
+    defer env.end();
+
+    const h = jsonHandler(LoginReq, BindHandlers.login, null);
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    try std.testing.expectEqualStrings("missing JSON body", env.ctx.getUserData(AppError).?.message);
+}
+
+test "jsonHandler: 非法 JSON → AppError(400) invalid JSON body" {
+    var env: CodecEnv = .{};
+    env.begin(.{ .content_type = "application/json", .body = .{ .buffered = "not json" } });
+    defer env.end();
+
+    const h = jsonHandler(LoginReq, BindHandlers.login, null);
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    try std.testing.expectEqualStrings("invalid JSON body", env.ctx.getUserData(AppError).?.message);
+}
+
+test "jsonHandler: 超限 → AppError(413) 且 keep_alive=false" {
+    var env: CodecEnv = .{};
+    // 同 JsonBody 超限测试：.streaming 在 content_length 预判阶段就被拦，
+    // 指针不会被解引用，可用 undefined。
+    env.begin(.{
+        .content_type = "application/json",
+        .body = .{ .streaming = undefined },
+        .content_length = 1000,
+    });
+    defer env.end();
+
+    const h = jsonHandler(LoginReq, BindHandlers.login, 10); // limit 10 < CL 1000
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    const ae = env.ctx.getUserData(AppError).?;
+    try std.testing.expectEqual(@as(@TypeOf(ae.status), .payload_too_large), ae.status);
+    try std.testing.expect(!env.res.keep_alive);
+}
+
+test "queryHandler: 按字段名绑定，可选字段缺省 → null" {
+    var env: CodecEnv = .{};
+    env.begin(.{});
+    defer env.end();
+    env.req.query = "name=alice&age=7&admin=true"; // tag 缺失 → null
+
+    const h = queryHandler(PageQuery, BindHandlers.page);
+    try h.dispatch(&env.ctx, &env.res);
+    const out = env.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "name=alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "age=7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "admin=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tag=null") != null);
+}
+
+test "queryHandler: 必填字段缺失 → AppError(400) 带字段名" {
+    var env: CodecEnv = .{};
+    env.begin(.{});
+    defer env.end();
+    env.req.query = "age=7&admin=true"; // 缺 name
+
+    const h = queryHandler(PageQuery, BindHandlers.page);
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    try std.testing.expectEqualStrings(
+        "missing query parameter 'name'",
+        env.ctx.getUserData(AppError).?.message,
+    );
+}
+
+test "queryHandler: 值解析失败 → AppError(400) 带字段名" {
+    var env: CodecEnv = .{};
+    env.begin(.{});
+    defer env.end();
+    env.req.query = "name=a&age=abc&admin=true";
+
+    const h = queryHandler(PageQuery, BindHandlers.page);
+    try std.testing.expectError(error.AppError, h.dispatch(&env.ctx, &env.res));
+    try std.testing.expectEqualStrings(
+        "invalid query parameter 'age'",
+        env.ctx.getUserData(AppError).?.message,
+    );
+}
+
+test "bindQuery: 不经 handler 直接绑定（含 percent 解码）" {
+    var env: CodecEnv = .{};
+    env.begin(.{});
+    defer env.end();
+    env.req.query = "name=a%20b&age=42&admin=1&tag=9";
+
+    const q = try bindQuery(PageQuery, &env.ctx, null);
+    try std.testing.expectEqualStrings("a b", q.name);
+    try std.testing.expectEqual(@as(u8, 42), q.age);
+    try std.testing.expect(q.admin);
+    try std.testing.expectEqual(@as(u32, 9), q.tag.?);
 }
 
 test {

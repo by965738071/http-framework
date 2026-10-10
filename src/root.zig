@@ -114,9 +114,15 @@ pub const RateLimitConfig = http_rate_limit.RateLimitConfig;
 // ── http_static ───────────────────────────────────────────────
 pub const StaticFileServer = http_static.StaticFileServer;
 
-// ── http_codec ────────────────────────────────────────────────
+// ── http_codec ──────────────────────────────────────────────
 pub const parseJson = http_codec.parseJson;
 pub const JsonBody = http_codec.JsonBody;
+/// JSON body 自动绑定到 struct 参数的 handler 适配器
+pub const jsonHandler = http_codec.jsonHandler;
+/// query 参数自动绑定到 struct 字段的 handler 适配器
+pub const queryHandler = http_codec.queryHandler;
+/// query 绑定核心逻辑（可在 handler 内直接调用）
+pub const bindQuery = http_codec.bindQuery;
 
 // ── http_multipart ───────────────────────────────────────────
 pub const FormData = http_multipart.FormData;
