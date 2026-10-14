@@ -400,8 +400,17 @@ pub const Logger = struct {
         self.file.close(self.io);
 
         if (max == 0) {
-            // 不保留备份：重开新文件即可
-            self.reopen();
+            // 不保留备份：直接重开一个**空**新文件（truncate）。
+            // 不能走 reopen()/openLogFile()：那里 truncate=false 且 file_offset=现有
+            // 文件大小，轮转条件（file_offset >= max_size）会立刻再次成立，导致每条
+            // 日志都触发轮转且文件永不截断、无限增长（bug.md §3）。
+            self.file = cwd.createFile(self.io, path, .{ .truncate = true }) catch {
+                // fd 已 close：重开失败必须暂停文件写，避免向失效句柄写入。
+                self.pauseFileWrites();
+                return;
+            };
+            self.file_offset = 0;
+            self.append_mode = enableAppendMode(self.file.handle);
             return;
         }
 
@@ -970,6 +979,43 @@ test "file output rotates and gzips backups" {
         std.debug.print("missing backup .2.gz: {s}\n", .{@errorName(err)});
         return err;
     };
+}
+
+test "max_backups 0 rotates by truncating instead of growing forever" {
+    // bug.md §3 回归：max_backups==0 时旧实现走 reopen()（truncate=false），
+    // 文件永不截断、file_offset 从不归零 → 每条日志都触发轮转且无限增长。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/zero.log",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(path);
+
+    var logger = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .text,
+        .output = .file,
+        .file = .{ .path = path, .max_size = 200, .max_backups = 0 },
+    });
+    defer logger.deinit();
+
+    // 每行约 90B，30 行 ≈ 2.7KB：若轮转不截断，文件会远超 max_size。
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        logger.info(null, "line {d} with padding ..........", &.{});
+    }
+
+    // 活动文件至多容纳刚轮转后的少量行（max_size + 一行）。
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.testing.expect(st.size < 400);
+
+    // max_backups == 0 不应产生任何备份文件。
+    const bak = try std.fmt.allocPrint(std.testing.allocator, "{s}.1", .{path});
+    defer std.testing.allocator.free(bak);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, bak, .{}));
 }
 
 test "rotated backup decompresses to original lines" {

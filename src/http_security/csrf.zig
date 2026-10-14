@@ -25,7 +25,7 @@ pub const CsrfConfig = struct {
     cookie_name: []const u8 = "csrf_token",
     header_name: []const u8 = "X-CSRF-Token",
     form_field_name: []const u8 = "csrf_token",
-    token_length: u8 = 32,
+    token_length: usize = 32,
     cookie_path: []const u8 = "/",
     /// CSRF cookie 是否只经 TLS 传输。默认 true（M9）：token 虽无 HttpOnly 仍须
     /// 防明文嗅探——明文 HTTP 下被嗅探即可伪造表单；纯本机开发请显式关掉。
@@ -161,7 +161,7 @@ test "CsrfConfig defaults" {
     const cfg = CsrfConfig{};
     try std.testing.expectEqualStrings("csrf_token", cfg.cookie_name);
     try std.testing.expectEqualStrings("X-CSRF-Token", cfg.header_name);
-    try std.testing.expectEqual(@as(u8, 32), cfg.token_length);
+    try std.testing.expectEqual(@as(usize, 32), cfg.token_length);
     try std.testing.expectEqual(@as(usize, 3), cfg.ignored_methods.len);
 }
 
@@ -184,6 +184,16 @@ test "CsrfMiddleware.generateToken produces hex string" {
         const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
         try std.testing.expect(is_hex);
     }
+}
+
+test "CsrfMiddleware.generateToken token_length >= 128 without overflow" {
+    // bug.md §1 回归：token_length 曾为 u8，byte_len*2 在 >=128 时溢出，
+    // hex 分配长度归零而循环仍按原长度写入 → 堆越界。改为 usize 后必须安全。
+    const allocator = std.testing.allocator;
+    const csrf = CsrfMiddleware{ .config = .{ .token_length = 200 }, .io = std.testing.io };
+    const token = try csrf.generateToken(allocator);
+    defer allocator.free(token);
+    try std.testing.expectEqual(@as(usize, 400), token.len);
 }
 
 test "CsrfMiddleware.generateToken produces different tokens" {

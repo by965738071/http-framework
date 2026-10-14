@@ -428,6 +428,36 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                     errdefer set.deinit(); // append OOM 时上面的 defer 看不到这个 set
                     try group_sets.append(self.allocator, set);
                 }
+            } else {
+                // 整行替换（bug.md §4）：每个命中行都拿到同一份 query.data，唯一
+                // 字段的新值在多行间必然相同。若只逐行 checkUnique（只比旧值、仅
+                // 排除自身 id），两行各自都检不出冲突 → 静默写入重复唯一值。
+                // 这里为**所有** unique 字段/联合索引建同样的「非命中行取值集」，
+                // 交给第二趟统一的累积式校验循环。
+                for (schema.fields) |fd| {
+                    if (!fd.constraints.unique) continue;
+                    try unique_field_names.append(self.allocator, fd.name);
+                    var set = std.StringHashMap(void).init(self.allocator);
+                    errdefer set.deinit();
+                    outer2: for (self.rows.items, 0..) |row, idx| {
+                        // skip rows that are being updated
+                        for (matched_indices.items) |mi| {
+                            if (mi == idx) continue :outer2;
+                        }
+                        if (query_mod.isFieldNull(T, row, fd.name)) continue;
+                        const fv = query_mod.getFieldValueOpt(T, row, fd.name) orelse continue;
+                        const key = try fieldValuesKey(key_alloc, fv);
+                        try set.put(key, {});
+                    }
+                    try unique_sets.append(self.allocator, set);
+                }
+                for (schema.indexes) |idx| {
+                    if (!idx.unique) continue;
+                    try group_names.append(self.allocator, idx.fields);
+                    var set = try self.buildGroupSet(self.allocator, key_alloc, matched_indices.items, idx.fields);
+                    errdefer set.deinit();
+                    try group_sets.append(self.allocator, set);
+                }
             }
 
             // Second pass: build + validate ALL updated rows in a scratch copy first.
@@ -447,33 +477,36 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                         setFieldByIdentifier(T, &updated, field_name, val);
                     }
                     setFieldByIdentifier(T, &updated, "id", orig_id);
-                    // Check unique constraints against the pre-built sets.
-                    for (unique_field_names.items, 0..) |ufn, ui| {
-                        if (query_mod.isFieldNull(T, updated, ufn)) continue;
-                        const new_val = query_mod.getFieldValueOpt(T, updated, ufn) orelse continue;
-                        const key = try fieldValuesKey(key_alloc, new_val);
-                        if (unique_sets.items[ui].contains(key)) {
-                            // 不显式 unlock——让 errdefer 处理（避免双重解锁）
-                            return error.UniqueViolation;
-                        }
-                        // Add the new value to the set so subsequent matched
-                        // rows can't collide with this row's new value either.
-                        try unique_sets.items[ui].put(key, {});
-                    }
-                    // 联合唯一：整组取值不得与集合里任何一行相同。
-                    for (group_names.items, 0..) |names, gi| {
-                        if (groupHasNull(updated, names)) continue;
-                        const key = try groupKey(key_alloc, updated, names);
-                        if (group_sets.items[gi].contains(key)) {
-                            return error.UniqueViolation;
-                        }
-                        try group_sets.items[gi].put(key, {});
-                    }
                 } else {
                     // 整行替换路径：同样必须做唯一约束校验（H2），排除自身 id。
+                    // 具体校验由下方与 update_fields 路径共用的累积集合完成
+                    // （旧于此处的逐行 checkUnique 漏检命中行之间的冲突，bug.md §4）。
                     updated = query.data.?;
                     setFieldByIdentifier(T, &updated, "id", orig_id);
-                    try self.checkUnique(updated, orig_id);
+                }
+                // Check unique constraints against the pre-built sets.
+                // 两条路径共用：每个通过校验的新值都追加进集合，使后续命中行的
+                // 相同新值也被判为冲突（累积式，覆盖「多行同名新值」）。
+                for (unique_field_names.items, 0..) |ufn, ui| {
+                    if (query_mod.isFieldNull(T, updated, ufn)) continue;
+                    const new_val = query_mod.getFieldValueOpt(T, updated, ufn) orelse continue;
+                    const key = try fieldValuesKey(key_alloc, new_val);
+                    if (unique_sets.items[ui].contains(key)) {
+                        // 不显式 unlock——让 errdefer 处理（避免双重解锁）
+                        return error.UniqueViolation;
+                    }
+                    // Add the new value to the set so subsequent matched
+                    // rows can't collide with this row's new value either.
+                    try unique_sets.items[ui].put(key, {});
+                }
+                // 联合唯一：整组取值不得与集合里任何一行相同。
+                for (group_names.items, 0..) |names, gi| {
+                    if (groupHasNull(updated, names)) continue;
+                    const key = try groupKey(key_alloc, updated, names);
+                    if (group_sets.items[gi].contains(key)) {
+                        return error.UniqueViolation;
+                    }
+                    try group_sets.items[gi].put(key, {});
                 }
                 try new_rows.append(self.allocator, updated);
             }
@@ -636,7 +669,12 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         pub fn updateById(self: *Self, id: u64, data: T) !bool {
             var qb = QueryBuilder(T).init(self.allocator);
             defer qb.deinit();
-            _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+            // FieldValue.integer 是 i64：id 超出范围时按「无此记录」返回 false，
+            // 不能 @intCast——安全构建下 panic、Unsafe 构建下 UB（bug.md §2，
+            // DELETE /users/18446744073709551615 即可远程打穿），与 toFieldValue
+            // 的 std.math.cast 饱和策略保持一致。
+            const id_i: i64 = std.math.cast(i64, id) orelse return false;
+            _ = qb.where(.Eq, "id", .{ .integer = id_i });
             _ = qb.update(data, null);
             const n = try self.update(&qb);
             return n > 0;
@@ -646,7 +684,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         pub fn deleteById(self: *Self, id: u64) !bool {
             var qb = QueryBuilder(T).init(self.allocator);
             defer qb.deinit();
-            _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+            // 同 updateById：u64 越界视为「无此记录」，避免 @intCast panic（bug.md §2）。
+            const id_i: i64 = std.math.cast(i64, id) orelse return false;
+            _ = qb.where(.Eq, "id", .{ .integer = id_i });
             _ = qb.delete();
             const n = try self.delete(&qb);
             return n > 0;
@@ -1083,13 +1123,33 @@ fn dupStringFields(comptime T: type, allocator: std.mem.Allocator, row: *T) !voi
         .@"struct" => |s| s,
         else => @compileError("expected struct"),
     };
+    // bug.md §5：某个字段 dupe 失败时，回滚本行中已 dup 的较前字段，
+    // 避免仅 OOM 路径泄漏。done 按「字符串字段序号」计数，errdefer 里
+    // 用同一顺序释放前 done 个（optional-null 字段未 dupe，free 自然跳过）。
+    var done: usize = 0;
+    errdefer {
+        var freed: usize = 0;
+        inline for (info.field_names, info.field_types) |fname, ftype| {
+            if (comptime isConstU8Slice(ftype)) {
+                if (freed < done) allocator.free(@field(row.*, fname));
+                freed += 1;
+            } else if (comptime isOptionalConstU8Slice(ftype)) {
+                if (freed < done) {
+                    if (@field(row.*, fname)) |s| allocator.free(s);
+                }
+                freed += 1;
+            }
+        }
+    }
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime isConstU8Slice(ftype)) {
             @field(row.*, fname) = try allocator.dupe(u8, @field(row.*, fname));
+            done += 1;
         } else if (comptime isOptionalConstU8Slice(ftype)) {
             if (@field(row.*, fname)) |s| {
                 @field(row.*, fname) = try allocator.dupe(u8, s);
             }
+            done += 1;
         }
     }
 }
@@ -2261,6 +2321,91 @@ test "unique constraint enforced on insert" {
 
     _ = try store.insert(.{ .id = 0, .email = "dup@x.com" });
     try std.testing.expectError(error.UniqueViolation, store.insert(.{ .id = 0, .email = "dup@x.com" }));
+}
+
+test "full-row replace update detects duplicate unique value across matched rows" {
+    // bug.md §4 回归：整行替换时每个命中行拿到同一份 data，旧实现逐行
+    // checkUnique（只比旧值）→ 两行各自检不出冲突，静默写入重复唯一值。
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, email: []const u8 };
+    const sch = TableSchema{
+        .table_name = "uniq_replace",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "email", .field_type = .string, .constraints = .{ .unique = true } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    _ = try store.insert(.{ .id = 0, .email = "a@x.com" });
+    _ = try store.insert(.{ .id = 0, .email = "b@x.com" });
+
+    // WHERE 命中 2 行，整行替换 email 为一个不同于任何旧值的新值：
+    // 两行新值彼此相同 → 必须拒绝。
+    var qb = QueryBuilder(U).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Gt, "id", .{ .integer = 0 });
+    _ = qb.update(.{ .id = 0, .email = "c@x.com" }, null);
+    try std.testing.expectError(error.UniqueViolation, store.update(&qb));
+
+    // 校验失败不得部分写回：两行旧值仍在。
+    var qb2 = QueryBuilder(U).init(allocator);
+    defer qb2.deinit();
+    const rows = try store.findAll(allocator, &qb2);
+    defer store.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("a@x.com", rows[0].email);
+    try std.testing.expectEqualStrings("b@x.com", rows[1].email);
+
+    // 单行整行替换新唯一值：正常通过。
+    var qb3 = QueryBuilder(U).init(allocator);
+    defer qb3.deinit();
+    _ = qb3.where(.Eq, "id", .{ .integer = 1 });
+    _ = qb3.update(.{ .id = 0, .email = "c@x.com" }, null);
+    try std.testing.expectEqual(@as(usize, 1), try store.update(&qb3));
+}
+
+test "updateById/deleteById reject ids beyond i64 range instead of panicking" {
+    // bug.md §2 回归：id > maxInt(i64) 时 @intCast 会 panic（远程 DoS）。
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Store = JsonStore(TestUser, test_schema);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    _ = try store.insert(.{ .id = 0, .name = "a", .email = "a@x.com" });
+
+    const huge: u64 = std.math.maxInt(u64);
+    try std.testing.expectEqual(false, try store.updateById(huge, .{ .id = 0, .name = "x", .email = "x@x.com" }));
+    try std.testing.expectEqual(false, try store.deleteById(huge));
+    // 越界 id 不能被误匹配到已有行。
+    try std.testing.expectEqual(@as(usize, 1), try store.countAll());
+    // 正常 id 仍工作。
+    try std.testing.expectEqual(true, try store.deleteById(1));
+    try std.testing.expectEqual(@as(usize, 0), try store.countAll());
+}
+
+test "dupStringFields rolls back earlier dups when a later dupe fails" {
+    // bug.md §5 回归：函数内部无回滚时，靠后的字段 dupe 失败会泄漏本行
+    // 较前字段已 dup 的字符串（仅 OOM 路径）。
+    const Row = struct { id: u64, first: []const u8, second: []const u8 };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var row = Row{ .id = 1, .first = "first", .second = "second" };
+    try std.testing.expectError(error.OutOfMemory, dupStringFields(Row, failing.allocator(), &row));
+    // first 的 dupe 已成功分配（第 1 次分配），second 的 dupe 被注入失败（第 2 次）；
+    // 若回滚生效，first 必须被释放 → 分配/释放次数相等。
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), failing.deallocations);
 }
 
 test "default_value applied on insert" {
