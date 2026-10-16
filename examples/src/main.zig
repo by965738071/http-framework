@@ -678,12 +678,13 @@ fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void 
         return;
     }
 
-    // getOrCreate：没有 cookie 就新建 session 并写 Set-Cookie
+    // rotate：没有 cookie 就新建 session 并写 Set-Cookie；已有 cookie 时先销毁
+    // 旧 ID 再签发新 ID（防会话固定，修复 bug.md §8）。
     const sessions = ctx.service(framework.SessionManager) orelse {
         try ctx.failWith(framework.AppError.internal("session service not available"));
         return;
     };
-    const session_id = try sessions.getOrCreate(ctx, res);
+    const session_id = try sessions.rotate(ctx, res);
     try sessions.setData(session_id, "username", body.username);
 
     if (ctx.service(framework.Logger)) |logger| {

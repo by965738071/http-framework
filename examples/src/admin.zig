@@ -125,22 +125,31 @@ pub const Notifications = struct {
         // zio 线程池是多 OS 线程的：register/unregister/broadcast 可能在
         // 不同 worker 上并发。不加锁 → connections 切片竞态 → 内存损坏。
         //
-        // 快照策略：锁内拷一份指针副本，锁外逐个 sendText——避免 I/O
-        // 期间持有锁（sendText 可能 yield 给事件循环，持锁会饿死其他
-        // register/unregister 调用，甚至死锁）。
+        // 修复 bug.md §9：sendText 必须在锁内完成。连接表存的 *WebSocket 指向
+        // handshake.zig run() 的栈局部变量，handler 返回即析构；旧写法「锁内
+        // 拷快照、锁外发送」在锁外解引用快照期间，持有该 ws 的 worker 线程
+        // 可能已断开返回 → 栈帧销毁 → use-after-free。
+        //
+        // 代价：某个客户端 TCP 写阻塞时，register/unregister 要等它超时
+        // （TimedWriter write_timeout_ns）才能拿锁——用可用性换内存安全。
+        // 发送失败就地 swap-remove 摘除，绝不能在持锁时调 self.unregister
+        // （std.Io.Mutex 非重入，锁内重入即死锁）。
         self.mutex.lockUncancelable(self.io);
-        const snapshot = self.allocator.dupe(*framework.WebSocket, self.connections) catch {
-            self.mutex.unlock(self.io);
-            return error.OutOfMemory;
-        };
-        self.mutex.unlock(self.io);
-        defer self.allocator.free(snapshot);
+        defer self.mutex.unlock(self.io);
 
-        for (snapshot) |ws| {
-            ws.sendText(msg) catch {
-                // 发送失败：注销该连接。在锁内做 swap-remove。
-                self.unregister(ws);
-            };
+        var i: usize = 0;
+        while (i < self.connections.len) {
+            const ws = self.connections[i];
+            if (ws.sendText(msg)) |_| {
+                i += 1;
+            } else |_| {
+                const last = self.connections.len - 1;
+                if (i != last) {
+                    self.connections[i] = self.connections[last];
+                }
+                self.connections.len = last;
+                // 不推进 i：last 已换到位置 i，需在下一轮处理
+            }
         }
     }
 
@@ -354,7 +363,11 @@ pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, servic
         try ctx.failWith(framework.AppError.internal("session unavailable"));
         return;
     };
-    const sid = try sessions.getOrCreate(ctx, res);
+    // 修复 bug.md §8（防会话固定 Session Fixation）：登录成功后必须用 rotate
+    // 而非 getOrCreate。getOrCreate 对 cookie 里已存在且未过期的 ID 原样复用，
+    // 攻击者可预取 ID 诱导受害者登录后复用同一会话；rotate 先销毁旧 ID 再
+    // 签发全新 ID 并覆写 Set-Cookie（见 session.zig rotate 的契约）。
+    const sid = try sessions.rotate(ctx, res);
     try sessions.setData(sid, "username", username);
     try sessions.setData(sid, "role", @tagName(role));
 

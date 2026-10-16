@@ -199,6 +199,45 @@ pub const StaticFileServer = struct {
             http_compress.chooseEncoding(accept_encoding, &.{.gzip}) == .gzip;
         if (can_compress) _ = try res.header("Vary", "Accept-Encoding");
 
+        // Range 请求（RFC 9110 §14.2）：仅支持单一 `bytes=a-b` 区间。
+        //
+        // 修复 bug.md §7：本块必须排在 HEAD 分支之前。RFC 9110 §9.3.2 要求
+        // HEAD 的响应头与同请求的 GET 完全一致（HEAD+Range 同样应得 206 +
+        // Content-Range）；旧顺序下 HEAD 先短路返回 200 + 全量 Content-Length，
+        // 断点续传/分片下载客户端拿 HEAD 探测区间时会得到错误结果。
+        if (ctx.request.getHeader("Range")) |range_hdr| {
+            // 修复 P2-15：If-Range（RFC 9110 §14.6，MUST）。验证器不匹配时必须
+            // 忽略 Range 回 200 全量，否则客户端缓存会把旧区间片段和新全量
+            // 拼接成损坏文件。
+            const if_range_ok = if (ctx.request.getHeader("If-Range")) |ir|
+                ifRangeMatch(ir, etag, stat.mtime.nanoseconds)
+            else
+                true;
+            if (if_range_ok) switch (parseByteRange(range_hdr, stat.size)) {
+                .range => |rng| {
+                    // HEAD + Range：头部与 GET 的 206 完全一致但不读文件。
+                    if (ctx.request.method == .HEAD) {
+                        return self.headRange(res, stat.size, content_type, rng);
+                    }
+                    return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng);
+                },
+                .unsatisfiable => {
+                    // 不可满足的范围 → 416 + Content-Range: bytes */size。
+                    // HEAD 共用本分支：res.text 是单次写入，Content-Length 只写
+                    // 一次（body 由 std 对 HEAD 自动省略），不会出现双 Content-Length。
+                    var cr_buf: [48]u8 = undefined;
+                    const cr = std.fmt.bufPrint(&cr_buf, "bytes */{d}", .{stat.size}) catch "bytes */0";
+                    _ = try res.header("Content-Range", cr);
+                    _ = res.statusCode(.range_not_satisfiable);
+                    try res.text("Range Not Satisfiable");
+                    return;
+                },
+                // 多区间 / 不可识别 unit：RFC 9110 §14.2 要求忽略该 Range，回 200 全量
+                // （含 HEAD：落到下面的 HEAD-200 分支）。
+                .ignore => {},
+            };
+        }
+
         // HEAD：只发头，不发 body（RFC 9110 §9.3.2）。
         //
         // 不能手写 Content-Length 再 res.text("")：std 的 respond() 会按 body.len
@@ -217,31 +256,6 @@ pub const StaticFileServer = struct {
             });
             try head_stream.end();
             return;
-        }
-
-        // Range 请求（RFC 9110 §14.2）：仅支持单一 `bytes=a-b` 区间。
-        if (ctx.request.getHeader("Range")) |range_hdr| {
-            // 修复 P2-15：If-Range（RFC 9110 §14.6，MUST）。验证器不匹配时必须
-            // 忽略 Range 回 200 全量，否则客户端缓存会把旧区间片段和新全量
-            // 拼接成损坏文件。
-            const if_range_ok = if (ctx.request.getHeader("If-Range")) |ir|
-                ifRangeMatch(ir, etag, stat.mtime.nanoseconds)
-            else
-                true;
-            if (if_range_ok) switch (parseByteRange(range_hdr, stat.size)) {
-                .range => |rng| return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng),
-                .unsatisfiable => {
-                    // 不可满足的范围 → 416 + Content-Range: bytes */size
-                    var cr_buf: [48]u8 = undefined;
-                    const cr = std.fmt.bufPrint(&cr_buf, "bytes */{d}", .{stat.size}) catch "bytes */0";
-                    _ = try res.header("Content-Range", cr);
-                    _ = res.statusCode(.range_not_satisfiable);
-                    try res.text("Range Not Satisfiable");
-                    return;
-                },
-                // 多区间 / 不可识别 unit：RFC 9110 §14.2 要求忽略该 Range，回 200 全量。
-                .ignore => {},
-            };
         }
 
         // 修复 fix.md 架构缺陷 #2：流式响应绕过缓冲中间件 → 压缩失效。
@@ -414,6 +428,33 @@ pub const StaticFileServer = struct {
             remaining -= n;
         }
         try stream.end();
+    }
+
+    /// 响应 HEAD + Range：状态行与头部（206 + Content-Range + 区间长度）与
+    /// serveRange 完全一致，但不打开文件、不读任何字节；body 由 std 对 HEAD
+    /// 自动 elide。走 stream + 声明长度（同 HEAD-200 分支），避免手写
+    /// Content-Length 造成双头。修复 bug.md §7。
+    fn headRange(
+        self: *const StaticFileServer,
+        res: *Response,
+        total: u64,
+        content_type: []const u8,
+        rng: ByteRange,
+    ) !void {
+        _ = self;
+        const len = rng.end - rng.start + 1;
+
+        var cr_buf: [64]u8 = undefined;
+        const cr = std.fmt.bufPrint(&cr_buf, "bytes {d}-{d}/{d}", .{ rng.start, rng.end, total }) catch "";
+        _ = try res.header("Content-Range", cr);
+
+        _ = res.statusCode(.partial_content);
+        var head_buf: [64]u8 = undefined;
+        var head_stream = try res.stream(&head_buf, .{
+            .content_length = len,
+            .content_type = content_type,
+        });
+        try head_stream.end();
     }
 
     fn stripPrefix(self: *const StaticFileServer, path: []const u8) ?[]const u8 {

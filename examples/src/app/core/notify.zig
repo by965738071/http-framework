@@ -1,7 +1,7 @@
 //!
-//! 与 examples/src/admin.zig 的 `Notifications` 同思路（锁内拷快照、锁外发送），
-//! 但连接表改用 `std.ArrayList` 而不是"手工扩窗 + 定长缓冲"，避免越界写与
-//! 满容量静默丢连接。
+//! 与 examples/src/admin.zig 的 `Notifications` 同思路（全程持锁发送，见
+//! bug.md §9），但连接表改用 `std.ArrayList` 而不是"手工扩窗 + 定长缓冲"，
+//! 避免越界写与满容量静默丢连接。
 
 const std = @import("std");
 const framework = @import("http_framework");
@@ -50,18 +50,27 @@ pub const Notifier = struct {
 
     /// 向所有连接推送一条文本。发送失败的连接会被注销。
     pub fn broadcast(self: *Notifier, text: []const u8) !void {
+        // 修复 bug.md §9（与 examples/src/admin.zig 的 Notifications 同一 bug）：
+        // 必须全程持锁发送。connections 里的 *WebSocket 指向 handshake.zig
+        // run() 的栈局部变量，handler 返回即析构；旧写法「锁内拷快照、
+        // 锁外发送」在锁外解引用快照期间，对应 worker 线程可能已断开返回
+        // → 栈帧销毁 → use-after-free。
+        //
+        // 代价：慢客户端的 TCP 写会阻塞 register/unregister 直到发送超时
+        // （TimedWriter write_timeout_ns）。锁内失败就地 orderedRemove，绝不能
+        // 在持锁时调 self.unregister（std.Io.Mutex 非重入 → 死锁）。
         self.mutex.lockUncancelable(self.io);
-        const snapshot = self.allocator.dupe(*framework.WebSocket, self.connections.items) catch {
-            self.mutex.unlock(self.io);
-            return error.OutOfMemory;
-        };
-        self.mutex.unlock(self.io);
-        defer self.allocator.free(snapshot);
+        defer self.mutex.unlock(self.io);
 
-        for (snapshot) |ws| {
-            ws.sendText(text) catch {
-                self.unregister(ws);
-            };
+        var i: usize = 0;
+        while (i < self.connections.items.len) {
+            const ws = self.connections.items[i];
+            if (ws.sendText(text)) |_| {
+                i += 1;
+            } else |_| {
+                _ = self.connections.orderedRemove(i);
+                // 不推进 i：后移元素落在位置 i，需在下一轮处理
+            }
         }
     }
 
