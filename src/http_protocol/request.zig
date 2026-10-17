@@ -42,9 +42,9 @@ pub const Request = struct {
 
     /// 方法不允许 body（GET/HEAD/DELETE/TRACE/OPTIONS，std requestHasBody 口径）
     /// 却携带 Content-Length > 0 时的字节数。init 按「收下但忽略」处理（body 恒为
-    /// .none），此字段告知 ConnectionRunner：响应发完且连接继续复用时，需从连接
-    /// 上排空这些字节，否则下一个 receiveHead 会把它们误解析成新请求（Issue 5）。
-    /// null = 无需处理。
+    /// .none），此字段告知 ConnectionRunner：超过上限时不排空、降级为关连接
+    /// （Issue 5）。keep-alive 时的排空自 std 0.18 起由 respond → discardBody
+    /// 自动完成，框架不再手动排空。null = 无需处理。
     ignored_body_len: ?u64 = null,
 
     pub const Body = union(enum) {
@@ -78,10 +78,9 @@ pub const Request = struct {
         // RFC 9110 §8.3 承认 DELETE 的 body 可以有语义（ES 风格 DELETE+body 等
         // 真实客户端在用），旧实现一律 400 与生态冲突（Issue 5）。现按 nginx 式
         // 宽容处理：收下但忽略——
-        //   - CL>0：置 ignored_body_len 放行（body 仍为 .none），由 ConnectionRunner
-        //     在响应后排空。std 对无 body 方法的成帧是恒空 .ending reader（从不消费
-        //     这些字节），而 receiveHead 只 toss 掉 head 部分——字节留在框架与 Server
-        //     共用的底层 reader 里，框架层排空是正确且唯一可行的位置。
+        //   - CL>0：置 ignored_body_len 放行（body 仍为 .none）。std 0.18 起，
+        //     keep-alive 响应时 respond → discardBody 会自动消费这些字节（旧版
+        //     恒空 .ending reader 不消费的假设已过期）；框架只负责超限降级决策。
         //   - chunked：无法预知长度可排空，且本就是 TE.TE 走私面，维持拒收。
         var ignored_body_len: ?u64 = null;
         if (!head.method.requestHasBody()) {

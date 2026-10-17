@@ -55,7 +55,7 @@
 .dependencies = .{
     .http_framework = .{ .path = "../" },
 },
-.minimum_zig_version = "0.17.0-dev.889+e6be5cfe3",
+.minimum_zig_version = "0.18.0-dev",
 ```
 
 ```zig
@@ -557,6 +557,14 @@ try res.statusCode(.forbidden).json(.{ .error_code = "forbidden" });
 ```zig
 try ctx.setUserData(SomeType, ptr);          // 中间件里
 const v = ctx.getUserData(SomeType);         // handler 里取，?*SomeType
+```
+
+**推荐入口 `ctx.state.slot(T)`**（`context.zig`）：不存在时在请求 arena 上分配零值载体并挂链，
+同类型幂等返回同一指针；payload 生命周期由框架锁在 arena 上，免去手写 create+set：
+
+```zig
+const actor = try ctx.state.slot(Actor);     // 首次：arena 分配零值 + 挂链
+actor.user_id = 42;                          // 后续 middleware/handler 拿到同一指针
 ```
 
 已被框架占用的槽：`AppError`（`failWith`）、`RequestId`（`request_id.zig:62`）、`AuthInfo`（AuthMiddleware）、以及 `JsonBody(T)` 中间件按 DTO 类型占位。

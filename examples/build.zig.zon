@@ -6,7 +6,7 @@
     .dependencies = .{
         .http_framework = .{ .path = "../" },
     },
-    .minimum_zig_version = "0.17.0-dev.889+e6be5cfe3",
+    .minimum_zig_version = "0.18.0-dev",
     .paths = .{
         "build.zig",
         "build.zig.zon",

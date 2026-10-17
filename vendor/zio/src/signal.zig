@@ -1,0 +1,681 @@
+// SPDX-FileCopyrightText: 2025 Lukáš Lalinský
+// SPDX-License-Identifier: MIT
+
+const std = @import("std");
+const builtin = @import("builtin");
+const posix = @import("os/posix.zig");
+const Runtime = @import("runtime.zig").Runtime;
+const Group = @import("group.zig").Group;
+const common = @import("common.zig");
+const Cancelable = common.Cancelable;
+const Timeoutable = common.Timeoutable;
+const Timeout = @import("time.zig").Timeout;
+const WaitQueue = @import("utils/wait_queue.zig").WaitQueue;
+const WaitNode = @import("utils/wait_queue.zig").WaitNode;
+const AutoCancel = @import("autocancel.zig").AutoCancel;
+const w = @import("os/windows.zig");
+const Waiter = @import("common.zig").Waiter;
+
+pub const SignalKind = switch (builtin.os.tag) {
+    .windows => enum(u8) {
+        interrupt = w.CTRL_C_EVENT,
+        terminate = w.CTRL_CLOSE_EVENT,
+    },
+    else => enum(u8) {
+        interrupt = @backingInt(posix.SIG.INT),
+        terminate = @backingInt(posix.SIG.TERM),
+        hangup = @backingInt(posix.SIG.HUP),
+        alarm = @backingInt(posix.SIG.ALRM),
+        child = @backingInt(posix.SIG.CHLD),
+        pipe = @backingInt(posix.SIG.PIPE),
+        quit = @backingInt(posix.SIG.QUIT),
+        user1 = @backingInt(posix.SIG.USR1),
+        user2 = @backingInt(posix.SIG.USR2),
+        _,
+    },
+};
+
+const NO_SIGNAL = 255;
+const INSTALLING = 254;
+const MAX_HANDLERS = 32;
+
+const HandlerEntry = struct {
+    kind: std.atomic.Value(u8) = .init(NO_SIGNAL),
+    counter: std.atomic.Value(usize) = .init(0),
+    waiters: WaitQueue(WaitNode) = .empty,
+};
+
+const HandlerRegistryUnix = struct {
+    handlers: [MAX_HANDLERS]HandlerEntry = @splat(.{}),
+    // Reference count for each signal value (0-255)
+    // Each signal type has its own OS-level handler that needs tracking
+    installed_handlers: [256]std.atomic.Value(u8) = @splat(.init(0)),
+    // Store previous signal handlers to restore when refcount reaches 0
+    prev_handlers: [256]posix.Sigaction = undefined,
+
+    fn install(self: *HandlerRegistryUnix, kind: SignalKind) !*HandlerEntry {
+        const signum: u8 = @backingInt(kind);
+
+        // Atomically increment refcount for this signal type
+        const prev_count = self.installed_handlers[signum].fetchAdd(1, .acq_rel);
+        errdefer _ = self.installed_handlers[signum].fetchSub(1, .acq_rel);
+
+        if (prev_count == 0) {
+            // First handler for this signal type - install OS signal handler
+            var sa = posix.Sigaction{
+                .handler = .{ .handler = signalHandlerUnix },
+                .mask = posix.sigemptyset(),
+                .flags = posix.SA.RESTART,
+            };
+
+            // Save the previous handler so we can restore it later
+            posix.sigaction(@backingInt(kind), &sa, &self.prev_handlers[signum]);
+        }
+
+        errdefer {
+            // Restore previous handler if this was the last handler
+            if (prev_count == 0) {
+                posix.sigaction(@backingInt(kind), &self.prev_handlers[signum], null);
+            }
+        }
+
+        // Now find a slot for this signal handler
+        for (&self.handlers) |*entry| {
+            const prev = entry.kind.cmpxchgStrong(NO_SIGNAL, INSTALLING, .acq_rel, .monotonic);
+            if (prev == null) {
+                errdefer entry.kind.store(NO_SIGNAL, .release);
+
+                // Initialize the wait queue and counter
+                entry.waiters = .empty;
+                entry.counter.store(0, .release);
+                entry.kind.store(signum, .release);
+
+                return entry;
+            }
+        }
+
+        return error.TooManySignalHandlers;
+    }
+
+    fn uninstall(self: *HandlerRegistryUnix, kind: SignalKind, entry: *HandlerEntry) void {
+        const signum: u8 = @backingInt(kind);
+
+        // First swap to INSTALLING to prevent signal handler from accessing this entry
+        const prev_value = entry.kind.swap(INSTALLING, .acq_rel);
+        std.debug.assert(prev_value == signum);
+
+        // Restore previous handler if this was the last handler for this signal type
+        const new_count = self.installed_handlers[signum].fetchSub(1, .acq_rel) - 1;
+        if (new_count == 0) {
+            posix.sigaction(@backingInt(kind), &self.prev_handlers[signum], null);
+        }
+
+        // Mark as available
+        entry.kind.store(NO_SIGNAL, .release);
+    }
+};
+
+const HandlerRegistryWindows = struct {
+    handlers: [MAX_HANDLERS]HandlerEntry = @splat(.{}),
+    // Total number of handlers across all signal types
+    // Only one global console control handler for all signals
+    total_handlers: std.atomic.Value(usize) = .init(0),
+
+    fn install(self: *HandlerRegistryWindows, kind: SignalKind) !*HandlerEntry {
+        const signum: u8 = @backingInt(kind);
+
+        const prev_total = self.total_handlers.fetchAdd(1, .acq_rel);
+        errdefer _ = self.total_handlers.fetchSub(1, .acq_rel);
+
+        if (prev_total == 0) {
+            // First handler of any type - install the global console control handler
+            const result = w.SetConsoleCtrlHandler(consoleCtrlHandlerWindows, w.TRUE);
+            if (result == w.FALSE) {
+                return error.SetConsoleCtrlHandlerFailed;
+            }
+        }
+
+        errdefer {
+            // Restore previous handler if this was the last handler
+            if (prev_total == 0) {
+                _ = w.SetConsoleCtrlHandler(consoleCtrlHandlerWindows, w.FALSE);
+            }
+        }
+
+        // Now find a slot for this signal handler
+        for (&self.handlers) |*entry| {
+            const prev = entry.kind.cmpxchgStrong(NO_SIGNAL, INSTALLING, .acq_rel, .monotonic);
+            if (prev == null) {
+                errdefer entry.kind.store(NO_SIGNAL, .release);
+
+                // Initialize the wait queue and counter
+                entry.waiters = .empty;
+                entry.counter.store(0, .release);
+                entry.kind.store(signum, .release);
+
+                return entry;
+            }
+        }
+
+        return error.TooManySignalHandlers;
+    }
+
+    fn uninstall(self: *HandlerRegistryWindows, kind: SignalKind, entry: *HandlerEntry) void {
+        const signum: u8 = @backingInt(kind);
+
+        // First swap to INSTALLING to prevent signal handler from accessing this entry
+        const prev_value = entry.kind.swap(INSTALLING, .acq_rel);
+        std.debug.assert(prev_value == signum);
+
+        // Restore previous handler if this was the last handler
+        const new_total = self.total_handlers.fetchSub(1, .acq_rel) - 1;
+        if (new_total == 0) {
+            _ = w.SetConsoleCtrlHandler(consoleCtrlHandlerWindows, w.FALSE);
+        }
+
+        // Mark as available
+        entry.kind.store(NO_SIGNAL, .release);
+    }
+};
+
+const HandlerRegistry = if (builtin.os.tag == .windows) HandlerRegistryWindows else HandlerRegistryUnix;
+
+var registry: HandlerRegistry = .{};
+
+fn signalHandlerUnix(sig: posix.SIG) callconv(.c) void {
+    const signum: u8 = @intCast(@backingInt(sig));
+    for (&registry.handlers) |*entry| {
+        const kind = entry.kind.load(.acquire);
+        if (kind == signum) {
+            _ = entry.counter.fetchAdd(1, .release);
+
+            // Wake all waiting tasks
+            while (entry.waiters.pop()) |wait_node| {
+                Waiter.fromNode(wait_node).signal();
+            }
+        }
+    }
+}
+
+fn consoleCtrlHandlerWindows(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
+    // Map Windows control events to SignalKind values
+    const signal_value: u8 = switch (ctrl_type) {
+        w.CTRL_C_EVENT => @backingInt(SignalKind.interrupt),
+        w.CTRL_CLOSE_EVENT => @backingInt(SignalKind.terminate),
+        else => return w.FALSE, // Not handled
+    };
+
+    // Notify all matching handlers
+    var found_handler = false;
+    for (&registry.handlers) |*entry| {
+        const kind = entry.kind.load(.acquire);
+        if (kind == signal_value) {
+            _ = entry.counter.fetchAdd(1, .release);
+
+            // Wake all waiting tasks
+            while (entry.waiters.pop()) |wait_node| {
+                Waiter.fromNode(wait_node).signal();
+            }
+
+            found_handler = true;
+        }
+    }
+
+    // Return TRUE if we handled it, FALSE to pass to default handler
+    return if (found_handler) w.TRUE else w.FALSE;
+}
+
+/// OS signal watcher.
+///
+/// Signal allows tasks to wait for OS signals (Unix) or console control events (Windows).
+/// Multiple watchers can be registered for the same signal type, and all watchers will
+/// be notified when the signal is received.
+///
+/// Signal watchers use an internal counter to track received signals, preventing signal
+/// loss between wait operations. If a signal is received while no task is waiting, the
+/// next wait operation will return immediately.
+///
+/// Example:
+/// ```zig
+/// var sig = try Signal.init(.interrupt);
+/// defer sig.deinit();
+/// try sig.wait();  // Blocks until SIGINT is received
+/// ```
+pub const Signal = struct {
+    kind: SignalKind,
+    entry: *HandlerEntry,
+
+    // Future protocol - allows Signal to be used with select()
+    pub const Result = void;
+
+    /// Initializes a new signal watcher for the specified signal kind.
+    /// Multiple watchers can be registered for the same signal type.
+    ///
+    /// When the first watcher for a signal type is initialized, the OS signal handler
+    /// is installed and the previous handler is saved.
+    ///
+    /// Returns error.TooManySignalHandlers if MAX_HANDLERS (32) concurrent watchers are already registered.
+    pub fn init(kind: SignalKind) !Signal {
+        const entry = try registry.install(kind);
+        return .{ .kind = kind, .entry = entry };
+    }
+
+    /// Deinitializes the signal watcher and releases its resources.
+    ///
+    /// When the last watcher for a signal type is deinitialized, the previous OS signal
+    /// handler is restored.
+    pub fn deinit(self: *Signal) void {
+        registry.uninstall(self.kind, self.entry);
+        self.entry = undefined;
+    }
+
+    /// Waits for the signal to be received.
+    /// If the signal was already received (counter > 0), returns immediately.
+    /// Otherwise, suspends the current task until the signal is received.
+    ///
+    /// This function can be called multiple times - each call will wait for a new signal.
+    /// The internal counter is reset after each wait, ensuring signals are not lost.
+    ///
+    /// Returns error.Canceled if the task is cancelled while waiting (including due to timeout expiry).
+    pub fn wait(self: *Signal) Cancelable!void {
+        // Check if we already have pending signals
+        if (self.entry.counter.swap(0, .acquire) > 0) {
+            return;
+        }
+
+        // Stack-allocated waiter - separates operation wait node from task wait node
+        var waiter: Waiter = .init();
+
+        // Add to wait queue
+        self.entry.waiters.push(&waiter.node);
+
+        // Wait for signal, handling spurious wakeups internally
+        waiter.wait(1, .allow_cancel) catch |err| {
+            // On cancellation, try to remove from queue
+            const was_in_queue = self.entry.waiters.remove(&waiter.node);
+            if (!was_in_queue) {
+                // Already removed by signal delivery - wait for signal to complete
+                waiter.wait(1, .no_cancel);
+            }
+            return err;
+        };
+
+        // Consume the counter
+        _ = self.entry.counter.swap(0, .acquire);
+    }
+
+    /// Waits for the signal to be received with a timeout.
+    /// If the signal was already received (counter > 0), returns immediately.
+    /// Otherwise, suspends the current task until either:
+    /// - The signal is received (returns successfully)
+    /// - The timeout expires (returns error.Timeout)
+    /// - The task is cancelled (returns error.Canceled)
+    ///
+    /// This function can be called multiple times - each call will wait for a new signal.
+    /// The internal counter is reset after each wait, ensuring signals are not lost.
+    ///
+    /// Arguments:
+    /// - timeout: Timeout
+    pub fn waitTimeout(self: *Signal, timeout: Timeout) (Timeoutable || Cancelable)!void {
+        // Check if we already have pending signals
+        if (self.entry.counter.swap(0, .acquire) > 0) {
+            return;
+        }
+
+        // Stack-allocated waiter - separates operation wait node from task wait node
+        var waiter: Waiter = .init();
+
+        // Add to wait queue
+        self.entry.waiters.push(&waiter.node);
+
+        // Set up timeout timer
+        var timer = AutoCancel.init;
+        defer timer.clear();
+        timer.set(timeout);
+
+        // Wait for signal, handling spurious wakeups internally
+        waiter.wait(1, .allow_cancel) catch |err| {
+            // On cancellation, try to remove from queue
+            const was_in_queue = self.entry.waiters.remove(&waiter.node);
+            if (!was_in_queue) {
+                // Already removed by signal delivery - wait for signal to complete
+                waiter.wait(1, .no_cancel);
+            }
+
+            // Check if this auto-cancel triggered, otherwise it was user cancellation
+            if (timer.check(err)) return error.Timeout;
+            return err;
+        };
+
+        // Consume the counter
+        _ = self.entry.counter.swap(0, .acquire);
+    }
+
+    /// Alias for `waitTimeout`. Deprecated, will be removed in a future release.
+    pub const timedWait = waitTimeout;
+
+    /// Registers a waiter to be notified when the signal is received, or
+    /// claims the select if one already was.
+    /// This is part of the Future protocol for select().
+    pub fn asyncWait(self: *Signal, waiter: *Waiter) common.AsyncWaitState {
+        // Unhook any previous registration so a re-poll never
+        // double-registers; one that is already gone was popped and signaled
+        // by the handler without a claim. A direct waiter is never
+        // re-polled, so it never has a registration to unhook.
+        const had_registration = !waiter.isDirect() and self.entry.waiters.remove(&waiter.node);
+
+        const n = self.entry.counter.swap(0, .acquire);
+        if (n > 0) {
+            switch (waiter.tryClaim()) {
+                .won => return if (had_registration) .ready else .ready_signaled,
+                .busy => unreachable,
+                .lost => {
+                    // A lost arm may not consume: the count is additive, so
+                    // put it back and re-broadcast to waiters that may have
+                    // gone back to sleep while we held it.
+                    _ = self.entry.counter.fetchAdd(n, .release);
+                    while (self.entry.waiters.pop()) |wait_node| {
+                        Waiter.fromNode(wait_node).signal();
+                    }
+                    return .decided;
+                },
+            }
+        }
+
+        // Add to wait queue
+        self.entry.waiters.push(&waiter.node);
+        return if (had_registration) .queued else .requeued;
+    }
+
+    /// Cancels a pending wait operation by removing the waiter.
+    /// This is part of the Future protocol for select().
+    /// Returns true if removed, false if already removed by completion (wake in-flight).
+    pub fn asyncCancelWait(self: *Signal, waiter: *Waiter) bool {
+        // Simply remove from queue - no need to wake another waiter since signals broadcast to all
+        return self.entry.waiters.remove(&waiter.node);
+    }
+
+    /// Gets the result value.
+    /// This is part of the Future protocol for select().
+    pub fn getResult(self: *Signal) void {
+        // Consume the counter to ensure signal is acknowledged
+        _ = self.entry.counter.swap(0, .acquire);
+    }
+};
+
+test "Signal: basic signal handling" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var signal_received = false;
+
+    const waitForSignal = struct {
+        fn call(flag: *bool) !void {
+            var sig = try Signal.init(.interrupt);
+            defer sig.deinit();
+            try sig.wait();
+            flag.* = true;
+        }
+    }.call;
+
+    const sendSignal = struct {
+        fn call(r: *Runtime) !void {
+            try r.sleep(.fromMilliseconds(10));
+            try posix.raise(@backingInt(SignalKind.interrupt));
+        }
+    }.call;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(waitForSignal, .{&signal_received});
+    try group.spawn(sendSignal, .{rt});
+
+    try group.wait();
+
+    try std.testing.expect(signal_received);
+}
+
+test "Signal: multiple handlers for same signal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var count = std.atomic.Value(usize).init(0);
+
+    const waitForSignal = struct {
+        fn call(cnt: *std.atomic.Value(usize)) !void {
+            var sig = try Signal.init(.interrupt);
+            defer sig.deinit();
+            try sig.wait();
+            _ = cnt.fetchAdd(1, .monotonic);
+        }
+    }.call;
+
+    const sendSignal = struct {
+        fn call(r: *Runtime) !void {
+            try r.sleep(.fromMilliseconds(10));
+            try posix.raise(@backingInt(SignalKind.interrupt));
+        }
+    }.call;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(waitForSignal, .{&count});
+    try group.spawn(waitForSignal, .{&count});
+    try group.spawn(waitForSignal, .{&count});
+    try group.spawn(sendSignal, .{rt});
+
+    try group.wait();
+
+    try std.testing.expectEqual(3, count.load(.monotonic));
+}
+
+test "Signal: waitTimeout timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var sig = try Signal.init(.interrupt);
+    defer sig.deinit();
+
+    const result = sig.waitTimeout(.{ .duration = .fromMilliseconds(50) });
+    try std.testing.expectError(error.Timeout, result);
+}
+
+test "Signal: waitTimeout receives signal before timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var signal_received = false;
+
+    const waitForSignalTimed = struct {
+        fn call(flag: *bool) !void {
+            var sig = try Signal.init(.interrupt);
+            defer sig.deinit();
+            try sig.waitTimeout(.{ .duration = .fromSeconds(1) });
+            flag.* = true;
+        }
+    }.call;
+
+    const sendSignal = struct {
+        fn call(r: *Runtime) !void {
+            try r.sleep(.fromMilliseconds(10));
+            try posix.raise(@backingInt(SignalKind.interrupt));
+        }
+    }.call;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(waitForSignalTimed, .{&signal_received});
+    try group.spawn(sendSignal, .{rt});
+
+    try group.wait();
+
+    try std.testing.expect(signal_received);
+}
+
+test "Signal: select on multiple signals" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const select = @import("select.zig").select;
+
+    var signal_received = std.atomic.Value(u8).init(0);
+
+    const waitForSignals = struct {
+        fn call(flag: *std.atomic.Value(u8)) !void {
+            var sig1 = try Signal.init(.user1);
+            defer sig1.deinit();
+            var sig2 = try Signal.init(.user2);
+            defer sig2.deinit();
+
+            const result = try select(.{ .sig1 = &sig1, .sig2 = &sig2 });
+            switch (result) {
+                .sig1 => flag.store(@backingInt(SignalKind.user1), .monotonic),
+                .sig2 => flag.store(@backingInt(SignalKind.user2), .monotonic),
+            }
+        }
+    }.call;
+
+    const sendSignal = struct {
+        fn call(r: *Runtime) !void {
+            try r.sleep(.fromMilliseconds(10));
+            try posix.raise(@backingInt(SignalKind.user2));
+        }
+    }.call;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(waitForSignals, .{&signal_received});
+    try group.spawn(sendSignal, .{rt});
+
+    try group.wait();
+
+    try std.testing.expectEqual(@backingInt(SignalKind.user2), signal_received.load(.monotonic));
+}
+
+test "Signal: select with signal already received (fast path)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const select = @import("select.zig").select;
+
+    var sig = try Signal.init(.user1);
+    defer sig.deinit();
+
+    // Send signal first
+    try posix.raise(@backingInt(SignalKind.user1));
+
+    // Small delay to ensure signal is processed
+    try rt.sleep(.fromMilliseconds(10));
+
+    // Now select should return immediately (fast path)
+    const result = try select(.{ .sig = &sig });
+    var signal_received = false;
+    switch (result) {
+        .sig => signal_received = true,
+    }
+
+    try std.testing.expect(signal_received);
+}
+
+test "Signal: select with signal and task" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const select = @import("select.zig").select;
+
+    const slowTask = struct {
+        fn call(r: *Runtime) !u32 {
+            try r.sleep(.fromMilliseconds(100));
+            return 42;
+        }
+    }.call;
+
+    const sendSignal = struct {
+        fn call(r: *Runtime) !void {
+            try r.sleep(.fromMilliseconds(10));
+            try posix.raise(@backingInt(SignalKind.user1));
+        }
+    }.call;
+
+    var sig = try Signal.init(.user1);
+    defer sig.deinit();
+
+    var task = try rt.spawn(slowTask, .{rt});
+    defer task.cancel();
+
+    var sender = try rt.spawn(sendSignal, .{rt});
+    defer sender.cancel();
+
+    // Signal should win (arrives much sooner)
+    const result = try select(.{ .sig = &sig, .task = &task });
+    var winner: enum { signal, task } = .task;
+    switch (result) {
+        .sig => winner = .signal,
+        .task => |val| {
+            _ = try val;
+            winner = .task;
+        },
+    }
+
+    try sender.join();
+
+    try std.testing.expectEqual(.signal, winner);
+}
+
+test "Signal: a delivery that races the commit fence is not lost" {
+    // The handler pops every waiter and signals it. When the select's sweep
+    // holds the commit fence for another arm, that signal cannot claim the
+    // winner word, and a re-poll afterwards need not recover it: a second
+    // waiter can consume the shared counter first. The bounced arm must be
+    // recorded instead, matching Signal.wait(), which returns on the signal
+    // without requiring the counter.
+    const NO_WINNER = common.NO_WINNER;
+
+    var sig = try Signal.init(.interrupt);
+    defer sig.deinit();
+
+    var parent = Waiter.init();
+    var winner: std.atomic.Value(usize) = .init(NO_WINNER);
+    var gen: std.atomic.Value(u32) = .init(0);
+    var pending: std.atomic.Value(usize) = .init(NO_WINNER);
+    var waiter = Waiter.initSelect(&parent, &winner, &gen, &pending, 2);
+
+    try std.testing.expectEqual(.requeued, sig.asyncWait(&waiter));
+
+    // Owner's sweep is committing a different arm when the signal arrives.
+    winner.store(common.COMMITTING, .seq_cst);
+    _ = sig.entry.counter.fetchAdd(1, .release);
+    while (sig.entry.waiters.pop()) |node| Waiter.fromNode(node).signal();
+
+    // A peer waiter drains the counter before we get to look again.
+    winner.store(NO_WINNER, .seq_cst);
+    _ = sig.entry.counter.swap(0, .acquire);
+
+    // Re-polling cannot see it: the counter is gone.
+    try std.testing.expectEqual(.requeued, sig.asyncWait(&waiter));
+
+    // The arm's identity survived, so the select still reports it.
+    try std.testing.expectEqual(2, pending.load(.acquire));
+    try std.testing.expect(Waiter.promotePending(&winner, &pending));
+    try std.testing.expectEqual(2, winner.load(.acquire));
+
+    _ = sig.asyncCancelWait(&waiter);
+}

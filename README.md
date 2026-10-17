@@ -63,10 +63,13 @@ json response                 ~5.3M ops/s    ~189 ns/op
 
 ## 环境要求
 
-- **Zig**: `0.17.0-dev.*`（与 zio 依赖锁定的 `zig-0.17` 分支配套，zio 后端的默认/首选工具链）。
-  std 后端（`runStd`/`StdServer`）已在 `0.17.0-dev.*` 与 `0.18.0-dev.*` 两个工具链上分别验证过
-  编译、测试与运行：在 0.18 工具链上请搭配 std 后端使用（zio 上游尚未适配 0.18）
-- **zio**: 默认后端所需的异步运行时依赖（在 `build.zig.zon` 里声明）；`std_server.zig` 后端只用 Zig 自带的 `std.Io.Threaded`，不依赖 zio
+- **Zig**: `0.18.0-dev.253+16d31ceed`（与仓库 vendored 的 zio 副本 `vendor/zio` 配套，
+  zio 后端为默认/首选工具链；zio 上游 0.19.0 尚未适配 0.18-dev 的 std.Io 变更，
+  故 vendor 并打补丁，见 `vendor/zio/README.md`）。换 zig 快照前务必先跑
+  `zig build` + `examples/zig build` 验证。
+  std 后端（`runStd`/`StdServer`）不依赖 zio，纯 `std.Io` 即可运行。
+- **zio**: 默认后端所需的异步运行时依赖，以路径依赖形式 vendored 在 `vendor/zio`；
+  `std_server.zig` 后端只用 Zig 自带的 `std.Io.Threaded`，不依赖 zio
 
 ```bash
 # 开发模式（框架自带示例）
@@ -677,6 +680,14 @@ const http_framework = b.dependency("http_framework", .{}).module("http_framewor
 `http_static`、`http_codec`、`http_multipart`、`http_compress`、`http_logging`、
 `http_orm`、`http_websocket`），按需 `b.dependency(...).module("...")` 导入即可。
 核心层的 `http_protocol` 不依赖任何其它模块。
+
+## 文档索引
+
+- `docs/API.md` —— API 参考、设计约束与「硬约束与陷阱」清单
+- `docs/API_generated.md` —— 全模块公开符号清单（`zig run tools/gen_api.zig -- generate > docs/API_generated.md` 刷新）
+- `docs/ROADMAP.md` —— 功能路线图：待办、已知缺口、**明确不做什么**
+- `examples/FRICTION.md` —— 真实业务使用踩坑清单（路线图的主要输入）
+- `ANALYSIS.md` —— 架构分析与改进报告（历史快照，不回改）
 
 ## 许可证
 

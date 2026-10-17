@@ -134,19 +134,11 @@ pub const ConnectionRunner = struct {
             // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
             // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
             if (request_failed or !response_keep_alive) break;
-            // Issue 5: 排空被忽略的 body 字节（无 body 方法携带 CL，见
-            // Request.ignored_body_len）。std 对 requestHasBody()==false 的方法
-            // 返回恒空的 .ending reader，从不消费这些字节；receiveHead 又只 toss
-            // 掉 head——不排空则残留字节会被下一次 receiveHead 当成请求行解析
-            // （走私面）。reader 与 std http.Server 共用同一底层缓冲，这里的精确
-            // 排空重新对齐报文边界。
-            // 失败 = 对端没兑现 CL 承诺，连接状态不可信，直接断开。
-            if (ignored_body_len) |n| {
-                self.reader.discardAll64(n) catch |err| {
-                    std.log.warn("drain ignored body failed: {s}", .{@errorName(err)});
-                    break;
-                };
-            }
+            // Issue 5: 无 body 方法携带 CL 的残留字节。std 0.18 起，keep-alive
+            // 响应时 respond → discardBody 会自动消费掉这些字节（旧 0.17 的恒空
+            // .ending reader 从不消费，框架才需要手动 discardAll64）。超限降级 /
+            // 客户端 close 时框架响应 keep_alive=false，std 不排空并置 .closing，
+            // 下面直接 break，未排空字节随连接一起丢弃。
             // 真正的空闲等待发生在下一次 conn_loop.next() 的阻塞读里，
             // 由 reader 的 read_timeout_ns 约束。旧代码在 next() 前采样 idle_start、
             // 在处理完后算差，实际测的是“读+处理”总耗时，既无法在真正空闲时

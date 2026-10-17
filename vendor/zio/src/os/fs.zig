@@ -1,0 +1,3675 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const posix = @import("posix.zig");
+const darwin = @import("darwin.zig");
+const w = @import("windows.zig");
+const options = @import("../options.zig").options;
+
+const unexpectedError = @import("base.zig").unexpectedError;
+const syscall_cancel = @import("syscall_cancel.zig");
+
+// Cached probe result: once we see ENOSYS from openat2, skip future attempts.
+var openat2_nosys: std.atomic.Value(bool) = .init(false);
+
+pub const fd_t = switch (builtin.os.tag) {
+    .windows => w.HANDLE,
+    else => posix.system.fd_t,
+};
+
+/// Returns a file descriptor for the current working directory.
+/// Used with *at() functions like openat(), unlinkat(), etc.
+pub fn cwd() fd_t {
+    if (builtin.os.tag == .windows) {
+        return w.FDCWD;
+    } else {
+        return posix.AT.FDCWD;
+    }
+}
+
+/// Returns file descriptor for stdin.
+pub fn stdin() fd_t {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.peb().ProcessParameters.hStdInput,
+        else => 0,
+    };
+}
+
+/// Returns file descriptor for stdout.
+pub fn stdout() fd_t {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.peb().ProcessParameters.hStdOutput,
+        else => 1,
+    };
+}
+
+/// Returns file descriptor for stderr.
+pub fn stderr() fd_t {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.peb().ProcessParameters.hStdError,
+        else => 2,
+    };
+}
+
+pub const PipeError = if (builtin.os.tag == .windows)
+    error{Unexpected}
+else
+    posix.PipeError;
+
+/// Create a pipe for inter-process communication.
+/// Returns a pair of file descriptors [read_fd, write_fd].
+pub fn pipe() PipeError![2]fd_t {
+    return switch (builtin.os.tag) {
+        .windows => w.pipe(),
+        else => posix.pipe(.{ .nonblocking = true, .cloexec = true }),
+    };
+}
+
+pub const iovec = @import("base.zig").iovec;
+pub const iovec_const = @import("base.zig").iovec_const;
+
+pub const mode_t = posix.sys.mode_t;
+pub const ino_t = posix.sys.ino_t;
+
+pub const FileKind = enum {
+    block_device,
+    character_device,
+    directory,
+    named_pipe,
+    sym_link,
+    file,
+    unix_domain_socket,
+    whiteout,
+    door,
+    event_port,
+    unknown,
+};
+
+pub const FileStatInfo = struct {
+    inode: ino_t,
+    /// Number of hard links.
+    nlink: u64,
+    size: u64,
+    mode: mode_t,
+    kind: FileKind,
+    /// Preferred I/O block size in bytes. Set to 1 on platforms that don't
+    /// expose this (e.g. Windows).
+    block_size: u32,
+    /// Access time in nanoseconds since Unix epoch
+    atime: i64,
+    /// Modification time in nanoseconds since Unix epoch
+    mtime: i64,
+    /// Change time (POSIX) / Creation time (Windows) in nanoseconds since Unix epoch
+    ctime: i64,
+};
+
+pub const FileOpenMode = enum {
+    read_only,
+    write_only,
+    read_write,
+};
+
+pub const FileOpenFlags = struct {
+    mode: FileOpenMode = .read_only,
+    nonblocking: bool = false,
+    /// When false, opening a directory path returns error.IsDir.
+    /// On Windows this is enforced without extra syscalls (no FILE_FLAG_BACKUP_SEMANTICS).
+    /// On POSIX an extra fstat is required; defaults to true to avoid the overhead.
+    allow_directory: bool = true,
+    /// When false, if the final path component is a symlink the open fails with
+    /// error.SymLinkLoop. Only the final component is affected; intermediate
+    /// symlinks are still followed. POSIX: O_NOFOLLOW. Windows: opens the reparse
+    /// point itself via FILE_FLAG_OPEN_REPARSE_POINT.
+    follow_symlinks: bool = true,
+    /// Open the file only for close/stat operations (POSIX O_PATH). Ignored on
+    /// platforms without an equivalent (e.g. Windows), where a normal handle is
+    /// returned that still supports close/stat.
+    path_only: bool = false,
+    /// Allow the opened file to become the controlling TTY for the process.
+    /// POSIX: clears O_NOCTTY. No effect on Windows.
+    allow_ctty: bool = false,
+    /// Prevent path resolution from escaping the starting directory (e.g. via ".." or symlinks).
+    /// Enforced by the kernel on Linux 5.6+ (openat2 RESOLVE_BENEATH) and FreeBSD 13+ (O_RESOLVE_BENEATH).
+    /// On other platforms a warning is logged and the flag is ignored.
+    resolve_beneath: bool = false,
+    /// Bypass the OS page cache and transfer data directly to/from userspace buffers.
+    /// The caller is responsible for satisfying the platform's alignment requirements
+    /// (buffer address, file offset, and transfer length must typically be multiples of
+    /// the underlying device's logical block size, e.g. 512 bytes) — otherwise I/O fails.
+    /// Linux: O_DIRECT. macOS: fcntl(F_NOCACHE) applied after open. Windows: FILE_FLAG_NO_BUFFERING.
+    /// On platforms without an equivalent a warning is logged and the flag is ignored.
+    direct: bool = false,
+};
+
+pub const DirOpenFlags = struct {
+    /// Whether to follow symlinks when opening the directory
+    follow_symlinks: bool = true,
+    /// Whether the directory will be iterated (affects O_PATH optimization on Linux)
+    iterate: bool = false,
+    /// Prevent path resolution from escaping the starting directory.
+    /// See FileOpenFlags.resolve_beneath for platform support details.
+    resolve_beneath: bool = false,
+};
+
+pub const FileCreateFlags = struct {
+    read: bool = false,
+    truncate: bool = false,
+    exclusive: bool = false,
+    mode: mode_t = 0o664,
+    nonblocking: bool = false,
+    /// Prevent path resolution from escaping the starting directory.
+    /// See FileOpenFlags.resolve_beneath for platform support details.
+    resolve_beneath: bool = false,
+    /// Bypass the OS page cache and transfer data directly to/from userspace buffers.
+    /// See FileOpenFlags.direct for the alignment requirements and platform support details.
+    direct: bool = false,
+};
+
+pub const FileOpenError = error{
+    AccessDenied,
+    PermissionDenied,
+    SymLinkLoop,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    NoDevice,
+    FileNotFound,
+    NameTooLong,
+    SystemResources,
+    FileTooBig,
+    IsDir,
+    NoSpaceLeft,
+    NotDir,
+    PathAlreadyExists,
+    DeviceBusy,
+    FileLocksNotSupported,
+    BadPathName,
+    InvalidUtf8,
+    InvalidWtf8,
+    NetworkNotFound,
+    ProcessNotFound,
+    FileBusy,
+    Canceled,
+    Unsupported,
+    Unexpected,
+};
+
+pub const DirOpenError = error{
+    AccessDenied,
+    PermissionDenied,
+    SymLinkLoop,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    NoDevice,
+    FileNotFound,
+    NameTooLong,
+    SystemResources,
+    NotDir,
+    BadPathName,
+    NetworkNotFound,
+    Canceled,
+    Unsupported,
+    Unexpected,
+};
+
+pub const FileReadError = error{
+    AccessDenied,
+    WouldBlock,
+    InputOutput,
+    IsDir,
+    BrokenPipe,
+    SystemResources,
+    NotOpenForReading,
+    Unseekable,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileWriteError = error{
+    AccessDenied,
+    WouldBlock,
+    InputOutput,
+    NoSpaceLeft,
+    BrokenPipe,
+    SystemResources,
+    NotOpenForWriting,
+    DiskQuota,
+    FileTooBig,
+    LockViolation,
+    Unseekable,
+    /// The device backing the file is busy.
+    DeviceBusy,
+    /// The file is an executable image that is currently being executed, or is
+    /// otherwise in use by the kernel.
+    FileBusy,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileCloseError = error{
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSyncFlags = struct {
+    only_data: bool = false,
+};
+
+/// What `fileSyncRange` waits for and starts. See sync_file_range(2).
+pub const FileSyncRangeFlags = struct {
+    /// Wait for writeback already in progress on the range to finish.
+    wait_before: bool = false,
+    /// Start writeback of the range's dirty pages.
+    write: bool = true,
+    /// Wait for the writeback of the range to finish.
+    wait_after: bool = false,
+};
+
+pub const FileSyncRangeError = error{
+    InputOutput,
+    NoSpaceLeft,
+    SystemResources,
+    Unseekable,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSyncError = error{
+    InputOutput,
+    NoSpaceLeft,
+    DiskQuota,
+    AccessDenied,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSeekError = error{
+    /// The file does not have a position that can be set: a pipe, FIFO, socket
+    /// or tty, or an offset the device cannot represent.
+    Unseekable,
+    AccessDenied,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirRenameError = error{
+    AccessDenied,
+    PermissionDenied,
+    BadPathName,
+    FileBusy,
+    DiskQuota,
+    IsDir,
+    SymLinkLoop,
+    LinkQuotaExceeded,
+    NameTooLong,
+    FileNotFound,
+    SystemResources,
+    NotDir,
+    NoSpaceLeft,
+    ReadOnlyFileSystem,
+    CrossDevice,
+    DirNotEmpty,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirRenamePreserveError = DirRenameError || HardLinkError || error{PathAlreadyExists};
+
+pub const DirDeleteFileError = error{
+    AccessDenied,
+    FileBusy,
+    FileNotFound,
+    IsDir,
+    SymLinkLoop,
+    NameTooLong,
+    BadPathName,
+    NotDir,
+    SystemResources,
+    ReadOnlyFileSystem,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirDeleteDirError = error{
+    AccessDenied,
+    FileBusy,
+    FileNotFound,
+    SymLinkLoop,
+    NameTooLong,
+    BadPathName,
+    NotDir,
+    SystemResources,
+    ReadOnlyFileSystem,
+    DirNotEmpty,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirCreateDirError = error{
+    AccessDenied,
+    PermissionDenied,
+    DiskQuota,
+    PathAlreadyExists,
+    SymLinkLoop,
+    LinkQuotaExceeded,
+    NameTooLong,
+    BadPathName,
+    FileNotFound,
+    SystemResources,
+    NoSpaceLeft,
+    NotDir,
+    ReadOnlyFileSystem,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirReadError = error{
+    AccessDenied,
+    PermissionDenied,
+    SystemResources,
+    Canceled,
+    Unexpected,
+};
+
+/// Parsed directory entry
+pub const DirEntry = struct {
+    name: []const u8,
+    kind: FileKind,
+    inode: ino_t,
+};
+
+/// Iterator over directory entries in a buffer filled by dirRead.
+/// Handles platform-specific parsing and UTF-16 to UTF-8 conversion on Windows.
+pub const DirEntryIterator = struct {
+    buffer: []u8,
+    /// Current position in raw entries (user-facing, relative to unreserved buffer).
+    index: usize,
+    /// End position of raw entries (user-facing, relative to unreserved buffer).
+    end: usize,
+    /// Position for writing UTF-8 names (Windows only).
+    name_index: usize,
+
+    pub const RawEntry = switch (builtin.os.tag) {
+        .linux => std.os.linux.dirent64,
+        .windows => w.FILE_BOTH_DIR_INFORMATION,
+        .macos, .ios, .tvos, .watchos, .visionos => std.c.dirent,
+        .freebsd, .netbsd, .openbsd, .dragonfly => std.c.dirent,
+        else => @compileError("DirEntryIterator not supported on this OS"),
+    };
+
+    /// On Windows, reserve space at start of buffer for UTF-8 name conversion.
+    /// Raw entries go in the unreserved portion. Names can overwrite processed entries.
+    pub const reserved_len = switch (builtin.os.tag) {
+        .windows => blk: {
+            const max_name_bytes = w.NAME_MAX * 3; // Worst-case UTF-8 expansion
+            const max_info_len = @sizeOf(w.FILE_BOTH_DIR_INFORMATION) + w.NAME_MAX * 2;
+            const info_align = @alignOf(w.FILE_BOTH_DIR_INFORMATION);
+            const reserve_needed = std.mem.alignForward(usize, max_name_bytes, info_align) - max_info_len;
+            break :blk std.mem.alignForward(usize, reserve_needed, info_align);
+        },
+        else => 0,
+    };
+
+    /// Initialize iterator over raw entries in the unreserved portion of buffer.
+    /// `start` is the starting index, `end` is the number of bytes filled by the syscall.
+    pub fn init(buffer: []u8, start: usize, end: usize) DirEntryIterator {
+        return .{
+            .buffer = buffer,
+            .index = start,
+            .end = end,
+            .name_index = 0,
+        };
+    }
+
+    /// Reset the iterator to the beginning.
+    pub fn reset(self: *DirEntryIterator) void {
+        self.index = 0;
+        self.name_index = 0;
+    }
+
+    /// Get the unreserved portion of the buffer (where raw entries should be written by syscall).
+    pub fn getUnreservedBuffer(buffer: []u8) []u8 {
+        return buffer[reserved_len..];
+    }
+
+    /// Convert user-facing index to raw buffer index.
+    inline fn rawIndex(self: *const DirEntryIterator) usize {
+        return reserved_len + self.index;
+    }
+
+    /// Convert user-facing end to raw buffer end.
+    inline fn rawEnd(self: *const DirEntryIterator) usize {
+        return reserved_len + self.end;
+    }
+
+    /// Get next directory entry, skipping "." and "..".
+    /// Returns null when no more entries, or if buffer space exhausted (Windows),
+    /// in which case `hasPending()` is still true.
+    pub fn next(self: *DirEntryIterator) ?DirEntry {
+        while (self.index < self.end) {
+            const start = self.index;
+            const entry = self.nextRaw() orelse return null;
+
+            // Skip . and ..
+            if (self.isDotOrDotDot(entry)) continue;
+
+            // On Darwin/NetBSD/OpenBSD a zero inode marks an invalid or deleted
+            // entry still present in the directory block; skip it (matches std).
+            if (builtin.os.tag.isDarwin() or builtin.os.tag == .netbsd or builtin.os.tag == .openbsd) {
+                if (self.extractInode(entry) == 0) continue;
+            }
+
+            // On Windows the name may be written over this entry's header.
+            const kind = self.extractKind(entry);
+            const inode = self.extractInode(entry);
+            const name = self.extractName(entry) orelse {
+                // On Windows, null means no buffer space - backtrack and stop
+                self.index = start;
+                return null;
+            };
+
+            return .{
+                .name = name,
+                .kind = kind,
+                .inode = inode,
+            };
+        }
+        return null;
+    }
+
+    /// Whether unparsed entries remain in the buffer.
+    pub fn hasPending(self: *const DirEntryIterator) bool {
+        return self.index < self.end;
+    }
+
+    fn nextRaw(self: *DirEntryIterator) ?*align(1) const RawEntry {
+        if (self.index >= self.end) return null;
+        const entry: *align(1) const RawEntry = @ptrCast(&self.buffer[self.rawIndex()]);
+
+        // Advance to next entry
+        self.index += switch (builtin.os.tag) {
+            .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd => entry.reclen,
+            .dragonfly => entry.reclen(),
+            .windows => if (entry.NextEntryOffset != 0)
+                entry.NextEntryOffset
+            else
+                self.end - self.index,
+            else => @compileError("unsupported OS"),
+        };
+
+        return entry;
+    }
+
+    fn extractName(self: *DirEntryIterator, entry: *align(1) const RawEntry) ?[]const u8 {
+        return switch (builtin.os.tag) {
+            .linux => blk: {
+                const name_ptr: [*]const u8 = @ptrCast(&entry.name);
+                const max_len = entry.reclen - @offsetOf(std.os.linux.dirent64, "name");
+                break :blk std.mem.sliceTo(name_ptr[0..max_len], 0);
+            },
+            .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => entry.name[0..entry.namlen],
+            .windows => blk: {
+                const name_ptr: [*]const u16 = @alignCast(@as([*]align(1) const u16, @ptrCast(&entry.FileName)));
+                const name_utf16 = name_ptr[0 .. entry.FileNameLength / 2];
+                const utf8_len = std.unicode.calcWtf8Len(name_utf16);
+
+                // Check if there's space without overwriting unprocessed entries
+                if (self.name_index + utf8_len > self.rawIndex()) return null;
+
+                const name_buf = self.buffer[self.name_index..][0..utf8_len];
+                _ = std.unicode.wtf16LeToWtf8(name_buf, name_utf16);
+                self.name_index += utf8_len;
+                break :blk name_buf;
+            },
+            else => @compileError("unsupported OS"),
+        };
+    }
+
+    fn extractKind(_: *DirEntryIterator, entry: *align(1) const RawEntry) FileKind {
+        return switch (builtin.os.tag) {
+            .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => switch (entry.type) {
+                posix.system.DT.BLK => .block_device,
+                posix.system.DT.CHR => .character_device,
+                posix.system.DT.DIR => .directory,
+                posix.system.DT.FIFO => .named_pipe,
+                posix.system.DT.LNK => .sym_link,
+                posix.system.DT.REG => .file,
+                posix.system.DT.SOCK => .unix_domain_socket,
+                posix.system.DT.WHT => .whiteout,
+                else => .unknown,
+            },
+            .windows => blk: {
+                const attrs = entry.FileAttributes;
+                if (attrs.REPARSE_POINT) break :blk .sym_link;
+                if (attrs.DIRECTORY) break :blk .directory;
+                break :blk .file;
+            },
+            else => @compileError("unsupported OS"),
+        };
+    }
+
+    fn extractInode(_: *DirEntryIterator, entry: *align(1) const RawEntry) ino_t {
+        return switch (builtin.os.tag) {
+            .linux, .macos, .ios, .tvos, .watchos, .visionos => entry.ino,
+            .freebsd, .netbsd, .openbsd, .dragonfly => entry.fileno,
+            .windows => entry.FileIndex,
+            else => @compileError("unsupported OS"),
+        };
+    }
+
+    fn isDotOrDotDot(self: *DirEntryIterator, entry: *align(1) const RawEntry) bool {
+        _ = self;
+        return switch (builtin.os.tag) {
+            .windows => blk: {
+                const name_ptr: [*]const u16 = @alignCast(@as([*]align(1) const u16, @ptrCast(&entry.FileName)));
+                const name = name_ptr[0 .. entry.FileNameLength / 2];
+                break :blk std.mem.eql(u16, name, &[_]u16{'.'}) or
+                    std.mem.eql(u16, name, &[_]u16{ '.', '.' });
+            },
+            .linux => blk: {
+                const name_ptr: [*]const u8 = @ptrCast(&entry.name);
+                const max_len = entry.reclen - @offsetOf(std.os.linux.dirent64, "name");
+                const name = std.mem.sliceTo(name_ptr[0..max_len], 0);
+                break :blk std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+            },
+            .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => blk: {
+                const name = entry.name[0..entry.namlen];
+                break :blk std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+            },
+            else => @compileError("unsupported OS"),
+        };
+    }
+};
+
+test "DirEntryIterator: a Windows name that doesn't fit is left for the next batch" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const Info = w.FILE_BOTH_DIR_INFORMATION;
+    const entry_size = comptime std.mem.alignForward(usize, @offsetOf(Info, "FileName") + w.NAME_MAX * 2, @alignOf(Info));
+    var buffer: [DirEntryIterator.reserved_len + 2 * entry_size]u8 align(@alignOf(Info)) = undefined;
+    const raw = DirEntryIterator.getUnreservedBuffer(&buffer);
+    for (0..2) |i| {
+        const info: *Info = @ptrCast(@alignCast(raw[i * entry_size ..].ptr));
+        info.* = std.mem.zeroes(Info);
+        info.NextEntryOffset = if (i == 0) entry_size else 0;
+        info.FileIndex = @intCast(100 + i);
+        info.FileAttributes = .{ .DIRECTORY = true };
+        info.FileNameLength = w.NAME_MAX * 2;
+        const name: [*]u16 = @ptrCast(&info.FileName);
+        @memset(name[0..w.NAME_MAX], @intCast(0x4e00 + i));
+    }
+
+    var it = DirEntryIterator.init(&buffer, 0, 2 * entry_size);
+    const first = it.next().?;
+    try std.testing.expectEqual(w.NAME_MAX * 3, first.name.len);
+    try std.testing.expectEqualStrings("\u{4e00}", first.name[0..3]);
+    try std.testing.expectEqual(.directory, first.kind);
+    try std.testing.expectEqual(100, first.inode);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expect(it.hasPending());
+
+    it = DirEntryIterator.init(&buffer, it.index, it.end);
+    const second = it.next().?;
+    try std.testing.expectEqual(w.NAME_MAX * 3, second.name.len);
+    try std.testing.expectEqualStrings("\u{4e01}", second.name[0..3]);
+    try std.testing.expectEqual(.directory, second.kind);
+    try std.testing.expectEqual(101, second.inode);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expect(!it.hasPending());
+}
+
+pub const FileSizeError = error{
+    AccessDenied,
+    PermissionDenied,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileStatError = error{
+    AccessDenied,
+    InvalidFileDescriptor,
+    FileNotFound,
+    NameTooLong,
+    BadPathName,
+    NotDir,
+    SymLinkLoop,
+    SystemResources,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileStatFlags = struct {
+    /// When stat'ing a path, whether to dereference a trailing symlink. Has no
+    /// effect when stat'ing a file descriptor directly.
+    follow_symlinks: bool = true,
+};
+
+pub const FileSetSizeError = error{
+    AccessDenied,
+    FileTooBig,
+    InputOutput,
+    FileBusy,
+    PermissionDenied,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSetPermissionsError = error{
+    AccessDenied,
+    PermissionDenied,
+    ReadOnlyFileSystem,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSetOwnerError = error{
+    AccessDenied,
+    PermissionDenied,
+    ReadOnlyFileSystem,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSetTimestampsError = error{
+    AccessDenied,
+    PermissionDenied,
+    ReadOnlyFileSystem,
+    Canceled,
+    Unexpected,
+};
+
+/// Open an existing file using openat() syscall
+pub fn openat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileOpenFlags) FileOpenError!fd_t {
+    if (builtin.os.tag == .windows) {
+        if (flags.resolve_beneath) {
+            if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+            std.log.warn("resolve_beneath is not supported on Windows, path escapes will not be detected", .{});
+        }
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        const access_mask: w.DWORD = switch (flags.mode) {
+            .read_only => w.GENERIC_READ,
+            .write_only => w.GENERIC_WRITE,
+            .read_write => w.GENERIC_READ | w.GENERIC_WRITE,
+        };
+
+        var file_flags: w.DWORD = if (flags.nonblocking)
+            w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_OVERLAPPED
+        else
+            w.FILE_ATTRIBUTE_NORMAL;
+        // FILE_FLAG_BACKUP_SEMANTICS is required to open directory handles.
+        // Without it, opening a directory path fails with ACCESS_DENIED, which
+        // gives us allow_directory=false semantics for free.
+        if (flags.allow_directory) file_flags |= w.FILE_FLAG_BACKUP_SEMANTICS;
+        // Open the reparse point itself instead of following it. This is the
+        // closest Windows analogue to O_NOFOLLOW; allow_ctty and path_only have
+        // no Windows equivalent and are ignored.
+        if (!flags.follow_symlinks) file_flags |= w.FILE_FLAG_OPEN_REPARSE_POINT;
+        // Direct (unbuffered) I/O, the Windows analogue of O_DIRECT.
+        if (flags.direct) file_flags |= w.FILE_FLAG_NO_BUFFERING;
+
+        const handle = w.CreateFileW(
+            path_w.ptr,
+            access_mask,
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            null,
+            w.OPEN_EXISTING,
+            file_flags,
+            null,
+        );
+
+        if (handle == w.INVALID_HANDLE_VALUE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            };
+        }
+
+        return handle;
+    }
+
+    var open_flags: posix.system.O = .{
+        .ACCMODE = switch (flags.mode) {
+            .read_only => .RDONLY,
+            .write_only => .WRONLY,
+            .read_write => .RDWR,
+        },
+        .CLOEXEC = true,
+        .NOFOLLOW = !flags.follow_symlinks,
+    };
+    if (@hasField(@TypeOf(open_flags), "NOCTTY")) open_flags.NOCTTY = !flags.allow_ctty;
+    if (@hasField(@TypeOf(open_flags), "PATH")) open_flags.PATH = flags.path_only;
+    if (flags.direct) {
+        if (@hasField(@TypeOf(open_flags), "DIRECT")) {
+            // Linux (and any platform whose O flags expose O_DIRECT).
+            open_flags.DIRECT = true;
+        } else if (!builtin.os.tag.isDarwin()) {
+            // Darwin has no open-time flag; it is applied via fcntl(F_NOCACHE)
+            // after a successful open (see below). Everything else is unsupported.
+            std.log.warn("direct I/O is not supported on {s}, buffering will not be disabled", .{@tagName(builtin.os.tag)});
+        }
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    // Cancelable region covering both the openat2 (resolve_beneath) path and the
+    // plain openat loop below: on a thread-pool worker bound to a cancellation
+    // token (delegated file ops on kqueue/poll backends), a SIGURG turns the
+    // blocking open into EINTR and `checkCancel` reports `Canceled`. Off a
+    // cancelable worker the token is null and every call here is a no-op.
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+
+    if (builtin.os.tag == .linux and flags.resolve_beneath) {
+        if (!openat2_nosys.load(.monotonic)) {
+            const how: posix.sys.open_how = .{
+                .flags = @as(u64, @as(u32, @bitCast(open_flags))),
+                .mode = 0,
+                .resolve = posix.sys.RESOLVE.BENEATH | posix.sys.RESOLVE.NO_MAGICLINKS,
+            };
+            while (true) {
+                const rc = posix.sys.openat2(dir, path_z.ptr, &how);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return @intCast(rc),
+                    .INTR => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    .AGAIN => continue,
+                    .NOSYS => {
+                        openat2_nosys.store(true, .monotonic);
+                        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+                        std.log.warn("openat2 not available (requires Linux 5.6+), resolve_beneath will not be enforced", .{});
+                        break;
+                    },
+                    else => |err| return errnoToFileOpenError(err, flags),
+                }
+            }
+        } else if (options.resolve_beneath_mode == .strict) {
+            return error.Unsupported;
+        }
+    } else if (@hasField(posix.O, "RESOLVE_BENEATH") and flags.resolve_beneath) {
+        open_flags.RESOLVE_BENEATH = true;
+    } else if (flags.resolve_beneath) {
+        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+        std.log.warn("resolve_beneath is not supported on {s}, path escapes will not be detected", .{@tagName(builtin.os.tag)});
+    }
+
+    while (true) {
+        const rc = posix.system.openat(dir, path_z.ptr, open_flags, @as(mode_t, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const opened_fd: fd_t = @intCast(rc);
+                // Darwin has no O_DIRECT; disable caching on the fd after opening.
+                if (builtin.os.tag.isDarwin() and flags.direct) {
+                    const err = posix.errno(posix.system.fcntl(opened_fd, posix.system.F.NOCACHE, @as(c_int, 1)));
+                    if (err != .SUCCESS) {
+                        std.log.warn("failed to enable direct I/O (F_NOCACHE) on fd {d}: {s}, caching remains enabled", .{ opened_fd, @tagName(err) });
+                    }
+                }
+                return opened_fd;
+            },
+            // EINTR is either the cancellation SIGURG (checkCancel -> Canceled) or
+            // a spurious/foreign wake, in which case we retry the open.
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| {
+                if (flags.resolve_beneath) {
+                    if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                }
+                return errnoToFileOpenError(err, flags);
+            },
+        }
+    }
+}
+
+/// Open a directory using openat() syscall
+pub fn dirOpen(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: DirOpenFlags) DirOpenError!fd_t {
+    if (builtin.os.tag == .windows) {
+        if (flags.resolve_beneath) {
+            if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+            std.log.warn("resolve_beneath is not supported on Windows, path escapes will not be detected", .{});
+        }
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        const access_mask: w.DWORD = w.GENERIC_READ;
+
+        // FILE_FLAG_BACKUP_SEMANTICS is required to open directory handles
+        var file_flags: w.DWORD = w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_BACKUP_SEMANTICS;
+        if (!flags.follow_symlinks) file_flags |= w.FILE_FLAG_OPEN_REPARSE_POINT;
+
+        const handle = w.CreateFileW(
+            path_w.ptr,
+            access_mask,
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            null,
+            w.OPEN_EXISTING,
+            file_flags,
+            null,
+        );
+
+        if (handle == w.INVALID_HANDLE_VALUE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            };
+        }
+        errdefer _ = w.CloseHandle(handle);
+
+        // FILE_FLAG_BACKUP_SEMANTICS opens regular files too.
+        var info: w.BY_HANDLE_FILE_INFORMATION = undefined;
+        if (w.GetFileInformationByHandle(handle, &info) == w.FALSE) {
+            return unexpectedError(w.GetLastError());
+        }
+        if (info.dwFileAttributes & w.FILE_ATTRIBUTE_DIRECTORY == 0) return error.NotDir;
+
+        return handle;
+    }
+
+    var open_flags: posix.system.O = .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = !flags.follow_symlinks,
+    };
+
+    // On Linux, O_PATH can be used to open a directory descriptor without read permission
+    // but only if we don't plan to iterate it
+    if (@hasField(posix.system.O, "PATH") and !flags.iterate) {
+        open_flags.PATH = true;
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    // Cancelable region covering both the openat2 (resolve_beneath) path and the
+    // plain openat loop below (see the note in `openat`).
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+
+    if (builtin.os.tag == .linux and flags.resolve_beneath) {
+        if (!openat2_nosys.load(.monotonic)) {
+            const how: posix.sys.open_how = .{
+                .flags = @as(u64, @as(u32, @bitCast(open_flags))),
+                .mode = 0,
+                .resolve = posix.sys.RESOLVE.BENEATH | posix.sys.RESOLVE.NO_MAGICLINKS,
+            };
+            while (true) {
+                const rc = posix.sys.openat2(dir, path_z.ptr, &how);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return @intCast(rc),
+                    .INTR => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    .AGAIN => continue,
+                    .NOSYS => {
+                        openat2_nosys.store(true, .monotonic);
+                        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+                        std.log.warn("openat2 not available (requires Linux 5.6+), resolve_beneath will not be enforced", .{});
+                        break;
+                    },
+                    else => |err| return errnoToDirOpenError(err, flags),
+                }
+            }
+        } else if (options.resolve_beneath_mode == .strict) {
+            return error.Unsupported;
+        }
+    } else if (builtin.os.tag == .freebsd and flags.resolve_beneath) {
+        open_flags.RESOLVE_BENEATH = true;
+    } else if (flags.resolve_beneath) {
+        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+        std.log.warn("resolve_beneath is not supported on {s}, path escapes will not be detected", .{@tagName(builtin.os.tag)});
+    }
+
+    while (true) {
+        const rc = posix.system.openat(dir, path_z.ptr, open_flags, @as(mode_t, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| {
+                if (flags.resolve_beneath) {
+                    if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                }
+                return errnoToDirOpenError(err, flags);
+            },
+        }
+    }
+}
+
+pub const FileCreateError = FileOpenError;
+
+/// Create a file using openat() syscall
+pub fn createat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileCreateFlags) FileCreateError!fd_t {
+    if (builtin.os.tag == .windows) {
+        if (flags.resolve_beneath) {
+            if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+            std.log.warn("resolve_beneath is not supported on Windows, path escapes will not be detected", .{});
+        }
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        const access_mask: w.DWORD = if (flags.read)
+            w.GENERIC_READ | w.GENERIC_WRITE
+        else
+            w.GENERIC_WRITE;
+
+        const creation: w.DWORD = if (flags.exclusive)
+            w.CREATE_NEW
+        else if (flags.truncate)
+            w.CREATE_ALWAYS
+        else
+            w.OPEN_ALWAYS;
+
+        var file_flags: w.DWORD = if (flags.nonblocking)
+            w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_OVERLAPPED
+        else
+            w.FILE_ATTRIBUTE_NORMAL;
+        // Direct (unbuffered) I/O, the Windows analogue of O_DIRECT.
+        if (flags.direct) file_flags |= w.FILE_FLAG_NO_BUFFERING;
+
+        const handle = w.CreateFileW(
+            path_w.ptr,
+            access_mask,
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            null,
+            creation,
+            file_flags,
+            null,
+        );
+
+        if (handle == w.INVALID_HANDLE_VALUE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                .ALREADY_EXISTS => error.PathAlreadyExists,
+                .FILE_EXISTS => error.PathAlreadyExists,
+                else => |err| return unexpectedError(err),
+            };
+        }
+
+        return handle;
+    }
+
+    var open_flags: posix.system.O = .{
+        .ACCMODE = if (flags.read) .RDWR else .WRONLY,
+        .CLOEXEC = true,
+        .CREAT = true,
+    };
+    if (flags.truncate) open_flags.TRUNC = true;
+    if (flags.exclusive) open_flags.EXCL = true;
+    if (flags.direct) {
+        if (@hasField(@TypeOf(open_flags), "DIRECT")) {
+            // Linux (and any platform whose O flags expose O_DIRECT).
+            open_flags.DIRECT = true;
+        } else if (!builtin.os.tag.isDarwin()) {
+            // Darwin has no open-time flag; it is applied via fcntl(F_NOCACHE)
+            // after a successful open (see below). Everything else is unsupported.
+            std.log.warn("direct I/O is not supported on {s}, buffering will not be disabled", .{@tagName(builtin.os.tag)});
+        }
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    // Cancelable region covering both the openat2 (resolve_beneath) path and the
+    // plain openat loop below (see the note in `openat`).
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+
+    if (builtin.os.tag == .linux and flags.resolve_beneath) {
+        if (!openat2_nosys.load(.monotonic)) {
+            const how: posix.sys.open_how = .{
+                .flags = @as(u64, @as(u32, @bitCast(open_flags))),
+                .mode = flags.mode,
+                .resolve = posix.sys.RESOLVE.BENEATH | posix.sys.RESOLVE.NO_MAGICLINKS,
+            };
+            while (true) {
+                const rc = posix.sys.openat2(dir, path_z.ptr, &how);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return @intCast(rc),
+                    .INTR => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    .AGAIN => continue,
+                    .NOSYS => {
+                        openat2_nosys.store(true, .monotonic);
+                        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+                        std.log.warn("openat2 not available (requires Linux 5.6+), resolve_beneath will not be enforced", .{});
+                        break;
+                    },
+                    else => |err| return errnoToFileOpenError(err, flags),
+                }
+            }
+        } else if (options.resolve_beneath_mode == .strict) {
+            return error.Unsupported;
+        }
+    } else if (builtin.os.tag == .freebsd and flags.resolve_beneath) {
+        open_flags.RESOLVE_BENEATH = true;
+    } else if (flags.resolve_beneath) {
+        if (options.resolve_beneath_mode == .strict) return error.Unsupported;
+        std.log.warn("resolve_beneath is not supported on {s}, path escapes will not be detected", .{@tagName(builtin.os.tag)});
+    }
+
+    while (true) {
+        const rc = posix.system.openat(dir, path_z.ptr, open_flags, flags.mode);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const opened_fd: fd_t = @intCast(rc);
+                // Darwin has no O_DIRECT; disable caching on the fd after opening.
+                if (builtin.os.tag.isDarwin() and flags.direct) {
+                    const err = posix.errno(posix.system.fcntl(opened_fd, posix.system.F.NOCACHE, @as(c_int, 1)));
+                    if (err != .SUCCESS) {
+                        std.log.warn("failed to enable direct I/O (F_NOCACHE) on fd {d}: {s}, caching remains enabled", .{ opened_fd, @tagName(err) });
+                    }
+                }
+                return opened_fd;
+            },
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| {
+                if (flags.resolve_beneath) {
+                    if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                }
+                return errnoToFileOpenError(err, flags);
+            },
+        }
+    }
+}
+
+/// Close a file descriptor
+pub fn close(fd: fd_t) FileCloseError!void {
+    if (builtin.os.tag == .windows) {
+        _ = w.CloseHandle(fd);
+        return;
+    }
+
+    while (true) {
+        const rc = posix.system.close(fd);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return errnoToFileCloseError(err),
+        }
+    }
+}
+
+// flock(2) operation bits. Identical across Linux and the BSDs, so we define
+// them directly rather than per-platform. Kept private: callers go through the
+// typed `flock` wrapper below, which makes illegal combinations unrepresentable.
+const LOCK_SH: i32 = 1; // shared lock
+const LOCK_EX: i32 = 2; // exclusive lock
+const LOCK_NB: i32 = 4; // don't block, fail with WouldBlock instead
+const LOCK_UN: i32 = 8; // unlock
+
+/// Which advisory lock to apply (or remove). These are mutually exclusive
+/// operations, not flags, which is why this is an enum rather than a bitfield.
+pub const FileLockOp = enum { shared, exclusive, unlock };
+
+/// Whether the lock attempt may block waiting for an incompatible holder.
+pub const FileLockMode = enum { blocking, non_blocking };
+
+pub const FileLockError = error{
+    WouldBlock,
+    Interrupted,
+    SystemResources,
+    FileLocksUnsupported,
+    Unexpected,
+};
+
+/// Apply or remove an advisory lock with flock(2). Unlike the other wrappers
+/// here, this does not retry on EINTR; it surfaces error.Interrupted so the
+/// caller decides whether to retry.
+pub fn fileLock(fd: fd_t, op: FileLockOp, mode: FileLockMode) FileLockError!void {
+    switch (builtin.os.tag) {
+        .windows => {
+            var overlapped = std.mem.zeroes(w.OVERLAPPED);
+            overlapped.hEvent = @ptrFromInt(1);
+
+            const ok = switch (op) {
+                .unlock => w.UnlockFileEx(fd, 0, 1, 0, &overlapped),
+                .shared, .exclusive => blk: {
+                    var flags: w.DWORD = 0;
+                    if (op == .exclusive) flags |= w.LOCKFILE_EXCLUSIVE_LOCK;
+                    if (mode == .non_blocking) flags |= w.LOCKFILE_FAIL_IMMEDIATELY;
+                    break :blk w.LockFileEx(fd, flags, 0, 1, 0, &overlapped);
+                },
+            };
+            if (ok == w.FALSE) {
+                return switch (w.GetLastError()) {
+                    .LOCK_VIOLATION => error.WouldBlock,
+                    .NOT_SUPPORTED => error.FileLocksUnsupported,
+                    else => error.Unexpected,
+                };
+            }
+        },
+        else => {
+            var operation: i32 = switch (op) {
+                .shared => LOCK_SH,
+                .exclusive => LOCK_EX,
+                .unlock => LOCK_UN,
+            };
+            if (mode == .non_blocking) operation |= LOCK_NB;
+
+            const rc = posix.system.flock(fd, operation);
+            return switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => error.Interrupted,
+                .AGAIN => error.WouldBlock,
+                .NOLCK => error.SystemResources,
+                .OPNOTSUPP => error.FileLocksUnsupported,
+                else => |err| unexpectedError(err),
+            };
+        },
+    }
+}
+
+/// Downgrade a held exclusive whole-file lock to a shared lock.
+pub fn fileLockDowngrade(fd: fd_t) FileLockError!void {
+    switch (builtin.os.tag) {
+        .windows => {
+            try fileLock(fd, .shared, .non_blocking);
+            try fileLock(fd, .unlock, .blocking);
+        },
+        else => {
+            try fileLock(fd, .shared, .non_blocking);
+        },
+    }
+}
+
+/// Read from file at offset using preadv()
+pub fn preadv(fd: fd_t, buffers: []iovec, offset: u64) FileReadError!usize {
+    if (builtin.os.tag == .windows) {
+        var total_read: usize = 0;
+        for (buffers) |buffer| {
+            var bytes_read: w.DWORD = undefined;
+            var overlapped: w.OVERLAPPED = std.mem.zeroes(w.OVERLAPPED);
+            overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Offset = @truncate(offset + total_read);
+            overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.OffsetHigh = @truncate((offset + total_read) >> 32);
+
+            const success = w.ReadFile(
+                fd,
+                buffer.buf,
+                @intCast(buffer.len),
+                &bytes_read,
+                &overlapped,
+            );
+
+            if (success == w.FALSE) {
+                const err = w.GetLastError();
+                switch (err) {
+                    .HANDLE_EOF => return if (total_read == 0) 0 else total_read,
+                    else => return errnoToFileReadError(err),
+                }
+            }
+
+            total_read += bytes_read;
+            if (bytes_read < buffer.len) break;
+        }
+
+        return total_read;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.preadv(fd, buffers.ptr, @intCast(buffers.len), @intCast(offset));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileReadError(err),
+        }
+    }
+}
+
+/// Write to file at offset using pwritev()
+pub fn pwritev(fd: fd_t, buffers: []const iovec_const, offset: u64) FileWriteError!usize {
+    if (builtin.os.tag == .windows) {
+        var total_written: usize = 0;
+        for (buffers) |buffer| {
+            var bytes_written: w.DWORD = undefined;
+            var overlapped: w.OVERLAPPED = std.mem.zeroes(w.OVERLAPPED);
+            overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Offset = @truncate(offset + total_written);
+            overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.OffsetHigh = @truncate((offset + total_written) >> 32);
+
+            const success = w.WriteFile(
+                fd,
+                buffer.buf,
+                @intCast(buffer.len),
+                &bytes_written,
+                &overlapped,
+            );
+
+            if (success == w.FALSE) {
+                return errnoToFileWriteError(w.GetLastError());
+            }
+
+            total_written += bytes_written;
+            if (bytes_written < buffer.len) break;
+        }
+
+        return total_written;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.pwritev(fd, buffers.ptr, @intCast(buffers.len), @intCast(offset));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileWriteError(err),
+        }
+    }
+}
+
+/// Read from file descriptor - for pipes and stream-like fds
+pub fn read(fd: fd_t, buffer: []u8) FileReadError!usize {
+    if (builtin.os.tag == .windows) {
+        var bytes_read: w.DWORD = undefined;
+        const success = w.ReadFile(
+            fd,
+            buffer.ptr,
+            @intCast(buffer.len),
+            &bytes_read,
+            null,
+        );
+        if (success == w.FALSE) {
+            const err = w.GetLastError();
+            switch (err) {
+                .HANDLE_EOF => return 0,
+                else => return errnoToFileReadError(err),
+            }
+        }
+        return bytes_read;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.read(fd, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileReadError(err),
+        }
+    }
+}
+
+/// Read from file descriptor using readv() - for pipes and stream-like fds
+pub fn readv(fd: fd_t, buffers: []iovec) FileReadError!usize {
+    if (builtin.os.tag == .windows) {
+        var total_read: usize = 0;
+        for (buffers) |buffer| {
+            var bytes_read: w.DWORD = undefined;
+
+            const success = w.ReadFile(
+                fd,
+                buffer.buf,
+                @intCast(buffer.len),
+                &bytes_read,
+                null,
+            );
+
+            if (success == w.FALSE) {
+                const err = w.GetLastError();
+                switch (err) {
+                    .HANDLE_EOF => return if (total_read == 0) 0 else total_read,
+                    else => return errnoToFileReadError(err),
+                }
+            }
+
+            total_read += bytes_read;
+            if (bytes_read < buffer.len) break;
+        }
+
+        return total_read;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.readv(fd, buffers.ptr, @intCast(buffers.len));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileReadError(err),
+        }
+    }
+}
+
+/// Write to file descriptor - for pipes and stream-like fds
+pub fn write(fd: fd_t, buffer: []const u8) FileWriteError!usize {
+    if (builtin.os.tag == .windows) {
+        var bytes_written: w.DWORD = undefined;
+        const success = w.WriteFile(
+            fd,
+            buffer.ptr,
+            @intCast(buffer.len),
+            &bytes_written,
+            null,
+        );
+        if (success == w.FALSE) {
+            return errnoToFileWriteError(w.GetLastError());
+        }
+        return bytes_written;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.write(fd, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileWriteError(err),
+        }
+    }
+}
+
+/// Write to file descriptor using writev() - for pipes and stream-like fds
+pub fn writev(fd: fd_t, buffers: []const iovec_const) FileWriteError!usize {
+    if (builtin.os.tag == .windows) {
+        var total_written: usize = 0;
+        for (buffers) |buffer| {
+            var bytes_written: w.DWORD = undefined;
+
+            const success = w.WriteFile(
+                fd,
+                buffer.buf,
+                @intCast(buffer.len),
+                &bytes_written,
+                null,
+            );
+
+            if (success == w.FALSE) {
+                return errnoToFileWriteError(w.GetLastError());
+            }
+
+            total_written += bytes_written;
+            if (bytes_written < buffer.len) break;
+        }
+
+        return total_written;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.writev(fd, buffers.ptr, @intCast(buffers.len));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileWriteError(err),
+        }
+    }
+}
+
+/// Sync file data to disk
+pub fn fileSync(fd: fd_t, flags: FileSyncFlags) FileSyncError!void {
+    if (builtin.os.tag == .windows) {
+        const success = w.FlushFileBuffers(fd);
+        if (success == w.FALSE) {
+            switch (w.GetLastError()) {
+                .ACCESS_DENIED => return error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            }
+        }
+        return;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+
+    // On Darwin, fsync() only hands the data to the drive, which can keep it in
+    // its volatile write cache; F_FULLFSYNC also flushes that cache. It applies
+    // to `only_data` too, which relaxes what metadata is flushed, not whether the
+    // data is durable. Some filesystems (SMB, some FUSE) don't support it, so
+    // those fall back to fsync()/fdatasync() below.
+    if (builtin.os.tag.isDarwin()) {
+        while (true) {
+            const rc = posix.system.fcntl(fd, posix.system.F.FULLFSYNC, @as(c_int, 0));
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                .OPNOTSUPP, .INVAL => break, // ENOTSUP is OPNOTSUPP on Darwin
+                else => |err| return errnoToFileSyncError(err),
+            }
+        }
+    }
+
+    while (true) {
+        const rc = if (flags.only_data)
+            posix.system.fdatasync(fd)
+        else
+            posix.system.fsync(fd);
+
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSyncError(err),
+        }
+    }
+}
+
+/// Start (and optionally wait for) writeback of a byte range of a file, as
+/// sync_file_range(2). This is a writeback hint, not a durability guarantee:
+/// it flushes neither metadata nor the drive cache, so `fileSync` is still
+/// needed to make data durable. `len == 0` means to the end of the file.
+/// Does nothing where the call is unavailable (other than 64-bit Linux).
+pub fn fileSyncRange(fd: fd_t, offset: u64, len: u64, flags: FileSyncRangeFlags) FileSyncRangeError!void {
+    if (builtin.os.tag != .linux) return;
+    if (!posix.sys.has_sync_file_range) return;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.sys.sync_file_range(fd, offset, len, .{
+            .WAIT_BEFORE = flags.wait_before,
+            .WRITE = flags.write,
+            .WAIT_AFTER = flags.wait_after,
+        });
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSyncRangeError(err),
+        }
+    }
+}
+
+/// Move the file position by `offset` bytes, relative to the current position.
+pub fn fileSeekBy(fd: fd_t, offset: i64) FileSeekError!void {
+    if (builtin.os.tag == .windows) {
+        return seekWindows(fd, offset, w.FILE_CURRENT);
+    }
+    return seekPosix(fd, offset, posix.system.SEEK.CUR);
+}
+
+/// Set the file position to `offset` bytes from the start of the file.
+pub fn fileSeekTo(fd: fd_t, offset: u64) FileSeekError!void {
+    // Both `LARGE_INTEGER` and `off_t` are signed, so an offset past 2^63 has
+    // no representation to seek to.
+    const signed = std.math.cast(i64, offset) orelse return error.Unseekable;
+    if (builtin.os.tag == .windows) {
+        return seekWindows(fd, signed, w.FILE_BEGIN);
+    }
+    return seekPosix(fd, signed, posix.system.SEEK.SET);
+}
+
+fn seekWindows(handle: fd_t, offset: i64, move_method: w.DWORD) FileSeekError!void {
+    if (w.SetFilePointerEx(handle, offset, null, move_method) == w.FALSE) {
+        return errnoToFileSeekError(w.GetLastError());
+    }
+}
+
+fn seekPosix(fd: fd_t, offset: i64, whence: u32) FileSeekError!void {
+    // `off_t` is narrower than 64 bits on some platforms; an offset that does
+    // not fit is one the file cannot be positioned at.
+    const off = std.math.cast(posix.off_t, offset) orelse return error.Unseekable;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.sys.lseek(fd, off, whence, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSeekError(err),
+        }
+    }
+}
+
+/// Rename a file using renameat() syscall
+pub fn renameat(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenameError!void {
+    if (builtin.os.tag == .windows) {
+        const old_path_w = try w.pathToWide(allocator, old_dir, old_path);
+        defer allocator.free(old_path_w);
+        const new_path_w = try w.pathToWide(allocator, new_dir, new_path);
+        defer allocator.free(new_path_w);
+
+        const success = w.MoveFileExW(
+            old_path_w.ptr,
+            new_path_w.ptr,
+            w.MOVEFILE_REPLACE_EXISTING,
+        );
+
+        if (success == w.FALSE) {
+            switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => return error.FileNotFound,
+                .PATH_NOT_FOUND => return error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
+                .ACCESS_DENIED => return error.AccessDenied,
+                .ALREADY_EXISTS => return error.Unexpected,
+                .SHARING_VIOLATION => return error.FileBusy,
+                .NOT_SAME_DEVICE => return error.CrossDevice,
+                .DIR_NOT_EMPTY => return error.DirNotEmpty,
+                .DIRECTORY => return error.NotDir,
+                else => |err| return unexpectedError(err),
+            }
+        }
+
+        return;
+    }
+
+    const old_path_z = allocator.dupeSentinel(u8, old_path, 0) catch return error.SystemResources;
+    defer allocator.free(old_path_z);
+    const new_path_z = allocator.dupeSentinel(u8, new_path, 0) catch return error.SystemResources;
+    defer allocator.free(new_path_z);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.renameat(old_dir, old_path_z.ptr, new_dir, new_path_z.ptr);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToDirRenameError(err),
+        }
+    }
+}
+
+/// Rename a file without replacing if the destination exists.
+/// On Linux, uses renameat2() with RENAME_NOREPLACE.
+/// On other POSIX systems, falls back to hardlink + delete.
+/// On Windows, uses MoveFileExW without MOVEFILE_REPLACE_EXISTING.
+pub fn renameatPreserve(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenamePreserveError!void {
+    if (builtin.os.tag == .windows) {
+        const old_path_w = try w.pathToWide(allocator, old_dir, old_path);
+        defer allocator.free(old_path_w);
+        const new_path_w = try w.pathToWide(allocator, new_dir, new_path);
+        defer allocator.free(new_path_w);
+
+        const success = w.MoveFileExW(
+            old_path_w.ptr,
+            new_path_w.ptr,
+            0, // No MOVEFILE_REPLACE_EXISTING: fails if destination exists.
+        );
+
+        if (success == w.FALSE) {
+            switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => return error.FileNotFound,
+                .PATH_NOT_FOUND => return error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
+                .ACCESS_DENIED => return error.AccessDenied,
+                .ALREADY_EXISTS, .FILE_EXISTS => return error.PathAlreadyExists,
+                .SHARING_VIOLATION => return error.FileBusy,
+                .NOT_SAME_DEVICE => return error.CrossDevice,
+                .DIR_NOT_EMPTY => return error.DirNotEmpty,
+                .DIRECTORY => return error.NotDir,
+                else => |err| return unexpectedError(err),
+            }
+        }
+
+        return;
+    }
+
+    const old_path_z = allocator.dupeSentinel(u8, old_path, 0) catch return error.SystemResources;
+    defer allocator.free(old_path_z);
+    const new_path_z = allocator.dupeSentinel(u8, new_path, 0) catch return error.SystemResources;
+    defer allocator.free(new_path_z);
+
+    if (builtin.os.tag == .linux) {
+        while (true) {
+            const rc = posix.system.renameat2(old_dir, old_path_z.ptr, new_dir, new_path_z.ptr, .{ .NOREPLACE = true });
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .EXIST => return error.PathAlreadyExists,
+                // RENAME_NOREPLACE needs per-filesystem support: EINVAL when
+                // the filesystem lacks it (out-of-tree ZFS; in-tree filesystems
+                // added it between 3.15 and 4.9), ENOSYS when renameat2 itself
+                // is absent (pre-3.15). Fall back to hardlink+delete.
+                .INVAL, .NOSYS => break,
+                else => |err| return errnoToDirRenameError(err),
+            }
+        }
+    }
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        while (true) {
+            const rc = darwin.renameatx_np(@intCast(old_dir), old_path_z.ptr, @intCast(new_dir), new_path_z.ptr, .{ .EXCL = true });
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .EXIST => return error.PathAlreadyExists,
+                // ENOTSUP (= 45 on Darwin, aliased as OPNOTSUPP in Zig's std.c.E):
+                // filesystem doesn't support RENAME_EXCL — fall through to hardlink+delete.
+                .OPNOTSUPP => break,
+                else => |err| return errnoToDirRenameError(err),
+            }
+        }
+    }
+
+    // Atomic no-replace rename unavailable on this platform/filesystem.
+    return renameatPreserveFallback(allocator, old_dir, old_path, new_dir, new_path);
+}
+
+/// No-replace rename via hardlink + delete for filesystems that reject the
+/// atomic renameat2(RENAME_NOREPLACE)/renameatx_np(RENAME_EXCL). The hardlink
+/// returns EEXIST -> error.PathAlreadyExists when the destination exists.
+/// Regular files only (a directory source fails the hardlink with EPERM).
+/// All-or-nothing: if the source cannot be deleted after linking, the link is
+/// removed again and the error is returned.
+fn renameatPreserveFallback(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenamePreserveError!void {
+    try dirHardLink(allocator, old_dir, old_path, new_dir, new_path, .{});
+    dirDeleteFile(allocator, old_dir, old_path) catch |err| switch (err) {
+        // The source vanished after the link was made, so the rename is
+        // complete; rolling back would delete the only name left for the data.
+        error.FileNotFound => {},
+        else => {
+            // Only undo the link while the source is verifiably still in
+            // place; if we can't confirm that, the new link may be the only
+            // name left for the data, so keep it.
+            if (dirAccess(allocator, old_dir, old_path, .{ .follow_symlinks = false })) |_| {
+                dirDeleteFile(allocator, new_dir, new_path) catch {};
+            } else |_| {}
+            return err;
+        },
+    };
+}
+
+test renameatPreserveFallback {
+    // The fallback is unreachable on Windows (renameatPreserve uses MoveFileExW).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const at_cwd = posix.AT.FDCWD;
+    const src = "zio_rnpf_src.tmp";
+    const dst = "zio_rnpf_dst.tmp";
+
+    dirDeleteFile(allocator, at_cwd, src) catch {};
+    dirDeleteFile(allocator, at_cwd, dst) catch {};
+    defer dirDeleteFile(allocator, at_cwd, src) catch {};
+    defer dirDeleteFile(allocator, at_cwd, dst) catch {};
+
+    // Free destination: source moves onto it.
+    try close(try createat(allocator, at_cwd, src, .{}));
+    try renameatPreserveFallback(allocator, at_cwd, src, at_cwd, dst);
+    try std.testing.expectError(error.FileNotFound, dirAccess(allocator, at_cwd, src, .{}));
+    try dirAccess(allocator, at_cwd, dst, .{});
+
+    // Occupied destination: fails and leaves the source in place.
+    try close(try createat(allocator, at_cwd, src, .{}));
+    try std.testing.expectError(error.PathAlreadyExists, renameatPreserveFallback(allocator, at_cwd, src, at_cwd, dst));
+    try dirAccess(allocator, at_cwd, src, .{});
+}
+
+test "renameatPreserveFallback: rollback when source cannot be deleted" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Root bypasses the directory permission check the test relies on.
+    if (posix.system.geteuid() == 0) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const at_cwd = posix.AT.FDCWD;
+    const src_dir_path = "zio_rnpf_rollback_dir.tmp";
+    const src = "src";
+    const dst = "zio_rnpf_rollback_dst.tmp";
+
+    dirDeleteFile(allocator, at_cwd, dst) catch {};
+    defer dirDeleteFile(allocator, at_cwd, dst) catch {};
+
+    try mkdirat(allocator, at_cwd, src_dir_path, 0o755);
+    defer {
+        dirSetFilePermissions(allocator, at_cwd, src_dir_path, 0o755, .{}) catch {};
+        dirDeleteFile(allocator, at_cwd, src_dir_path ++ "/" ++ src) catch {};
+        dirDeleteDir(allocator, at_cwd, src_dir_path) catch {};
+    }
+
+    const src_dir = try dirOpen(allocator, at_cwd, src_dir_path, .{});
+    defer posix.close(src_dir);
+
+    try close(try createat(allocator, src_dir, src, .{}));
+
+    // Make the source directory read-only so the post-link unlink fails.
+    try dirSetFilePermissions(allocator, at_cwd, src_dir_path, 0o555, .{});
+
+    if (renameatPreserveFallback(allocator, src_dir, src, at_cwd, dst)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => {},
+        else => return err,
+    }
+
+    // Nothing changed: source still present, destination link rolled back.
+    try dirAccess(allocator, src_dir, src, .{});
+    try std.testing.expectError(error.FileNotFound, dirAccess(allocator, at_cwd, dst, .{}));
+}
+
+/// Delete a file using unlinkat() syscall
+pub fn dirDeleteFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) DirDeleteFileError!void {
+    if (builtin.os.tag == .windows) {
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        if (w.DeleteFileW(path_w.ptr) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => blk: {
+                    // DeleteFileW returns ACCESS_DENIED when the path is a
+                    // directory.  Check with GetFileAttributesW so the caller
+                    // sees error.IsDir instead of a misleading
+                    // error.AccessDenied.
+                    const attrs = w.GetFileAttributesW(path_w.ptr);
+                    if (attrs != w.INVALID_FILE_ATTRIBUTES and
+                        attrs & w.FILE_ATTRIBUTE_DIRECTORY != 0)
+                    {
+                        break :blk error.IsDir;
+                    }
+                    break :blk error.AccessDenied;
+                },
+                .SHARING_VIOLATION => error.FileBusy,
+                else => |err| return unexpectedError(err),
+            };
+        }
+        return;
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.unlinkat(dir, path_z.ptr, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            .PERM => {
+                // macOS and BSDs return EPERM (not EISDIR) when unlinkat is
+                // called on a directory without AT_REMOVEDIR.  Check with
+                // fstatat so the caller sees error.IsDir instead of a
+                // misleading error.AccessDenied.  EPERM can also mean the
+                // file has the immutable flag set, which we don't distinguish
+                // here — it stays AccessDenied.
+                if (comptime builtin.os.tag.isDarwin() or
+                    builtin.os.tag == .freebsd or
+                    builtin.os.tag == .netbsd or
+                    builtin.os.tag == .openbsd or
+                    builtin.os.tag == .dragonfly)
+                {
+                    var stat_buf: posix.system.Stat = undefined;
+                    const stat_rc = posix.system.fstatat(dir, path_z.ptr, &stat_buf, posix.AT.SYMLINK_NOFOLLOW);
+                    if (posix.errno(stat_rc) == .SUCCESS and
+                        stat_buf.mode & posix.system.S.IFMT == posix.system.S.IFDIR)
+                    {
+                        return error.IsDir;
+                    }
+                }
+                return error.AccessDenied;
+            },
+            else => |err| return errnoToDirDeleteFileError(err),
+        }
+    }
+}
+
+/// Delete a directory using unlinkat() syscall with AT_REMOVEDIR
+pub fn dirDeleteDir(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) DirDeleteDirError!void {
+    if (builtin.os.tag == .windows) {
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        if (w.RemoveDirectoryW(path_w.ptr) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                .SHARING_VIOLATION => error.FileBusy,
+                .DIR_NOT_EMPTY => error.DirNotEmpty,
+                else => |err| return unexpectedError(err),
+            };
+        }
+        return;
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.unlinkat(dir, path_z.ptr, posix.AT.REMOVEDIR);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToDirDeleteDirError(err),
+        }
+    }
+}
+
+/// Create a directory using mkdirat() syscall
+pub fn mkdirat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, mode: mode_t) DirCreateDirError!void {
+    if (builtin.os.tag == .windows) {
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        if (w.CreateDirectoryW(path_w.ptr, null) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                .ALREADY_EXISTS => error.PathAlreadyExists,
+                .FILE_EXISTS => error.PathAlreadyExists,
+                else => |err| return unexpectedError(err),
+            };
+        }
+
+        return;
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.mkdirat(dir, path_z.ptr, mode);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToDirCreateDirError(err),
+        }
+    }
+}
+
+pub fn errnoToFileOpenError(errno: posix.system.E, flags: anytype) FileOpenError {
+    // NetBSD returns EFTYPE (not ELOOP) when O_NOFOLLOW hits a symlink.
+    if (@hasField(@TypeOf(errno), "FTYPE") and errno == .FTYPE)
+        return if (@hasField(@TypeOf(flags), "follow_symlinks") and !flags.follow_symlinks) error.SymLinkLoop else unexpectedError(errno);
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .LOOP => error.SymLinkLoop,
+        // BSD returns EMLINK (not ELOOP) when O_NOFOLLOW hits a symlink.
+        .MLINK => if (@hasField(@TypeOf(flags), "follow_symlinks") and !flags.follow_symlinks) error.SymLinkLoop else unexpectedError(errno),
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NODEV => error.NoDevice,
+        .NOENT => error.FileNotFound,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOMEM => error.SystemResources,
+        .FBIG => error.FileTooBig,
+        .ISDIR => error.IsDir,
+        .NOSPC => error.NoSpaceLeft,
+        .NOTDIR => error.NotDir,
+        .EXIST => error.PathAlreadyExists,
+        .BUSY => error.DeviceBusy,
+        .TXTBSY => error.FileBusy,
+        .XDEV => if (flags.resolve_beneath) error.AccessDenied else unexpectedError(errno),
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToDirOpenError(errno: posix.system.E, flags: DirOpenFlags) DirOpenError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .LOOP => error.SymLinkLoop,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NODEV => error.NoDevice,
+        .NOENT => error.FileNotFound,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOMEM => error.SystemResources,
+        .NOTDIR => error.NotDir,
+        .XDEV => if (flags.resolve_beneath) error.AccessDenied else unexpectedError(errno),
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub const E = if (builtin.os.tag == .windows) w.Win32Error else posix.system.E;
+
+pub fn errnoToFileReadError(err: E) FileReadError {
+    switch (builtin.os.tag) {
+        .windows => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .INVALID_HANDLE => error.NotOpenForReading,
+                .ACCESS_DENIED => error.AccessDenied,
+                .BROKEN_PIPE => error.BrokenPipe,
+                .IO_INCOMPLETE, .IO_PENDING => error.WouldBlock,
+                .HANDLE_EOF => error.InputOutput,
+                .OPERATION_ABORTED => error.Canceled,
+                .NOT_ENOUGH_MEMORY, .OUTOFMEMORY => error.SystemResources,
+                else => |e| unexpectedError(e),
+            };
+        },
+        else => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .ACCES => error.AccessDenied,
+                .AGAIN => error.WouldBlock,
+                .IO => error.InputOutput,
+                .ISDIR => error.IsDir,
+                .CANCELED => error.Canceled,
+                .PIPE => error.BrokenPipe,
+                .NOMEM => error.SystemResources,
+                .BADF => error.NotOpenForReading,
+                // ESPIPE is the usual "not seekable" answer for a positional
+                // read, but macOS returns ENXIO for a tty, and EOVERFLOW when
+                // the offset is past what the device can represent.
+                .SPIPE, .NXIO, .OVERFLOW => error.Unseekable,
+                else => |e| unexpectedError(e),
+            };
+        },
+    }
+}
+
+pub fn errnoToFileWriteError(err: E) FileWriteError {
+    switch (builtin.os.tag) {
+        .windows => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .INVALID_HANDLE => error.NotOpenForWriting,
+                .ACCESS_DENIED => error.AccessDenied,
+                .BROKEN_PIPE => error.BrokenPipe,
+                .NO_DATA => error.BrokenPipe, // Pipe is being closed
+                .IO_INCOMPLETE, .IO_PENDING => error.WouldBlock,
+                .OPERATION_ABORTED => error.Canceled,
+                .DISK_FULL, .HANDLE_DISK_FULL => error.NoSpaceLeft,
+                .NOT_ENOUGH_MEMORY, .OUTOFMEMORY => error.SystemResources,
+                else => |e| unexpectedError(e),
+            };
+        },
+        else => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .ACCES => error.AccessDenied,
+                .AGAIN => error.WouldBlock,
+                .IO => error.InputOutput,
+                .NOSPC => error.NoSpaceLeft,
+                .CANCELED => error.Canceled,
+                .PIPE => error.BrokenPipe,
+                .NOMEM => error.SystemResources,
+                .BADF => error.NotOpenForWriting,
+                .DQUOT => error.DiskQuota,
+                .FBIG => error.FileTooBig,
+                .BUSY => error.DeviceBusy,
+                .TXTBSY => error.FileBusy,
+                // ESPIPE is the usual "not seekable" answer for a positional
+                // write, but macOS returns ENXIO for a tty, and EOVERFLOW when
+                // the offset is past what the device can represent.
+                .SPIPE, .NXIO, .OVERFLOW => error.Unseekable,
+                else => |e| unexpectedError(e),
+            };
+        },
+    }
+}
+
+pub fn errnoToFileCloseError(errno: E) FileCloseError {
+    switch (builtin.os.tag) {
+        .windows => {
+            return switch (errno) {
+                .SUCCESS => unreachable,
+                else => |e| unexpectedError(e),
+            };
+        },
+        else => {
+            return switch (errno) {
+                .SUCCESS => unreachable,
+                .CANCELED => error.Canceled,
+                else => |e| unexpectedError(e),
+            };
+        },
+    }
+}
+
+pub fn errnoToFileSyncRangeError(errno: posix.system.E) FileSyncRangeError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .NOMEM => error.SystemResources,
+        .SPIPE => error.Unseekable,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToFileSyncError(errno: posix.system.E) FileSyncError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .DQUOT => error.DiskQuota,
+        .ACCES, .PERM, .ROFS => error.AccessDenied,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToFileSeekError(err: E) FileSeekError {
+    switch (builtin.os.tag) {
+        .windows => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                // The answers for "this handle has no file position". Windows
+                // reports a pipe as INVALID_PARAMETER and Wine reports one as
+                // BAD_DEV_TYPE; INVALID_FUNCTION is the documented answer for a
+                // handle type that cannot seek, and SEEK_ON_DEVICE for a
+                // character device. The move method is a constant and the
+                // distance is range checked before the call, so the handle is
+                // the only parameter left for INVALID_PARAMETER to be about.
+                // NEGATIVE_SEEK is a position before the start of the file.
+                .INVALID_FUNCTION,
+                .INVALID_PARAMETER,
+                .BAD_DEV_TYPE,
+                .SEEK_ON_DEVICE,
+                .NEGATIVE_SEEK,
+                => error.Unseekable,
+                .ACCESS_DENIED => error.AccessDenied,
+                .OPERATION_ABORTED => error.Canceled,
+                else => |e| unexpectedError(e),
+            };
+        },
+        else => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .CANCELED => error.Canceled,
+                // ESPIPE is the usual "not seekable" answer, but macOS returns
+                // ENXIO for a tty, and EOVERFLOW when the resulting offset is
+                // past what the device can represent. EINVAL is a resulting
+                // offset before the start of the file.
+                .SPIPE, .NXIO, .OVERFLOW, .INVAL => error.Unseekable,
+                // Not specified by POSIX for lseek, but sandboxes that filter
+                // the syscall report a denied seek this way.
+                .ACCES, .PERM => error.AccessDenied,
+                else => |e| unexpectedError(e),
+            };
+        },
+    }
+}
+
+pub fn errnoToDirRenameError(errno: posix.system.E) DirRenameError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .BUSY => error.FileBusy,
+        .DQUOT => error.DiskQuota,
+        .ISDIR => error.IsDir,
+        .LOOP => error.SymLinkLoop,
+        .MLINK => error.LinkQuotaExceeded,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOENT => error.FileNotFound,
+        .NOMEM => error.SystemResources,
+        .NOTDIR => error.NotDir,
+        .EXIST => error.DirNotEmpty,
+        .NOSPC => error.NoSpaceLeft,
+        .ROFS => error.ReadOnlyFileSystem,
+        .XDEV => error.CrossDevice,
+        .NOTEMPTY => error.DirNotEmpty,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToDirDeleteFileError(errno: posix.system.E) DirDeleteFileError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.AccessDenied,
+        .BUSY => error.FileBusy,
+        .NOENT => error.FileNotFound,
+        .ISDIR => error.IsDir,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .NOMEM => error.SystemResources,
+        .ROFS => error.ReadOnlyFileSystem,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToDirDeleteDirError(errno: posix.system.E) DirDeleteDirError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.AccessDenied,
+        .BUSY => error.FileBusy,
+        .NOENT => error.FileNotFound,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .NOMEM => error.SystemResources,
+        .ROFS => error.ReadOnlyFileSystem,
+        .NOTEMPTY => error.DirNotEmpty,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToDirCreateDirError(errno: posix.system.E) DirCreateDirError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .DQUOT => error.DiskQuota,
+        .EXIST => error.PathAlreadyExists,
+        .LOOP => error.SymLinkLoop,
+        .MLINK => error.LinkQuotaExceeded,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOENT => error.FileNotFound,
+        .NOMEM => error.SystemResources,
+        .NOSPC => error.NoSpaceLeft,
+        .NOTDIR => error.NotDir,
+        .ROFS => error.ReadOnlyFileSystem,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// Get the size of a file
+pub fn fileSize(fd: fd_t) FileSizeError!u64 {
+    if (builtin.os.tag == .windows) {
+        var file_size: w.LARGE_INTEGER = undefined;
+        const success = w.GetFileSizeEx(fd, &file_size);
+
+        if (success == w.FALSE) {
+            switch (w.GetLastError()) {
+                .ACCESS_DENIED => return error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            }
+        }
+
+        return @intCast(file_size);
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        while (true) {
+            const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX{ .SIZE = true }, &statx_buf);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return statx_buf.size,
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToFileSizeError(err),
+            }
+        }
+    }
+
+    while (true) {
+        var stat_buf: posix.system.Stat = undefined;
+        const rc = posix.system.fstat(fd, &stat_buf);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(stat_buf.size),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSizeError(err),
+        }
+    }
+}
+
+pub fn errnoToFileSizeError(errno: posix.system.E) FileSizeError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// Get file metadata by file descriptor
+pub fn fstat(fd: fd_t) FileStatError!FileStatInfo {
+    if (builtin.os.tag == .windows) {
+        var info: w.BY_HANDLE_FILE_INFORMATION = undefined;
+        const success = w.GetFileInformationByHandle(fd, &info);
+
+        if (success == w.FALSE) {
+            switch (w.GetLastError()) {
+                .INVALID_HANDLE => return error.InvalidFileDescriptor,
+                .ACCESS_DENIED => return error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            }
+        }
+
+        const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        const inode: ino_t = @bitCast((@as(u64, info.nFileIndexHigh) << 32) | info.nFileIndexLow);
+
+        const kind: FileKind = if (info.dwFileAttributes & w.FILE_ATTRIBUTE_DIRECTORY != 0)
+            .directory
+        else if (info.dwFileAttributes & w.FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .sym_link
+        else
+            .file;
+
+        return .{
+            .inode = inode,
+            .nlink = info.nNumberOfLinks,
+            .size = size,
+            .mode = 0, // Windows doesn't have POSIX modes
+            .kind = kind,
+            .block_size = 1,
+            .atime = w.fileTimeToNanos(info.ftLastAccessTime),
+            .mtime = w.fileTimeToNanos(info.ftLastWriteTime),
+            .ctime = w.fileTimeToNanos(info.ftCreationTime),
+        };
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const mask = linux.STATX{ .TYPE = true, .MODE = true, .INO = true, .NLINK = true, .SIZE = true, .ATIME = true, .MTIME = true, .CTIME = true };
+        var statx_buf: linux.Statx = undefined;
+        while (true) {
+            const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &statx_buf);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return statxToFileStat(statx_buf),
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToFileStatError(err),
+            }
+        }
+    }
+
+    while (true) {
+        var stat_buf: posix.system.Stat = undefined;
+        const rc = posix.system.fstat(fd, &stat_buf);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return statToFileStat(stat_buf),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileStatError(err),
+        }
+    }
+}
+
+/// Get file metadata by path relative to directory
+pub fn fstatat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileStatFlags) FileStatError!FileStatInfo {
+    if (builtin.os.tag == .windows) {
+        const path_w = try w.pathToWide(allocator, dir, path);
+        defer allocator.free(path_w);
+
+        var create_flags: u32 = w.FILE_FLAG_BACKUP_SEMANTICS; // Required to open directories
+        if (!flags.follow_symlinks) create_flags |= w.FILE_FLAG_OPEN_REPARSE_POINT;
+
+        // Open with minimal access just to query attributes
+        const handle = w.CreateFileW(
+            path_w.ptr,
+            0, // No access needed, just want to query attributes
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            null,
+            w.OPEN_EXISTING,
+            create_flags,
+            null,
+        );
+
+        if (handle == w.INVALID_HANDLE_VALUE) {
+            return switch (w.GetLastError()) {
+                .FILE_NOT_FOUND => error.FileNotFound,
+                .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| return unexpectedError(err),
+            };
+        }
+        defer _ = w.CloseHandle(handle);
+
+        return fstat(handle);
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    const at_flags: u32 = if (flags.follow_symlinks) 0 else posix.AT.SYMLINK_NOFOLLOW;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const mask = linux.STATX{ .TYPE = true, .MODE = true, .INO = true, .NLINK = true, .SIZE = true, .ATIME = true, .MTIME = true, .CTIME = true };
+        var statx_buf: linux.Statx = undefined;
+        while (true) {
+            const rc = linux.statx(dir, path_z.ptr, at_flags, mask, &statx_buf);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return statxToFileStat(statx_buf),
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToFileStatError(err),
+            }
+        }
+    }
+
+    while (true) {
+        var stat_buf: posix.system.Stat = undefined;
+        const rc = posix.system.fstatat(dir, path_z.ptr, &stat_buf, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return statToFileStat(stat_buf),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileStatError(err),
+        }
+    }
+}
+
+fn statToFileStat(stat_buf: posix.system.Stat) FileStatInfo {
+    const S = posix.system.S;
+    const kind: FileKind = switch (stat_buf.mode & S.IFMT) {
+        S.IFBLK => .block_device,
+        S.IFCHR => .character_device,
+        S.IFDIR => .directory,
+        S.IFIFO => .named_pipe,
+        S.IFLNK => .sym_link,
+        S.IFREG => .file,
+        S.IFSOCK => .unix_domain_socket,
+        else => .unknown,
+    };
+
+    return .{
+        .inode = stat_buf.ino,
+        .nlink = @intCast(stat_buf.nlink),
+        .size = @intCast(stat_buf.size),
+        .mode = stat_buf.mode,
+        .kind = kind,
+        .block_size = @intCast(stat_buf.blksize),
+        .atime = timespecToNanos(stat_buf.atime()),
+        .mtime = timespecToNanos(stat_buf.mtime()),
+        .ctime = timespecToNanos(stat_buf.ctime()),
+    };
+}
+
+fn timespecToNanos(ts: posix.system.timespec) i64 {
+    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+fn statxToFileStat(statx_buf: std.os.linux.Statx) FileStatInfo {
+    const S = std.os.linux.S;
+    const kind: FileKind = switch (statx_buf.mode & S.IFMT) {
+        S.IFBLK => .block_device,
+        S.IFCHR => .character_device,
+        S.IFDIR => .directory,
+        S.IFIFO => .named_pipe,
+        S.IFLNK => .sym_link,
+        S.IFREG => .file,
+        S.IFSOCK => .unix_domain_socket,
+        else => .unknown,
+    };
+
+    return .{
+        .inode = statx_buf.ino,
+        .nlink = statx_buf.nlink,
+        .size = statx_buf.size,
+        .mode = statx_buf.mode,
+        .kind = kind,
+        .block_size = statx_buf.blksize,
+        .atime = statxTimeToNanos(statx_buf.atime),
+        .mtime = statxTimeToNanos(statx_buf.mtime),
+        .ctime = statxTimeToNanos(statx_buf.ctime),
+    };
+}
+
+fn statxTimeToNanos(ts: std.os.linux.statx_timestamp) i64 {
+    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+pub fn errnoToFileStatError(errno: posix.system.E) FileStatError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .BADF => error.InvalidFileDescriptor,
+        .NOENT => error.FileNotFound,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .LOOP => error.SymLinkLoop,
+        .NOMEM => error.SystemResources,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// Set file size (truncate or extend)
+pub fn fileSetSize(fd: fd_t, length: u64) FileSetSizeError!void {
+    if (builtin.os.tag == .windows) {
+        // Save current position
+        var current_pos: w.LARGE_INTEGER = undefined;
+        if (w.SetFilePointerEx(fd, 0, &current_pos, w.FILE_CURRENT) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .INVALID_HANDLE => error.Unexpected,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| unexpectedError(err),
+            };
+        }
+
+        // Check for overflow - LARGE_INTEGER is signed, so length must fit in i64
+        if (length >= (1 << 63)) {
+            return error.FileTooBig;
+        }
+
+        // Seek to desired length
+        const len_signed: w.LARGE_INTEGER = @bitCast(length);
+        if (w.SetFilePointerEx(fd, len_signed, null, w.FILE_BEGIN) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .INVALID_HANDLE => error.Unexpected,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| unexpectedError(err),
+            };
+        }
+
+        // Set end of file at current position
+        if (w.SetEndOfFile(fd) == w.FALSE) {
+            // Try to restore position before returning error
+            _ = w.SetFilePointerEx(fd, current_pos, null, w.FILE_BEGIN);
+            return switch (w.GetLastError()) {
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| unexpectedError(err),
+            };
+        }
+
+        // Restore original position
+        _ = w.SetFilePointerEx(fd, current_pos, null, w.FILE_BEGIN);
+        return;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.ftruncate(fd, @intCast(length));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetSizeError(err),
+        }
+    }
+}
+
+pub fn errnoToFileSetSizeError(errno: posix.system.E) FileSetSizeError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .FBIG => error.FileTooBig,
+        .IO => error.InputOutput,
+        .TXTBSY => error.FileBusy,
+        .PERM => error.PermissionDenied,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub const uid_t = if (builtin.os.tag == .windows) u32 else posix.system.uid_t;
+pub const gid_t = if (builtin.os.tag == .windows) u32 else posix.system.gid_t;
+
+/// Set file permissions (mode)
+pub fn fileSetPermissions(fd: fd_t, mode: mode_t) FileSetPermissionsError!void {
+    // Windows doesn't have POSIX-style permissions
+    if (builtin.os.tag == .windows) return;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.fchmod(fd, mode);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetPermissionsError(err),
+        }
+    }
+}
+
+pub fn errnoToFileSetPermissionsError(errno: posix.system.E) FileSetPermissionsError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .ROFS => error.ReadOnlyFileSystem,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// Set file owner (uid/gid)
+pub fn fileSetOwner(fd: fd_t, uid: ?uid_t, gid: ?gid_t) FileSetOwnerError!void {
+    // Windows doesn't have POSIX-style ownership
+    if (builtin.os.tag == .windows) return;
+
+    // -1 means "don't change"
+    const uid_arg: uid_t = uid orelse @bitCast(@as(i32, -1));
+    const gid_arg: gid_t = gid orelse @bitCast(@as(i32, -1));
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.fchown(fd, uid_arg, gid_arg);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetOwnerError(err),
+        }
+    }
+}
+
+pub fn errnoToFileSetOwnerError(errno: posix.system.E) FileSetOwnerError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .ROFS => error.ReadOnlyFileSystem,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// New value of a single file timestamp
+pub const SetTimestamp = union(enum) {
+    /// Keep the timestamp unchanged
+    unchanged,
+    /// Set the timestamp to the current time
+    now,
+    /// Nanoseconds since Unix epoch
+    new: i96,
+};
+
+/// Timestamps for fileSetTimestamps
+pub const FileTimestamps = struct {
+    /// Access time
+    atime: SetTimestamp = .unchanged,
+    /// Modification time
+    mtime: SetTimestamp = .unchanged,
+};
+
+fn setTimestampToTimespec(timestamp: SetTimestamp) posix.system.timespec {
+    return switch (timestamp) {
+        .unchanged => posix.system.UTIME.OMIT,
+        .now => posix.system.UTIME.NOW,
+        .new => |ns| .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) },
+    };
+}
+
+fn setTimestampToFileTime(timestamp: SetTimestamp, now: w.FILETIME) ?w.FILETIME {
+    return switch (timestamp) {
+        .unchanged => null,
+        .now => now,
+        .new => |ns| w.nanosToFileTime(ns),
+    };
+}
+
+/// Set file timestamps
+pub fn fileSetTimestamps(fd: fd_t, timestamps: FileTimestamps) FileSetTimestampsError!void {
+    if (builtin.os.tag == .windows) {
+        const now_ticks: u64 = if (timestamps.atime == .now or timestamps.mtime == .now)
+            @bitCast(w.RtlGetSystemTimePrecise())
+        else
+            0;
+        const now: w.FILETIME = .{ .dwLowDateTime = @truncate(now_ticks), .dwHighDateTime = @truncate(now_ticks >> 32) };
+        const atime = setTimestampToFileTime(timestamps.atime, now);
+        const mtime = setTimestampToFileTime(timestamps.mtime, now);
+
+        if (w.SetFileTime(
+            fd,
+            null, // creation time - don't change
+            if (atime) |*a| a else null,
+            if (mtime) |*m| m else null,
+        ) == w.FALSE) {
+            return switch (w.GetLastError()) {
+                .INVALID_HANDLE => error.Unexpected,
+                .ACCESS_DENIED => error.AccessDenied,
+                else => |err| unexpectedError(err),
+            };
+        }
+        return;
+    }
+
+    const times: [2]posix.system.timespec = .{
+        setTimestampToTimespec(timestamps.atime),
+        setTimestampToTimespec(timestamps.mtime),
+    };
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.futimens(fd, &times);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetTimestampsError(err),
+        }
+    }
+}
+
+pub fn errnoToFileSetTimestampsError(errno: posix.system.E) FileSetTimestampsError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .ROFS => error.ReadOnlyFileSystem,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+/// Options for path-based permission/owner operations
+pub const PathSetFlags = struct {
+    follow_symlinks: bool = true,
+};
+
+/// Set permissions of a file relative to a directory (fchmodat)
+pub fn dirSetFilePermissions(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, mode: mode_t, flags: PathSetFlags) FileSetPermissionsError!void {
+    // Windows doesn't have POSIX-style permissions
+    if (builtin.os.tag == .windows) return;
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.Unexpected;
+    defer allocator.free(path_z);
+
+    // Note: AT_SYMLINK_NOFOLLOW for fchmodat requires Linux 6.6+ (fchmodat2)
+    const at_flags: u32 = if (flags.follow_symlinks) 0 else posix.AT.SYMLINK_NOFOLLOW;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.fchmodat(dir, path_z.ptr, mode, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetPermissionsError(err),
+        }
+    }
+}
+
+/// Set owner of a file relative to a directory (fchownat)
+pub fn dirSetFileOwner(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, uid: ?uid_t, gid: ?gid_t, flags: PathSetFlags) FileSetOwnerError!void {
+    // Windows doesn't have POSIX-style ownership
+    if (builtin.os.tag == .windows) return;
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.Unexpected;
+    defer allocator.free(path_z);
+
+    // -1 means "don't change"
+    const uid_arg: uid_t = uid orelse @bitCast(@as(i32, -1));
+    const gid_arg: gid_t = gid orelse @bitCast(@as(i32, -1));
+
+    const at_flags: u32 = if (!flags.follow_symlinks) posix.AT.SYMLINK_NOFOLLOW else 0;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.fchownat(dir, path_z.ptr, uid_arg, gid_arg, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetOwnerError(err),
+        }
+    }
+}
+
+/// Set timestamps of a file relative to a directory (utimensat)
+pub fn dirSetFileTimestamps(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, timestamps: FileTimestamps, flags: PathSetFlags) FileSetTimestampsError!void {
+    if (builtin.os.tag == .windows) {
+        // On Windows, we need to open the file first, set timestamps, then close
+        // For now, return success (no-op like other Windows permission functions)
+        return;
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.Unexpected;
+    defer allocator.free(path_z);
+
+    const times: [2]posix.system.timespec = .{
+        setTimestampToTimespec(timestamps.atime),
+        setTimestampToTimespec(timestamps.mtime),
+    };
+
+    const at_flags: u32 = if (!flags.follow_symlinks) posix.AT.SYMLINK_NOFOLLOW else 0;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.utimensat(dir, path_z.ptr, &times, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSetTimestampsError(err),
+        }
+    }
+}
+
+pub const SymLinkError = error{
+    AccessDenied,
+    PermissionDenied,
+    DiskQuota,
+    PathAlreadyExists,
+    SymLinkLoop,
+    FileNotFound,
+    ReadOnlyFileSystem,
+    NotDir,
+    NameTooLong,
+    NoSpaceLeft,
+    SystemResources,
+    Canceled,
+    Unexpected,
+};
+
+pub const SymLinkFlags = struct {
+    is_directory: bool = false,
+};
+
+/// Create a symbolic link using symlinkat() syscall
+pub fn dirSymLink(allocator: std.mem.Allocator, dir: fd_t, target: []const u8, link_path: []const u8, flags: SymLinkFlags) SymLinkError!void {
+    _ = flags;
+
+    if (builtin.os.tag == .windows) {
+        // TODO: Implement Windows symlink creation via CreateSymbolicLinkW
+        return error.Unexpected;
+    }
+
+    const target_z = allocator.dupeSentinel(u8, target, 0) catch return error.SystemResources;
+    defer allocator.free(target_z);
+
+    const link_path_z = allocator.dupeSentinel(u8, link_path, 0) catch return error.SystemResources;
+    defer allocator.free(link_path_z);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.symlinkat(target_z.ptr, dir, link_path_z.ptr);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToSymLinkError(err),
+        }
+    }
+}
+
+pub fn errnoToSymLinkError(errno: posix.system.E) SymLinkError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .DQUOT => error.DiskQuota,
+        .EXIST => error.PathAlreadyExists,
+        .LOOP => error.SymLinkLoop,
+        .NOENT => error.FileNotFound,
+        .ROFS => error.ReadOnlyFileSystem,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOSPC => error.NoSpaceLeft,
+        .NOMEM => error.SystemResources,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub const ReadLinkError = error{
+    AccessDenied,
+    PermissionDenied,
+    FileNotFound,
+    NotLink,
+    SymLinkLoop,
+    NameTooLong,
+    NotDir,
+    SystemResources,
+    Canceled,
+    Unexpected,
+};
+
+/// Read a symbolic link using readlinkat() syscall
+pub fn dirReadLink(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, buffer: []u8) ReadLinkError!usize {
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    return dirReadLinkZ(dir, path_z, buffer);
+}
+
+pub fn dirReadLinkZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) ReadLinkError!usize {
+    if (builtin.os.tag == .windows) {
+        // TODO: Implement Windows readlink via DeviceIoControl with FSCTL_GET_REPARSE_POINT
+        return error.Unexpected;
+    }
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.system.readlinkat(dir, path, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToReadLinkError(err),
+        }
+    }
+}
+
+pub fn errnoToReadLinkError(errno: posix.system.E) ReadLinkError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOENT => error.FileNotFound,
+        .INVAL => error.NotLink,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .NOMEM => error.SystemResources,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub const HardLinkError = error{
+    AccessDenied,
+    PermissionDenied,
+    DiskQuota,
+    PathAlreadyExists,
+    SymLinkLoop,
+    FileNotFound,
+    ReadOnlyFileSystem,
+    NotDir,
+    NameTooLong,
+    NoSpaceLeft,
+    SystemResources,
+    CrossDevice,
+    Canceled,
+    Unexpected,
+};
+
+pub const HardLinkFlags = struct {
+    follow_symlinks: bool = false,
+};
+
+/// Create a hard link using linkat() syscall
+pub fn dirHardLink(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8, flags: HardLinkFlags) HardLinkError!void {
+    if (builtin.os.tag == .windows) {
+        // TODO: Implement Windows hardlink via CreateHardLinkW
+        return error.Unexpected;
+    }
+
+    const old_path_z = allocator.dupeSentinel(u8, old_path, 0) catch return error.SystemResources;
+    defer allocator.free(old_path_z);
+
+    const new_path_z = allocator.dupeSentinel(u8, new_path, 0) catch return error.SystemResources;
+    defer allocator.free(new_path_z);
+
+    const at_flags: u32 = if (flags.follow_symlinks) posix.AT.SYMLINK_FOLLOW else 0;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.linkat(old_dir, old_path_z.ptr, new_dir, new_path_z.ptr, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToHardLinkError(err),
+        }
+    }
+}
+
+pub fn errnoToHardLinkError(errno: posix.system.E) HardLinkError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .DQUOT => error.DiskQuota,
+        .EXIST => error.PathAlreadyExists,
+        .LOOP => error.SymLinkLoop,
+        .NOENT => error.FileNotFound,
+        .ROFS => error.ReadOnlyFileSystem,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOSPC => error.NoSpaceLeft,
+        .NOMEM => error.SystemResources,
+        .XDEV => error.CrossDevice,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub const FileHardLinkError = HardLinkError || error{
+    OperationUnsupported,
+};
+
+/// Create a hard link from an open file descriptor using linkat() with AT_EMPTY_PATH
+pub fn fileHardLink(allocator: std.mem.Allocator, fd: fd_t, new_dir: fd_t, new_path: []const u8, flags: HardLinkFlags) FileHardLinkError!void {
+    if (builtin.os.tag == .windows) {
+        return error.OperationUnsupported;
+    }
+
+    const new_path_z = allocator.dupeSentinel(u8, new_path, 0) catch return error.SystemResources;
+    defer allocator.free(new_path_z);
+
+    const at_flags: u32 = if (flags.follow_symlinks) posix.AT.SYMLINK_FOLLOW else 0;
+
+    if (@hasDecl(posix.AT, "EMPTY_PATH")) {
+        // Linux: try AT_EMPTY_PATH first, fall back to /proc/self/fd/{fd}
+        while (true) {
+            const rc = posix.linkat(fd, "", new_dir, new_path_z.ptr, at_flags | posix.AT.EMPTY_PATH);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .INVAL, .OPNOTSUPP => return error.OperationUnsupported,
+                .NOENT => {
+                    // AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH, fall back to /proc/self/fd
+                    var proc_buf: ["/proc/self/fd/-2147483648\x00".len]u8 = undefined;
+                    const proc_path = std.fmt.bufPrintSentinel(&proc_buf, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable;
+                    while (true) {
+                        const rc2 = posix.linkat(posix.AT.FDCWD, proc_path.ptr, new_dir, new_path_z.ptr, posix.AT.SYMLINK_FOLLOW);
+                        switch (posix.errno(rc2)) {
+                            .SUCCESS => return,
+                            .INTR => continue,
+                            else => |err2| return errnoToHardLinkError(err2),
+                        }
+                    }
+                },
+                else => |err| return errnoToHardLinkError(err),
+            }
+        }
+    } else {
+        // macOS/BSD: get real path from fd, then use dirHardLink
+        var path_buf: [posix.PATH_MAX]u8 = undefined;
+        const len = dirRealPath(fd, &path_buf) catch return error.OperationUnsupported;
+
+        const old_path_z = allocator.dupeSentinel(u8, path_buf[0..len], 0) catch return error.SystemResources;
+        defer allocator.free(old_path_z);
+
+        while (true) {
+            const rc = posix.linkat(posix.AT.FDCWD, old_path_z.ptr, new_dir, new_path_z.ptr, at_flags);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .INVAL, .OPNOTSUPP => return error.OperationUnsupported,
+                else => |err| return errnoToHardLinkError(err),
+            }
+        }
+    }
+}
+
+pub const DirAccessError = error{
+    AccessDenied,
+    PermissionDenied,
+    FileNotFound,
+    InputOutput,
+    SystemResources,
+    FileBusy,
+    SymLinkLoop,
+    ReadOnlyFileSystem,
+    NameTooLong,
+    BadPathName,
+    Canceled,
+    Unexpected,
+};
+
+pub const AccessFlags = struct {
+    read: bool = false,
+    write: bool = false,
+    execute: bool = false,
+    follow_symlinks: bool = true,
+};
+
+/// Check file accessibility using faccessat() syscall
+pub fn dirAccess(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: AccessFlags) DirAccessError!void {
+    if (builtin.os.tag == .windows) {
+        return dirAccessWindows(allocator, dir, path, flags);
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    var mode: u32 = posix.system.F_OK;
+    if (flags.read) mode |= posix.system.R_OK;
+    if (flags.write) mode |= posix.system.W_OK;
+    if (flags.execute) mode |= posix.system.X_OK;
+
+    const at_flags: u32 = if (flags.follow_symlinks) 0 else posix.AT.SYMLINK_NOFOLLOW;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.faccessat(dir, path_z.ptr, mode, at_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToDirAccessError(err),
+        }
+    }
+}
+
+pub fn errnoToDirAccessError(errno: posix.system.E) DirAccessError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOENT => error.FileNotFound,
+        .IO => error.InputOutput,
+        .NOMEM => error.SystemResources,
+        .TXTBSY => error.FileBusy,
+        .LOOP => error.SymLinkLoop,
+        .ROFS => error.ReadOnlyFileSystem,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.FileNotFound,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+fn dirAccessWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: AccessFlags) DirAccessError!void {
+    _ = flags; // Windows access check doesn't distinguish read/write/execute
+
+    // Handle "." and ".." specially
+    if (path.len == 1 and path[0] == '.') return;
+    if (path.len == 2 and path[0] == '.' and path[1] == '.') return;
+
+    const path_w = try w.pathToWide(allocator, dir, path);
+    defer allocator.free(path_w);
+
+    if (w.GetFileAttributesW(path_w) != w.INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    switch (w.GetLastError()) {
+        .FILE_NOT_FOUND, .PATH_NOT_FOUND => return error.FileNotFound,
+        .ACCESS_DENIED => return error.AccessDenied,
+        .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
+        else => return error.Unexpected,
+    }
+}
+
+/// Read directory entries into buffer.
+/// Returns number of bytes read, 0 when no more entries.
+/// If restart is true, seeks to beginning first (POSIX) or passes RestartScan (Windows).
+pub fn dirRead(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
+    if (builtin.os.tag == .windows) {
+        return dirReadWindows(handle, buffer, restart);
+    } else {
+        return dirReadPosix(handle, buffer, restart);
+    }
+}
+
+fn dirReadPosix(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
+    // Seek to beginning if restart requested
+    if (restart) {
+        const rc = posix.sys.lseek(handle, 0, posix.system.SEEK.SET, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .BADF => return error.Unexpected,
+            else => |err| return unexpectedError(err),
+        }
+    }
+
+    // Call getdents64 (Linux) or getdirentries (BSD)
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = switch (builtin.os.tag) {
+            .linux => std.os.linux.getdents64(handle, buffer.ptr, @intCast(@min(buffer.len, std.math.maxInt(c_uint)))),
+            .macos, .ios, .tvos, .watchos, .visionos => blk: {
+                var basep: i64 = 0;
+                break :blk @as(usize, @bitCast(std.c.__getdirentries64(handle, buffer.ptr, buffer.len, &basep)));
+            },
+            // NetBSD's getdirentries(2) is a legacy compat interface that returns
+            // the old dirent layout (32-bit d_fileno), which does not match the
+            // modern std.c.dirent we parse with. getdents(2) (__getdents30) returns
+            // the modern layout, matching std's own directory iteration.
+            // OpenBSD removed the getdirentries(2) libc wrapper; getdents(2) is
+            // the only interface and returns the modern dirent layout std parses.
+            .netbsd, .openbsd => posix.system.getdents(handle, buffer.ptr, buffer.len),
+            .freebsd, .dragonfly => blk: {
+                var basep: c_long = 0;
+                break :blk posix.system.getdirentries(handle, buffer.ptr, buffer.len, &basep);
+            },
+            else => @compileError("dirRead not implemented for this OS"),
+        };
+
+        switch (posix.errno(rc)) {
+            .SUCCESS => return if (builtin.os.tag == .linux) rc else @intCast(rc),
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            .BADF, .FAULT, .NOTDIR => return error.Unexpected,
+            .NOENT => return 0, // Directory deleted during iteration
+            .ACCES => return error.AccessDenied,
+            .PERM => return error.PermissionDenied,
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedError(err),
+        }
+    }
+}
+
+fn dirReadWindows(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
+    var io_status_block: w.IO_STATUS_BLOCK = undefined;
+
+    while (true) {
+        const rc = w.NtQueryDirectoryFile(
+            handle,
+            null, // Event
+            null, // ApcRoutine
+            null, // ApcContext
+            &io_status_block,
+            buffer.ptr,
+            @intCast(buffer.len),
+            .FileBothDirectoryInformation,
+            .FALSE, // ReturnSingleEntry
+            null, // FileName filter
+            w.BOOLEAN.fromBool(restart),
+        );
+
+        switch (rc) {
+            .SUCCESS => return io_status_block.Information,
+            .NO_MORE_FILES => return 0,
+            .CANCELLED => continue,
+            .ACCESS_DENIED => return error.AccessDenied,
+            .NOT_A_DIRECTORY => return error.Unexpected,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+pub const DirRealPathError = error{
+    OperationUnsupported,
+    NameTooLong,
+    FileNotFound,
+    AccessDenied,
+    PermissionDenied,
+    NotDir,
+    SymLinkLoop,
+    InputOutput,
+    FileSystem,
+    SystemResources,
+    Canceled,
+    Unexpected,
+};
+
+pub const DirRealPathFileError = DirRealPathError || error{
+    FileTooBig,
+    IsDir,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    NoDevice,
+    NoSpaceLeft,
+    DeviceBusy,
+    BadPathName,
+    PathAlreadyExists,
+};
+
+/// Get the real path of a directory fd using /proc/self/fd on Linux or F_GETPATH on macOS
+pub fn dirRealPath(fd: fd_t, buffer: []u8) DirRealPathError!usize {
+    if (builtin.os.tag == .windows) {
+        return dirRealPathWindows(fd, buffer);
+    }
+
+    // Handle AT_FDCWD specially - it's not a real fd
+    const actual_fd: fd_t = if (fd == posix.AT.FDCWD) blk: {
+        // Open "." to get a real fd for cwd
+        const rc = posix.system.openat(fd, ".", .{ .CLOEXEC = true }, @as(mode_t, 0));
+        if (posix.errno(rc) != .SUCCESS) return error.FileNotFound;
+        break :blk @intCast(rc);
+    } else fd;
+    defer if (fd == posix.AT.FDCWD) posix.close(actual_fd);
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    if (builtin.os.tag == .linux) {
+        // Use /proc/self/fd/{fd} with readlink
+        var proc_path_buf: [32:0]u8 = undefined;
+        const proc_path = std.fmt.bufPrintSentinel(&proc_path_buf, "/proc/self/fd/{d}", .{actual_fd}, 0) catch unreachable;
+
+        while (true) {
+            const rc = posix.system.readlink(proc_path, buffer.ptr, buffer.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToDirRealPathError(err),
+            }
+        }
+    } else if (comptime builtin.os.tag.isDarwin() or builtin.os.tag == .netbsd) {
+        // macOS/iOS/NetBSD: use fcntl F_GETPATH
+        var sufficient_buffer: [posix.PATH_MAX]u8 = undefined;
+        @memset(&sufficient_buffer, 0);
+
+        while (true) {
+            const rc = posix.system.fcntl(actual_fd, posix.system.F.GETPATH, &sufficient_buffer);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    const n = std.mem.indexOfScalar(u8, &sufficient_buffer, 0) orelse sufficient_buffer.len;
+                    if (n > buffer.len) return error.NameTooLong;
+                    @memcpy(buffer[0..n], sufficient_buffer[0..n]);
+                    return n;
+                },
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToDirRealPathError(err),
+            }
+        }
+    } else if (comptime builtin.os.tag == .freebsd) {
+        // FreeBSD: use fcntl F_KINFO
+        var kf: posix.sys.kinfo_file = undefined;
+        kf.structsize = @sizeOf(posix.sys.kinfo_file);
+
+        while (true) {
+            const rc = posix.system.fcntl(actual_fd, posix.system.F.KINFO, &kf);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    const n = std.mem.indexOfScalar(u8, &kf.path, 0) orelse kf.path.len;
+                    if (n == 0) return error.Unexpected; // F_KINFO cache miss
+                    if (n > buffer.len) return error.NameTooLong;
+                    @memcpy(buffer[0..n], kf.path[0..n]);
+                    return n;
+                },
+                .INTR => {
+                    try sc.checkCancel();
+                    continue;
+                },
+                else => |err| return errnoToDirRealPathError(err),
+            }
+        }
+    } else {
+        // OpenBSD and other BSDs have no way to recover a path from an fd
+        // (no /proc, no F_GETPATH, no F_KINFO), so realPath by fd is unsupported.
+        return error.OperationUnsupported;
+    }
+}
+
+/// Get the real path of a file relative to a directory
+pub fn dirRealPathFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, buffer: []u8) DirRealPathFileError!usize {
+    if (builtin.os.tag == .windows) {
+        return dirRealPathFileWindows(allocator, dir, path, buffer);
+    }
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
+    defer allocator.free(path_z);
+
+    return dirRealPathFileZ(dir, path_z, buffer);
+}
+
+/// POSIX only; Windows paths have to be converted to UTF-16 first, which
+/// `dirRealPathFile` does.
+pub fn dirRealPathFileZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) DirRealPathFileError!usize {
+    // On non-Linux with libc, we can use realpath() directly for AT_FDCWD
+    if (builtin.os.tag != .linux and builtin.link_libc and dir == posix.AT.FDCWD) {
+        if (buffer.len < posix.PATH_MAX) return error.NameTooLong;
+        while (true) {
+            if (std.c.realpath(path, buffer.ptr)) |_| {
+                return std.mem.indexOfScalar(u8, buffer, 0) orelse buffer.len;
+            }
+            const err: posix.system.E = @fromBackingInt(@intCast(std.c._errno().*));
+            if (err == .INTR) continue;
+            return errnoToDirRealPathFileError(err);
+        }
+    }
+
+    // Open the file with O_PATH to get its fd without actually opening it
+    var open_flags: posix.system.O = .{ .CLOEXEC = true };
+    if (@hasField(posix.system.O, "PATH")) open_flags.PATH = true;
+
+    const file_fd: fd_t = while (true) {
+        const rc = posix.system.openat(dir, path, open_flags, @as(mode_t, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => |err| return errnoToDirRealPathFileError(err),
+        }
+    };
+    defer posix.close(file_fd);
+
+    // Now get the real path of the opened fd
+    return dirRealPath(file_fd, buffer);
+}
+
+fn errnoToDirRealPathFileError(errno: posix.system.E) DirRealPathFileError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOENT => error.FileNotFound,
+        .IO => error.InputOutput,
+        .NOMEM => error.SystemResources,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .BADF => error.FileNotFound,
+        .NOSPC, .RANGE => error.NameTooLong,
+        .CANCELED => error.Canceled,
+        .FBIG, .OVERFLOW => error.FileTooBig,
+        .ISDIR => error.IsDir,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NODEV, .NXIO => error.NoDevice,
+        .EXIST => error.PathAlreadyExists,
+        .BUSY, .TXTBSY => error.DeviceBusy,
+        .ILSEQ, .INVAL => error.BadPathName,
+        else => |e| unexpectedError(e),
+    };
+}
+
+pub fn errnoToDirRealPathError(errno: posix.system.E) DirRealPathError {
+    return switch (errno) {
+        .SUCCESS => unreachable,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOENT => error.FileNotFound,
+        .IO => error.InputOutput,
+        .NOMEM => error.SystemResources,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOTDIR => error.NotDir,
+        .BADF => error.FileNotFound,
+        .NOSPC, .RANGE => error.NameTooLong,
+        .CANCELED => error.Canceled,
+        else => |e| unexpectedError(e),
+    };
+}
+
+fn dirRealPathWindows(handle: fd_t, buffer: []u8) DirRealPathError!usize {
+    // For cwd handle, we need to get a real handle first
+    const is_cwd = (handle == cwd());
+    const actual_handle = if (is_cwd) blk: {
+        // Open "." to get a real handle
+        const h = w.CreateFileW(
+            &[_:0]u16{ '.', 0 },
+            0, // No access needed, just query
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            null,
+            w.OPEN_EXISTING,
+            w.FILE_FLAG_BACKUP_SEMANTICS, // Required for directories
+            null,
+        );
+        if (h == w.INVALID_HANDLE_VALUE) return error.FileNotFound;
+        break :blk h;
+    } else handle;
+    defer if (is_cwd) {
+        _ = w.CloseHandle(actual_handle);
+    };
+
+    // Use a wide char buffer for the Windows API
+    var wide_buf: [std.os.windows.PATH_MAX_WIDE]w.WCHAR = undefined;
+
+    const result = w.GetFinalPathNameByHandleW(
+        actual_handle,
+        &wide_buf,
+        wide_buf.len,
+        w.FILE_NAME_NORMALIZED | w.VOLUME_NAME_DOS,
+    );
+
+    if (result == 0) {
+        return switch (w.GetLastError()) {
+            .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED => error.AccessDenied,
+            .NOT_ENOUGH_MEMORY => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
+
+    if (result > wide_buf.len) return error.NameTooLong;
+
+    // Convert UTF-16 to UTF-8
+    const wide_slice = wide_buf[0..result];
+
+    // Skip the \\?\ prefix if present
+    const skip: usize = if (result >= 4 and wide_slice[0] == '\\' and wide_slice[1] == '\\' and wide_slice[2] == '?' and wide_slice[3] == '\\') 4 else 0;
+
+    const len = std.unicode.calcWtf8Len(wide_slice[skip..]);
+    if (len > buffer.len) return error.NameTooLong;
+
+    return std.unicode.wtf16LeToWtf8(buffer, wide_slice[skip..]);
+}
+
+fn dirRealPathFileWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, buffer: []u8) DirRealPathFileError!usize {
+    const path_w = try w.pathToWide(allocator, dir, path);
+    defer allocator.free(path_w);
+
+    const handle = w.CreateFileW(
+        path_w.ptr,
+        0, // No access needed, just query
+        w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+        null,
+        w.OPEN_EXISTING,
+        w.FILE_FLAG_BACKUP_SEMANTICS, // Required for directories
+        null,
+    );
+
+    if (handle == w.INVALID_HANDLE_VALUE) {
+        return switch (w.GetLastError()) {
+            .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED => error.AccessDenied,
+            .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
+            .NOT_ENOUGH_MEMORY => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
+    defer _ = w.CloseHandle(handle);
+
+    return dirRealPathWindows(handle, buffer);
+}
+
+/// Returns true if `fd` refers to a terminal.
+pub fn isTty(fd: fd_t) bool {
+    if (builtin.os.tag == .windows) {
+        // A console handle is one the console driver will report a mode for.
+        var mode: w.DWORD = undefined;
+        if (w.GetConsoleMode(fd, &mode) != w.FALSE) return true;
+        return isCygwinPty(fd);
+    }
+
+    if (builtin.os.tag == .linux) {
+        // Asking a descriptor for its window size is a question only a terminal
+        // answers, and unlike `isatty` it does not need libc. The answer itself
+        // is four u16 we do not read.
+        var wsz: [4]u16 = undefined;
+        return ioctlPosix(fd, @intCast(posix.system.T.IOCGWINSZ), &wsz) >= 0;
+    }
+
+    // Everywhere else libc is linked and `isatty` is the canonical answer. The
+    // window size ioctl is not a stand-in for it there: a pty master on macOS
+    // rejects the ioctl, and which devices answer it is a per-system detail we
+    // would rather not carry.
+    return posix.system.isatty(fd) != 0;
+}
+
+/// Returns true if ANSI escape codes written to `fd` will be interpreted.
+pub fn supportsAnsiEscapeCodes(fd: fd_t) bool {
+    if (builtin.os.tag == .windows) {
+        var mode: w.DWORD = undefined;
+        if (w.GetConsoleMode(fd, &mode) != w.FALSE) {
+            // A console that already has the mode set needs nothing further.
+            // One that does not can still have it turned on, which is what
+            // `enableAnsiEscapeCodes` is for, so it counts as supporting them.
+            return true;
+        }
+        return isCygwinPty(fd);
+    }
+
+    return isTty(fd);
+}
+
+/// An MSYS2/Cygwin pty is a named pipe rather than a console, named
+/// `msys-[...]-ptyN-[...]` or `cygwin-[...]-ptyN-[...]`.
+fn isCygwinPty(handle: fd_t) bool {
+    if (builtin.os.tag != .windows) return false;
+
+    // Checking the device type first keeps the more expensive name query off
+    // every handle that is not a pipe at all.
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var device_info: w.FILE_FS_DEVICE_INFORMATION = undefined;
+    if (w.NtQueryVolumeInformationFile(
+        handle,
+        &iosb,
+        &device_info,
+        @sizeOf(w.FILE_FS_DEVICE_INFORMATION),
+        .FileFsDeviceInformation,
+    ) != .SUCCESS) return false;
+    if (device_info.DeviceType != w.FILE_DEVICE_NAMED_PIPE) return false;
+
+    // The names we are looking for are far shorter than a full path, so a
+    // buffer that cannot hold every possible name is enough; anything that does
+    // not fit is not one of ours.
+    const name_offset = @offsetOf(w.FILE_NAME_INFORMATION, "FileName");
+    var name_bytes: [name_offset + 256 * 2]u8 align(@alignOf(w.FILE_NAME_INFORMATION)) = @splat(0);
+    if (w.NtQueryInformationFile(
+        handle,
+        &iosb,
+        &name_bytes,
+        @intCast(name_bytes.len),
+        .FileNameInformation,
+    ) != .SUCCESS) return false;
+
+    const name_info: *const w.FILE_NAME_INFORMATION = @ptrCast(&name_bytes);
+    const len = @min(name_info.FileNameLength, name_bytes.len - name_offset);
+    const name = std.mem.bytesAsSlice(u16, name_bytes[name_offset..][0..len]);
+
+    // The queried name is prefixed with a '\', e.g. \msys-1888ae32e00d56aa-pty0-to-master
+    const msys = std.unicode.utf8ToUtf16LeStringLiteral("\\msys-");
+    const cygwin = std.unicode.utf8ToUtf16LeStringLiteral("\\cygwin-");
+    const pty = std.unicode.utf8ToUtf16LeStringLiteral("-pty");
+    return (std.mem.startsWith(u16, name, msys) or std.mem.startsWith(u16, name, cygwin)) and
+        std.mem.indexOf(u16, name, pty) != null;
+}
+
+/// Call ioctl(2) on `fd`, retrying on EINTR. Returns the raw ioctl return
+/// value on success, or a negative errno value on failure, matching the
+/// `std.Io.Operation.DeviceIoControl.Result` contract.
+pub const ioctl = if (builtin.os.tag == .windows) ioctlWindows else ioctlPosix;
+
+fn ioctlPosix(fd: fd_t, code: u32, arg: ?*anyopaque) i32 {
+    while (true) {
+        const rc = posix.system.ioctl(fd, @bitCast(code), @intFromPtr(arg));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return if (@TypeOf(rc) == usize)
+                @bitCast(@as(u32, @truncate(rc)))
+            else
+                rc,
+            .INTR => continue,
+            else => |err| return -@as(i32, @backingInt(err)),
+        }
+    }
+}
+
+fn ioctlWindows(handle: fd_t, code: std.os.windows.CTL_CODE, in: []const u8, out: []u8) std.os.windows.IO_STATUS_BLOCK {
+    var io_status: std.os.windows.IO_STATUS_BLOCK = undefined;
+    const status = std.os.windows.ntdll.NtDeviceIoControlFile(
+        handle,
+        null,
+        null,
+        null,
+        &io_status,
+        @bitCast(code),
+        in.ptr,
+        @intCast(in.len),
+        out.ptr,
+        @intCast(out.len),
+    );
+    if (status != .SUCCESS) {
+        io_status.u = .{ .Status = status };
+        io_status.Information = 0;
+    }
+    return io_status;
+}

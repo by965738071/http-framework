@@ -1,0 +1,120 @@
+// SPDX-FileCopyrightText: 2025 Lukáš Lalinský
+// SPDX-License-Identifier: MIT
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+const options = @import("options.zig");
+/// Compile-time configuration; declare `pub const zio_options: zio.Options`
+/// in your root module to set it.
+pub const Options = options.Options;
+pub const Scheduling = options.Scheduling;
+
+const runtime = @import("runtime.zig");
+pub const Runtime = runtime.Runtime;
+pub const RuntimeOptions = runtime.RuntimeOptions;
+pub const JoinHandle = runtime.JoinHandle;
+pub const Placement = runtime.Placement;
+pub const ExecutorId = runtime.ExecutorId;
+
+// Standalone task functions
+pub const spawn = runtime.spawn;
+pub const spawnInto = runtime.spawnInto;
+pub const spawnBlocking = runtime.spawnBlocking;
+pub const yield = runtime.yield;
+pub const maybeYield = runtime.maybeYield;
+pub const sleep = runtime.sleep;
+pub const now = runtime.now;
+
+pub const random = @import("random.zig").random;
+pub const randomSecure = @import("random.zig").randomSecure;
+pub const RandomSecureError = @import("random.zig").RandomSecureError;
+pub const beginShield = runtime.beginShield;
+pub const endShield = runtime.endShield;
+pub const checkCancel = runtime.checkCancel;
+pub const recancel = runtime.recancel;
+
+pub const AutoCancel = @import("autocancel.zig").AutoCancel;
+pub const withTimeout = @import("autocancel.zig").withTimeout;
+pub const WithTimeoutResult = @import("autocancel.zig").WithTimeoutResult;
+
+pub const Group = @import("group.zig").Group;
+pub const CompletionQueue = @import("completion_queue.zig").CompletionQueue;
+
+pub const TaskLocal = @import("task.zig").TaskLocal;
+
+const common = @import("common.zig");
+pub const Cancelable = common.Cancelable;
+pub const Timeoutable = common.Timeoutable;
+pub const Closeable = common.Closeable;
+pub const blockInPlace = common.blockInPlace;
+pub const blockInPlaceReserved = common.blockInPlaceReserved;
+
+pub const time = @import("time.zig"); // TODO: make non-pub
+pub const Duration = time.Duration;
+pub const Timestamp = time.Timestamp;
+pub const Timeout = time.Timeout;
+pub const Clock = time.Clock;
+pub const Stopwatch = time.Stopwatch;
+
+const fs = @import("fs.zig");
+pub const File = fs.File;
+pub const Dir = fs.Dir;
+pub const AtomicFile = fs.AtomicFile;
+pub const TempFile = fs.TempFile;
+pub const TempDir = fs.TempDir;
+pub const openSystemTempDir = fs.openSystemTempDir;
+pub const createTempFile = fs.createTempFile;
+pub const createTempDir = fs.createTempDir;
+pub const max_temp_prefix_len = fs.max_temp_prefix_len;
+pub const max_temp_name_len = fs.max_temp_name_len;
+pub const PipePair = fs.PipePair;
+
+pub const stdin = fs.stdin;
+pub const stdout = fs.stdout;
+pub const stderr = fs.stderr;
+
+pub const net = @import("net.zig");
+
+pub const Mutex = @import("sync/Mutex.zig");
+pub const Condition = @import("sync/Condition.zig");
+pub const Event = @import("sync/Event.zig");
+pub const RwLock = @import("sync/RwLock.zig");
+pub const Semaphore = @import("sync/Semaphore.zig");
+pub const Barrier = @import("sync/Barrier.zig");
+pub const Futex = @import("sync/Futex.zig");
+pub const Channel = @import("sync/channel.zig").Channel;
+pub const BroadcastChannel = @import("sync/broadcast_channel.zig").BroadcastChannel;
+pub const Future = @import("sync/future.zig").Future;
+
+/// Alias for `Event`. Deprecated, will be removed in a future release.
+pub const ResetEvent = Event;
+
+pub const Signal = @import("signal.zig").Signal;
+pub const SignalKind = @import("signal.zig").SignalKind;
+
+pub const select = @import("select.zig").select;
+pub const wait = @import("select.zig").wait;
+pub const SelectResult = @import("select.zig").SelectResult;
+pub const WaitResult = @import("select.zig").WaitResult;
+
+pub const debug_io = @import("io.zig").debug_io;
+
+/// Low-level coroutine library.
+pub const coro = @import("coro/root.zig");
+
+/// Low-level event loop library.
+pub const ev = @import("ev/root.zig");
+
+/// Low-level OS APIs.
+pub const os = @import("os/root.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("io.zig");
+    _ = @import("random.zig");
+    _ = @import("task.zig");
+    _ = @import("stderr.zig");
+    _ = @import("os/syscall_cancel.zig");
+    _ = @import("compat.zig");
+}

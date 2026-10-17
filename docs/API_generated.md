@@ -6,8 +6,8 @@
 | --- | --- | --- |
 | `ConnectionLoop` | src/http_protocol/conn_loop.zig:15 | `const ConnectionLoop = struct` |
 | `Request` | src/http_protocol/request.zig:25 | `const Request = struct` |
-| `urlDecode` | src/http_protocol/request.zig:462 | `fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8` |
-| `urlDecodePath` | src/http_protocol/request.zig:470 | `fn urlDecodePath(allocator: mem.Allocator, s: []const u8) ![]const u8` |
+| `urlDecode` | src/http_protocol/request.zig:461 | `fn urlDecode(allocator: mem.Allocator, s: []const u8) ![]const u8` |
+| `urlDecodePath` | src/http_protocol/request.zig:469 | `fn urlDecodePath(allocator: mem.Allocator, s: []const u8) ![]const u8` |
 | `Sink` | src/http_protocol/response.zig:20 | `const Sink = struct` |
 | `Cookie` | src/http_protocol/response.zig:134 | `const Cookie = struct` |
 | `Response` | src/http_protocol/response.zig:145 | `const Response = struct` |
@@ -28,9 +28,9 @@
 | `Hijack` | src/http_app/context.zig:30 | `const Hijack = struct` |
 | `PathParams` | src/http_app/context.zig:49 | `const PathParams = struct` |
 | `RequestState` | src/http_app/context.zig:103 | `const RequestState = struct` |
-| `UserData` | src/http_app/context.zig:178 | `const UserData = struct` |
-| `RequestConfig` | src/http_app/context.zig:186 | `const RequestConfig = struct` |
-| `Context` | src/http_app/context.zig:193 | `const Context = struct` |
+| `UserData` | src/http_app/context.zig:192 | `const UserData = struct` |
+| `RequestConfig` | src/http_app/context.zig:200 | `const RequestConfig = struct` |
+| `Context` | src/http_app/context.zig:207 | `const Context = struct` |
 | `AppError` | src/http_app/error.zig:15 | `const AppError = struct` |
 | `ErrorRenderer` | src/http_app/error.zig:101 | `const ErrorRenderer = struct` |
 | `Handler` | src/http_app/handler.zig:20 | `const Handler = union` |
@@ -60,8 +60,10 @@
 | 符号 | 文件:行 | 签名 |
 | --- | --- | --- |
 | `ConnectionRunner` | src/http_server/connection.zig:24 | `const ConnectionRunner = struct` |
-| `run` | src/http_server/zio_server.zig:21 | `fn run(allocator: std.mem.Allocator, comptime appFn: fn (std.Io, std.mem.Allocator) anyerror!void,) !void` |
-| `Server` | src/http_server/zio_server.zig:66 | `const Server = struct` |
+| `run` | src/http_server/std_server.zig:35 | `fn run(allocator: std.mem.Allocator, comptime appFn: fn (std.Io, std.mem.Allocator) anyerror!void,) !void` |
+| `Server` | src/http_server/std_server.zig:78 | `const Server = struct` |
+| `run` | src/http_server/zio_server.zig:27 | `fn run(allocator: std.mem.Allocator, comptime appFn: fn (std.Io, std.mem.Allocator) anyerror!void,) !void` |
+| `Server` | src/http_server/zio_server.zig:73 | `const Server = struct` |
 
 ## http_security
 
@@ -111,7 +113,7 @@
 | 符号 | 文件:行 | 签名 |
 | --- | --- | --- |
 | `StaticFileServer` | src/http_static/static.zig:19 | `const StaticFileServer = struct` |
-| `formatHttpDateForTest` | src/http_static/static.zig:609 | `fn formatHttpDateForTest(buf: []u8, mtime_ns: i128) ?[]const u8` |
+| `formatHttpDateForTest` | src/http_static/static.zig:650 | `fn formatHttpDateForTest(buf: []u8, mtime_ns: i128) ?[]const u8` |
 
 ## http_logging
 
@@ -131,15 +133,18 @@
 | `FileOutputConfig` | src/http_logging/root.zig:160 | `const FileOutputConfig = struct` |
 | `LoggerConfig` | src/http_logging/root.zig:172 | `const LoggerConfig = struct` |
 | `Logger` | src/http_logging/root.zig:190 | `const Logger = struct` |
-| `LoggingMiddleware` | src/http_logging/root.zig:693 | `const LoggingMiddleware = struct` |
-| `LoggingHook` | src/http_logging/root.zig:734 | `const LoggingHook = struct` |
+| `LoggingMiddleware` | src/http_logging/root.zig:702 | `const LoggingMiddleware = struct` |
+| `LoggingHook` | src/http_logging/root.zig:743 | `const LoggingHook = struct` |
 
 ## http_codec
 
 | 符号 | 文件:行 | 签名 |
 | --- | --- | --- |
-| `parseJson` | src/http_codec/root.zig:35 | `fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T` |
-| `JsonBody` | src/http_codec/root.zig:71 | `fn JsonBody(comptime T: type) type` |
+| `parseJson` | src/http_codec/root.zig:39 | `fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T` |
+| `JsonBody` | src/http_codec/root.zig:75 | `fn JsonBody(comptime T: type) type` |
+| `jsonHandler` | src/http_codec/root.zig:147 | `fn jsonHandler(comptime T: type, comptime handler: fn (*const T, *Context, *Response) anyerror!void, comptime body_limit: ?u64,) Handler` |
+| `queryHandler` | src/http_codec/root.zig:190 | `fn queryHandler(comptime T: type, comptime handler: fn (T, *Context, *Response) anyerror!void,) Handler` |
+| `bindQuery` | src/http_codec/root.zig:222 | `fn bindQuery(comptime T: type, ctx: *const Context, failed_field: ?*[]const u8) !T` |
 
 ## http_multipart
 

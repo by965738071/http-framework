@@ -1,0 +1,1129 @@
+// SPDX-FileCopyrightText: 2025 Lukáš Lalinský
+// SPDX-License-Identifier: MIT
+
+const std = @import("std");
+const MemoryPoolAligned = @import("utils/memory_pool.zig").MemoryPoolAligned;
+const ev = @import("ev/root.zig");
+
+const Runtime = @import("runtime.zig").Runtime;
+const Executor = @import("runtime.zig").Executor;
+const runtime = @import("runtime.zig");
+const Awaitable = @import("awaitable.zig").Awaitable;
+const Coroutine = @import("coro/coroutines.zig").Coroutine;
+const WaitNode = @import("utils/wait_queue.zig").WaitNode;
+const Cancelable = @import("common.zig").Cancelable;
+const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
+const Group = @import("group.zig").Group;
+const registerGroupTask = @import("group.zig").registerGroupTask;
+const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
+const os = @import("os/root.zig");
+const Timestamp = @import("time.zig").Timestamp;
+const zio_options = @import("options.zig").options;
+
+pub const Closure = struct {
+    start: Start,
+    result_len: u12,
+    result_padding: u4,
+    context_len: u12,
+    context_padding: u4,
+
+    pub const Start = union(enum) {
+        /// Regular task: fn(context, result) -> void
+        regular: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        /// Group task: fn(context) -> void
+        group: *const fn (context: *const anyopaque) void,
+    };
+
+    pub const max_result_len = 1 << 12;
+    pub const max_result_alignment = 1 << 4;
+    pub const max_context_len = 1 << 12;
+    pub const max_context_alignment = 1 << 4;
+    pub const task_alignment = 1 << 4;
+
+    pub fn getResultPtr(self: *const Closure, comptime TaskType: type, task: *TaskType) *anyopaque {
+        const result_ptr = @intFromPtr(task) + @sizeOf(TaskType) + self.result_padding;
+        return @ptrFromInt(result_ptr);
+    }
+
+    pub fn getResultSlice(self: *const Closure, comptime TaskType: type, task: *TaskType) []u8 {
+        const result_ptr = @intFromPtr(task) + @sizeOf(TaskType) + self.result_padding;
+        const result: [*]u8 = @ptrFromInt(result_ptr);
+        return result[0..self.result_len];
+    }
+
+    pub fn getContextPtr(self: *const Closure, comptime TaskType: type, task: *TaskType) *const anyopaque {
+        const result_ptr = @intFromPtr(task) + @sizeOf(TaskType) + self.result_padding;
+        const context_ptr = result_ptr + self.result_len + self.context_padding;
+        return @ptrFromInt(context_ptr);
+    }
+
+    pub fn getContextSlice(self: *const Closure, comptime TaskType: type, task: *TaskType) []u8 {
+        const result_ptr = @intFromPtr(task) + @sizeOf(TaskType) + self.result_padding;
+        const context_ptr = result_ptr + self.result_len + self.context_padding;
+        const context: [*]u8 = @ptrFromInt(context_ptr);
+        return context[0..self.context_len];
+    }
+
+    /// Call the start function with the appropriate arguments.
+    pub fn call(self: *const Closure, comptime TaskType: type, task: *TaskType) void {
+        const context = self.getContextPtr(TaskType, task);
+
+        switch (self.start) {
+            .regular => |start| {
+                const result = self.getResultPtr(TaskType, task);
+                start(context, result);
+            },
+            .group => |start| {
+                start(context);
+            },
+        }
+    }
+
+    pub fn getAllocationSlice(self: *const Closure, comptime TaskType: type, task: *TaskType) []align(task_alignment) u8 {
+        var allocation_size: usize = @sizeOf(TaskType);
+        allocation_size += self.result_padding;
+        allocation_size += self.result_len;
+        allocation_size += self.context_padding;
+        allocation_size += self.context_len;
+        return @as([*]align(task_alignment) u8, @ptrCast(@alignCast(task)))[0..allocation_size];
+    }
+
+    pub fn AllocResult(comptime TaskType: type) type {
+        return struct {
+            closure: Closure,
+            task: *TaskType,
+        };
+    }
+
+    pub fn alloc(
+        comptime TaskType: type,
+        rt: *Runtime,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context_len: usize,
+        context_alignment: std.mem.Alignment,
+        start: Start,
+    ) !AllocResult(TaskType) {
+        var allocation_size: usize = @sizeOf(TaskType);
+
+        // Reserve space for result
+        if (result_len > max_result_len) return error.ResultTooLarge;
+        if (result_alignment.toByteUnits() > max_result_alignment) return error.ResultTooLarge;
+        const result_padding = result_alignment.forward(allocation_size) - allocation_size;
+        allocation_size += result_padding + result_len;
+
+        // Reserve space for context
+        if (context_len > max_context_len) return error.ContextTooLarge;
+        if (context_alignment.toByteUnits() > max_context_alignment) return error.ContextTooLarge;
+        const context_padding = context_alignment.forward(allocation_size) - allocation_size;
+        allocation_size += context_padding + context_len;
+
+        // Allocate task from pool or fallback allocator
+        const allocation = try rt.task_pool.alloc(rt, allocation_size);
+
+        return .{
+            .closure = .{
+                .start = start,
+                .result_len = @intCast(result_len),
+                .result_padding = @intCast(result_padding),
+                .context_len = @intCast(context_len),
+                .context_padding = @intCast(context_padding),
+            },
+            .task = @ptrCast(allocation.ptr),
+        };
+    }
+
+    pub fn free(self: *const Closure, comptime TaskType: type, rt: *Runtime, task: *TaskType) void {
+        const allocation = self.getAllocationSlice(TaskType, task);
+        rt.task_pool.free(rt, allocation);
+    }
+};
+
+// Cancellation status - tracks both user and auto-cancellation
+// Organized as 4 bytes for easier alignment:
+// Byte 0: user_canceled flag + delivered counter
+// Byte 1: auto_canceled counter
+// Byte 2: pending_errors counter
+// Byte 3: shield_count counter
+pub const CanceledStatus = packed struct(u32) {
+    user_canceled: bool = false,
+    /// Net count of error.Canceled delivered to the task, wrapping: `checkCancel`
+    /// adds one per error it reports and `recancel` takes it back. An
+    /// auto-cancel records it when it fires, and an unchanged count later means
+    /// none of the task's cancellation points has reported an error since (see
+    /// `retractAutoCancel`). Wrapping can only mistake 128 net deliveries for
+    /// none, which takes that many other auto-cancels firing in between.
+    delivered: u7 = 0,
+    auto_canceled: u8 = 0,
+    pending_errors: u8 = 0,
+    shield_count: u8 = 0,
+};
+
+// Kind of cancellation
+pub const CancelKind = enum { user, auto };
+
+/// Intrusive node for a single task-local binding (see `TaskLocal`).
+///
+/// The storage for a node is provided by the caller — on the stack for a scoped
+/// binding, embedded in a longer-lived struct, or heap-allocated — so a binding
+/// lives exactly as long as its node. A node must stay alive and unmoved while
+/// linked (between `set` and `clear`).
+///
+/// Nodes form a per-task doubly-linked stack rooted at `AnyTask.tls_head`. It is
+/// only ever touched by the owning task itself, so no synchronization is needed,
+/// and because the node records its `owner` it unlinks correctly regardless of
+/// which executor currently runs the task (tasks keep their identity across
+/// migration).
+pub const TaskLocalNode = struct {
+    /// The `TaskLocal` instance this binding belongs to (its address is the key),
+    /// or null when the node is unbound. Doubles as the "is this node linked?"
+    /// marker, so `set`/`clear` can catch misuse cheaply.
+    key: ?*const anyopaque = null,
+    /// The task whose chain this node is linked into.
+    owner: *AnyTask = undefined,
+    prev: ?*TaskLocalNode = null,
+    next: ?*TaskLocalNode = null,
+};
+
+pub const AnyTask = struct {
+    awaitable: Awaitable,
+    coro: Coroutine,
+    state: std.atomic.Value(State),
+
+    // Cancellation status - tracks user cancel, timeout, pending errors, and shield count
+    canceled_status: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    // Closure for the task
+    closure: Closure,
+
+    runtime: *Runtime,
+
+    /// Head of this task's intrusive task-local binding chain (see `TaskLocal`).
+    /// Only ever accessed by the task itself, so it needs no synchronization.
+    tls_head: ?*TaskLocalNode = null,
+
+    /// See `Options.debug_cancel`. Only accessed by the task itself.
+    cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
+
+    const CancelDebug = struct {
+        addrs: [32]usize = undefined,
+        trace: ?std.debug.StackTrace = null,
+        reported: bool = false,
+        /// Nesting depth of waits that handle a cancellation themselves.
+        exempt: u32 = 0,
+    };
+
+    /// Marks a cancelable wait that handles error.Canceled itself (e.g.
+    /// `waitUntilComplete`), so parking in it is not reported. No-op unless
+    /// `Options.debug_cancel` is set.
+    pub fn beginCancelHandlingWait(self: *AnyTask) void {
+        if (zio_options.debug_cancel) self.cancel_debug.exempt += 1;
+    }
+
+    pub fn endCancelHandlingWait(self: *AnyTask) void {
+        if (zio_options.debug_cancel) self.cancel_debug.exempt -= 1;
+    }
+
+    /// Task state and park token, packed into a single byte for atomic operations.
+    ///
+    /// The `awaken` bit implements a NetBSD-style park token:
+    /// - Set by wakers when the task is in `.ready` state (not yet parked)
+    /// - Consumed by `processCleanup.park` to reschedule the task instead of
+    ///   transitioning it to `.waiting` when the task was pre-woken
+    pub const State = packed struct(u8) {
+        tag: Tag = .new,
+        awaken: bool = false,
+        _: u4 = 0,
+
+        pub const Tag = enum(u3) {
+            new = 0,
+            ready = 1,
+            waiting = 2,
+            finished = 3,
+        };
+    };
+
+    pub inline fn fromAwaitable(awaitable: *Awaitable) *AnyTask {
+        std.debug.assert(awaitable.kind == .task);
+        return @fieldParentPtr("awaitable", awaitable);
+    }
+
+    pub inline fn fromWaitNode(wait_node: *WaitNode) *AnyTask {
+        const awaitable: *Awaitable = @fieldParentPtr("wait_node", wait_node);
+        std.debug.assert(awaitable.kind == .task);
+        return @fieldParentPtr("awaitable", awaitable);
+    }
+
+    pub inline fn fromCoroutine(coro: *Coroutine) *AnyTask {
+        return @fieldParentPtr("coro", coro);
+    }
+
+    /// Get the typed result from this task's closure.
+    pub fn getResult(self: *AnyTask, comptime T: type) T {
+        // Sanity checks before unsafe casting
+        if (std.debug.runtime_safety) {
+            std.debug.assert(self.awaitable.hasResult()); // Task must be completed
+            std.debug.assert(@sizeOf(T) == self.closure.result_len); // Size must match
+            std.debug.assert(@alignOf(T) <= Closure.max_result_alignment); // Alignment must fit
+        }
+
+        const result_ptr: *T = @ptrCast(@alignCast(self.closure.getResultPtr(AnyTask, self)));
+        return result_ptr.*;
+    }
+
+    /// Get the executor that owns this task.
+    pub inline fn getExecutor(self: *AnyTask) *Executor {
+        return Executor.fromCoroutine(&self.coro);
+    }
+
+    /// Whether tasks migrate is fixed at compile time by `zio_options.scheduling`.
+    pub inline fn getRuntime(self: *AnyTask) *Runtime {
+        return self.getExecutor().runtime;
+    }
+
+    pub inline fn getThreadPool(self: *AnyTask) *ev.ThreadPool {
+        return &self.getRuntime().thread_pool;
+    }
+
+    pub const YieldMode = enum { park, reschedule };
+
+    /// Cooperatively yield control to other tasks.
+    ///
+    /// - `.park`: Suspend until resumed (I/O, sync primitives, timeout, cancellation).
+    ///   The actual transition to `.waiting` is deferred until after the context is saved
+    ///   (in `processCleanup.park`), which also handles any pre-wake via the `awaken` bit.
+    ///
+    /// - `.reschedule`: Reschedule immediately (cooperative yielding).
+    ///   The task state remains `.ready`.
+    pub fn yield(self: *AnyTask, comptime mode: YieldMode, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
+        return self.yieldFrom(getCurrentExecutor(), mode, cancel_mode);
+    }
+
+    /// Yield using the executor already resolved by the caller. `executor` is
+    /// valid only until the context switch; the resume path still reloads TLS
+    /// because the task may have migrated to another executor thread.
+    pub fn yieldFrom(self: *AnyTask, initial_executor: *Executor, comptime mode: YieldMode, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
+        var executor = initial_executor;
+
+        // Check and consume cancellation flag before yielding (unless no_cancel).
+        // On the cancel-error return, `state` must be left untouched: the tag is
+        // already .ready (we are running), and the awaken bit may hold a wake
+        // token set by a concurrent signal whose payload a cleanup path still
+        // has to observe (e.g. lockSlow's no_cancel wait for an in-flight
+        // signal). Clearing it here would strand that wake; a leftover token
+        // only costs one spurious reschedule at the next park.
+        if (cancel_mode == .allow_cancel) {
+            try self.checkCancel();
+            if (zio_options.debug_cancel and mode == .park and self.reportSwallowedCancel()) {
+                // Printing can suspend, and the task may have migrated.
+                executor = getCurrentExecutor();
+            }
+        }
+
+        // Set up deferred cleanup — state transition happens after context is saved
+        executor.pending_cleanup = switch (mode) {
+            .park => .{ .park = self },
+            .reschedule => .{ .reschedule = self },
+        };
+
+        if (self == &executor.main_task) {
+            // Main task enters the run loop instead of context switching
+            executor.run(.until_ready) catch |err| {
+                std.log.err("Event loop error during yield: {}", .{err});
+            };
+        } else {
+            executor.switchOut(&self.coro);
+
+            // --- Resumed: landing site (b) ---
+            // We could be on a different executor now due to task migration
+            executor = getCurrentExecutor();
+            executor.processCleanup();
+        }
+
+        std.debug.assert(self.state.load(.acquire).tag == .ready);
+
+        // Check after resuming in case we were canceled while suspended
+        if (cancel_mode == .allow_cancel) {
+            try self.checkCancel();
+        }
+    }
+
+    /// Begin a cancellation shield to prevent being canceled during critical sections.
+    pub fn beginShield(self: *AnyTask) void {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+            status.shield_count += 1;
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// End a cancellation shield.
+    pub fn endShield(self: *AnyTask) void {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+            std.debug.assert(status.shield_count > 0);
+            status.shield_count -= 1;
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Set the canceled status on this task.
+    /// Returns the `delivered` count at the time of the cancellation if it
+    /// triggered, null if shadowed by prior user cancellation.
+    pub fn setCanceled(self: *AnyTask, kind: CancelKind) ?u7 {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+            var triggered: bool = undefined;
+
+            switch (kind) {
+                .user => {
+                    status.user_canceled = true;
+                    status.pending_errors += 1;
+                    triggered = true;
+                },
+                .auto => {
+                    if (status.user_canceled) {
+                        // Shadowed by user cancellation
+                        status.pending_errors += 1;
+                        triggered = false;
+                    } else {
+                        status.auto_canceled += 1;
+                        status.pending_errors += 1;
+                        triggered = true;
+                    }
+                },
+            }
+
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            return if (triggered) status.delivered else null;
+        }
+    }
+
+    /// Re-arm cancellation after it was acknowledged.
+    /// This increments pending_errors so the next cancellation point returns error.Canceled.
+    /// Asserts that the task is under a cancellation, either user-requested or from a
+    /// live auto-cancel, so that a re-arm is always putting back a delivered error.
+    pub fn recancel(self: *AnyTask) void {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+
+            // Must have been canceled already
+            std.debug.assert(status.user_canceled or status.auto_canceled > 0);
+
+            // Increment pending_errors
+            status.pending_errors += 1;
+            status.delivered -%= 1;
+
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            // The delivered error is pending again, so it was not swallowed.
+            if (zio_options.debug_cancel) self.cancel_debug.trace = null;
+            break;
+        }
+    }
+
+    /// Try to consume an auto-cancel. Returns true if an auto-cancel was consumed,
+    /// false if user-canceled or no auto-cancel pending.
+    pub fn checkAutoCancel(self: *AnyTask) bool {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+
+            // User cancellation has priority
+            if (status.user_canceled) return false;
+
+            // Check if there's an auto-cancel to consume
+            if (status.auto_canceled > 0) {
+                status.auto_canceled -= 1;
+                const new: u32 = @bitCast(status);
+                if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                    current = prev;
+                    continue;
+                }
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// Take back an auto-cancel that fired when the `delivered` count was
+    /// `delivered`, has not been consumed by `checkAutoCancel`, and whose
+    /// error no cancellation point has reported since. Returns true if it was
+    /// taken back, false if user-canceled or if some error was delivered in
+    /// the meantime, which may have been this one.
+    pub fn retractAutoCancel(self: *AnyTask, delivered: u7) bool {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+
+            // User cancellation has priority
+            if (status.user_canceled) return false;
+            if (status.delivered != delivered) return false;
+
+            // A `check` on another instance can consume this one's unit
+            // through a forwarded error, so the increments may be gone.
+            if (status.auto_canceled == 0 or status.pending_errors == 0) return false;
+            status.auto_canceled -= 1;
+            status.pending_errors -= 1;
+
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            return true;
+        }
+    }
+
+    /// Check if there are pending cancellation errors to consume.
+    /// If pending_errors > 0 and not shielded, decrements the count and returns error.Canceled.
+    /// Otherwise returns void (no error).
+    pub fn checkCancel(self: *AnyTask) Cancelable!void {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+
+            // If shielded, nothing to consume
+            if (status.shield_count > 0) return;
+
+            // If no pending errors, nothing to consume
+            if (status.pending_errors == 0) return;
+
+            // Decrement pending_errors
+            status.pending_errors -= 1;
+            status.delivered +%= 1;
+
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            if (zio_options.debug_cancel) {
+                const d = &self.cancel_debug;
+                d.trace = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &d.addrs);
+            }
+            return error.Canceled;
+        }
+    }
+
+    /// The task is about to park on a cancelable wait. If a cancellation was
+    /// delivered earlier and is neither pending again nor shielded, whoever
+    /// received the error.Canceled did not propagate it and the wait can block
+    /// forever. Reports the first occurrence per task; returns whether it did.
+    fn reportSwallowedCancel(self: *AnyTask) bool {
+        const d = &self.cancel_debug;
+        if (d.reported or d.exempt > 0) return false;
+        const trace = d.trace orelse return false;
+        const status: CanceledStatus = @bitCast(self.canceled_status.load(.acquire));
+        if (status.pending_errors > 0 or status.shield_count > 0) return false;
+        d.reported = true;
+
+        std.debug.print("zio: task {*} parks on a cancelable wait after error.Canceled was delivered and not propagated\n", .{self});
+        std.debug.print("error.Canceled was delivered at:\n", .{});
+        std.debug.dumpStackTrace(&trace);
+        std.debug.print("the task is now parking at:\n", .{});
+        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+        return true;
+    }
+
+    /// Cancel this task by setting canceled status and waking it if suspended.
+    pub fn cancel(self: *AnyTask) void {
+        if (self.setCanceled(.user) != null) {
+            self.wake();
+        }
+    }
+
+    /// Wake this task (mark it as ready and schedule for execution).
+    pub fn wake(self: *AnyTask) void {
+        Executor.scheduleTask(self);
+    }
+
+    /// Return the coroutine's stack to the pool and retire its TSan fiber.
+    ///
+    /// Both are owned by the coroutine, not by the task, so they are reclaimed
+    /// as soon as the coroutine is done rather than when the last reference to
+    /// the task goes away: the executor calls this from its finish cleanup,
+    /// once control has left the coroutine's stack. `destroy` calls it again
+    /// for tasks that were created but never ran. Idempotent, with a zeroed
+    /// `allocation_len` marking the resources as already released.
+    pub fn releaseCoro(self: *AnyTask, rt: *Runtime) void {
+        if (self.coro.context.stack_info.allocation_len == 0) return;
+        rt.stack_pool.release(self.coro.context.stack_info);
+        self.coro.context.stack_info.allocation_len = 0;
+        self.coro.deinit();
+    }
+
+    pub fn destroy(self: *AnyTask) void {
+        const rt = self.getRuntime();
+        self.releaseCoro(rt);
+
+        self.closure.free(AnyTask, rt, self);
+    }
+
+    pub fn startFn(coro: *Coroutine, _: ?*anyopaque) void {
+        const self = fromCoroutine(coro);
+
+        // Landing site (a): handle cleanup for the task that yielded to us
+        var executor = getCurrentExecutor();
+        executor.current_task = self;
+        executor.processCleanup();
+
+        // Run the task's function
+        self.closure.call(AnyTask, self);
+
+        // Every task-local binding must be cleared before the task body returns;
+        // a leftover node points into storage that is about to die. Catch the
+        // missing `clear` here, at the task that leaked it.
+        if (std.debug.runtime_safety) {
+            std.debug.assert(self.tls_head == null);
+        }
+
+        // Re-fetch executor — task may have migrated during execution
+        executor = getCurrentExecutor();
+        executor.pending_cleanup = .{ .finish = self };
+        executor.switchOut(&self.coro);
+        unreachable;
+    }
+
+    pub fn create(
+        executor: *Executor,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: Closure.Start,
+    ) !*AnyTask {
+        // Allocate task with closure
+        const alloc_result = try Closure.alloc(
+            AnyTask,
+            executor.runtime,
+            result_len,
+            result_alignment,
+            context.len,
+            context_alignment,
+            start,
+        );
+        errdefer alloc_result.closure.free(AnyTask, executor.runtime, alloc_result.task);
+
+        const self = alloc_result.task;
+        self.* = .{
+            .state = .init(.{ .tag = .new }),
+            .awaitable = .{
+                .kind = .task,
+                .wait_node = .{},
+            },
+            .coro = .{
+                .parent_context_ptr = &executor.main_task.coro.context,
+            },
+            .runtime = executor.runtime,
+            .closure = alloc_result.closure,
+        };
+
+        // Acquire stack from pool and initialize context. Nothing below can
+        // fail, so the acquired stack needs no errdefer release here.
+        self.coro.context.stack_info = try executor.runtime.stack_pool.acquire();
+
+        // Copy context data into the allocation
+        const context_dest = self.closure.getContextSlice(AnyTask, self);
+        @memcpy(context_dest, context);
+
+        self.coro.setup(&AnyTask.startFn, null);
+
+        return self;
+    }
+};
+
+/// Task-local storage: a per-task binding for a value of type `T`, keyed by the
+/// address of the `TaskLocal` instance itself. The analogue of a thread-local,
+/// but scoped to a task and carried across task migration.
+///
+/// Declare an instance at container scope and bind it for as long as the
+/// caller-provided node lives:
+///
+/// ```zig
+/// var trace_id: zio.TaskLocal(u64) = .{};
+///
+/// fn handler() void {
+///     var node: @TypeOf(trace_id).Node = .unset;
+///     trace_id.set(&node, 42);
+///     defer trace_id.clear(&node);
+///     // trace_id.get() returns 42 here and in any callee, across yields
+///     // and executor migration.
+/// }
+/// ```
+///
+/// Because the node storage is caller-owned, the binding lives exactly as long
+/// as that storage: put the node on the stack for a scoped binding, or embed it
+/// in a longer-lived struct (or heap-allocate it) to keep the binding for the
+/// task's lifetime. The node must not move while linked and must be `clear`ed
+/// before its storage dies — the usual acquire/`defer`-release discipline. In
+/// safety builds a task that returns with a binding still live trips an assert.
+///
+/// Bindings nest and shadow: the most recent `set` for a key wins until cleared,
+/// and `clear` may interleave bindings in any order (not just LIFO). All access
+/// is from the owning task only, so it needs no locking.
+///
+/// `scoped(value, func, args)` is a convenience that binds for the duration of a
+/// single call without a caller-managed node; see below.
+pub fn TaskLocal(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The instance's address is its key, so the type must not be zero-sized
+        /// (distinct zero-sized vars can share an address). This marker gives each
+        /// declared instance a distinct address; it is otherwise unused.
+        _key_marker: u8 = 0,
+
+        /// Caller-provided storage for one binding. Declare it `.unset`; `set`
+        /// fills it in and `clear` returns it to `.unset` so it can be reused.
+        pub const Node = struct {
+            base: TaskLocalNode = .{},
+            value: T = undefined,
+
+            /// A node that holds no binding. Declaring nodes with this (rather
+            /// than `undefined`) makes a stray `clear` before `set`, or a double
+            /// `clear`, an assertion failure instead of chain corruption.
+            pub const unset: Node = .{};
+        };
+
+        /// Bind `value` in the current task using caller-provided `node` storage.
+        /// Visible to `get` until `clear(node)`. `node` must be `.unset` (freshly
+        /// declared or previously cleared) and must stay alive and unmoved until
+        /// it is cleared. Panics if called outside a task.
+        pub fn set(self: *Self, node: *Node, value: T) void {
+            const task = runtime.getCurrentTask();
+            std.debug.assert(node.base.key == null); // node already in use
+
+            node.value = value;
+            node.base = .{
+                .key = self,
+                .owner = task,
+                .prev = null,
+                .next = task.tls_head,
+            };
+            if (task.tls_head) |h| h.prev = &node.base;
+            task.tls_head = &node.base;
+        }
+
+        /// Remove a binding established with `set`, returning `node` to `.unset`.
+        /// May be interleaved with other bindings in any order.
+        pub fn clear(self: *Self, node: *Node) void {
+            const b = &node.base;
+            std.debug.assert(b.key == @as(?*const anyopaque, self)); // bound by this TaskLocal
+            if (std.debug.runtime_safety) {
+                std.debug.assert(b.owner == runtime.getCurrentTask()); // same task
+            }
+            if (b.prev) |p| p.next = b.next else b.owner.tls_head = b.next;
+            if (b.next) |n| n.prev = b.prev;
+            b.* = .{}; // back to .unset
+        }
+
+        /// The value bound in the current task (the innermost active binding),
+        /// or null if unbound or called outside a task. Returns a copy — for
+        /// mutable per-task state, bind a pointer (`TaskLocal(*T)`) and mutate
+        /// through it, so the lifetime of the mutable storage is yours and not
+        /// tied to the node.
+        pub fn get(self: *Self) ?T {
+            const task = runtime.getCurrentTaskOrNull() orelse return null;
+            const key: ?*const anyopaque = self;
+            var cur = task.tls_head;
+            while (cur) |n| : (cur = n.next) {
+                if (n.key == key) {
+                    // `base` is at offset 0 of a `Node`, so the node is really
+                    // Node-aligned even though the chain is typed `*TaskLocalNode`
+                    // (lower alignment on 32-bit targets).
+                    const node: *Node = @alignCast(@fieldParentPtr("base", n));
+                    return node.value;
+                }
+            }
+            return null;
+        }
+
+        /// Bind `value` for the dynamic extent of `func(args...)`, then restore
+        /// the previous state — the `defer`-free convenience over `set`/`clear`.
+        /// The node lives on the stack, so this allocates nothing, and `func` is
+        /// invoked via `@call` (any comptime-known callable, no fn-pointer
+        /// indirection). Returns whatever `func` returns.
+        pub fn scoped(self: *Self, value: T, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) @TypeOf(@call(.auto, func, args)) {
+            var node: Node = .unset;
+            self.set(&node, value);
+            defer self.clear(&node);
+            return @call(.auto, func, args);
+        }
+    };
+}
+
+const getPlacementExecutor = @import("runtime.zig").getPlacementExecutor;
+const Placement = @import("runtime.zig").Placement;
+
+/// Ready-queue length past which a spawning task yields to let new tasks start.
+const spawn_yield_threshold = 13;
+
+/// Register a task with the runtime and schedule it for execution.
+/// Increments its reference count, adds the task to the runtime's task list,
+/// and schedules it on its executor.
+/// Returns error.RuntimeShutdown if the runtime is shutting down.
+pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
+    // Check if runtime is shutting down before incrementing counter
+    if (rt.shutting_down.load(.acquire)) {
+        return error.RuntimeShutdown;
+    }
+
+    _ = rt.task_count.fetchAdd(1, .acq_rel);
+
+    Executor.scheduleTask(task);
+
+    if (runtime.getCurrentExecutorOrNull()) |current_executor| {
+        if (current_executor.runtime == task.runtime) {
+            // Backpressure for spawn loops: once the ready queue grows past the
+            // threshold, yield so new tasks start running instead of piling up
+            // (distinct from maybeYield's time-slice check). Only needed when
+            // no other executor can steal the backlog.
+            if (!rt.stealingActive() and current_executor.run_queue.len() >= spawn_yield_threshold) {
+                if (current_executor.current_task) |spawner| {
+                    spawner.yield(.reschedule, .no_cancel);
+                }
+            }
+        }
+    }
+}
+
+pub fn finishTask(rt: *Runtime, awaitable: *Awaitable) void {
+    // Decrement task count BEFORE marking complete to prevent race where
+    // waiting thread wakes up and sees non-zero task_count in deinit()
+    _ = rt.task_count.fetchSub(1, .acq_rel);
+
+    // Mark awaitable as complete and wake all waiters
+    awaitable.markComplete();
+
+    // For group tasks, decrement counter and release group's reference
+    if (awaitable.group_node.group) |group| {
+        unregisterGroupTask(group, awaitable);
+    }
+
+    // Decref for task completion
+    awaitable.release();
+}
+
+/// Spawn a task with raw context bytes and start function.
+/// Used by Runtime.spawn, Group.spawn, and std.Io vtable implementations.
+pub fn spawnTask(
+    rt: *Runtime,
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: Closure.Start,
+    group: ?*Group,
+    placement: Placement,
+) !*AnyTask {
+    // With `.auto` placement, new tasks are homed round-robin and scheduled
+    // through the global queue with a wake of the home executor. Initial spread
+    // matters: on epoll and kqueue backends a socket is pinned to the loop that
+    // registers it, so a task's first executor decides where its I/O lives.
+    const executor = try getPlacementExecutor(rt, placement);
+
+    const task = try AnyTask.create(
+        executor,
+        result_len,
+        result_alignment,
+        context,
+        context_alignment,
+        start,
+    );
+    errdefer task.destroy();
+
+    // +1 ref before the task is reachable by anyone else, to prevent a race
+    // where it completes before the caller can take ownership. For a task with
+    // a JoinHandle this is the caller's ref; for a group task, which returns no
+    // handle, it is the group's, dropped by unregisterGroupTask or by cancel
+    // popping the node. Taking it before registerGroupTask matters: once the
+    // node is in the group's list, a concurrent cancel() can pop it and release,
+    // and with no ref of our own that would free the task under us.
+    task.awaitable.ref_count.incr();
+    errdefer _ = task.awaitable.ref_count.decr();
+
+    if (group) |g| try registerGroupTask(g, &task.awaitable);
+    errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
+
+    try registerTask(rt, task);
+
+    return task;
+}
+
+pub const TaskPool = struct {
+    pub const pool_item_size = std.mem.alignForward(usize, @sizeOf(AnyTask) + 128, 128);
+
+    pool: MemoryPoolAligned([pool_item_size]u8, .fromByteUnits(Closure.task_alignment)),
+    mutex: os.Mutex = .init(),
+
+    pub fn init(allocator: std.mem.Allocator) TaskPool {
+        return .{
+            .pool = .init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *TaskPool) void {
+        self.pool.deinit();
+    }
+
+    pub fn alloc(self: *TaskPool, rt: *Runtime, size: usize) ![]align(Closure.task_alignment) u8 {
+        if (size <= pool_item_size) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const ptr = try self.pool.create();
+            return ptr;
+        } else {
+            return try rt.allocator.alignedAlloc(u8, .fromByteUnits(Closure.task_alignment), size);
+        }
+    }
+
+    pub fn free(self: *TaskPool, rt: *Runtime, slice: []align(Closure.task_alignment) u8) void {
+        if (slice.len <= pool_item_size) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.pool.destroy(@ptrCast(slice.ptr));
+        } else {
+            rt.allocator.free(slice);
+        }
+    }
+};
+
+test "TaskLocal: set/get/clear returns the bound value" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var tl: TaskLocal(u64) = .{};
+
+        fn run() !void {
+            try std.testing.expect(tl.get() == null);
+
+            var node: @TypeOf(tl).Node = .unset;
+            tl.set(&node, 123);
+            defer tl.clear(&node);
+
+            try std.testing.expectEqual(123, tl.get().?);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: mutable per-task state via a bound pointer" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var counter: TaskLocal(*u64) = .{};
+
+        fn bump() void {
+            counter.get().?.* += 1;
+        }
+
+        fn run() !void {
+            var n: u64 = 0;
+            var node: @TypeOf(counter).Node = .unset;
+            counter.set(&node, &n);
+            defer counter.clear(&node);
+
+            bump();
+            bump();
+            try std.testing.expectEqual(2, n);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: nested bindings shadow and restore" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var tl: TaskLocal(u32) = .{};
+
+        fn run() !void {
+            var outer: @TypeOf(tl).Node = .unset;
+            tl.set(&outer, 1);
+            defer tl.clear(&outer);
+            try std.testing.expectEqual(1, tl.get().?);
+
+            {
+                var inner: @TypeOf(tl).Node = .unset;
+                tl.set(&inner, 2);
+                defer tl.clear(&inner);
+                try std.testing.expectEqual(2, tl.get().?);
+            }
+
+            // Inner cleared: the outer binding is visible again.
+            try std.testing.expectEqual(1, tl.get().?);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: non-LIFO clear unlinks a middle node" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var a: TaskLocal(u32) = .{};
+        var b: TaskLocal(u32) = .{};
+
+        fn run() !void {
+            var na: @TypeOf(a).Node = .unset;
+            var nb: @TypeOf(b).Node = .unset;
+            a.set(&na, 10);
+            b.set(&nb, 20);
+
+            // Clear the older (non-head) binding first.
+            a.clear(&na);
+            try std.testing.expect(a.get() == null);
+            try std.testing.expectEqual(20, b.get().?);
+
+            b.clear(&nb);
+            try std.testing.expect(b.get() == null);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: bindings are isolated per task and survive yielding" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var tl: TaskLocal(u32) = .{};
+
+        fn run(r: *Runtime, id: u32) !void {
+            var node: @TypeOf(tl).Node = .unset;
+            tl.set(&node, id);
+            defer tl.clear(&node);
+
+            // Yield so both tasks have a live binding at the same time; if the
+            // chain were shared/global this would observe the other task's value.
+            try r.sleep(.fromMilliseconds(5));
+
+            try std.testing.expectEqual(id, tl.get().?);
+        }
+    };
+
+    var h1 = try rt.spawn(S.run, .{ rt, 1 });
+    defer h1.cancel();
+    var h2 = try rt.spawn(S.run, .{ rt, 2 });
+    defer h2.cancel();
+    try h1.join();
+    try h2.join();
+}
+
+test "TaskLocal: scoped binds for the call and restores after" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var tl: TaskLocal(u32) = .{};
+
+        fn inner(addend: u32) u32 {
+            return tl.get().? + addend;
+        }
+
+        fn run() !void {
+            try std.testing.expect(tl.get() == null);
+
+            // Value is visible inside the call and the return value flows back.
+            const r = tl.scoped(40, inner, .{2});
+            try std.testing.expectEqual(42, r);
+
+            // Binding is gone once scoped returns.
+            try std.testing.expect(tl.get() == null);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: a node is reusable after clear" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var tl: TaskLocal(u32) = .{};
+
+        fn run() !void {
+            var node: @TypeOf(tl).Node = .unset;
+
+            tl.set(&node, 1);
+            try std.testing.expectEqual(1, tl.get().?);
+            tl.clear(&node);
+            try std.testing.expect(tl.get() == null);
+
+            // clear() returned the node to .unset, so it can be set again.
+            tl.set(&node, 2);
+            defer tl.clear(&node);
+            try std.testing.expectEqual(2, tl.get().?);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}
+
+test "TaskLocal: unbound key reads back null" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        var bound: TaskLocal(u8) = .{};
+        var other: TaskLocal(u8) = .{};
+
+        fn run() !void {
+            var node: @TypeOf(bound).Node = .unset;
+            bound.set(&node, 7);
+            defer bound.clear(&node);
+
+            // A different instance is a different key, even of the same type.
+            try std.testing.expect(other.get() == null);
+            try std.testing.expectEqual(7, bound.get().?);
+        }
+    };
+
+    var h = try rt.spawn(S.run, .{});
+    defer h.cancel();
+    try h.join();
+}

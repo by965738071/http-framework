@@ -1,0 +1,3117 @@
+// SPDX-FileCopyrightText: 2025 Lukáš Lalinský
+// SPDX-License-Identifier: MIT
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const zio_options = @import("options.zig").options;
+const multi_executor = zio_options.scheduling.multiExecutor();
+const migrates = zio_options.scheduling.migrates();
+
+const ev = @import("ev/root.zig");
+const os = @import("os/root.zig");
+const cgroup = @import("cgroup.zig");
+
+const meta = @import("meta.zig");
+const compat = @import("compat.zig");
+const Cancelable = @import("common.zig").Cancelable;
+const log = @import("common.zig").log;
+const time = @import("time.zig");
+const Duration = time.Duration;
+const Timestamp = time.Timestamp;
+
+const Coroutine = @import("coro/coroutines.zig").Coroutine;
+const Context = @import("coro/coroutines.zig").Context;
+const StackPool = @import("coro/stack_pool.zig").StackPool;
+const StackPoolConfig = @import("coro/stack_pool.zig").Config;
+const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
+const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
+
+const AnyTask = @import("task.zig").AnyTask;
+const TaskPool = @import("task.zig").TaskPool;
+const spawnTask = @import("task.zig").spawnTask;
+const finishTask = @import("task.zig").finishTask;
+const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+const Group = @import("group.zig").Group;
+
+const dns = @import("dns/root.zig");
+
+const select = @import("select.zig");
+const common = @import("common.zig");
+const Waiter = common.Waiter;
+const random_mod = @import("random.zig");
+
+pub const ExecutorId = switch (@sizeOf(usize)) {
+    4 => u5,
+    8 => u6,
+    else => @compileError("Unsupported architecture"),
+};
+
+// SIGPIPE protection. Zig 0.15's start code ignored SIGPIPE process-wide, but
+// Zig 0.16 moved that into std.Io.Threaded.init, which zio replaces — so
+// without this, a write to a peer-closed socket or pipe kills the process
+// instead of failing with EPIPE. (Zig's test runner creates its own
+// std.Io.Threaded, which is why tests never see the crash.) A do-nothing
+// handler rather than SIG_IGN so the disposition is not inherited across
+// execve into child processes, mirroring std.Io.Threaded.
+const have_sig_pipe = builtin.os.tag != .windows and @hasField(os.posix.SIG, "PIPE");
+
+// The disposition is process-global while Runtime instances may overlap, so
+// ownership is refcounted at module scope: the first acquire installs (only
+// when the disposition is still SIG_DFL — embedders that manage SIGPIPE
+// themselves, e.g. a host language runtime, are left alone), and only the
+// last release restores what the install replaced. Only referenced when
+// have_sig_pipe, so the posix types are never analyzed on Windows.
+const sig_pipe_guard = struct {
+    var mutex: os.Mutex = .init();
+    var refcount: usize = 0;
+    var installed: bool = false;
+    var old: os.posix.Sigaction = undefined;
+
+    fn doNothingSignalHandler(_: os.posix.SIG) callconv(.c) void {}
+
+    fn acquire() void {
+        mutex.lock();
+        defer mutex.unlock();
+        refcount += 1;
+        if (refcount > 1) return;
+        os.posix.sigaction(os.posix.SIG.PIPE, null, &old);
+        if (old.handler.handler == os.posix.SIG.DFL) {
+            const act: os.posix.Sigaction = .{
+                .handler = .{ .handler = doNothingSignalHandler },
+                .mask = os.posix.sigemptyset(),
+                .flags = 0,
+            };
+            os.posix.sigaction(os.posix.SIG.PIPE, &act, null);
+            installed = true;
+        }
+    }
+
+    fn release() void {
+        mutex.lock();
+        defer mutex.unlock();
+        refcount -= 1;
+        if (refcount == 0 and installed) {
+            os.posix.sigaction(os.posix.SIG.PIPE, &old, null);
+            installed = false;
+        }
+    }
+};
+const mod = @This();
+
+/// Number of executor threads to run (including main).
+pub const ExecutorCount = enum(u8) {
+    /// Auto-detect based on CPU count.
+    auto = 0,
+    _,
+
+    /// Create an exact executor count (1 = single-threaded, no worker threads)
+    pub fn exact(n: u8) ExecutorCount {
+        assert(n >= 1 and n <= Executor.max_executors);
+        return @fromBackingInt(@intCast(n));
+    }
+
+    /// Always 1 under `.single_executor` scheduling.
+    pub fn resolve(self: ExecutorCount) u8 {
+        if (!multi_executor) return 1;
+        return switch (self) {
+            .auto => autoDetect(),
+            _ => @backingInt(self),
+        };
+    }
+
+    fn autoDetect() u8 {
+        const affinity = @min(Executor.max_executors, std.Thread.getCpuCount() catch 1);
+        // Honor a cgroup CPU quota (Docker/Kubernetes CPU limits) that
+        // sched_getaffinity() can't see, mirroring Go's container-aware
+        // GOMAXPROCS. The affinity mask still wins when it is the tighter bound.
+        const limit = cgroup.cpuLimit() orelse return @intCast(affinity);
+        return @intCast(@min(affinity, @as(usize, limit)));
+    }
+};
+
+// Runtime configuration options
+pub const RuntimeOptions = struct {
+    thread_pool: ev.ThreadPool.Options = .{},
+    stack_pool: StackPoolConfig = .{
+        .maximum_size = 8 * 1024 * 1024,
+        .committed_size = 256 * 1024,
+    },
+    /// When non-zero, a monitor thread logs the scheduler counters'
+    /// per-interval deltas at this cadence. A dedicated thread rather than
+    /// an executor timer, so it keeps reporting even when every executor is
+    /// wedged or asleep. Requires the counters compiled in (build option
+    /// `scheduler_metrics`) and a multi-threaded build; warns and stays off
+    /// otherwise.
+    metrics_log_interval: Duration = .zero,
+
+    /// Total number of executors to run. Always one unless `zio_options.scheduling`
+    /// is `.pinned` or `.work_stealing`.
+    /// When enable_main_executor is true (default), this includes the main executor on the calling thread.
+    /// When enable_main_executor is false, all executors run as background worker threads.
+    executors: ExecutorCount = .exact(1),
+    /// When true (default), the calling thread becomes the main executor (executor 0).
+    /// Set to false when creating runtimes in background threads that should not block
+    /// the creating thread in an event loop. Requires executors >= 1 to have any workers.
+    enable_main_executor: bool = true,
+    /// DNS resolver configuration.
+    dns: DnsOptions = .{},
+};
+
+pub const DnsOptions = struct {
+    /// Use the built-in native DNS resolver instead of getaddrinfo.
+    custom_resolver: bool = ev.backend == .linux or ev.backend == .io_uring,
+};
+
+const Awaitable = @import("awaitable.zig").Awaitable;
+
+// Public handle for spawned tasks and futures
+pub fn JoinHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        pub const Result = T;
+
+        awaitable: ?*Awaitable,
+        result: T,
+
+        /// Helper to get result from awaitable and release it
+        fn finishAwaitable(self: *Self, awaitable: *Awaitable) void {
+            self.result = awaitable.getTypedResult(T);
+            awaitable.release();
+            self.awaitable = null;
+        }
+
+        /// Wait for the task to complete and return its result.
+        ///
+        /// If the current task is canceled while waiting, the spawned task will be canceled too.
+        ///
+        /// Example:
+        /// ```zig
+        /// var handle = try rt.spawn(myTask, .{});
+        /// const result = handle.join();
+        /// ```
+        pub fn join(self: *Self) T {
+            // If awaitable is null, result is already cached
+            const awaitable = self.awaitable orelse return self.result;
+
+            // Wait for completion
+            _ = select.waitUntilComplete(awaitable);
+
+            // Get result and release awaitable
+            self.finishAwaitable(awaitable);
+            return self.result;
+        }
+
+        /// Check if the task has completed and a result is available.
+        pub fn hasResult(self: *const Self) bool {
+            if (self.awaitable) |awaitable| {
+                return awaitable.hasResult();
+            }
+            return true; // If awaitable is null, result is already cached
+        }
+
+        /// Get the result value of type T (preserving any error union).
+        /// Asserts that the task has already completed.
+        /// This is used internally by select() to preserve error union types.
+        pub fn getResult(self: *Self) T {
+            if (self.awaitable) |awaitable| {
+                return awaitable.getTypedResult(T);
+            }
+            return self.result;
+        }
+
+        /// Registers a waiter to be notified when the task completes, or
+        /// claims the select if it already did.
+        /// This is part of the Future protocol for select().
+        pub fn asyncWait(self: Self, waiter: *Waiter) common.AsyncWaitState {
+            if (self.awaitable) |awaitable| {
+                return awaitable.asyncWait(waiter);
+            }
+            // Already complete: claim before reporting ready.
+            return switch (waiter.tryClaim()) {
+                .won => .ready,
+                .busy => unreachable,
+                .lost => .decided,
+            };
+        }
+
+        /// Cancels a pending wait operation by removing the waiter.
+        /// This is part of the Future protocol for select().
+        /// Returns true if removed, false if already removed by completion (wake in-flight).
+        pub fn asyncCancelWait(self: Self, waiter: *Waiter) bool {
+            if (self.awaitable) |awaitable| {
+                return awaitable.asyncCancelWait(waiter);
+            }
+            return true; // No awaitable means already completed, no wake in-flight
+        }
+
+        /// Request cancellation and wait for the task to complete.
+        ///
+        /// Safe to call after `join()` - typically used in defer for cleanup.
+        ///
+        /// Example:
+        /// ```zig
+        /// var handle = try rt.spawn(myTask, .{});
+        /// defer handle.cancel();
+        /// // Do some other work that could return early
+        /// const result = handle.join();
+        /// // cancel() in defer is a no-op since join() already completed
+        /// ```
+        pub fn cancel(self: *Self) void {
+            // If awaitable is null, already completed/detached - no-op
+            const awaitable = self.awaitable orelse return;
+
+            // If already done, just clean up
+            if (awaitable.hasResult()) {
+                self.finishAwaitable(awaitable);
+                return;
+            }
+
+            // Request cancellation
+            awaitable.cancel();
+
+            // Wait for completion
+            _ = select.waitUntilComplete(awaitable);
+
+            // Get result and release awaitable
+            self.finishAwaitable(awaitable);
+        }
+
+        /// Detach the task, allowing it to run in the background.
+        ///
+        /// After detaching, the result is no longer retrievable.
+        ///
+        /// Example:
+        /// ```zig
+        /// var handle = try rt.spawn(backgroundTask, .{});
+        /// handle.detach(); // Task runs independently
+        /// ```
+        pub fn detach(self: *Self) void {
+            // If awaitable is null, already detached - no-op
+            const awaitable = self.awaitable orelse return;
+
+            awaitable.release();
+            self.awaitable = null;
+            self.result = undefined;
+        }
+    };
+}
+
+// Generic data structures (private)
+const WaitNode = @import("utils/wait_queue.zig").WaitNode;
+const SimpleQueue = @import("utils/simple_queue.zig").SimpleQueue;
+const LocalRunQueue = @import("utils/local_run_queue.zig").LocalRunQueue;
+const GlobalOverflowQueue = @import("utils/local_run_queue.zig").GlobalOverflowQueue;
+const OsMutex = @import("os/thread.zig").Mutex;
+
+comptime {
+    // WaitNode needs at least 4-byte alignment for 2 spare bits in pointers
+    std.debug.assert(@alignOf(WaitNode) >= 4);
+}
+
+// A coroutine's parent_context_ptr points at the scheduler context to switch back
+// to when it yields, and is read cross-thread by fromCoroutine (to route a wake to
+// the task's home executor). With task migration a task can run on different
+// executors over its life, so the pointer changes and must be published/read
+// atomically. Without migration a task is pinned to its home executor, so the
+// value is constant from spawn: the initial store is plain, reads are plain, and
+// the per-dispatch re-publish is skipped entirely (it would only rewrite the same
+// value), making parent_context_ptr effectively write-once.
+inline fn storeParentContext(field: **Context, ctx: *Context) void {
+    if (migrates) {
+        @atomicStore(*Context, field, ctx, .release);
+    } else {
+        field.* = ctx;
+    }
+}
+inline fn updateParentContext(task: *AnyTask, ctx: *Context) void {
+    if (migrates) {
+        @atomicStore(*Context, &task.coro.parent_context_ptr, ctx, .release);
+    } else {
+        // Pinned task: parent_context_ptr is constant, so there is nothing to
+        // update. Assert that invariant in safe builds (plain load — there is no
+        // concurrent writer when migration is off).
+        assert(task.coro.parent_context_ptr == ctx);
+    }
+}
+inline fn loadParentContext(field: *const *Context) *Context {
+    return if (migrates)
+        @atomicLoad(*Context, field, .acquire)
+    else
+        field.*;
+}
+
+pub fn getNextExecutor(rt: *Runtime) error{RuntimeShutdown}!*Executor {
+    if (rt.shutting_down.load(.acquire)) {
+        return error.RuntimeShutdown;
+    }
+
+    if (!multi_executor) return rt.executors.items[0];
+
+    const index = rt.next_executor_index.fetchAdd(1, .monotonic);
+    return rt.executors.items[index % rt.executors.items.len];
+}
+
+/// Where `spawnInto` places a new task.
+///
+/// Only `.auto` is valid with `.work_stealing` scheduling. The other
+/// placements promise the task stays on the chosen executor for its whole
+/// life, which holds only when tasks never migrate, so there they fail with
+/// `error.InvalidPlacement`.
+pub const Placement = union(enum) {
+    /// Let the runtime pick the executor. This is what `spawn` does.
+    auto,
+    /// The executor of the calling thread. Fails with `error.InvalidPlacement`
+    /// when called from a thread that is not an executor of this runtime.
+    local,
+    /// The executor with the given index, from zero up to the executor count.
+    executor: ExecutorId,
+};
+
+pub const PlacementError = error{ RuntimeShutdown, InvalidPlacement };
+
+pub fn getPlacementExecutor(rt: *Runtime, placement: Placement) PlacementError!*Executor {
+    if (placement == .auto) return getNextExecutor(rt);
+    if (migrates) return error.InvalidPlacement;
+
+    if (rt.shutting_down.load(.acquire)) {
+        return error.RuntimeShutdown;
+    }
+
+    switch (placement) {
+        .auto => unreachable,
+        .local => {
+            const executor = getCurrentExecutorOrNull() orelse return error.InvalidPlacement;
+            if (executor.runtime != rt) return error.InvalidPlacement;
+            return executor;
+        },
+        .executor => |id| {
+            if (id >= rt.executors.items.len) return error.InvalidPlacement;
+            return rt.executors.items[id];
+        },
+    }
+}
+
+/// Whether scheduler event counters are compiled in (build option
+/// `scheduler_metrics`).
+pub const metrics_enabled = zio_options.scheduler_metrics;
+
+/// Counts of scheduler events, kept per executor (plain increments on the
+/// owning thread) and summed by `Runtime.schedulerMetrics`. With
+/// `metrics_enabled` false the per-executor storage is zero-bit and the
+/// summed snapshot is all zeros.
+pub const SchedulerMetrics = struct {
+    /// Idle probes: a non-blocking poll of the loop before an indefinite park.
+    /// Named for the capped park the probe replaced.
+    parks_doze: u64 = 0,
+    /// Indefinite parks.
+    parks_full: u64 = 0,
+    /// Park exits where a pusher had claimed this executor's idle bit.
+    park_elections: u64 = 0,
+    /// stealWork scans that ran / that took work.
+    steal_attempts: u64 = 0,
+    steal_hits: u64 = 0,
+    /// Steals satisfied by the hinted victim on the first probe.
+    steal_hint_hits: u64 = 0,
+    /// Indefinite parks capped at baton_tick because this executor held the
+    /// rescue baton / tasks taken from an executor stuck in one task.
+    baton_parks: u64 = 0,
+    rescues: u64 = 0,
+    /// Dispatched-queue drains that woke at least one task / tasks woken.
+    drain_batches: u64 = 0,
+    drain_woken: u64 = 0,
+    /// Sleepers woken by batched wake decisions.
+    batch_wake_claims: u64 = 0,
+    pub fn add(self: *SchedulerMetrics, other: SchedulerMetrics) void {
+        inline for (compat.fieldNames(SchedulerMetrics)) |name| {
+            @field(self, name) += @field(other, name);
+        }
+    }
+
+    pub fn sub(self: *SchedulerMetrics, other: SchedulerMetrics) void {
+        inline for (compat.fieldNames(SchedulerMetrics)) |name| {
+            @field(self, name) -= @field(other, name);
+        }
+    }
+};
+
+const MetricsStorage = if (metrics_enabled) SchedulerMetrics else void;
+const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
+
+// Executor - per-thread execution unit for running coroutines
+pub const Executor = struct {
+    pub const max_executors = std.math.maxInt(ExecutorId) + 1;
+
+    const no_steal_hint = std.math.maxInt(u32);
+
+    /// Per-executor work-stealing state; empty unless tasks migrate.
+    const Stealing = if (migrates) struct {
+        /// Cheap PRNG for steal victim selection; the CSPRNG is for user-facing
+        /// random() and too heavy for the park/steal path.
+        prng: std.Random.DefaultPrng = undefined,
+
+        /// Consecutive polls this executor made with tasks still in its ring,
+        /// that is, passes where it fell behind; reset by a poll with an empty
+        /// ring. Written by the owner only; a pre-park steal takes only from
+        /// an executor whose backlog is nonzero (see stealWork).
+        backlog: std.atomic.Value(u32) = .init(0),
+
+        /// Where the pusher that elected this executor as searcher has surplus
+        /// work; armSearcher writes it just before the wake, stealWork consumes
+        /// it as the scan's starting victim. `no_steal_hint` means none.
+        hint: std.atomic.Value(u32) = .init(no_steal_hint),
+
+        /// Whether this executor holds the rescue baton. Owner-only shadow
+        /// of Runtime.Stealing.baton.
+        holds_baton: bool = false,
+        /// While holding the baton: each executor's ring head at the last
+        /// rescue scan, and when that scan ran (0 for none yet).
+        rescue_heads: [max_executors]u32 = @splat(0),
+        rescue_scan_at: u64 = 0,
+    } else struct {};
+
+    id: ExecutorId,
+    loop: ev.Loop,
+
+    /// Per-executor random state (non-secure CSPRNG; later the secure-path fd/handle).
+    random_state: random_mod.RandomState,
+
+    // Per-executor local run queue: bounded FIFO ring buffer (Go runq / Tokio
+    // style). Overflow and cross-thread wakes go to `run_queue.overflow`: the
+    // runtime's shared queue when tasks migrate, or the ring's own lock-free
+    // queue, drained only by this executor, when they don't.
+    run_queue: LocalRunQueue(WaitNode, migrates) = .{},
+
+    // Scheduling quanta (task runs, yield fast-paths, maybeYield checks) spent
+    // since the last event loop tick. Once it reaches tick_task_budget the
+    // executor forces an I/O poll.
+    tick_task_count: u32 = 0,
+
+    // How many quanta fit in tick_target_ns, re-estimated after each tick from
+    // task_ns_ewma. Counting against this approximates a time-based poll
+    // interval without reading the clock on the hot path.
+    tick_task_budget: u32 = initial_tick_budget,
+
+    // EWMA of nanoseconds per quantum, measured across each tick's batch.
+    task_ns_ewma: f64 = @as(f64, tick_target_ns) / initial_tick_budget,
+
+    // When the current tick's batch started running tasks.
+    tick_started_at: Timestamp = .zero,
+
+    // Set by the periodic checkpoint when the batch has already run past
+    // tick_target_ns (the budget was a misprediction); forces a poll like an
+    // exhausted budget, while tick_task_count stays truthful for the EWMA.
+    tick_expired: bool = false,
+
+    // Quanta left until the next clock checkpoint (cheaper than a modulo on
+    // the hot path).
+    tick_checkpoint_countdown: u32 = checkpoint_interval,
+
+    // Scheduler event counters; written only by this executor's thread.
+    metrics: MetricsStorage = metrics_storage_init,
+
+    // True while drainDispatched signals a batch of task wakes:
+    // scheduleTaskLocal skips the per-push announce, the drain announces
+    // once at the end.
+    draining_wakes: bool = false,
+
+    stealing: Stealing = .{},
+
+    // Deferred cleanup for the task that just yielded away from this executor.
+    // Processed by the next coroutine to run (at landing sites: startFn, yield resume, run loop).
+    pending_cleanup: TaskCleanup = .none,
+
+    // Back-reference to runtime for global coordination
+    runtime: *Runtime,
+
+    // Main task for non-coroutine contexts (e.g., main thread calling rt.sleep())
+    // This allows the main thread to use the same yield/wake mechanisms as spawned tasks.
+    // Note: main_task.coro is not a real coroutine - scheduleTask handles it specially
+    // by setting state to .ready without queuing.
+    main_task: AnyTask = undefined,
+
+    // Shutdown event - keeps the event loop active and provides cross-thread shutdown.
+    // When notified, it calls loop.stop() to exit the event loop.
+    shutdown: ev.Async = ev.Async.init(),
+
+    // Periodic timer driving the stack pool's watermark shrink pass. The
+    // pool rate-limits itself, so every executor may carry this timer.
+    stack_pool_shrink_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(60) }),
+
+    // The task currently executing on this executor, or null when we are running
+    // scheduler code (the run loop, a context switch, a completion callback) rather
+    // than a task body. A null value routes any I/O performed here through the
+    // blocking path in waitForIo instead of re-entering the event loop, which would
+    // otherwise recurse into Loop.add (see issue #545).
+    // Updated before every context switch into a task and after every switch back.
+    // Used by getCurrentTaskOrNull() instead of the TLS current_context chain.
+    current_task: ?*AnyTask,
+
+    // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
+    // clearing `current_task`, this leaves the task identity visible to locks,
+    // user log callbacks and the wake path's "inside the run loop" test.
+    // Owning thread only, so no atomics.
+    no_suspend: u32 = 0,
+
+    // Executor dedicated to this thread. Written once on init, never updated.
+    pub threadlocal var current_DO_NOT_ACCESS_DIRECTLY: ?*Executor = null;
+
+    /// Get the Executor instance from any coroutine that belongs to it.
+    /// Coroutines have parent_context_ptr pointing to main_task.coro.context,
+    /// so we navigate: context -> coro -> main_task -> executor.
+    /// Only valid on the executor thread that is currently running the coroutine.
+    pub fn fromCoroutine(coro: *Coroutine) *Executor {
+        const parent_context_ptr = loadParentContext(&coro.parent_context_ptr);
+        const main_coro: *Coroutine = @fieldParentPtr("context", parent_context_ptr);
+        const main_task: *AnyTask = @fieldParentPtr("coro", main_coro);
+        return @alignCast(@fieldParentPtr("main_task", main_task));
+    }
+
+    pub fn init(self: *Executor, runtime: *Runtime, id: ExecutorId) !void {
+        self.* = .{
+            .id = id,
+            .loop = undefined,
+            .random_state = undefined,
+            .current_task = undefined,
+            .runtime = runtime,
+            .shutdown = ev.Async.init(),
+        };
+
+        // With migration, overflow goes to the shared queue that every executor
+        // drains; otherwise the ring keeps its own.
+        if (migrates) self.run_queue.overflow = &runtime.stealing.global_overflow;
+
+        // Initialize main_task - this serves as both the scheduler context and
+        // the task context for async operations called from main.
+        // main_task.coro.context is where spawned tasks yield back to.
+        self.main_task = .{
+            .state = std.atomic.Value(AnyTask.State).init(.{ .tag = .ready }),
+            .awaitable = .{
+                .kind = .task,
+                .wait_node = .{},
+            },
+            .coro = .{
+                .context = std.mem.zeroes(Context),
+                .parent_context_ptr = undefined,
+            },
+            .runtime = runtime,
+            .closure = undefined, // main_task has no closure
+        };
+        storeParentContext(&self.main_task.coro.parent_context_ptr, &self.main_task.coro.context);
+
+        try setupStackGrowth();
+        errdefer cleanupStackGrowth();
+
+        // Initialize this executor's random state from OS entropy.
+        try random_mod.setup(&self.random_state);
+        if (migrates) self.stealing.prng = .init(self.random_state.csprng.random().int(u64));
+
+        try self.loop.init(.{
+            .allocator = self.runtime.allocator,
+            .thread_pool = &self.runtime.thread_pool,
+            .loop_group = &self.runtime.loop_group,
+        });
+        errdefer self.loop.deinit();
+
+        // Register shutdown handle to keep loop active and enable cross-thread shutdown
+        self.shutdown.c.callback = shutdownCallback;
+        self.loop.add(&self.shutdown.c);
+
+        // Register the periodic stack pool shrink timer (skipped when
+        // shrinking is disabled).
+        const shrink_interval = self.runtime.options.stack_pool.shrink_interval;
+        if (shrink_interval.value > 0) {
+            self.stack_pool_shrink_timer = ev.Timer.init(.{ .duration = shrink_interval });
+            self.stack_pool_shrink_timer.c.callback = stackPoolShrinkCallback;
+            self.stack_pool_shrink_timer.c.flags.rearm = true;
+            self.loop.add(&self.stack_pool_shrink_timer.c);
+        }
+
+        self.main_task.coro.setCurrent();
+        setCurrentExecutor(self);
+        self.current_task = &self.main_task;
+    }
+
+    pub fn deinit(self: *Executor) void {
+        setCurrentExecutor(null);
+        Coroutine.clearCurrent();
+
+        self.loop.deinit();
+
+        cleanupStackGrowth();
+    }
+
+    fn shutdownCallback(loop: *ev.Loop, _: *ev.Completion) void {
+        loop.stop();
+    }
+
+    fn stackPoolShrinkCallback(loop: *ev.Loop, c: *ev.Completion) void {
+        const timer = c.cast(ev.Timer);
+        const self: *Executor = @alignCast(@fieldParentPtr("stack_pool_shrink_timer", timer));
+        self.runtime.stack_pool.shrink(loop.now());
+    }
+
+    /// Submit a completion to this executor's loop. The call is a no-suspend
+    /// region: loop internals must not park, so any wait they perform (the
+    /// stderr write behind a backend's log line, for example) blocks the
+    /// thread instead of suspending the task. Must be called on the
+    /// executor's own thread.
+    pub fn loopAdd(self: *Executor, c: *ev.Completion) void {
+        self.no_suspend += 1;
+        defer self.no_suspend -= 1;
+        self.loop.add(c);
+    }
+
+    /// Cancel a completion on this executor's loop. A no-suspend region,
+    /// see `loopAdd`.
+    pub fn loopCancel(self: *Executor, c: *ev.Completion) void {
+        self.no_suspend += 1;
+        defer self.no_suspend -= 1;
+        self.loop.cancel(c);
+    }
+
+    /// Arm a timer on this executor's loop. A no-suspend region, see
+    /// `loopAdd`.
+    pub fn loopSetTimer(self: *Executor, timer: *ev.Timer, timeout: time.Timeout) void {
+        self.no_suspend += 1;
+        defer self.no_suspend -= 1;
+        self.loop.setTimer(timer, timeout);
+    }
+
+    pub const YieldCancelMode = enum { allow_cancel, no_cancel };
+
+    inline fn bump(self: *Executor, comptime field: []const u8, n: u64) void {
+        if (comptime metrics_enabled) @field(self.metrics, field) += n;
+    }
+
+    /// Aim to poll I/O roughly this often while running tasks back-to-back.
+    const tick_target_ns = 100_000;
+    /// Budget until the first measurement (Go's scheduler / tokio's event_interval).
+    const initial_tick_budget = 61;
+    /// Budget clamp: at least 2 to make progress between polls, capped so a
+    /// mis-measured EWMA can't defer polling indefinitely.
+    pub const max_tick_budget = 8192;
+    /// Weight of one quantum in the EWMA (tokio's value).
+    const task_ns_ewma_alpha = 0.1;
+    /// Quanta between clock checkpoints: a hard time backstop for budget
+    /// mispredictions. Prime (like Go's 61) to avoid resonating with periodic
+    /// workloads; also tokio's max tasks per global-queue interval.
+    const checkpoint_interval = 127;
+
+    /// How long the rescue baton holder parks at most, and the minimum time
+    /// between its rescue scans (see park). A task stuck behind a running
+    /// task that doesn't yield is taken within one to two of these.
+    const baton_tick: Duration = .fromMilliseconds(10);
+
+    /// True while the current tick may keep spending quanta without polling.
+    inline fn tickBudgetLeft(self: *const Executor) bool {
+        return self.tick_task_count < self.tick_task_budget and !self.tick_expired;
+    }
+
+    /// Account one scheduling quantum. Every checkpoint_interval quanta the
+    /// clock is read to catch budget mispredictions: if the batch has already
+    /// overrun tick_target_ns, the tick is expired so every budget check fails
+    /// until the next poll resets it.
+    fn spendQuantum(self: *Executor) void {
+        self.tick_task_count += 1;
+        self.tick_checkpoint_countdown -= 1;
+        if (self.tick_checkpoint_countdown == 0) {
+            self.tick_checkpoint_countdown = checkpoint_interval;
+            const elapsed = Timestamp.now(.monotonic).toNanoseconds() -| self.tick_started_at.toNanoseconds();
+            if (elapsed >= tick_target_ns) self.tick_expired = true;
+        }
+    }
+
+    pub fn maybeYield(self: *Executor, comptime mode: AnyTask.YieldMode, comptime cancel_mode: YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
+        // Cancellation is observed even on the fast path, so a CPU-bound loop
+        // that only calls maybeYield() reacts to cancel promptly, like yield().
+        // Must not touch task.state on the error return (see AnyTask.yield).
+        if (cancel_mode == .allow_cancel) {
+            try getCurrentTask().checkCancel();
+        }
+        // Pure time-slice check: each call spends a quantum of the tick budget,
+        // and only when the slice is used up does a real yield happen (letting
+        // other tasks run and I/O get polled). Within the slice this returns
+        // immediately without looking at the queues.
+        self.spendQuantum();
+        if (!self.tickBudgetLeft()) {
+            return getCurrentTask().yield(mode, cancel_mode);
+        }
+    }
+
+    pub const RunMode = enum {
+        /// Run until main_task.state becomes .ready.
+        /// Caller must set up the state before calling (e.g., .waiting for I/O).
+        until_ready,
+        /// Run until explicitly stopped via loop.stop().
+        /// Used for worker executor threads.
+        until_stopped,
+    };
+
+    /// Run the executor event loop.
+    pub fn run(self: *Executor, mode: RunMode) !void {
+        const check_ready = mode != .until_stopped;
+
+        // The run loop is scheduler code, not a task: clear current_task so any I/O
+        // it performs (a completion callback, std.log, a debug_io write) takes the
+        // blocking path rather than recursing into the event loop. Restored to the
+        // main task on return, since control goes back to the main task's user code
+        // (or, for worker executors, to shutdown). On the crash path this defer
+        // does not run (a panic does not unwind), so the null marker survives
+        // until abort(); markCrashed additionally pins the thread as a
+        // no-suspend region.
+        self.current_task = null;
+        defer self.current_task = &self.main_task;
+
+        // Process deferred cleanup (e.g. main task's park/reschedule)
+        self.processCleanup();
+
+        // When entered with the tick budget already spent (e.g. the main task
+        // yielded because its slice ran out), ready tasks must get one
+        // fresh-budget batch after the next poll before control can return to
+        // the main task — otherwise they'd starve behind the exhausted budget.
+        var need_fresh_drain = !self.tickBudgetLeft();
+
+        // Start the batch window here: time spent in the main task between
+        // run() calls must not count toward the per-quantum estimate.
+        self.tick_started_at = Timestamp.now(.monotonic);
+
+        while (true) {
+            // Process ready coroutines
+            while (self.getNextTask()) |next_task| {
+                updateParentContext(next_task, &self.main_task.coro.context);
+                self.current_task = next_task;
+                next_task.coro.step();
+                self.current_task = null;
+                self.processCleanup();
+            }
+
+            // Quanta spent this cycle mean tasks ran here: a busy executor
+            // can't watch for stuck tasks, so it gives up the rescue baton.
+            if (migrates and self.tick_task_count > 0) self.releaseBaton();
+
+            // Exit if loop is stopped
+            if (self.loop.stopped()) {
+                if (mode == .until_stopped) {
+                    return;
+                }
+                @panic("event loop stopped while the main task was yielding");
+            }
+
+            const has_work = self.checkLocalWork(check_ready);
+            // Polling with tasks still queued means this pass fell behind.
+            if (migrates) self.updateBacklog(!self.run_queue.isEmpty());
+            if (has_work) {
+                try self.loop.poll(.zero);
+            } else {
+                try self.parkAndSearch(check_ready);
+            }
+
+            // Retune the tick budget from this batch. Skipped when we may have
+            // slept in parkAndSearch — sleep time would poison the estimate.
+            // The cached snapshot: every path above ends in a `loop.poll`,
+            // which refreshes it on return.
+            const tick_now = self.loop.now();
+            // Skip the retune on the fresh-drain entry pass: tick_task_count
+            // still holds quanta spent before run() was entered, while
+            // tick_started_at was just reset, so the pair would yield a bogus
+            // near-zero estimate and inflate the budget.
+            if (has_work and self.tick_task_count > 0 and self.tick_started_at.value != 0 and !need_fresh_drain) {
+                const elapsed: f64 = @floatFromInt(tick_now.toNanoseconds() -| self.tick_started_at.toNanoseconds());
+                const n: f64 = @floatFromInt(self.tick_task_count);
+                // One EWMA step per quantum, applied per batch (tokio's scheme).
+                const alpha = 1.0 - std.math.pow(f64, 1.0 - task_ns_ewma_alpha, n);
+                self.task_ns_ewma = alpha * (elapsed / n) + (1.0 - alpha) * self.task_ns_ewma;
+                self.tick_task_budget = @intFromFloat(std.math.clamp(tick_target_ns / self.task_ns_ewma, 2.0, max_tick_budget));
+            }
+            self.tick_started_at = tick_now;
+            self.tick_task_count = 0;
+            self.tick_expired = false;
+            self.tick_checkpoint_countdown = checkpoint_interval;
+            if (need_fresh_drain) {
+                need_fresh_drain = false;
+                continue;
+            }
+
+            // Check again after I/O
+            if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
+                return;
+            }
+        }
+    }
+
+    /// One idle step per call; the run loop re-checks stopped/main-ready/local
+    /// work between calls.
+    ///
+    /// Each empty pass first probes the loop with a non-blocking poll, without
+    /// touching idle_mask: completions that have already arrived usually
+    /// re-ready the tasks that just ran here (their I/O is homed on this
+    /// loop), and they go back on the busy path without inviting a searcher
+    /// or paying for a steal. Only when the probe finds nothing does the
+    /// executor park indefinitely, with stealing folded into the pre-park
+    /// check, which is also what makes the park's wake protocol sound (see
+    /// park).
+    fn parkAndSearch(self: *Executor, check_ready: bool) !void {
+        if (!migrates) {
+            self.bump("parks_full", 1);
+            try self.loop.poll(.max);
+            self.drainDispatched();
+            return;
+        }
+
+        // With nobody to steal from (or to), the probe would only delay the
+        // real park; skip it.
+        if (self.runtime.stealingActive()) {
+            self.bump("parks_doze", 1);
+            try self.loop.poll(.zero);
+            self.drainDispatched();
+            if (self.checkLocalWork(check_ready)) return self.leaveIdle();
+        }
+        self.bump("parks_full", 1);
+        try self.park(check_ready);
+        if (!self.run_queue.isEmpty() or (check_ready and self.main_task.state.load(.acquire).tag == .ready)) {
+            self.leaveIdle();
+        }
+    }
+
+    /// Leaving the idle path with work in hand, from the probe or a full
+    /// park: a busy executor can't watch for stuck tasks, so give up the
+    /// rescue baton if held, and if nobody holds it, hand it to a parked
+    /// executor before running anything, since the first task may never
+    /// yield (see Runtime.passBaton). The probe needs this as much as the
+    /// park: a park can return with nothing runnable and its work turn up in
+    /// the next pass's probe, and that work may be a task that never yields.
+    fn leaveIdle(self: *Executor) void {
+        self.releaseBaton();
+        self.runtime.passBaton(self.id);
+    }
+
+    /// One indefinite park: publish the idle bit, give the event loop one
+    /// unbounded poll, withdraw the bit. The holder of the rescue baton caps
+    /// that poll at baton_tick instead (see holdBaton). If armSearcher elected this executor
+    /// as the searcher meanwhile, run the searcher-token protocol: consume the
+    /// token by finding work, or release it and steal on the pusher's behalf.
+    ///
+    /// The pre-park work check extends to the other executors' rings. The bit
+    /// is published before the check while a pusher publishes its task before
+    /// reading idle_mask (both seq_cst), so either the pusher sees the bit and
+    /// wakes us, or this check sees the pushed task — including one sitting in
+    /// the pusher's own ring. The check takes such a task only if the pusher
+    /// has fallen behind (see stealWork); otherwise the task is left to the
+    /// pusher, which is awake and reaches it after its current task, or, if
+    /// that task never yields, to the baton holder's rescue.
+    fn park(self: *Executor, check_ready: bool) !void {
+        const my_bit = @as(usize, 1) << self.id;
+        // seq_cst: pairs with armSearcher's idle_mask load (see there). The bit
+        // must be globally visible before the work check below, or a concurrent
+        // pusher can both miss the bit and have its push missed by the check.
+        _ = self.runtime.stealing.idle_mask.fetchOr(my_bit, .seq_cst);
+        errdefer {
+            const previous_bit = self.runtime.stealing.idle_mask.fetchAnd(~my_bit, .acq_rel);
+            if (previous_bit & my_bit == 0) {
+                _ = self.runtime.stealing.searchers.cmpxchgStrong(1, 0, .acq_rel, .monotonic);
+            }
+        }
+
+        var found_work = self.checkLocalWork(check_ready);
+        if (!found_work) found_work = self.stealWork(.backlogged);
+        if (!found_work) found_work = self.rescueStuck();
+        const wait: Duration = if (found_work) .zero else if (self.holdBaton()) baton_tick else .max;
+        if (wait.value == baton_tick.value) self.bump("baton_parks", 1);
+        try self.loop.poll(wait);
+        // Drain before withdrawing the bit, so the post-park work checks
+        // below see the woken batch.
+        self.drainDispatched();
+
+        // seq_cst: pairs with the baton holder's release and re-check (see
+        // holdBaton), ahead of this executor's baton load in passBaton.
+        const previous_bit = self.runtime.stealing.idle_mask.fetchAnd(~my_bit, .seq_cst);
+
+        if (previous_bit & my_bit == 0) {
+            self.bump("park_elections", 1);
+            if (found_work or (check_ready and self.main_task.state.load(.acquire).tag == .ready) or !self.run_queue.isEmpty()) {
+                _ = self.runtime.stealing.searchers.cmpxchgStrong(1, 0, .acq_rel, .monotonic);
+                return;
+            }
+
+            const batch = self.overflowBatch();
+            if (batch != 0) {
+                if (self.run_queue.refill(batch, .block) > 0) {
+                    _ = self.runtime.stealing.searchers.cmpxchgStrong(1, 0, .acq_rel, .monotonic);
+                    if (!self.run_queue.overflow.isEmpty()) self.runtime.armSearcher(null);
+                    return;
+                }
+            }
+
+            // Release the token before the final recheck. A concurrent
+            // pusher that sees searchers == 0 can arm a fresh search instead of
+            // being blocked behind a token we're about to give up anyway.
+            // seq_cst: pairs with armSearcher's searchers load. The release must
+            // be globally visible before the recheck below, or a pusher can
+            // both read the stale token (skipping its announce) and have its
+            // push missed by this recheck - a dropped wake with no retry.
+            _ = self.runtime.stealing.searchers.cmpxchgStrong(1, 0, .seq_cst, .monotonic);
+            if (self.stealWork(.any)) return;
+            // No main-ready here: only queued (stealable) work justifies
+            // arming a fresh searcher.
+            if (self.checkLocalWork(false)) self.runtime.armSearcher(self.id);
+        }
+    }
+
+    /// Take or keep the rescue baton while some executor is busy, so that one
+    /// parked executor looks for stuck tasks every baton_tick; give it up
+    /// when every executor is parked. Pushes onto an empty ring don't
+    /// announce (see scheduleTaskLocal), so a task queued behind a running
+    /// task that never yields is found only by this scan. A runtime whose
+    /// executors are all parked holds no baton and wakes nobody.
+    fn holdBaton(self: *Executor) bool {
+        if (!migrates) return false;
+        const executors = self.runtime.executors.items.len;
+        const all: usize = if (executors >= @bitSizeOf(usize)) std.math.maxInt(usize) else (@as(usize, 1) << @intCast(executors)) - 1;
+        if (self.runtime.stealing.idle_mask.load(.acquire) & all == all) {
+            if (!self.stealing.holds_baton) return false;
+            self.releaseBaton();
+            // An executor may be leaving its park right now, having read the
+            // baton before the release above. seq_cst, pairing with the idle
+            // bit clear and baton load in park and passBaton: either it sees
+            // the release and passes the baton on, or this sees its cleared
+            // bit and takes the baton back.
+            if (self.runtime.stealing.idle_mask.load(.seq_cst) & all == all) return false;
+        }
+        if (self.stealing.holds_baton) return true;
+        if (self.runtime.stealing.baton.cmpxchgStrong(0, @as(u32, self.id) + 1, .acq_rel, .monotonic) != null) return false;
+        self.stealing.holds_baton = true;
+        self.stealing.rescue_scan_at = 0;
+        _ = self.rescueStuck(); // record the heads to compare against
+        return true;
+    }
+
+    fn releaseBaton(self: *Executor) void {
+        if (!migrates or !self.stealing.holds_baton) return;
+        self.stealing.holds_baton = false;
+        // seq_cst: see holdBaton.
+        self.runtime.stealing.baton.store(0, .seq_cst);
+    }
+
+    /// Baton holder only, at most once per baton_tick: take work from an
+    /// executor whose ring held tasks but whose head didn't move since the
+    /// last scan, i.e. which is stuck in a single task. Records every head
+    /// for the next scan.
+    fn rescueStuck(self: *Executor) bool {
+        if (!migrates or !self.stealing.holds_baton) return false;
+        const now_ns = Timestamp.now(.monotonic).toNanoseconds();
+        const first = self.stealing.rescue_scan_at == 0;
+        if (!first and now_ns -| self.stealing.rescue_scan_at < baton_tick.toNanoseconds()) return false;
+        self.stealing.rescue_scan_at = now_ns;
+        // Only executors that aren't parked can be stuck in a task; a parked
+        // one may just be taking the task its own completions queued.
+        const executors = self.runtime.executors.items;
+        const all: usize = if (executors.len >= @bitSizeOf(usize)) std.math.maxInt(usize) else (@as(usize, 1) << @intCast(executors.len)) - 1;
+        var busy = all & ~self.runtime.stealing.idle_mask.load(.acquire) & ~(@as(usize, 1) << self.id);
+        while (busy != 0) : (busy &= busy - 1) {
+            const victim = executors[@ctz(busy)];
+            const head = victim.run_queue.headCursor();
+            const previous = self.stealing.rescue_heads[victim.id];
+            self.stealing.rescue_heads[victim.id] = head;
+            if (first or head != previous or victim.run_queue.isEmpty()) continue;
+            if (self.run_queue.steal(&victim.run_queue)) |node| {
+                _ = self.run_queue.push(node);
+                self.bump("rescues", 1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Local work check: the main task (when `check_main_ready`), the ring,
+    /// and a refill from the overflow queue. Deliberately never steals — see
+    /// parkAndSearch for when remote work is taken.
+    fn checkLocalWork(self: *Executor, check_main_ready: bool) bool {
+        // Refill from the overflow queue before draining the dispatched queue:
+        // overflow tasks became runnable earlier, and a busy ring has room only
+        // in the slots this pass freed, which a steady completion stream would
+        // fill on every pass. A busy ring takes one task per check, which bounds
+        // an overflow task's wait; this executor is often its only consumer, as
+        // stealing takes from rings and armSearcher does nothing while nobody is
+        // idle. An empty ring takes a batch. Overflow work counts as work, so a
+        // local ring spill (which doesn't wake the loop) can't put this executor
+        // to sleep.
+        if (!self.run_queue.overflow.isEmpty()) {
+            if (self.run_queue.isEmpty()) {
+                _ = self.run_queue.refill(self.overflowBatch(), .block);
+            } else {
+                _ = self.run_queue.refill(1, .try_only);
+            }
+        }
+        // Task wakes can enter the dispatched queue outside any poll: an
+        // operation that completes inline during loop.add finishes on this
+        // thread before its task parks. Every work check must see those, or
+        // a pre-park check can sleep on the only work in existence.
+        self.drainDispatched();
+        const main_ready = check_main_ready and self.main_task.state.load(.acquire).tag == .ready;
+        return main_ready or !self.run_queue.isEmpty();
+    }
+
+    /// How many tasks an empty ring should pull from the overflow queue, or 0
+    /// if it is empty. The shared queue is split into fair ~1/n_exec slices so
+    /// no executor monopolizes it; a private one is drained as far as the ring
+    /// fits (refill caps it).
+    fn overflowBatch(self: *Executor) usize {
+        if (migrates) {
+            const pending = self.run_queue.overflow.len();
+            if (pending == 0) return 0;
+            return pending / @max(self.runtime.executors.items.len, 1) + 1;
+        }
+        return if (self.run_queue.overflow.isEmpty()) 0 else std.math.maxInt(usize);
+    }
+
+    /// Which executors a steal may take from.
+    const Victims = enum {
+        /// Only those that fell behind on their last poll. An executor that
+        /// drains its ring every pass is keeping up, and taking its tasks only
+        /// moves them, and their I/O, away from the loop they are homed on.
+        backlogged,
+        /// Any busy executor: an elected searcher acts on a pusher's announce
+        /// of surplus work.
+        any,
+    };
+
+    /// Records whether this pass polls with tasks still in the ring.
+    fn updateBacklog(self: *Executor, behind: bool) void {
+        const backlog = &self.stealing.backlog;
+        const was = backlog.load(.monotonic);
+        if (behind) {
+            backlog.store(was +| 1, .monotonic);
+        } else if (was != 0) {
+            backlog.store(0, .monotonic);
+        }
+    }
+
+    /// Steal half of a random victim's ring into ours. Reached only from
+    /// park() — the indefinite park's pre-check, which takes only from
+    /// executors that fell behind, and the searcher-token path — never while
+    /// this executor still has plausible local work and never before its own
+    /// loop has been probed, since migrating a task also re-homes its I/O and
+    /// the home loop often has work ready to hand back.
+    fn stealWork(self: *Executor, victims: Victims) bool {
+        if (!self.runtime.stealingActive()) return false;
+        const executors = self.runtime.executors.items;
+        if (executors.len <= 1) return false;
+
+        // A pending hint points at the electing pusher's loaded ring; start
+        // the scan there. Stale hints are harmless: the circular sweep just
+        // continues past them.
+        const hinted = self.stealing.hint.swap(no_steal_hint, .acquire);
+        const hint_start = hinted != no_steal_hint and hinted < executors.len;
+        const start = if (hint_start)
+            hinted
+        else
+            self.stealing.prng.random().uintLessThan(usize, executors.len);
+        self.bump("steal_attempts", 1);
+        for (0..executors.len) |i| {
+            const victim = executors[(start + i) % executors.len];
+            if (victim == self) continue;
+
+            const victim_bit = @as(usize, 1) << victim.id;
+            const victim_idle = self.runtime.stealing.idle_mask.load(.acquire) & victim_bit != 0;
+            if (victim_idle) continue;
+            if (victims == .backlogged and victim.stealing.backlog.load(.monotonic) == 0) continue;
+
+            if (self.run_queue.steal(&victim.run_queue)) |node| {
+                _ = self.run_queue.push(node);
+                self.bump("steal_hits", 1);
+                if (hint_start and i == 0) self.bump("steal_hint_hits", 1);
+                // The rest of the loaded ring is still at the victim; point
+                // the next searcher straight at it.
+                self.runtime.armSearcher(victim.id);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Get the next task to run from the ready queue.
+    ///
+    /// Returns null if no tasks are available, or if the tick's quantum budget
+    /// is spent (to ensure I/O responsiveness).
+    fn getNextTask(self: *Executor) ?*AnyTask {
+        // The budget approximates tick_target_ns of task time (see the field
+        // docs): a re-readied task may run repeatedly within a tick, but once
+        // the budget is spent the executor polls I/O, so a self-looping task
+        // can't starve timers or I/O.
+        if (!self.tickBudgetLeft()) {
+            return null;
+        }
+
+        const node = self.run_queue.pop() orelse return null;
+        self.spendQuantum();
+        return AnyTask.fromWaitNode(node);
+    }
+
+    /// Schedule a task on this executor's local run queue. MUST run on the owning
+    /// executor thread — the single-pusher invariant is what makes the ring pop
+    /// (and, later, steal) protocols correct. The ring handles overflow to
+    /// `run_queue.overflow` internally when full.
+    fn scheduleTaskLocal(self: *Executor, task: *AnyTask) void {
+        // Main task is never queued — its readiness is driven by its state field,
+        // which the run loop checks directly. processCleanup can reach here with the
+        // main task on the pre-woken park / reschedule paths.
+        if (task == &self.main_task) return;
+
+        std.debug.assert(getCurrentExecutorOrNull() == self);
+
+        // Only surplus is announced. A task pushed onto an empty ring is the
+        // one this executor runs next: right after completion processing
+        // when woken from scheduler context, or as soon as the waker blocks
+        // when woken by a running task. An announcement could only drag it
+        // (and its I/O home) to another executor. A second queued task is
+        // work this executor can't get to right away, so that push elects a
+        // searcher. A lone task behind a waker that never yields is taken by
+        // the rescue baton holder (see holdBaton).
+        const was_empty = self.run_queue.push(&task.awaitable.wait_node);
+        if (self.draining_wakes) return; // one batched announce after the drain
+        if (!was_empty) self.runtime.armSearcher(self.id);
+    }
+
+    /// Drain the completions the loop handed out instead of calling (null
+    /// callback, see finishCompletion): signal every waiter with per-push
+    /// announces suppressed, then wake sleepers once for the whole batch.
+    /// Runs after every poll and from checkLocalWork, so no park decision
+    /// can miss a pending wake.
+    fn drainDispatched(self: *Executor) void {
+        var first = self.loop.nextDispatched() orelse return;
+
+        self.draining_wakes = true;
+        var count: usize = 0;
+        while (true) {
+            const c = first;
+            if (c.callback != null) {
+                // Not a task wake: a completion with a real callback, only
+                // possible under do_not_call_callbacks.
+                @branchHint(.unlikely);
+                c.call(&self.loop);
+            } else {
+                const waiter: *Waiter = @ptrCast(@alignCast(c.userdata.?));
+                waiter.signal();
+                count += 1;
+            }
+            first = self.loop.nextDispatched() orelse break;
+        }
+        self.draining_wakes = false;
+
+        if (count > 0) {
+            self.bump("drain_batches", 1);
+            self.bump("drain_woken", count);
+            const claims = self.runtime.batchWakeSleepers(self.run_queue.len(), self.id);
+            self.bump("batch_wake_claims", claims);
+        }
+    }
+
+    /// Schedule a task from another thread (or no executor context) onto its home
+    /// executor, and wake that executor's loop. Goes to the home executor's
+    /// overflow queue: the shared one (migration on, any executor may run it) or
+    /// the home executor's own (migration off, stays home).
+    fn scheduleTaskRemote(self: *Executor, task: *AnyTask) void {
+        std.debug.assert(task != &self.main_task);
+
+        self.run_queue.overflow.push(&task.awaitable.wait_node);
+        self.loop.wake();
+        self.runtime.armSearcher(null);
+    }
+
+    /// Schedule a task for execution.
+    /// Atomically transitions task state to .ready and schedules it for execution.
+    /// May migrate the task to the current executor for cache locality.
+    pub fn scheduleTask(task: *AnyTask) void {
+        var old = task.state.load(.acquire);
+        while (true) {
+            switch (old.tag) {
+                // Task already finished (race between completion and cancel) - nothing to do
+                .finished => return,
+                // Task is in .ready state (running or about to park).
+                // Set the awaken bit as a park token; processCleanup.park will consume it
+                // and reschedule the task instead of transitioning to .waiting.
+                // The CAS runs even when the token is already set (rewriting the
+                // same value): a coalescing waker must still join the release
+                // sequence on `state`, or the parker's token-consume would not
+                // synchronize with it and the payload published before this wake
+                // (a notify count, a result) could be invisible to the recheck
+                // after the reschedule.
+                .ready => {
+                    const desired = AnyTask.State{ .tag = .ready, .awaken = true };
+                    if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                        old = actual;
+                        continue;
+                    }
+                    return; // Awaken token set; task will handle it before/during next park
+                },
+                // Valid states to transition to .ready
+                .new, .waiting => {},
+            }
+            const desired = AnyTask.State{ .tag = .ready, .awaken = false };
+            if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                old = actual;
+                continue;
+            }
+            break;
+        }
+
+        const home_exec = Executor.fromCoroutine(&task.coro);
+
+        if (task == &home_exec.main_task) {
+            home_exec.loop.wake();
+            return;
+        }
+
+        if (getCurrentExecutorOrNull()) |current_exec| {
+            if (current_exec == home_exec) {
+                // Schedule locally
+                current_exec.scheduleTaskLocal(task);
+                return;
+            }
+            // Tasks spawned from an executor of this runtime are homed there and
+            // take the local branch above; this remote path serves foreign-thread
+            // spawns and round-robin homes (migration off). Only already-running
+            // tasks may migrate to the current executor (cache locality with the
+            // waker).
+            if (migrates and old.tag != .new and current_exec.runtime == home_exec.runtime) {
+                // Migrate to the current executor
+                current_exec.scheduleTaskLocal(task);
+                return;
+            }
+        }
+
+        // Schedule on the home executor
+        home_exec.scheduleTaskRemote(task);
+    }
+
+    const TaskCleanup = union(enum) {
+        none,
+        reschedule: *AnyTask,
+        park: *AnyTask,
+        finish: *AnyTask,
+    };
+
+    /// Process deferred cleanup for the task that just yielded away.
+    /// Called at each landing site after a context switch:
+    /// - startFn (new task entry)
+    /// - yield resume (after yieldTo returns)
+    /// - run loop (after step returns)
+    pub fn processCleanup(self: *Executor) void {
+        switch (self.pending_cleanup) {
+            .none => {},
+            .reschedule => |task| {
+                self.pending_cleanup = .none;
+                self.scheduleTaskLocal(task);
+            },
+            .park => |task| {
+                self.pending_cleanup = .none;
+                // Context is now saved — safe to make the task wakeable.
+                // Atomically check the awaken bit and either:
+                // - Transition (ready, awaken=false) → (waiting, awaken=false): normal park
+                // - Consume (ready, awaken=true) → (ready, awaken=false): pre-woken, reschedule
+                var old = task.state.load(.acquire);
+                while (true) {
+                    std.debug.assert(old.tag == .ready);
+                    if (old.awaken) {
+                        // Pre-woken: consume the token, keep .ready, and reschedule
+                        const desired = AnyTask.State{ .tag = .ready, .awaken = false };
+                        if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                            old = actual;
+                            continue;
+                        }
+                        self.scheduleTaskLocal(task);
+                        return;
+                    }
+                    // Normal: transition to .waiting
+                    const desired = AnyTask.State{ .tag = .waiting, .awaken = false };
+                    if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                        old = actual;
+                        continue;
+                    }
+                    break; // Task is now .waiting
+                }
+            },
+            .finish => |task| {
+                self.pending_cleanup = .none;
+                task.state.store(.{ .tag = .finished }, .release);
+                task.releaseCoro(self.runtime);
+                finishTask(self.runtime, &task.awaitable);
+            },
+        }
+    }
+
+    /// Yield the current coroutine to the next ready task or back to the run loop.
+    /// Sets current_task for the target and performs the context switch.
+    pub fn switchOut(self: *Executor, coro: *Coroutine) void {
+        // Picking the next task and switching is scheduler code: clear current_task
+        // so I/O performed here doesn't re-enter the event loop. On the direct-switch
+        // path it is set to the target task just before the switch; on the fall-back
+        // path it stays null and the run loop keeps it null until it steps a task.
+        self.current_task = null;
+        if (self.getNextTask()) |next_task| {
+            updateParentContext(next_task, &self.main_task.coro.context);
+            self.current_task = next_task;
+            coro.yieldTo(&next_task.coro);
+        } else {
+            coro.yield();
+        }
+    }
+};
+
+/// Get the current thread's executor, or null if not in executor context.
+pub noinline fn getCurrentExecutorOrNull() ?*Executor {
+    return Executor.current_DO_NOT_ACCESS_DIRECTLY;
+}
+
+noinline fn setCurrentExecutor(current: ?*Executor) void {
+    Executor.current_DO_NOT_ACCESS_DIRECTLY = current;
+}
+
+/// Get the current thread's executor.
+/// Panics if called from a thread without an active executor context.
+pub fn getCurrentExecutor() *Executor {
+    return getCurrentExecutorOrNull() orelse @panic("no current executor");
+}
+
+/// Get the currently executing task.
+/// Panics if called from a thread without an active executor context.
+pub fn getCurrentTask() *AnyTask {
+    return getCurrentTaskOrNull() orelse @panic("no current task");
+}
+
+/// Get the currently executing task, or null if not in task context.
+pub fn getCurrentTaskOrNull() ?*AnyTask {
+    const exec = getCurrentExecutorOrNull() orelse return null;
+    return exec.current_task;
+}
+
+/// The current task for wait routing: null when this thread must not park,
+/// because there is no mounted task or because it is inside a no-suspend
+/// region. `Waiter.Direct.init` uses this, so every wait in a no-suspend
+/// region blocks the thread instead of suspending. Identity readers (the
+/// stderr lock, user log callbacks, diagnostics) use `getCurrentTaskOrNull`,
+/// which reports the mounted task even inside a region.
+pub fn getWaitableTaskOrNull() ?*AnyTask {
+    const exec = getCurrentExecutorOrNull() orelse return null;
+    if (exec.no_suspend != 0) return null;
+    return exec.current_task;
+}
+
+/// Whether the calling thread is runtime machinery rather than user code.
+/// Only thread-pool workers set it, once, for their whole life.
+threadlocal var machinery_thread: bool = false;
+
+/// Mark the calling thread as runtime machinery for the rest of its life.
+///
+/// **Internal to the runtime, and not exported from `zio`.** A thread-pool
+/// worker runs the scheduler's own work: a delegated operation, and then the
+/// completion that hands its result to the task parked on it. That task can
+/// hold the stderr lock while it waits, so a log call on the worker must not
+/// block on it -- `stderr.currentContext` classifies a machinery thread as
+/// no-suspend, diverting it to the scheduler sink instead.
+///
+/// Called once per worker, from `ThreadPool.run`.
+pub fn markMachineryThread() void {
+    machinery_thread = true;
+}
+
+/// Whether the calling thread was marked by `markMachineryThread`.
+pub fn isMachineryThread() bool {
+    return machinery_thread;
+}
+
+/// Enter a no-suspend region on this thread.
+///
+/// **Internal to the runtime, and not exported from `zio`.** This is for code
+/// that runs the scheduler itself -- the event loop, the paths that submit to
+/// it, the crash handler. Ordinary code, including code that logs or writes to
+/// stderr from a task, needs none of it: a task parks like it does for any
+/// other I/O and everything works. `Executor.loopAdd`/`loopCancel`/
+/// `loopSetTimer` and `loopClearTimer` already wrap the loop entry points, so
+/// even inside the runtime this is only for scheduler code that reaches stderr
+/// some other way.
+///
+/// Inside a region, waits block the calling thread instead of parking the task
+/// (`getWaitableTaskOrNull` reports no task) and the stderr lock treats the
+/// caller as one that must never wait for a parked holder.
+///
+/// **Regions must be exited on the thread that entered them, with no
+/// suspension point in between.** The depth lives on the `Executor`, so a task
+/// that suspends and migrates mid-region decrements a different executor:
+/// the one it left stays no-suspend forever, and every task that runs there
+/// afterwards blocks its thread instead of parking. Nothing detects this, which
+/// is the main reason not to reach for these outside the runtime.
+///
+/// No-op without an executor: such threads never park to begin with.
+pub fn beginNoSuspend() void {
+    const exec = getCurrentExecutorOrNull() orelse return;
+    exec.no_suspend += 1;
+}
+
+/// Exit a no-suspend region. See `beginNoSuspend` for the pairing rules.
+pub fn endNoSuspend() void {
+    const exec = getCurrentExecutorOrNull() orelse return;
+    std.debug.assert(exec.no_suspend > 0);
+    exec.no_suspend -= 1;
+}
+
+/// Disarm a timer inside a no-suspend region. `loop` is the loop the timer
+/// was armed on, which after a migration is not necessarily the current
+/// executor's; the region is entered on the current thread regardless, since
+/// that is where any wait during the call would run.
+pub fn loopClearTimer(loop: *ev.Loop, timer: *ev.Timer) bool {
+    beginNoSuspend();
+    defer endNoSuspend();
+    return loop.clearTimer(timer);
+}
+
+/// Called from the panic/crash handler. Makes this thread a permanent
+/// no-suspend region so any I/O performed while producing the panic message —
+/// in particular writing it through debug_io — takes the blocking path in
+/// waitForIo instead of re-entering the event loop (which would recurse into
+/// Loop.add and abort with no message, see issue #545). `current_task` is
+/// deliberately left in place: the stderr lock uses it to recognize that the
+/// crashing thread's own task holds the user lock and take it over (see
+/// stderr.zig). Never undone: markCrashed()'s callers (defaultPanic,
+/// defaultHandleSegfault) are noreturn and a panic does not unwind through
+/// defers, so no scheduler code runs again on this thread before abort().
+pub fn markCrashed() void {
+    const exec = getCurrentExecutorOrNull() orelse return;
+    exec.no_suspend += 1;
+}
+
+/// Cooperatively yield control to allow other tasks to run.
+/// The current task will be rescheduled and continue execution later.
+/// Returns error.Canceled if the task was canceled.
+/// No-op if called from a thread without an executor (returns without error).
+pub fn yield() Cancelable!void {
+    const exec = getCurrentExecutorOrNull() orelse {
+        os.thread.yield();
+        return;
+    };
+    const task = exec.current_task orelse {
+        os.thread.yield();
+        return;
+    };
+    // Fast path: no other task is ready and there is tick budget left, so
+    // there is nothing to switch to and no poll due yet — spend a quantum and
+    // keep running. Budget exhaustion falls through to the real yield, which
+    // reaches the run loop and polls I/O, keeping timers and I/O bounded. The
+    // main task is not in the run queue, so its readiness is checked directly.
+    if (exec.tickBudgetLeft() and
+        exec.run_queue.isEmpty() and exec.run_queue.overflow.isEmpty() and
+        exec.main_task.state.load(.acquire).tag != .ready)
+    {
+        // Must not touch task.state on the error return (see AnyTask.yield).
+        try task.checkCancel();
+        exec.spendQuantum();
+        return;
+    }
+    return task.yieldFrom(exec, .reschedule, .allow_cancel);
+}
+
+/// Cooperatively yield, but only if enough other tasks are waiting (a cheap
+/// fairness check for long CPU-bound loops that would otherwise hog the
+/// executor). Returns error.Canceled if the task was canceled. No-op if called
+/// from a thread without an executor.
+pub fn maybeYield() Cancelable!void {
+    const exec = getCurrentExecutorOrNull() orelse return;
+    return exec.maybeYield(.reschedule, .allow_cancel);
+}
+
+/// Spawn a task on the current runtime.
+/// Panics if called outside of a task context.
+pub fn spawn(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+    const rt = getCurrentExecutor().runtime;
+    return rt.spawn(func, args);
+}
+
+/// Spawn a task on the current runtime, on the executor chosen by `placement`.
+/// Panics if called outside of a task context.
+pub fn spawnInto(placement: Placement, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+    const rt = getCurrentExecutor().runtime;
+    return rt.spawnInto(placement, func, args);
+}
+
+/// Spawn a blocking task on the current runtime.
+/// Panics if called outside of a task context.
+pub fn spawnBlocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+    const rt = getCurrentExecutor().runtime;
+    return rt.spawnBlocking(func, args);
+}
+
+/// Begin a cancellation shield to prevent being canceled during critical sections.
+/// If not in a task context, this is a no-op.
+pub fn beginShield() void {
+    if (getCurrentTaskOrNull()) |task| {
+        task.beginShield();
+    }
+}
+
+/// End a cancellation shield.
+/// If not in a task context, this is a no-op.
+pub fn endShield() void {
+    if (getCurrentTaskOrNull()) |task| {
+        task.endShield();
+    }
+}
+
+/// Re-arm a cancellation that a previous cancellation point already reported, so
+/// that the next one returns error.Canceled again. Use it when a canceled
+/// operation still has a result to hand back before the cancellation is acted on.
+///
+/// Asserts the task is under a cancellation (an explicit cancel or a live
+/// auto-cancel). If not in a task context, this is a no-op: a blocking task's
+/// cancellation is never consumed, so there is nothing to put back.
+pub fn recancel() void {
+    if (getCurrentTaskOrNull()) |task| {
+        task.recancel();
+    }
+}
+
+/// Check if the current task has been cancelled and return an error if so.
+/// If not in a task context, this is a no-op.
+pub fn checkCancel() Cancelable!void {
+    if (getCurrentTaskOrNull()) |task| {
+        try task.checkCancel();
+    } else {
+        try os.syscall_cancel.checkCanceled();
+    }
+}
+
+/// Get the current monotonic timestamp.
+pub fn now() Timestamp {
+    return .now(.monotonic);
+}
+
+/// Sleep for a specified duration.
+pub fn sleep(duration: Duration) Cancelable!void {
+    // Nothing to time: don't arm a loop timer just to yield.
+    if (duration.value == 0) return yield();
+    var waiter: Waiter = .init();
+    // Nothing ever signals this waiter, so the timeout firing is the sleep
+    // finishing.
+    waiter.timedWait(1, .{ .duration = duration }, .allow_cancel) catch |err| switch (err) {
+        error.Timeout => {},
+        error.Canceled => return error.Canceled,
+    };
+}
+
+// Runtime - orchestrator for one or more Executors
+pub const Runtime = struct {
+    thread_pool: ev.ThreadPool,
+    stack_pool: StackPool,
+    task_pool: TaskPool,
+    allocator: Allocator,
+    options: RuntimeOptions,
+
+    executors: std.ArrayList(*Executor) = .empty,
+    stealing: Stealing = .{},
+    loop_group: ev.LoopGroup = .{},
+    main_executor: Executor,
+    next_executor_index: std.atomic.Value(usize) = .init(0),
+    workers: std.ArrayList(Worker) = .empty,
+    task_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // Active task counter
+    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Worker lifecycle barriers, see runWorker(). A worker starts running
+    // only once worker_start is .run, after every executor is registered, so
+    // no worker can park, and appear in idle_mask, before it is in the
+    // executor list. If init() fails first, worker_start becomes .abort and
+    // workers skip running altogether. On the way out a worker counts itself
+    // in workers_stopped and tears down its executor only once teardown is
+    // set, after every worker has stopped running, so no executor can steal
+    // from or wake an executor that is already torn down.
+    worker_mutex: os.Mutex = .init(),
+    worker_cond: os.Condition = .init(),
+    worker_start: WorkerStart = .wait,
+    workers_stopped: usize = 0,
+    teardown: bool = false,
+    metrics_monitor: ?std.Thread = null,
+    metrics_stop: std.atomic.Value(u32) = .init(0),
+    own_self: bool = false,
+
+    resolver: ?dns.Resolver = null,
+
+    /// Runtime-wide work-stealing state; empty unless tasks migrate.
+    const Stealing = if (migrates) struct {
+        /// Shared global run queue: external submissions, cross-thread wakes,
+        /// and per-executor ring overflow land here, and every executor drains
+        /// a fair batch from it once per tick.
+        global_overflow: GlobalOverflowQueue(WaitNode) = .{},
+        /// One bit per parked executor.
+        idle_mask: std.atomic.Value(usize) = .init(0),
+        /// The single-searcher token, see armSearcher.
+        searchers: std.atomic.Value(u32) = .init(0),
+        /// Id + 1 of the executor holding the rescue baton, or 0 (see
+        /// Executor.park).
+        baton: std.atomic.Value(u32) = .init(0),
+    } else struct {};
+
+    const WorkerStart = enum { wait, run, abort };
+
+    const Worker = struct {
+        thread: std.Thread = undefined,
+        ready: os.ResetEvent = .init(),
+        err: ?anyerror = null,
+        executor: Executor = undefined,
+    };
+
+    pub fn init(allocator: Allocator, options: RuntimeOptions) !*Runtime {
+        const self = try allocator.create(Runtime);
+        errdefer allocator.destroy(self);
+
+        try self.initStatic(allocator, options);
+        self.own_self = true;
+        return self;
+    }
+
+    pub fn initStatic(self: *Runtime, allocator: Allocator, options: RuntimeOptions) !void {
+        const num_executors = options.executors.resolve();
+        const num_workers = if (options.enable_main_executor) num_executors - 1 else num_executors;
+
+        self.* = .{
+            .allocator = allocator,
+            .options = options,
+            .thread_pool = undefined,
+            .main_executor = undefined,
+            .stack_pool = .init(options.stack_pool),
+            .task_pool = .init(allocator),
+            .resolver = if (options.dns.custom_resolver) dns.Resolver.init(allocator) else null,
+        };
+        errdefer if (self.resolver) |*r| r.deinit();
+
+        // Carve the requested number of stack slots up front (no-op when
+        // prewarm is 0 or slab allocation is compiled out). The errdefer
+        // comes first: a mid-loop failure in prewarm itself must unmap the
+        // slabs it already reserved.
+        errdefer self.stack_pool.deinit();
+        try self.stack_pool.prewarm();
+
+        if (comptime have_sig_pipe) sig_pipe_guard.acquire();
+        errdefer if (comptime have_sig_pipe) sig_pipe_guard.release();
+
+        try self.thread_pool.init(allocator, options.thread_pool);
+        errdefer self.thread_pool.deinit();
+
+        try self.executors.ensureTotalCapacity(allocator, num_executors);
+        errdefer self.executors.deinit(allocator);
+
+        var main_executor_initialized = false;
+        if (options.enable_main_executor) {
+            try self.main_executor.init(self, 0);
+            main_executor_initialized = true;
+            self.executors.appendAssumeCapacity(&self.main_executor);
+        }
+        errdefer if (main_executor_initialized) self.main_executor.deinit();
+
+        try self.workers.ensureTotalCapacity(allocator, num_workers);
+
+        errdefer self.shutdownWorkers();
+
+        if (!builtin.single_threaded) {
+            const worker_id_start: ExecutorId = if (options.enable_main_executor) 1 else 0;
+            for (0..num_workers) |i| {
+                log.debug("Spawning worker thread {}", .{i + worker_id_start});
+                const worker = self.workers.addOneAssumeCapacity();
+                errdefer _ = self.workers.pop();
+                worker.* = .{};
+                worker.thread = try std.Thread.spawn(.{}, runWorker, .{ self, worker, @as(ExecutorId, @intCast(i + worker_id_start)) });
+            }
+
+            for (self.workers.items, 0..) |*worker, i| {
+                log.debug("Waiting for worker thread {}", .{i + worker_id_start});
+                worker.ready.wait();
+                if (worker.err) |e| {
+                    return e;
+                }
+                self.executors.appendAssumeCapacity(&worker.executor);
+            }
+            self.startWorkers(.run);
+        }
+
+        if (options.metrics_log_interval.value > 0) {
+            if (comptime !metrics_enabled) {
+                log.warn("metrics_log_interval set, but scheduler metrics are compiled out", .{});
+            } else if (comptime builtin.single_threaded) {
+                log.warn("metrics_log_interval set, but a single-threaded build cannot start the monitor thread", .{});
+            } else if (comptime os.Futex == void) {
+                log.warn("metrics_log_interval set, but this target has no futex for the monitor thread", .{});
+            } else {
+                self.metrics_monitor = try std.Thread.spawn(.{}, runMetricsMonitor, .{self});
+            }
+        }
+    }
+
+    /// Logs scheduler counter deltas every metrics_log_interval until deinit
+    /// sets metrics_stop.
+    fn runMetricsMonitor(self: *Runtime) void {
+        const interval = self.options.metrics_log_interval;
+        var last: SchedulerMetrics = .{};
+        while (self.metrics_stop.load(.acquire) == 0) {
+            os.Futex.timedWait(&self.metrics_stop, 0, interval) catch {
+                const total = self.schedulerMetrics();
+                var delta = total;
+                delta.sub(last);
+                last = total;
+                log.info("scheduler: parks probe={d} full={d} baton={d} elections={d} steals={d}/{d} hint_hits={d} rescues={d} drains={d} woken={d} batch_claims={d}", .{
+                    delta.parks_doze,
+                    delta.parks_full,
+                    delta.baton_parks,
+                    delta.park_elections,
+                    delta.steal_hits,
+                    delta.steal_attempts,
+                    delta.steal_hint_hits,
+                    delta.rescues,
+                    delta.drain_batches,
+                    delta.drain_woken,
+                    delta.batch_wake_claims,
+                });
+            };
+        }
+    }
+
+    /// Release the worker threads waiting in runWorker(), either to run their
+    /// executors or to skip straight to shutdown. Only the first call decides.
+    fn startWorkers(self: *Runtime, start: WorkerStart) void {
+        self.worker_mutex.lock();
+        defer self.worker_mutex.unlock();
+        if (self.worker_start != .wait) return;
+        self.worker_start = start;
+        self.worker_cond.broadcast();
+    }
+
+    /// Stop worker executors and join threads. Used by deinit() and init() error path.
+    fn shutdownWorkers(self: *Runtime) void {
+        // A worker whose run() fails retries until this is set.
+        self.shutting_down.store(true, .release);
+
+        // Wait for all workers to finish initialization. Workers that failed
+        // to initialize (err != null) don't have valid executors; the rest
+        // all pass through the stop barrier below.
+        var running: usize = 0;
+        for (self.workers.items) |*worker| {
+            worker.ready.wait();
+            if (worker.err == null) running += 1;
+        }
+
+        // On the init() error path the executor list may be incomplete, so
+        // workers still waiting to start must not run.
+        self.startWorkers(.abort);
+
+        for (self.workers.items) |*worker| {
+            if (worker.err == null) {
+                worker.executor.shutdown.notify();
+            }
+        }
+
+        // Once every worker has stopped running, no executor can steal from or
+        // wake another, and every notify() above has returned, so no waker
+        // syscall is in flight against a worker loop any more; workers may now
+        // tear theirs down.
+        {
+            self.worker_mutex.lock();
+            defer self.worker_mutex.unlock();
+            while (self.workers_stopped < running) {
+                self.worker_cond.wait(&self.worker_mutex);
+            }
+            self.teardown = true;
+            self.worker_cond.broadcast();
+        }
+
+        // Join worker threads
+        for (self.workers.items) |*worker| {
+            worker.thread.join();
+        }
+        self.workers.deinit(self.allocator);
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        const allocator = self.allocator;
+
+        // Set shutting_down flag to prevent new spawns
+        self.shutting_down.store(true, .release);
+
+        // The monitor reads executor state, so it must go before any of the
+        // teardown below.
+        if (self.metrics_monitor) |monitor| {
+            self.metrics_stop.store(1, .release);
+            os.Futex.wake(&self.metrics_stop, .one);
+            monitor.join();
+            self.metrics_monitor = null;
+        }
+
+        // Stop and join the thread pool first, while all executor loops are
+        // still alive. Thread-pool completion callbacks wake the owning loop
+        // (writing its eventfd), so the pool's worker threads must be fully
+        // joined before any loop is torn down. stop() leaves the pool object
+        // valid (in shutdown mode), so any late submissions from executors being
+        // shut down are safely dropped.
+        self.thread_pool.stop();
+
+        // Stop worker executors and join threads (deinits their loops)
+        self.shutdownWorkers();
+
+        // All tasks should be complete before deinit
+        std.debug.assert(self.task_count.load(.acquire) == 0);
+
+        // Clean up ThreadPool (worker threads already joined by stop()).
+        self.thread_pool.deinit();
+
+        // Worker executors clean themselves up via defer in runWorker.
+        // We only need to deinit the main executor here (if it was created).
+        if (self.options.enable_main_executor) {
+            self.main_executor.deinit();
+        }
+
+        self.executors.deinit(allocator);
+
+        // Clean up stack pool
+        self.stack_pool.deinit();
+
+        // Clean up task pool
+        self.task_pool.deinit();
+
+        if (self.resolver) |*r| r.deinit();
+
+        if (comptime have_sig_pipe) sig_pipe_guard.release();
+
+        // Free the Runtime allocation
+        if (self.own_self) {
+            allocator.destroy(self);
+        }
+    }
+
+    // High-level public API
+    pub fn spawn(self: *Runtime, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+        return self.spawnInto(.auto, func, args);
+    }
+
+    /// Spawn a task on the executor chosen by `placement`.
+    pub fn spawnInto(self: *Runtime, placement: Placement, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+        const Result = meta.ReturnType(func);
+        const Args = @TypeOf(args);
+
+        const Wrapper = struct {
+            fn start(ctx: *const anyopaque, result: *anyopaque) void {
+                const a: *const Args = @ptrCast(@alignCast(ctx));
+                const r: *Result = @ptrCast(@alignCast(result));
+                r.* = @call(.auto, func, a.*);
+            }
+        };
+
+        const task = try spawnTask(
+            self,
+            @sizeOf(Result),
+            .fromByteUnits(@alignOf(Result)),
+            std.mem.asBytes(&args),
+            .fromByteUnits(@alignOf(Args)),
+            .{ .regular = &Wrapper.start },
+            null,
+            placement,
+        );
+
+        return JoinHandle(Result){
+            .awaitable = &task.awaitable,
+            .result = undefined,
+        };
+    }
+
+    pub fn spawnBlocking(self: *Runtime, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !JoinHandle(meta.ReturnType(func)) {
+        const Result = meta.ReturnType(func);
+        const Args = @TypeOf(args);
+
+        const Wrapper = struct {
+            fn start(ctx: *const anyopaque, result: *anyopaque) void {
+                const a: *const Args = @ptrCast(@alignCast(ctx));
+                const r: *Result = @ptrCast(@alignCast(result));
+                r.* = @call(.always_inline, func, a.*);
+            }
+        };
+
+        const task = try spawnBlockingTask(
+            self,
+            @sizeOf(Result),
+            .fromByteUnits(@alignOf(Result)),
+            std.mem.asBytes(&args),
+            .fromByteUnits(@alignOf(Args)),
+            .{ .regular = &Wrapper.start },
+            null,
+            .{},
+        );
+
+        return JoinHandle(Result){
+            .awaitable = &task.awaitable,
+            .result = undefined,
+        };
+    }
+
+    /// Worker thread entry point. Initializes the executor and signals
+    /// worker.ready (success or failure), then waits for startWorkers() to
+    /// release it, runs until stopped (unless aborted), and waits for
+    /// teardown before deinit.
+    fn runWorker(self: *Runtime, worker: *Worker, id: ExecutorId) void {
+        worker.executor.init(self, id) catch |e| {
+            worker.err = e;
+            worker.ready.set();
+            return;
+        };
+        defer worker.executor.deinit();
+
+        worker.ready.set();
+
+        self.worker_mutex.lock();
+        while (self.worker_start == .wait) {
+            self.worker_cond.wait(&self.worker_mutex);
+        }
+        const start = self.worker_start;
+        self.worker_mutex.unlock();
+
+        defer {
+            // A cross-thread notifier publishes its wake (Async.pending plus the
+            // loop's wake_requested bit) before it performs the waker syscall,
+            // and the loop is free to act on that publication in between: it can
+            // run the shutdown callback, stop, and get here while the notifier
+            // is still short of its write(). Other executors may also still be
+            // running, stealing from this one or waking its loop. Deiniting now
+            // would close the waker fds underneath them, so wait until
+            // shutdownWorkers() reports that every worker has stopped and every
+            // notification has been delivered.
+            self.worker_mutex.lock();
+            defer self.worker_mutex.unlock();
+            self.workers_stopped += 1;
+            self.worker_cond.broadcast();
+            while (!self.teardown) {
+                self.worker_cond.wait(&self.worker_mutex);
+            }
+        }
+
+        if (start == .abort) return;
+
+        var backoff = Duration.fromMilliseconds(10);
+        const max_backoff = Duration.fromMilliseconds(1000);
+
+        while (true) {
+            worker.executor.run(.until_stopped) catch |e| {
+                if (self.shutting_down.load(.acquire)) break;
+                log.err("Worker executor error: {}, retrying in {f}", .{ e, backoff });
+                os.time.sleep(backoff);
+                backoff = .{ .value = @min(backoff.value *| 2, max_backoff.value) };
+                continue;
+            };
+            break;
+        }
+    }
+
+    /// Sum of all executors' scheduler event counters. The counters are
+    /// written without atomics by their owning threads, so this is an
+    /// approximate snapshot while executors are running; it is exact once
+    /// they are quiesced. All zeros when `metrics_enabled` is false.
+    pub fn schedulerMetrics(self: *Runtime) SchedulerMetrics {
+        var total: SchedulerMetrics = .{};
+        if (comptime metrics_enabled) {
+            for (self.executors.items) |executor| {
+                total.add(executor.metrics);
+            }
+        }
+        return total;
+    }
+
+    /// Whether other executors can steal from this runtime's queues. The
+    /// executor list only grows during init, before any worker runs.
+    pub inline fn stealingActive(self: *Runtime) bool {
+        return migrates and self.executors.items.len > 1;
+    }
+
+    fn armSearcher(self: *Runtime, hint: ?ExecutorId) void {
+        if (!migrates) return;
+
+        // The two early-return loads pair with the parker: an executor sets its
+        // idle bit (seq_cst RMW) and only then makes its final work check, while
+        // a pusher publishes the task and only then reads idle_mask/searchers
+        // here. Both sides run store-then-load, so with anything weaker than
+        // seq_cst each can read the other's stale value on a weakly ordered CPU
+        // and the announce is dropped: the task then sits in a queue no awake
+        // executor looks at until some poll timeout (observed as ~60s stalls on
+        // Apple Silicon). seq_cst loads are enough on the pusher side; the
+        // parker's RMWs anchor the total order.
+        if (!self.stealingActive() or (self.stealing.idle_mask.load(.seq_cst) == 0) or (self.stealing.searchers.load(.seq_cst) != 0)) return;
+        if (self.stealing.searchers.cmpxchgStrong(0, 1, .seq_cst, .monotonic)) |_| return;
+
+        if (!self.claimAndWake(hint, null)) {
+            _ = self.stealing.searchers.cmpxchgStrong(1, 0, .acq_rel, .monotonic);
+        }
+    }
+
+    /// Called by an executor leaving the idle path with work (see
+    /// Executor.leaveIdle): if nobody holds the rescue baton and some executor
+    /// is parked, wake one to take it. The baton is released whenever every
+    /// executor is parked, so this is the wake that brings it back when work
+    /// starts after full idleness; while a holder exists it is one load.
+    fn passBaton(self: *Runtime, from: ExecutorId) void {
+        if (!migrates) return;
+        // seq_cst: pairs with the holder's release (see Executor.holdBaton).
+        if (self.stealing.baton.load(.seq_cst) != 0) return;
+        if (self.stealing.idle_mask.load(.monotonic) == 0) return;
+        _ = self.claimAndWake(null, from);
+    }
+
+    /// Claim one parked executor from the idle mask (skipping `exclude`),
+    /// deliver the hint, and wake it. The bit-clear is the claim: exactly one
+    /// caller wins a given bit, and only the winner writes the hint. Returns
+    /// false if no executor could be claimed.
+    fn claimAndWake(self: *Runtime, hint: ?ExecutorId, exclude: ?ExecutorId) bool {
+        var candidates = self.stealing.idle_mask.load(.acquire);
+        if (exclude) |id| candidates &= ~(@as(usize, 1) << id);
+        while (candidates != 0) {
+            const id: ExecutorId = @intCast(@ctz(candidates));
+            const bit = @as(usize, 1) << id;
+            const previous_mask = self.stealing.idle_mask.fetchAnd(~bit, .acq_rel);
+            if (previous_mask & bit != 0) {
+                const target = self.executors.items[id];
+                // Deliver (or clear) the hint before the wake; the wake edge
+                // publishes it. Exclusive: only the bit winner writes.
+                target.stealing.hint.store(hint orelse Executor.no_steal_hint, .release);
+                target.loop.wake();
+                return true;
+            }
+            candidates &= ~bit;
+        }
+        return false;
+    }
+
+    /// Wake several sleepers at once for `ready` freshly woken tasks in the
+    /// calling executor's ring (Go's injectglist). Bypasses the
+    /// single-searcher token: the token throttles speculative announces, and
+    /// a counted batch is not speculative. Each claimed searcher steals half
+    /// of what remains, so log2(ready) searchers cover the batch; more would
+    /// just race.
+    ///
+    /// A claimed searcher's park exit may release a token it never took;
+    /// that lets one extra election through, it never loses a wake.
+    /// Returns the number of sleepers actually woken.
+    fn batchWakeSleepers(self: *Runtime, ready: usize, hint: ExecutorId) u64 {
+        if (!migrates) return 0;
+
+        if (!self.stealingActive() or ready < 2) return 0;
+        if (self.stealing.idle_mask.load(.seq_cst) == 0) return 0;
+
+        var wakes: usize = 0;
+        var covered: usize = 2; // wakes = ceil(log2(ready))
+        while (covered < ready) : (covered *= 2) wakes += 1;
+        var woken: u64 = 0;
+        while (wakes > 0) : (wakes -= 1) {
+            if (!self.claimAndWake(hint, hint)) break;
+            woken += 1;
+        }
+        return woken;
+    }
+
+    // Convenience methods that operate on the current coroutine context
+    // These delegate to the current executor automatically
+    // Most are no-op if not called from within a coroutine
+
+    /// Cooperatively yield control to allow other tasks to run.
+    /// The current task will be rescheduled and continue execution later.
+    /// Can be called from the main thread or from within a coroutine.
+    /// If called from a thread without an executor, yields the OS thread.
+    /// Deprecated: use zio.yield() instead.
+    pub fn yield(_: *Runtime) Cancelable!void {
+        return mod.yield();
+    }
+
+    /// Sleep for the specified number of milliseconds.
+    /// Returns error.Canceled if the task was canceled during sleep.
+    /// Deprecated: use zio.sleep() instead.
+    pub fn sleep(_: *Runtime, duration: Duration) Cancelable!void {
+        return mod.sleep(duration);
+    }
+
+    /// Begin a cancellation shield to prevent being canceled during critical sections.
+    /// Deprecated: use zio.beginShield() instead.
+    pub fn beginShield(_: *Runtime) void {
+        mod.beginShield();
+    }
+
+    /// End a cancellation shield.
+    /// Deprecated: use zio.endShield() instead.
+    pub fn endShield(_: *Runtime) void {
+        mod.endShield();
+    }
+
+    /// Check if cancellation has been requested and return error.Canceled if so.
+    /// This consumes the cancellation flag.
+    /// Use this after endShield() to detect cancellation that occurred during the shielded section.
+    /// Deprecated: use zio.checkCancel() instead.
+    pub fn checkCancel(_: *Runtime) Cancelable!void {
+        return mod.checkCancel();
+    }
+
+    /// Get the current monotonic timestamp.
+    /// This uses the event loop's cached time for efficiency.
+    /// Deprecated: use zio.now() instead.
+    pub fn now(_: *Runtime) Timestamp {
+        return mod.now();
+    }
+
+    /// Construct a `std.Io` instance backed by this runtime.
+    pub fn io(self: *Runtime) std.Io {
+        return @import("io.zig").fromRuntime(self, .regular);
+    }
+
+    /// Construct a `std.Io` whose `concurrent`/`async` dispatch to
+    /// `spawnBlocking` instead of coroutine tasks. The returned handle
+    /// shares the same vtable and runtime; only the scheduling path for
+    /// new work differs.
+    pub fn blockingIo(self: *Runtime) std.Io {
+        return @import("io.zig").fromRuntime(self, .blocking);
+    }
+
+    /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
+    /// or `Runtime.blockingIo()`, or null when it is backed by some other
+    /// implementation.
+    pub fn fromIo(value: std.Io) ?*Runtime {
+        const io_impl = @import("io.zig");
+        if (value.vtable != &io_impl.vtable or value.userdata == null) return null;
+        return io_impl.toRuntime(value);
+    }
+};
+
+test "Runtime: scheduler metrics count parks and drained wakes" {
+    if (!metrics_enabled) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(2),
+    });
+    defer runtime.deinit();
+
+    // An Async wait goes through waitForIo, so its wake is delivered through
+    // the dispatched queue whether it completes inline or after parking.
+    const waitForIo = @import("common.zig").waitForIo;
+    const Ctx = struct {
+        handle: ev.Async = ev.Async.init(),
+        fn wait(ctx: *@This()) void {
+            waitForIo(&ctx.handle.c) catch {};
+        }
+    };
+    var ctx: Ctx = .{};
+    var handle = try runtime.spawn(Ctx.wait, .{&ctx});
+    defer handle.cancel();
+
+    try runtime.sleep(.fromMilliseconds(1));
+    ctx.handle.notify();
+    handle.join();
+
+    const m = runtime.schedulerMetrics();
+    try std.testing.expect(m.drain_woken >= 1);
+    try std.testing.expect(m.drain_batches >= 1);
+    try std.testing.expect(m.parks_doze + m.parks_full >= 1);
+}
+
+test "Runtime: metrics monitor thread starts and stops" {
+    if (!metrics_enabled or builtin.single_threaded) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .metrics_log_interval = .fromMilliseconds(5),
+    });
+    defer runtime.deinit();
+
+    // Long enough for a couple of monitor reports.
+    try runtime.sleep(.fromMilliseconds(15));
+}
+
+test "runtime: spawnBlocking smoke test" {
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .thread_pool = .{},
+    });
+    defer runtime.deinit();
+
+    const blockingWork = struct {
+        fn call(x: i32) i32 {
+            return x * 2;
+        }
+    }.call;
+
+    var handle = try runtime.spawnBlocking(blockingWork, .{21});
+    defer handle.cancel();
+
+    const result = handle.join();
+    try std.testing.expectEqual(42, result);
+}
+
+test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker" {
+    if (!os.syscall_cancel.enabled) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    // The blocking function parks in a cancelable read on an empty pipe. When the
+    // task is canceled, SIGURG (first signal + loop-driven resend) must interrupt
+    // the read and surface as error.Canceled.
+    const worker = struct {
+        fn cancelableRead(fd: std.c.fd_t, ready: *std.atomic.Value(bool)) error{ Canceled, Unexpected }!void {
+            const sc = try os.syscall_cancel.Syscall.begin();
+            defer sc.finish();
+            ready.store(true, .release);
+            var buf: [1]u8 = undefined;
+            while (true) {
+                const rc = std.c.read(fd, &buf, buf.len);
+                if (rc >= 0) return error.Unexpected;
+                switch (std.posix.errno(rc)) {
+                    .INTR => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    else => return error.Unexpected,
+                }
+            }
+        }
+    };
+
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    var ready = std.atomic.Value(bool).init(false);
+    var handle = try runtime.spawnBlocking(worker.cancelableRead, .{ fds[0], &ready });
+
+    // Wait until the worker is inside the cancelable read (the pool has bound the
+    // task's token), then cancel the blocking task directly.
+    while (!ready.load(.acquire)) try runtime.sleep(.fromMicroseconds(100));
+
+    handle.cancel(); // requests cancellation and waits for completion
+    try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
+test "Runtime: implicit run" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const start = runtime.now();
+    try std.testing.expect(start.value > 0);
+
+    try runtime.sleep(.fromMilliseconds(10));
+
+    const end = runtime.now();
+    try std.testing.expect(end.value > start.value);
+    try std.testing.expect(start.durationTo(end).toMilliseconds() >= 10);
+}
+
+test "Runtime: sleep from main" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    // Call sleep directly from main thread - no spawn needed
+    const start = runtime.now();
+    try runtime.sleep(.fromMilliseconds(10));
+    const end = runtime.now();
+
+    try std.testing.expect(end.value > start.value);
+    try std.testing.expect(start.durationTo(end).toMilliseconds() >= 10);
+}
+
+test "runtime: spawnBlocking does not leak with a large result" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    // Regression test for a blocking-task refcount leak. A large result forces
+    // TaskPool.alloc down the direct allocator path (size > pool_item_size), so
+    // the leaked allocation is reported by testing.allocator. With a small (e.g.
+    // i32) result the task is pool-allocated and the leak is masked by
+    // pool.deinit freeing the pool's backing buffer -- which is why the existing
+    // smoke test did not catch it.
+    const blockingWork = struct {
+        fn call(x: u8) [4000]u8 {
+            return @splat(x);
+        }
+    }.call;
+
+    var handle = try runtime.spawnBlocking(blockingWork, .{@as(u8, 7)});
+    const result = handle.join();
+    try std.testing.expectEqual(@as(u8, 7), result[0]);
+}
+
+test "runtime: basic sleep" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    try runtime.sleep(.fromMilliseconds(1));
+}
+
+test "runtime: now() returns monotonic time" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const start = runtime.now();
+    try std.testing.expect(start.value > 0);
+
+    // Sleep to ensure time advances
+    try runtime.sleep(.fromMilliseconds(10));
+
+    const end = runtime.now();
+    try std.testing.expect(end.value > start.value);
+    try std.testing.expect(start.durationTo(end).toMilliseconds() >= 10);
+}
+
+test "runtime: sleep is cancelable" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const sleepingTask = struct {
+        fn call(rt: *Runtime) !void {
+            // This will sleep for 1 second but should be canceled before completion
+            try rt.sleep(.fromMilliseconds(1000));
+            // Should not reach here
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var timer = time.Stopwatch.start();
+
+    var handle = try runtime.spawn(sleepingTask, .{runtime});
+    defer handle.cancel();
+
+    // Cancel the sleeping task
+    handle.cancel();
+
+    // Should return error.Canceled
+    const result = handle.join();
+    try std.testing.expectError(error.Canceled, result);
+
+    // Ensure the sleep was canceled before completion
+    try std.testing.expect(timer.read().toMilliseconds() <= 500);
+}
+
+test "runtime: shielded sleep is not cancelable" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const shieldedSleepTask = struct {
+        fn call(rt: *Runtime) !void {
+            rt.beginShield();
+            defer rt.endShield();
+            // This sleep should complete even when canceled because it's shielded
+            try rt.sleep(.fromMilliseconds(50));
+        }
+    }.call;
+
+    var timer = time.Stopwatch.start();
+
+    var handle = try runtime.spawn(shieldedSleepTask, .{runtime});
+    defer handle.cancel();
+
+    // Wait a bit to ensure the task is actually in the waiting state
+    try runtime.sleep(.fromMilliseconds(10));
+
+    // Try to cancel the sleeping task
+    handle.cancel();
+
+    // Should complete successfully (not canceled) because the sleep was shielded
+    const result = handle.join();
+    try std.testing.expectEqual({}, result);
+
+    // Ensure the sleep completed (took at least 50ms)
+    try std.testing.expect(timer.read().toMilliseconds() >= 40);
+}
+
+test "runtime: recancel re-arms a delivered cancellation" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const recancelingTask = struct {
+        fn call() !void {
+            sleep(.fromMilliseconds(60_000)) catch |err| {
+                std.debug.assert(err == error.Canceled);
+                // The cancellation was consumed by the sleep; putting it back
+                // means the next cancellation point has to report it again.
+                recancel();
+                try checkCancel();
+                return error.TestUnexpectedResult;
+            };
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(recancelingTask, .{});
+    defer handle.cancel();
+
+    // Let the task reach the sleep before canceling it.
+    try runtime.sleep(.fromMilliseconds(10));
+    handle.cancel();
+
+    try std.testing.expectError(error.Canceled, handle.join());
+}
+
+test "runtime: yield from main allows tasks to run" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    var counter: usize = 0;
+
+    const yieldingTask = struct {
+        fn call(counter_ptr: *usize) !void {
+            for (0..10) |_| {
+                counter_ptr.* += 1;
+                try yield();
+            }
+        }
+    }.call;
+
+    var handle = try runtime.spawn(yieldingTask, .{&counter});
+    defer handle.cancel();
+
+    // Instead of join(), use yield() from main to let the task run
+    var iterations: usize = 0;
+    while (counter < 10) : (iterations += 1) {
+        if (iterations >= 100) {
+            std.debug.print("yield from main not working: counter={}, iterations={}\n", .{ counter, iterations });
+            return error.TestExpectedEqual;
+        }
+        try yield();
+    }
+
+    try std.testing.expectEqual(10, counter);
+}
+
+test "runtime: yield without an executor is a no-op" {
+    // No Runtime has been initialized on this thread, so there's no current
+    // executor. yield() should just fall back to an OS thread yield and return.
+    try yield();
+}
+
+test "runtime: maybeYield without an executor is a no-op" {
+    // Same as above, but for the fairness-checked variant.
+    try maybeYield();
+}
+
+test "runtime: maybeYield yields once the tick budget is spent" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+
+    var event: Event = .init;
+    var counter: usize = 0;
+
+    const waiterTask = struct {
+        fn call(reset_event: *Event, counter_ptr: *usize) !void {
+            try reset_event.wait();
+            counter_ptr.* += 1;
+        }
+    }.call;
+
+    // maybeYield() only does a real yield once the tick budget is spent, so the
+    // main loop below must be allowed at least one full budget of iterations.
+    const task_count = 18;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    for (0..task_count) |_| {
+        try group.spawn(waiterTask, .{ &event, &counter });
+    }
+
+    // Every task is now parked in event.wait(); wake them all at once so the
+    // main loop's maybeYield() has ready work to hand control to.
+    event.set();
+
+    var iterations: usize = 0;
+    while (counter < task_count) : (iterations += 1) {
+        if (iterations >= Executor.max_tick_budget * 2) {
+            std.debug.print("maybeYield not working: counter={}, iterations={}\n", .{ counter, iterations });
+            return error.TestExpectedEqual;
+        }
+        try maybeYield();
+    }
+
+    try std.testing.expectEqual(task_count, counter);
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+}
+
+test "runtime: sleep from main allows tasks to run" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    var counter: usize = 0;
+
+    const yieldingTask = struct {
+        fn call(counter_ptr: *usize) !void {
+            for (0..10) |_| {
+                counter_ptr.* += 1;
+                try yield();
+            }
+        }
+    }.call;
+
+    var handle = try runtime.spawn(yieldingTask, .{&counter});
+    defer handle.cancel();
+
+    // Instead of join(), use sleep() from main to let the task run
+    var iterations: usize = 0;
+    while (counter < 10) : (iterations += 1) {
+        if (iterations >= 100) {
+            std.debug.print("sleep from main not working: counter={}, iterations={}\n", .{ counter, iterations });
+            return error.TestExpectedEqual;
+        }
+        try runtime.sleep(.fromMilliseconds(1));
+    }
+
+    try std.testing.expectEqual(10, counter);
+}
+
+test "runtime: executor count is one under single_executor scheduling" {
+    if (multi_executor) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer runtime.deinit();
+    try std.testing.expectEqual(1, runtime.executors.items.len);
+}
+
+test "runtime: multi-threaded execution with 2 executors" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    const TestContext = struct {
+        var counter: usize = 0;
+
+        fn task(rt: *Runtime) !void {
+            try rt.sleep(.fromMilliseconds(10));
+            _ = @atomicRmw(usize, &counter, .Add, 1, .monotonic);
+        }
+    };
+
+    TestContext.counter = 0;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    for (0..4) |_| {
+        try group.spawn(TestContext.task, .{runtime});
+    }
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+
+    try std.testing.expectEqual(4, TestContext.counter);
+}
+
+test "runtime: a task stuck behind a waker that never yields is rescued" {
+    if (!migrates) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    const Channel = @import("sync/channel.zig").Channel;
+
+    const Ctx = struct {
+        wake: Channel(u32),
+        waiting: std.atomic.Value(bool) = .init(false),
+        ran: std.atomic.Value(bool) = .init(false),
+
+        fn waiter(ctx: *@This()) !void {
+            ctx.waiting.store(true, .release);
+            _ = try ctx.wake.receive();
+            ctx.ran.store(true, .release);
+        }
+
+        // Lets every executor park, then wakes the waiter, which queues on
+        // this executor without an announce, and keeps the executor busy
+        // without yielding: the waiter runs only if another executor takes it.
+        fn spinner(ctx: *@This()) !void {
+            while (!ctx.waiting.load(.acquire)) try yield();
+            try sleep(.fromMilliseconds(20));
+            try ctx.wake.send(1);
+            const deadline = Timestamp.now(.monotonic).addDuration(.fromSeconds(2));
+            while (!ctx.ran.load(.acquire)) {
+                if (Timestamp.now(.monotonic).toNanoseconds() >= deadline.toNanoseconds()) return error.Timeout;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var ctx: Ctx = .{ .wake = .init(&.{}) };
+
+    var group: Group = .init;
+    defer group.cancel();
+    try group.spawn(Ctx.waiter, .{&ctx});
+    try group.spawn(Ctx.spinner, .{&ctx});
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    try std.testing.expect(ctx.ran.load(.acquire));
+}
+
+test "runtime: local ring overflow spills and drains with pinned scheduling" {
+    // With pinned scheduling, spawn far more ready tasks than the local ring
+    // holds (capacity 256) so the ring spills into the executor's own overflow
+    // queue (the runqputslow path) and must drain every task back out. All are
+    // spawned before any drain, so the ring genuinely overflows. Two executors
+    // also covers the remote sub-path: tasks whose round-robin home is the other
+    // executor go straight to that executor's overflow queue.
+    if (zio_options.scheduling != .pinned) return error.SkipZigTest;
+
+    const H = struct {
+        const n_tasks = 2 * LocalRunQueue(WaitNode, migrates).capacity; // 512 >> 256
+
+        fn child(counter: *std.atomic.Value(u32)) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    var counter = std.atomic.Value(u32).init(0);
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    for (0..H.n_tasks) |_| {
+        try group.spawn(H.child, .{&counter});
+    }
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    try std.testing.expectEqual(@as(u32, H.n_tasks), counter.load(.monotonic));
+}
+
+test "runtime: spawnInto rejects fixed placements with work stealing" {
+    if (!migrates) return error.SkipZigTest;
+
+    const H = struct {
+        fn child() void {}
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    try std.testing.expectError(error.InvalidPlacement, runtime.spawnInto(.local, H.child, .{}));
+    try std.testing.expectError(error.InvalidPlacement, runtime.spawnInto(.{ .executor = 0 }, H.child, .{}));
+
+    var group: Group = .init;
+    defer group.cancel();
+    try std.testing.expectError(error.InvalidPlacement, group.spawnInto(.local, H.child, .{}));
+
+    var handle = try runtime.spawnInto(.auto, H.child, .{});
+    handle.join();
+}
+
+test "runtime: spawnInto keeps tasks on the chosen executor" {
+    if (migrates) return error.SkipZigTest;
+
+    const H = struct {
+        fn currentId() ExecutorId {
+            return getCurrentExecutor().id;
+        }
+
+        fn groupChild(expected: ExecutorId, mismatches: *std.atomic.Value(u32)) void {
+            if (currentId() != expected) _ = mismatches.fetchAdd(1, .monotonic);
+        }
+
+        fn parent(rt: *Runtime, id: ExecutorId) !void {
+            try std.testing.expectEqual(id, currentId());
+
+            var handle = try rt.spawnInto(.local, currentId, .{});
+            try std.testing.expectEqual(id, handle.join());
+
+            var mismatches = std.atomic.Value(u32).init(0);
+            var group: Group = .init;
+            defer group.cancel();
+            for (0..8) |_| {
+                try group.spawnInto(.local, groupChild, .{ id, &mismatches });
+            }
+            try group.wait();
+            try std.testing.expectEqual(0, mismatches.load(.monotonic));
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer runtime.deinit();
+
+    const n: ExecutorId = @intCast(runtime.executors.items.len);
+    for (0..n) |i| {
+        const id: ExecutorId = @intCast(i);
+        var handle = try runtime.spawnInto(.{ .executor = id }, H.parent, .{ runtime, id });
+        try handle.join();
+    }
+
+    try std.testing.expectError(error.InvalidPlacement, runtime.spawnInto(.{ .executor = n }, H.currentId, .{}));
+}
+
+test "runtime: spawnInto local placement from a foreign thread" {
+    if (migrates or builtin.single_threaded) return error.SkipZigTest;
+
+    const H = struct {
+        fn child() void {}
+
+        fn foreign(rt: *Runtime, result: *?anyerror) void {
+            var handle = rt.spawnInto(.local, child, .{}) catch |err| {
+                result.* = err;
+                return;
+            };
+            handle.detach();
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    var result: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, H.foreign, .{ runtime, &result });
+    thread.join();
+    try std.testing.expectEqual(error.InvalidPlacement, result.?);
+}
+
+test "runtime: multi-threaded execution with max executors" {
+    if (!multi_executor) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(Executor.max_executors) });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(Executor.max_executors, runtime.executors.items.len);
+}
+
+test "Runtime: multi-threaded with task migration" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(8) });
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+
+    const TestContext = struct {
+        group: *Group,
+        done: Event = .{},
+        counter: std.atomic.Value(u32) = .init(0),
+
+        fn task(ctx: *@This(), parent: *Event) !void {
+            parent.set();
+
+            const n = ctx.counter.fetchAdd(1, .acquire);
+            if (n >= 99) {
+                ctx.done.set();
+                return;
+            }
+
+            var event: Event = .{};
+            ctx.group.spawn(task, .{ ctx, &event }) catch |err| {
+                std.debug.print("task migration failed: {}\n", .{err});
+                return err;
+            };
+            event.wait() catch |err| {
+                std.debug.print("event wait failed: {}\n", .{err});
+                return err;
+            };
+        }
+    };
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    var ctx: TestContext = .{ .group = &group };
+
+    var event: Event = .{};
+
+    try group.spawn(TestContext.task, .{ &ctx, &event });
+
+    try ctx.done.wait();
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+
+    try std.testing.expectEqual(100, ctx.counter.load(.acquire));
+}
+
+test "runtime: wake-before-park awaken bit stress (single executor)" {
+    try wakeBeforeParkStress(1);
+}
+
+test "runtime: wake-before-park awaken bit stress (two executors)" {
+    try wakeBeforeParkStress(2);
+}
+
+fn wakeBeforeParkStress(executor_count: u6) !void {
+    const Event = @import("sync/Event.zig");
+
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(executor_count),
+    });
+    defer runtime.deinit();
+
+    const Ctx = struct {
+        // Number of ping-pong iterations to exercise the wake-before-park window.
+        const iterations: u32 = 10_000;
+
+        ping: Event = .{},
+        pong: Event = .{},
+        counter: std.atomic.Value(u32) = .init(0),
+
+        // Waits on ping each iteration — this is the task that parks, and the one
+        // whose awaken bit gets set when the waker fires between the condition check
+        // and the actual park CAS in processCleanup.park.
+        fn parker(ctx: *@This()) !void {
+            for (0..iterations) |_| {
+                try ctx.ping.wait();
+                ctx.ping.reset();
+                _ = ctx.counter.fetchAdd(1, .release);
+                ctx.pong.set();
+            }
+        }
+
+        // Fires ping immediately each iteration, without waiting for parker to park first.
+        // With two executors this races directly with the park CAS, exercising the path
+        // where scheduleTask sets awaken=true on a .ready task and processCleanup.park
+        // consumes the token instead of transitioning to .waiting.
+        fn waker(ctx: *@This()) !void {
+            for (0..iterations) |_| {
+                ctx.ping.set();
+                try ctx.pong.wait();
+                ctx.pong.reset();
+            }
+        }
+    };
+
+    var ctx: Ctx = .{};
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(Ctx.parker, .{&ctx});
+    try group.spawn(Ctx.waker, .{&ctx});
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    // Any lost wake would cause parker to hang in ping.wait() forever — group.wait()
+    // would never return. The counter confirms all iterations ran to completion.
+    try std.testing.expectEqual(Ctx.iterations, ctx.counter.load(.acquire));
+}
+
+test "runtime: mutex contention with task migration" {
+    const Mutex = @import("sync/Mutex.zig");
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    var mutex: Mutex = .init;
+    var counter: u32 = 0;
+
+    const Worker = struct {
+        fn run(m: *Mutex, c: *u32) !void {
+            for (0..1_000) |_| {
+                try m.lock();
+                defer m.unlock();
+                c.* += 1;
+            }
+        }
+    };
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(Worker.run, .{ &mutex, &counter });
+    try group.spawn(Worker.run, .{ &mutex, &counter });
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    try std.testing.expectEqual(2_000, counter);
+}
+
+test "runtime: disable main executor" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // Create a runtime where the calling thread is not an executor.
+    // All tasks run on background worker threads.
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(2),
+        .enable_main_executor = false,
+    });
+    defer runtime.deinit();
+
+    const compute = struct {
+        fn call(x: i32) i32 {
+            return x * 2;
+        }
+    }.call;
+
+    // Spawn tasks and join from the non-executor calling thread.
+    // join() blocks via OS futex when called outside an executor context.
+    var handle = try runtime.spawn(compute, .{21});
+    const result = handle.join();
+    try std.testing.expectEqual(42, result);
+}
+
+test "runtime: installs a SIGPIPE handler while the disposition is default" {
+    if (comptime !have_sig_pipe) return error.SkipZigTest;
+
+    // The test runner's std.Io.Threaded already owns SIGPIPE, so stash its
+    // disposition, run the whole test from SIG_DFL, and restore at the end.
+    var saved: os.posix.Sigaction = undefined;
+    os.posix.sigaction(os.posix.SIG.PIPE, null, &saved);
+    defer os.posix.sigaction(os.posix.SIG.PIPE, &saved, null);
+
+    const dfl: os.posix.Sigaction = .{
+        .handler = .{ .handler = os.posix.SIG.DFL },
+        .mask = os.posix.sigemptyset(),
+        .flags = 0,
+    };
+    os.posix.sigaction(os.posix.SIG.PIPE, &dfl, null);
+
+    var current: os.posix.Sigaction = undefined;
+    {
+        const runtime = try Runtime.init(std.testing.allocator, .{});
+        defer runtime.deinit();
+
+        // The runtime replaced SIG_DFL with its do-nothing handler.
+        os.posix.sigaction(os.posix.SIG.PIPE, null, &current);
+        try std.testing.expect(current.handler.handler != os.posix.SIG.DFL);
+
+        // The proof: without the handler this write kills the test process.
+        const fds = try os.fs.pipe();
+        os.fs.close(fds[0]) catch {};
+        defer os.fs.close(fds[1]) catch {};
+        try std.testing.expectError(error.BrokenPipe, os.fs.write(fds[1], "x"));
+    }
+
+    // deinit restored SIG_DFL.
+    os.posix.sigaction(os.posix.SIG.PIPE, null, &current);
+    try std.testing.expect(current.handler.handler == os.posix.SIG.DFL);
+
+    // Overlapping lifetimes: the disposition is owned by the group of live
+    // runtimes, so the first deinit must not strip protection from the second.
+    // Worker-thread executors only — two main executors cannot share the test
+    // thread (loop thread-affinity).
+    if (!builtin.single_threaded) {
+        const opts: RuntimeOptions = .{ .executors = .exact(1), .enable_main_executor = false };
+        const a = try Runtime.init(std.testing.allocator, opts);
+        const b = try Runtime.init(std.testing.allocator, opts);
+        a.deinit();
+        os.posix.sigaction(os.posix.SIG.PIPE, null, &current);
+        try std.testing.expect(current.handler.handler != os.posix.SIG.DFL);
+        b.deinit();
+        os.posix.sigaction(os.posix.SIG.PIPE, null, &current);
+        try std.testing.expect(current.handler.handler == os.posix.SIG.DFL);
+    }
+
+    // A non-default (embedder-owned) disposition must be left alone.
+    os.posix.sigaction(os.posix.SIG.PIPE, &saved, null);
+    {
+        const runtime = try Runtime.init(std.testing.allocator, .{});
+        defer runtime.deinit();
+        os.posix.sigaction(os.posix.SIG.PIPE, null, &current);
+        try std.testing.expect(current.handler.handler == saved.handler.handler);
+    }
+}
+
+test "runtime: a busy ring still drains cross-thread wakes from the overflow queue" {
+    // A ring that keeps refilling itself never empties, so it never reaches the
+    // batch refill: the inner drain exits on tick budget with tasks still queued.
+    // A task woken from a foreign thread lands in the overflow queue, whose only
+    // consumer is this executor, so without the per-check single-task peek it
+    // waits for the spinners to finish rather than for the wake.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Event = @import("sync/Event.zig");
+
+    const H = struct {
+        // Bounds the failing case: without the peek the spinners run to the cap
+        // instead of being stopped by the woken task, so the test fails rather
+        // than hangs. Counted from the wake rather than from the first yield:
+        // how long the foreign thread takes to start and reach set() is the
+        // machine's business, it swamps the wait being measured, and charging
+        // it here is what made this flaky on a loaded CI runner.
+        const spin_cap: u32 = 2_000_000;
+        // The foreign thread waits for this many yields before signaling, so the
+        // wake is guaranteed to land while the ring is busy.
+        const spin_before_wake: u32 = 1_000;
+
+        fn spinner(stop: *std.atomic.Value(bool), ticks: *std.atomic.Value(u32), hit_cap: *std.atomic.Value(bool), signaled: *std.atomic.Value(bool)) !void {
+            var i: u32 = 0;
+            while (!stop.load(.acquire)) {
+                if (signaled.load(.acquire)) {
+                    if (i == spin_cap) {
+                        hit_cap.store(true, .release);
+                        return;
+                    }
+                    i += 1;
+                }
+                _ = ticks.fetchAdd(1, .monotonic);
+                try yield();
+            }
+        }
+
+        fn waiter(event: *Event, stop: *std.atomic.Value(bool), woken: *std.atomic.Value(bool)) !void {
+            try event.wait();
+            woken.store(true, .release);
+            stop.store(true, .release);
+        }
+
+        fn signaler(event: *Event, ticks: *std.atomic.Value(u32), signaled: *std.atomic.Value(bool)) void {
+            while (ticks.load(.monotonic) < spin_before_wake) os.thread.yield();
+            // Before set(), so the cap starts counting no later than the wake
+            // it is there to measure.
+            signaled.store(true, .release);
+            event.set();
+        }
+    };
+
+    // One executor: the overflow queue then has exactly one possible consumer,
+    // and no thief can rescue the woken task.
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    var event = Event.init;
+    var stop = std.atomic.Value(bool).init(false);
+    var ticks = std.atomic.Value(u32).init(0);
+    var hit_cap = std.atomic.Value(bool).init(false);
+    var signaled = std.atomic.Value(bool).init(false);
+    var woken = std.atomic.Value(bool).init(false);
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(H.waiter, .{ &event, &stop, &woken });
+    try group.spawn(H.spinner, .{ &stop, &ticks, &hit_cap, &signaled });
+
+    const thread = try std.Thread.spawn(.{}, H.signaler, .{ &event, &ticks, &signaled });
+    defer thread.join();
+
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+
+    try std.testing.expect(woken.load(.acquire));
+    // The spinner was stopped by the wake, not by its own cap.
+    try std.testing.expect(!hit_cap.load(.acquire));
+}
+
+test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
+    if (!zio_options.debug_cancel) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const T = struct {
+        fn swallow() !void {
+            sleep(.fromSeconds(60)) catch {};
+            sleep(.fromMilliseconds(1)) catch return error.TestUnexpectedResult;
+            try std.testing.expect(getCurrentTaskOrNull().?.cancel_debug.reported);
+        }
+
+        fn propagate() !void {
+            sleep(.fromSeconds(60)) catch {
+                recancel();
+                try std.testing.expectError(error.Canceled, sleep(.fromMilliseconds(1)));
+                try std.testing.expect(!getCurrentTaskOrNull().?.cancel_debug.reported);
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var swallowing = try runtime.spawn(T.swallow, .{});
+    defer swallowing.cancel();
+    var propagating = try runtime.spawn(T.propagate, .{});
+    defer propagating.cancel();
+
+    try runtime.sleep(.fromMilliseconds(10));
+    swallowing.cancel();
+    propagating.cancel();
+    try swallowing.join();
+    try propagating.join();
+}

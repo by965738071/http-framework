@@ -1,0 +1,918 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const posix = @import("../../os/posix.zig");
+const net = @import("../../os/net.zig");
+const time = @import("../../os/time.zig");
+const Duration = @import("../../time.zig").Duration;
+const common = @import("common.zig");
+const LoopState = @import("../loop.zig").LoopState;
+const Completion = @import("../completion.zig").Completion;
+const Op = @import("../completion.zig").Op;
+const Queue = @import("../queue.zig").Queue;
+const NetConnect = @import("../completion.zig").NetConnect;
+const NetAccept = @import("../completion.zig").NetAccept;
+const NetRecv = @import("../completion.zig").NetRecv;
+const NetSend = @import("../completion.zig").NetSend;
+const NetRecvFrom = @import("../completion.zig").NetRecvFrom;
+const NetSendTo = @import("../completion.zig").NetSendTo;
+const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
+const NetRecvMmsg = @import("../completion.zig").NetRecvMmsg;
+const NetSendMsg = @import("../completion.zig").NetSendMsg;
+const NetPoll = @import("../completion.zig").NetPoll;
+const PipePoll = @import("../completion.zig").PipePoll;
+const PipeClose = @import("../completion.zig").PipeClose;
+
+pub const NetHandle = net.fd_t;
+
+const Support = @import("../completion.zig").Support;
+const WallTimerMode = @import("../completion.zig").WallTimerMode;
+const fs = @import("../../os/fs.zig");
+
+/// Nothing but the poll timeout, so every wall deadline rides the cap.
+pub const wall_timer_modes: [3]WallTimerMode = .{ .fallback, .fallback, .fallback };
+pub const supports_nonblocking_file_io = false;
+pub const supports_recv_dontwait = true;
+pub const supports_recvmmsg = net.has_recvmmsg;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        .file_read_streaming, .file_write_streaming => .maybe,
+        .net_send_file,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_read,
+        .file_write,
+        .file_sync,
+        .file_sync_range,
+        .file_set_size,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        .process_wait,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_recvmmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        => .yes,
+    };
+}
+
+pub fn supports(_: *const Self, comptime op: Op, data: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_read_streaming or op == .file_write_streaming) {
+        return common.resolveStreamingSupport(data);
+    }
+    @compileError("unhandled runtime poll capability: " ++ @tagName(op));
+}
+
+pub const SharedState = struct {};
+
+pub const NetOpenError = error{
+    Unexpected,
+};
+
+pub const NetShutdownHow = net.ShutdownHow;
+pub const NetShutdownError = error{
+    Unexpected,
+};
+
+const PollEntryType = enum {
+    connect,
+    accept,
+    send_or_recv,
+};
+
+const PollEntry = struct {
+    completions: Queue(Completion),
+    type: PollEntryType,
+    index: usize,
+};
+
+const Self = @This();
+
+const log = @import("../../common.zig").log;
+
+allocator: std.mem.Allocator,
+poll_queue: std.AutoHashMapUnmanaged(NetHandle, PollEntry) = .empty,
+poll_fds: std.ArrayList(net.pollfd) = .empty,
+waker_read_fd: net.fd_t = undefined,
+waker_write_fd: net.fd_t = undefined,
+queue_size: u16,
+pending_changes: usize = 0,
+/// Backend-internal inflight count: ops accepted by submit() and not yet
+/// completed. This backend is strictly per-loop (submit and completion on the
+/// owner thread), so a plain counter suffices. Read by hasInflight() to skip
+/// the poll syscall when nothing can arrive.
+inflight: usize = 0,
+
+pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    _ = shared_state;
+
+    const waker_fds = switch (builtin.os.tag) {
+        .windows => try net.createLoopbackSocketPair(),
+        else => try posix.pipe(.{ .nonblocking = true, .cloexec = true }),
+    };
+
+    self.* = .{
+        .allocator = allocator,
+        .waker_read_fd = waker_fds[0],
+        .waker_write_fd = waker_fds[1],
+        .queue_size = queue_size,
+    };
+    errdefer {
+        net.close(self.waker_read_fd);
+        net.close(self.waker_write_fd);
+    }
+
+    try self.poll_fds.ensureTotalCapacity(self.allocator, queue_size);
+    errdefer self.poll_fds.deinit(self.allocator);
+
+    try self.poll_queue.ensureTotalCapacity(self.allocator, queue_size);
+    errdefer self.poll_queue.deinit(self.allocator);
+
+    // Add waker read fd to poll_fds
+    try self.poll_fds.append(self.allocator, .{
+        .fd = self.waker_read_fd,
+        .events = net.POLL.IN,
+        .revents = 0,
+    });
+}
+
+pub fn deinit(self: *Self) void {
+    net.close(self.waker_read_fd);
+    net.close(self.waker_write_fd);
+    self.poll_queue.deinit(self.allocator);
+    self.poll_fds.deinit(self.allocator);
+}
+
+pub fn wake(self: *Self, state: *LoopState) void {
+    _ = state;
+    const byte: [1]u8 = .{1};
+    // A silently failed write strands the sleeping loop until its poll
+    // timeout: wake_requested is already set, so later wakers skip the
+    // syscall. A full pipe is fine (the pending bytes already make the
+    // waker fd readable); anything else means the waker is broken and
+    // every subsequent wake would be lost, so fail loudly.
+    switch (builtin.os.tag) {
+        .windows => {
+            _ = net.send(self.waker_write_fd, &[_]net.iovec_const{net.iovecConstFromSlice(&byte)}, .{}) catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => std.debug.panic("poll: waker send failed: {t}", .{err}),
+            };
+        },
+        else => {
+            // Raw write, not fs.write: the waker runs on any thread and needs
+            // neither the cancel bracket nor its error surface.
+            while (true) {
+                const rc = posix.system.write(self.waker_write_fd, &byte, byte.len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    // Full pipe: the pending bytes already make the fd readable.
+                    .AGAIN => break,
+                    else => |err| std.debug.panic("poll: waker write failed: {t}", .{err}),
+                }
+            }
+        },
+    }
+}
+
+fn drainWaker(self: *Self) void {
+    var buf: [64]u8 = undefined;
+    switch (builtin.os.tag) {
+        .windows => {
+            var bufs: [1]net.iovec = .{net.iovecFromSlice(&buf)};
+            _ = net.recv(self.waker_read_fd, &bufs, .{}) catch {};
+        },
+        else => {
+            _ = fs.read(self.waker_read_fd, &buf) catch {};
+        },
+    }
+}
+
+fn getEvents(completion: *Completion) @FieldType(net.pollfd, "events") {
+    return switch (completion.op) {
+        .net_connect => net.POLL.OUT,
+        .net_accept => net.POLL.IN,
+        .net_recv => net.POLL.IN,
+        .net_send => net.POLL.OUT,
+        .net_recvfrom => net.POLL.IN,
+        .net_sendto => net.POLL.OUT,
+        .net_recvmsg => net.POLL.IN,
+        .net_recvmmsg => net.POLL.IN,
+        .net_sendmsg => net.POLL.OUT,
+        .net_poll => blk: {
+            const poll_data = completion.cast(NetPoll);
+            break :blk switch (poll_data.event) {
+                .recv => net.POLL.IN,
+                .send => net.POLL.OUT,
+            };
+        },
+        // Pipe operations not supported on Windows (poll uses SOCKET, not HANDLE - Windows uses IOCP)
+        .file_read_streaming => if (builtin.os.tag == .windows) unreachable else net.POLL.IN,
+        .file_write_streaming => if (builtin.os.tag == .windows) unreachable else net.POLL.OUT,
+        .pipe_poll => if (builtin.os.tag == .windows) unreachable else blk: {
+            const poll_data = completion.cast(PipePoll);
+            break :blk switch (poll_data.event) {
+                .read => net.POLL.IN,
+                .write => net.POLL.OUT,
+            };
+        },
+        else => unreachable,
+    };
+}
+
+fn getPollType(op: Op) PollEntryType {
+    return switch (op) {
+        .net_accept => .accept,
+        .net_connect => .connect,
+        .net_recv => .send_or_recv,
+        .net_send => .send_or_recv,
+        .net_recvfrom => .send_or_recv,
+        .net_sendto => .send_or_recv,
+        .net_recvmsg => .send_or_recv,
+        .net_recvmmsg => .send_or_recv,
+        .net_sendmsg => .send_or_recv,
+        .net_poll => .send_or_recv,
+        .file_read_streaming, .file_write_streaming => if (builtin.os.tag == .windows) unreachable else .send_or_recv,
+        .pipe_poll => if (builtin.os.tag == .windows) unreachable else .send_or_recv,
+        else => unreachable,
+    };
+}
+
+/// Try a socket op once before it joins the poll set, as the sockreg backends
+/// do: a ready socket completes inline without a poll round trip, and a
+/// dontwait receive on an empty queue completes as WouldBlock here instead of
+/// waiting for readiness it never asked for.
+fn submitSocketIo(self: *Self, state: *LoopState, fd: NetHandle, c: *Completion) void {
+    const events = getEvents(c);
+    const item: net.pollfd = .{ .fd = fd, .events = events, .revents = events };
+    switch (checkCompletion(c, &item)) {
+        .completed => state.markCompletedFromBackend(c),
+        .requeue => self.addToPollQueue(state, fd, c),
+    }
+}
+
+/// Add a completion to the poll queue, merging with existing fd if present.
+/// If queuing fails, completes the completion with error.Unexpected.
+fn addToPollQueue(self: *Self, state: *LoopState, fd: NetHandle, completion: *Completion) void {
+    // If at capacity, flush with non-blocking poll to drain completions
+    if (self.pending_changes >= self.queue_size) {
+        _ = self.poll(state, .zero) catch {
+            log.err("Failed to do no-wait poll during addToPollQueue", .{});
+        };
+    }
+    self.pending_changes += 1;
+
+    completion.prev = null;
+    completion.next = null;
+
+    const gop = self.poll_queue.getOrPut(self.allocator, fd) catch {
+        log.err("Failed to add to poll queue: OutOfMemory", .{});
+        completion.setError(error.Unexpected);
+        state.markCompletedFromBackend(completion);
+        return;
+    };
+
+    var entry = gop.value_ptr;
+    const op_events = getEvents(completion);
+
+    if (!gop.found_existing) {
+        self.poll_fds.append(self.allocator, .{ .fd = fd, .events = op_events, .revents = 0 }) catch {
+            log.err("Failed to append to poll_fds: OutOfMemory", .{});
+            _ = self.poll_queue.remove(fd);
+            completion.setError(error.Unexpected);
+            state.markCompletedFromBackend(completion);
+            return;
+        };
+        entry.* = .{
+            .completions = .{},
+            .type = getPollType(completion.op),
+            .index = self.poll_fds.items.len - 1,
+        };
+        entry.completions.push(completion);
+        return;
+    }
+
+    std.debug.assert(entry.type == getPollType(completion.op));
+
+    self.poll_fds.items[entry.index].events |= op_events;
+    entry.completions.push(completion);
+}
+
+fn removeFromPollQueue(self: *Self, fd: NetHandle, completion: *Completion) !void {
+    const entry = self.poll_queue.getPtr(fd) orelse return;
+
+    _ = entry.completions.remove(completion);
+    if (entry.completions.head == null) {
+        // No more completions - remove from poll list and poll queue
+        const removed_pollfd = self.poll_fds.swapRemove(entry.index);
+        std.debug.assert(removed_pollfd.fd == fd);
+
+        // Because we swapped the position with the last fd,
+        // we need to update the index of that fd in the poll queue
+        if (entry.index < self.poll_fds.items.len) {
+            const updated_fd = self.poll_fds.items[entry.index].fd;
+            if (self.poll_queue.getPtr(updated_fd)) |updated_entry| {
+                updated_entry.index = entry.index;
+            }
+        }
+
+        // Now we can remove the entry from the poll queue
+        const was_removed = self.poll_queue.remove(fd);
+        std.debug.assert(was_removed);
+        return;
+    }
+
+    // Recalculate events from remaining completions
+    var new_events: @FieldType(net.pollfd, "events") = 0;
+    var iter: ?*Completion = entry.completions.head;
+    while (iter) |c| : (iter = c.next) {
+        new_events |= getEvents(c);
+    }
+
+    self.poll_fds.items[entry.index].events = new_events;
+}
+
+fn getHandle(completion: *Completion) NetHandle {
+    return switch (completion.op) {
+        .net_accept => completion.cast(NetAccept).handle,
+        .net_connect => completion.cast(NetConnect).handle,
+        .net_recv => completion.cast(NetRecv).handle,
+        .net_send => completion.cast(NetSend).handle,
+        .net_recvfrom => completion.cast(NetRecvFrom).handle,
+        .net_sendto => completion.cast(NetSendTo).handle,
+        .net_recvmsg => completion.cast(NetRecvMsg).handle,
+        .net_recvmmsg => completion.cast(NetRecvMmsg).handle,
+        .net_sendmsg => completion.cast(NetSendMsg).handle,
+        .net_poll => completion.cast(NetPoll).handle,
+        // Pipe handles are only compatible with NetHandle on non-Windows (Windows uses IOCP)
+        inline .file_read_streaming, .file_write_streaming => |op| if (builtin.os.tag == .windows) unreachable else completion.cast(op.toType()).handle,
+        .pipe_close => if (builtin.os.tag == .windows) unreachable else completion.cast(PipeClose).handle,
+        .pipe_poll => if (builtin.os.tag == .windows) unreachable else completion.cast(PipePoll).handle,
+        else => unreachable,
+    };
+}
+
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend on the
+/// owner thread.
+pub fn decrInflight(self: *Self) void {
+    self.inflight -= 1;
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.inflight > 0;
+}
+
+/// Submit a completion to the backend - infallible.
+/// On error, completes the operation immediately with error.Unexpected.
+/// `op` is `c.op`, passed at compile time so each op compiles to its own
+/// specialized submit with no runtime dispatch on the op.
+pub fn submit(self: *Self, state: *LoopState, comptime op: Op, c: *Completion) void {
+    // Counted for every accepted op (sync completers decrement right back via
+    // markCompletedFromBackend), mirroring the decrInflight in every completion
+    // path so the balance needs no per-path reasoning.
+    self.inflight += 1;
+
+    switch (op) {
+        .group, .timer, .async, .work => unreachable, // Managed by the loop
+
+        // Synchronous operations - complete immediately
+        .net_open => {
+            common.handleNetOpen(c);
+            state.markCompletedFromBackend(c);
+        },
+        .net_bind => {
+            common.handleNetBind(c);
+            state.markCompletedFromBackend(c);
+        },
+        .net_listen => {
+            common.handleNetListen(c);
+            state.markCompletedFromBackend(c);
+        },
+        .net_close => {
+            common.handleNetClose(c);
+            state.markCompletedFromBackend(c);
+        },
+        .net_shutdown => {
+            common.handleNetShutdown(c);
+            state.markCompletedFromBackend(c);
+        },
+
+        // Connect - must call connect() first
+        .net_connect => {
+            const data = c.cast(NetConnect);
+            if (net.connect(data.handle, data.addr, data.addr_len)) |_| {
+                // Connected immediately (e.g., localhost)
+                c.setResult(.net_connect, {});
+                state.markCompletedFromBackend(c);
+            } else |err| switch (err) {
+                error.WouldBlock, error.ConnectionPending => {
+                    // Queue for completion - addToPollQueue handles errors
+                    self.addToPollQueue(state, data.handle, c);
+                },
+                else => {
+                    c.setError(err);
+                    state.markCompletedFromBackend(c);
+                },
+            }
+        },
+
+        // Socket I/O: try the syscall once, park on WouldBlock
+        .net_accept => {
+            const data = c.cast(NetAccept);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_recv => {
+            const data = c.cast(NetRecv);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_send => {
+            const data = c.cast(NetSend);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_recvfrom => {
+            const data = c.cast(NetRecvFrom);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_sendto => {
+            const data = c.cast(NetSendTo);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_recvmsg => {
+            const data = c.cast(NetRecvMsg);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_recvmmsg => {
+            const data = c.cast(NetRecvMmsg);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        .net_sendmsg => {
+            const data = c.cast(NetSendMsg);
+            self.submitSocketIo(state, data.handle, c);
+        },
+        // Readiness only: nothing to try, wait for the event
+        .net_poll => {
+            const data = c.cast(NetPoll);
+            self.addToPollQueue(state, data.handle, c);
+        },
+
+        .pipe_poll => {
+            if (builtin.os.tag == .windows) {
+                c.setError(error.Unexpected);
+                state.markCompletedFromBackend(c);
+                return;
+            }
+            const data = c.cast(PipePoll);
+            self.addToPollQueue(state, data.handle, c);
+        },
+
+        // Pipe operations (not supported on Windows - poll uses SOCKET, not HANDLE; Windows uses IOCP)
+        .pipe_create => {
+            const fds = fs.pipe() catch |err| {
+                c.setError(err);
+                state.markCompletedFromBackend(c);
+                return;
+            };
+            c.setResult(.pipe_create, fds);
+            state.markCompletedFromBackend(c);
+        },
+        // Streaming file I/O is routed here by the loop only when the fd is
+        // pollable (non-seekable), so it is handled exactly like pipe read/write.
+        .file_read_streaming, .file_write_streaming => {
+            if (builtin.os.tag == .windows) {
+                c.setError(error.Unexpected);
+                state.markCompletedFromBackend(c);
+                return;
+            }
+            self.addToPollQueue(state, c.cast(op.toType()).handle, c);
+        },
+        .pipe_close => {
+            if (builtin.os.tag == .windows) {
+                c.setError(error.Unexpected);
+                state.markCompletedFromBackend(c);
+                return;
+            }
+            const data = c.cast(PipeClose);
+            if (fs.close(data.handle)) |_| {
+                c.setResult(.pipe_close, {});
+            } else |err| {
+                c.setError(err);
+            }
+            state.markCompletedFromBackend(c);
+        },
+
+        // File operations, process_wait and device_io_control are handled by Loop via thread pool
+        .file_open, .file_create, .file_close, .file_read, .file_write, .file_sync, .file_sync_range, .file_size, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .file_stat, .dir_open, .dir_close, .dir_read, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control, .process_wait => unreachable,
+        // Driven by Loop's generic read/write fallback, never reaches the backend.
+        .net_send_file => unreachable,
+        .mach_port => unreachable,
+    }
+}
+
+/// Cancel a completion - infallible.
+/// Note: target.canceled is already set by loop.add() or loop.cancel() before this is called.
+pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
+    // Try to remove from queue
+    const fd = getHandle(target);
+    self.removeFromPollQueue(fd, target) catch {
+        // Removal failed - target is still in queue, let it complete naturally
+        log.err("Failed to remove completion from poll queue during cancel", .{});
+        return;
+    };
+
+    // Successfully removed - complete target with error.Canceled
+    target.setError(error.Canceled);
+    state.markCompletedFromBackend(target);
+}
+
+pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    const timeout_ms: i32 = std.math.cast(i32, timeout.toMilliseconds()) orelse std.math.maxInt(i32);
+
+    // Reset pending changes counter before poll (less aggressive)
+    self.pending_changes = 0;
+
+    const n = try net.poll(self.poll_fds.items, timeout_ms);
+
+    if (n == 0) {
+        return true; // Timed out
+    }
+
+    var i: usize = 0;
+    while (i < self.poll_fds.items.len) {
+        const item = &self.poll_fds.items[i];
+        if (item.revents == 0) {
+            i += 1;
+            continue;
+        }
+
+        const fd = item.fd;
+
+        // Check if this is the async wakeup fd
+        if (fd == self.waker_read_fd) {
+            self.drainWaker();
+            i += 1;
+            continue;
+        }
+
+        const entry = self.poll_queue.get(fd) orelse unreachable;
+
+        var iter: ?*Completion = entry.completions.head;
+        while (iter) |completion| {
+            iter = completion.next;
+
+            // Skip if already completed (can happen with cancellations)
+            if (completion.loadState().phase != .running) {
+                continue;
+            }
+
+            switch (checkCompletion(completion, item)) {
+                .completed => {
+                    try self.removeFromPollQueue(fd, completion);
+                    state.markCompletedFromBackend(completion);
+                },
+                .requeue => {
+                    // Spurious wakeup - keep in poll queue
+                },
+            }
+        }
+
+        // Only increment if the fd at position i is still the same.
+        // If it changed, swapRemove moved a different fd here, so reprocess.
+        if (item.fd == fd) {
+            i += 1;
+        }
+    }
+
+    return false; // Did not timeout, woke up due to events
+}
+
+const CheckResult = enum { completed, requeue };
+
+fn handlePollError(item: *const net.pollfd, comptime errnoToError: fn (net.E) anyerror) ?anyerror {
+    const has_error = (item.revents & net.POLL.ERR) != 0;
+    const has_hup = (item.revents & net.POLL.HUP) != 0;
+    if (!has_error and !has_hup) return null;
+
+    const sock_err = net.getSockError(item.fd) catch return error.Unexpected;
+    if (sock_err == 0) return null; // No actual error, caller should retry operation
+    return errnoToError(@fromBackingInt(@intCast(sock_err)));
+}
+
+fn checkSpuriousWakeup(result: anytype) CheckResult {
+    if (result) |_| {
+        return .completed;
+    } else |err| switch (err) {
+        error.WouldBlock => return .requeue,
+        else => return .completed,
+    }
+}
+
+pub fn checkCompletion(c: *Completion, item: *const net.pollfd) CheckResult {
+    switch (c.op) {
+        .net_connect => {
+            if (handlePollError(item, net.errnoToConnectError)) |err| {
+                c.setError(err);
+            } else {
+                c.setResult(.net_connect, {});
+            }
+            return .completed;
+        },
+        .net_accept => {
+            const data = c.cast(NetAccept);
+            if (handlePollError(item, net.errnoToAcceptError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.accept(data.handle, data.addr, data.addr_len, data.flags)) |handle| {
+                c.setResult(.net_accept, handle);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_recv => {
+            const data = c.cast(NetRecv);
+            if (handlePollError(item, net.errnoToRecvError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.recv(data.handle, data.buffers.iovecs, data.flags)) |n| {
+                c.setResult(.net_recv, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => {
+                    if (data.flags.dontwait) {
+                        c.setError(err);
+                        return .completed;
+                    }
+                    return .requeue;
+                },
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_send => {
+            const data = c.cast(NetSend);
+            if (handlePollError(item, net.errnoToSendError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.send(data.handle, data.buffer.iovecs, data.flags)) |n| {
+                c.setResult(.net_send, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_recvfrom => {
+            const data = c.cast(NetRecvFrom);
+            if (handlePollError(item, net.errnoToRecvError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.recvfrom(data.handle, data.buffer.iovecs, data.flags, data.addr, data.addr_len)) |n| {
+                c.setResult(.net_recvfrom, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => {
+                    if (data.flags.dontwait) {
+                        c.setError(err);
+                        return .completed;
+                    }
+                    return .requeue;
+                },
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_sendto => {
+            const data = c.cast(NetSendTo);
+            if (handlePollError(item, net.errnoToSendError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.sendto(data.handle, data.buffer.iovecs, data.flags, data.addr, data.addr_len)) |n| {
+                c.setResult(.net_sendto, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_recvmsg => {
+            const data = c.cast(NetRecvMsg);
+            if (handlePollError(item, net.errnoToRecvError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.recvmsg(data.handle, data.data.iovecs, data.flags, data.addr, data.addr_len, data.control)) |result| {
+                c.setResult(.net_recvmsg, result);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => {
+                    if (data.flags.dontwait) {
+                        c.setError(err);
+                        return .completed;
+                    }
+                    return .requeue;
+                },
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_recvmmsg => {
+            const data = c.cast(NetRecvMmsg);
+            if (handlePollError(item, net.errnoToRecvError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (data.recvFromSlots()) |count| {
+                c.setResult(.net_recvmmsg, count);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_sendmsg => {
+            const data = c.cast(NetSendMsg);
+            if (handlePollError(item, net.errnoToSendError)) |err| {
+                c.setError(err);
+                return .completed;
+            }
+            if (net.sendmsg(data.handle, data.data.iovecs, data.flags, data.addr, data.addr_len, data.control)) |n| {
+                c.setResult(.net_sendmsg, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .net_poll => {
+            // For poll operations, we want to know when the socket is "ready"
+            // This includes error conditions (POLLERR, POLLHUP) because they
+            // indicate the socket is ready to return an error on the next I/O
+            const has_error = (item.revents & net.POLL.ERR) != 0;
+            const has_hup = (item.revents & net.POLL.HUP) != 0;
+
+            if (has_error or has_hup) {
+                // Socket has error or hangup - it's "ready" in the sense that
+                // the next I/O operation will complete (with an error)
+                c.setResult(.net_poll, {});
+                return .completed;
+            }
+
+            // Check if the requested events are actually ready
+            const requested_events = getEvents(c);
+            const ready_events = item.revents & requested_events;
+            if (ready_events != 0) {
+                c.setResult(.net_poll, {});
+                return .completed;
+            }
+            // Requested events not ready yet - requeue
+            return .requeue;
+        },
+        // Pipe operations not supported on Windows (poll uses SOCKET, not HANDLE - Windows uses IOCP)
+        inline .file_read_streaming => |op| if (builtin.os.tag == .windows) unreachable else {
+            const data = c.cast(op.toType());
+            // Try to read - there might still be data in the pipe buffer
+            if (fs.readv(data.handle, data.buffer.iovecs)) |n| {
+                c.setResult(op, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => {
+                    // For pipes, HUP means the write end is closed
+                    // If we got WouldBlock and HUP is set, that's EOF (no more data)
+                    const has_hup = (item.revents & net.POLL.HUP) != 0;
+                    if (has_hup) {
+                        c.setResult(op, 0);
+                        return .completed;
+                    }
+                    return .requeue;
+                },
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        inline .file_write_streaming => |op| if (builtin.os.tag == .windows) unreachable else {
+            const data = c.cast(op.toType());
+            // For pipes, check for errors but don't use getSockError
+            const has_error = (item.revents & net.POLL.ERR) != 0;
+            const has_hup = (item.revents & net.POLL.HUP) != 0;
+            if (has_error or has_hup) {
+                // Pipe error or read end closed
+                c.setError(error.BrokenPipe);
+                return .completed;
+            }
+            if (fs.writev(data.handle, data.buffer.iovecs)) |n| {
+                c.setResult(op, n);
+                return .completed;
+            } else |err| switch (err) {
+                error.WouldBlock => return .requeue,
+                else => {
+                    c.setError(err);
+                    return .completed;
+                },
+            }
+        },
+        .pipe_poll => if (builtin.os.tag == .windows) unreachable else {
+            // For poll operations, we want to know when the fd is "ready"
+            const has_error = (item.revents & net.POLL.ERR) != 0;
+            const has_hup = (item.revents & net.POLL.HUP) != 0;
+
+            if (has_error or has_hup) {
+                // Stream has error or hangup - it's "ready"
+                c.setResult(.pipe_poll, {});
+                return .completed;
+            }
+
+            // Check if the requested events are actually ready
+            const requested_events = getEvents(c);
+            const ready_events = item.revents & requested_events;
+            if (ready_events != 0) {
+                c.setResult(.pipe_poll, {});
+                return .completed;
+            }
+            // Requested events not ready yet - requeue
+            return .requeue;
+        },
+        .pipe_create => unreachable, // Handled synchronously in submit
+        .pipe_close => unreachable, // Handled synchronously in submit
+        else => {
+            std.debug.panic("unexpected completion type in complete: {}", .{c.op});
+        },
+    }
+}

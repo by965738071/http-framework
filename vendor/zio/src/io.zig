@@ -1,0 +1,5876 @@
+// SPDX-FileCopyrightText: 2025 Lukáš Lalinský
+// SPDX-License-Identifier: MIT
+
+//! Implementation of the `std.Io` interface backed by zio's runtime.
+//!
+//! Many vtable methods are implemented; stubs remain for batches, some
+//! process operations, file locking (delegates to std), memory maps,
+//! and partial directory operations.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const Alignment = std.mem.Alignment;
+
+const coro = @import("coro/root.zig");
+const runtime_mod = @import("runtime.zig");
+const random_mod = @import("random.zig");
+const Runtime = runtime_mod.Runtime;
+const getCurrentTask = runtime_mod.getCurrentTask;
+const getCurrentExecutor = runtime_mod.getCurrentExecutor;
+const beginShield = runtime_mod.beginShield;
+const endShield = runtime_mod.endShield;
+const checkCancel = runtime_mod.checkCancel;
+
+const spawnTask = @import("task.zig").spawnTask;
+const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+const Awaitable = @import("awaitable.zig").Awaitable;
+const Group = @import("group.zig").Group;
+const groupSpawnTask = @import("group.zig").groupSpawnTask;
+const groupSpawnBlockingTask = @import("group.zig").groupSpawnBlockingTask;
+const select = @import("select.zig");
+const Futex = @import("sync/Futex.zig");
+const Mutex = @import("sync/Mutex.zig");
+const stderr = @import("stderr.zig");
+const time = @import("time.zig");
+const common = @import("common.zig");
+const Waiter = common.Waiter;
+const waitForIo = common.waitForIo;
+const timedWaitForIoClock = common.timedWaitForIoClock;
+const waitForIoUncancelable = common.waitForIoUncancelable;
+
+const ev = @import("ev/root.zig");
+const os_net = @import("os/net.zig");
+const os_fs = @import("os/fs.zig");
+const zio_fs = @import("fs.zig");
+const os_posix = @import("os/posix.zig");
+const os_process = @import("os/process.zig");
+const process_impl = @import("process.zig");
+const zio_net = @import("net.zig");
+const zio_dns = @import("dns/root.zig");
+const fillBuf = @import("utils/writer.zig").fillBuf;
+const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
+const zio_options = @import("options.zig").options;
+
+/// Must match `net.Stream.max_iovecs_len` in std.Io. Used as the cap on
+/// scatter/gather vector counts for netRead/netWrite so we never promise
+/// the caller more than std.Io's reader/writer is prepared to handle.
+const max_iovecs_len = 8;
+
+pub const debug_io: Io = .{ .userdata = null, .vtable = &vtable };
+
+/// Read the pollable-cache state from `File.Flags`.
+///
+/// When hacks are enabled, the `nonblocking` bool byte is overloaded:
+///  - 0x01: known pollable (opened non-blocking)
+///  - 0xCC: known not pollable (cached from previous probe)
+///  - other: unknown (determine lazily)
+fn flagsReadPollable(flags: *const Io.File.Flags) ?bool {
+    if (zio_options.no_hacks) {
+        return if (flags.nonblocking) true else null;
+    }
+    return switch (@as(*const u8, @ptrCast(flags)).*) {
+        0x01 => true,
+        0xCC => false,
+        else => null,
+    };
+}
+
+/// Write the pollable verdict into `File.Flags`.
+fn flagsWritePollable(flags: *Io.File.Flags, pollable: bool) void {
+    if (zio_options.no_hacks) {
+        flags.nonblocking = pollable;
+        return;
+    }
+    @as(*u8, @ptrCast(flags)).* = if (pollable) 0x01 else 0xCC;
+}
+
+/// Build a `std.Io.File` from a zio `fs.File`, carrying its pollable verdict in
+/// the (possibly hack-encoded) flags so the std Reader/Writer picks the right
+/// streaming-vs-positional path. A `null` verdict is left unknown (probed
+/// lazily). Used by `fs.File.stdReader` / `fs.File.stdWriter`.
+pub fn zioFileToStd(file: zio_fs.File) Io.File {
+    // nonblocking=false is the "unknown" encoding in both hack modes.
+    var f: Io.File = .{ .handle = file.fd, .flags = .{ .nonblocking = false } };
+    if (file.pollable) |pollable| flagsWritePollable(&f.flags, pollable);
+    return f;
+}
+
+/// Whether a positional (offset-based) op on `file` cannot be served by the
+/// async backend and should be reported as `Unseekable` so the std.Io
+/// Reader/Writer falls back to streaming.
+///
+/// On Windows, IOCP-driven positional I/O only works on handles zio opened and
+/// associated with its completion port (their pollable verdict is recorded in
+/// the flags). A handle whose verdict is unknown here was not opened by us
+/// (e.g. an inherited stdio handle obtained via `std.Io.File.stdin()`); an
+/// overlapped ReadFile/WriteFile on it would block the loop thread or never
+/// complete. Reporting `Unseekable` makes the reader/writer switch to the
+/// streaming path, which routes to the thread pool's blocking I/O. This relies
+/// on the flag-smuggling tri-state, so it is disabled under `no_hacks`.
+fn positionalUnsupported(file: Io.File) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (zio_options.no_hacks) return false;
+    return flagsReadPollable(&file.flags) == null;
+}
+
+pub const Mode = enum { regular, blocking };
+
+/// Tag bit stored in the low bit of `userdata` to select the dispatch mode.
+/// Safe because `Runtime` is pointer-aligned (>= 4 bytes).
+const mode_tag: usize = 1;
+
+fn encodeUserdata(rt: *Runtime, mode: Mode) ?*anyopaque {
+    return @ptrFromInt(@intFromPtr(rt) | switch (mode) {
+        .regular => @as(usize, 0),
+        .blocking => mode_tag,
+    });
+}
+
+fn decodeUserdata(userdata: ?*anyopaque) struct { *Runtime, Mode } {
+    const addr = @intFromPtr(userdata);
+    const rt: *Runtime = @ptrFromInt(addr & ~mode_tag);
+    const mode: Mode = if (addr & mode_tag != 0) .blocking else .regular;
+    return .{ rt, mode };
+}
+
+pub fn fromRuntime(rt: *Runtime, mode: Mode) Io {
+    return .{
+        .userdata = encodeUserdata(rt, mode),
+        .vtable = &vtable,
+    };
+}
+
+/// Recover the underlying runtime from a `std.Io` produced by `fromRuntime`.
+pub fn toRuntime(io: Io) *Runtime {
+    std.debug.assert(io.vtable == &vtable);
+    const rt, _ = decodeUserdata(io.userdata);
+    return rt;
+}
+
+pub const vtable: Io.VTable = .{
+    .crashHandler = crashHandlerImpl,
+
+    .async = asyncImpl,
+    .concurrent = concurrentImpl,
+    .await = awaitImpl,
+    .cancel = cancelImpl,
+
+    .groupAsync = groupAsyncImpl,
+    .groupConcurrent = groupConcurrentImpl,
+    .groupAwait = groupAwaitImpl,
+    .groupCancel = groupCancelImpl,
+
+    .recancel = recancelImpl,
+    .swapCancelProtection = swapCancelProtectionImpl,
+    .checkCancel = checkCancelImpl,
+
+    .futexWait = futexWaitImpl,
+    .futexWaitUncancelable = futexWaitUncancelableImpl,
+    .futexWake = futexWakeImpl,
+
+    .operate = operateImpl,
+    .batchAwaitAsync = batchAwaitAsyncImpl,
+    .batchAwaitConcurrent = batchAwaitConcurrentImpl,
+    .batchCancel = batchCancelImpl,
+
+    .dirCreateDir = dirCreateDirImpl,
+    .dirCreateDirPath = dirCreateDirPathImpl,
+    .dirCreateDirPathOpen = dirCreateDirPathOpenImpl,
+    .dirOpenDir = dirOpenDirImpl,
+    .dirStat = dirStatImpl,
+    .dirStatFile = dirStatFileImpl,
+    .dirAccess = dirAccessImpl,
+    .dirCreateFile = dirCreateFileImpl,
+    .dirCreateFileAtomic = dirCreateFileAtomicImpl,
+    .dirOpenFile = dirOpenFileImpl,
+    .dirClose = dirCloseImpl,
+    .dirRead = dirReadImpl,
+    .dirRealPath = dirRealPathImpl,
+    .dirRealPathFile = dirRealPathFileImpl,
+    .dirDeleteFile = dirDeleteFileImpl,
+    .dirDeleteDir = dirDeleteDirImpl,
+    .dirRename = dirRenameImpl,
+    .dirRenamePreserve = dirRenamePreserveImpl,
+    .dirSymLink = dirSymLinkImpl,
+    .dirReadLink = dirReadLinkImpl,
+    .dirSetOwner = dirSetOwnerImpl,
+    .dirSetFileOwner = dirSetFileOwnerImpl,
+    .dirSetPermissions = dirSetPermissionsImpl,
+    .dirSetFilePermissions = dirSetFilePermissionsImpl,
+    .dirSetTimestamps = dirSetTimestampsImpl,
+    .dirHardLink = dirHardLinkImpl,
+
+    .fileStat = fileStatImpl,
+    .fileLength = fileLengthImpl,
+    .fileClose = fileCloseImpl,
+    .fileWritePositional = fileWritePositionalImpl,
+    .fileWriteFileStreaming = Io.noFileWriteFileStreaming,
+    .fileWriteFilePositional = Io.noFileWriteFilePositional,
+    .fileReadPositional = fileReadPositionalImpl,
+    .fileSeekBy = fileSeekByImpl,
+    .fileSeekTo = fileSeekToImpl,
+    .fileSync = fileSyncImpl,
+    .fileIsTty = fileIsTtyImpl,
+    .fileEnableAnsiEscapeCodes = fileEnableAnsiEscapeCodesImpl,
+    .fileSupportsAnsiEscapeCodes = fileSupportsAnsiEscapeCodesImpl,
+    .fileSetLength = fileSetLengthImpl,
+    .fileSetOwner = fileSetOwnerImpl,
+    .fileSetPermissions = fileSetPermissionsImpl,
+    .fileSetTimestamps = fileSetTimestampsImpl,
+    .fileLock = fileLockImpl,
+    .fileTryLock = fileTryLockImpl,
+    .fileUnlock = fileUnlockImpl,
+    .fileDowngradeLock = fileDowngradeLockImpl,
+    .fileRealPath = fileRealPathImpl,
+    .fileHardLink = fileHardLinkImpl,
+
+    .fileMemoryMapCreate = fileMemoryMapCreateImpl,
+    .fileMemoryMapDestroy = fileMemoryMapDestroyImpl,
+    .fileMemoryMapSetLength = fileMemoryMapSetLengthImpl,
+    .fileMemoryMapRead = fileMemoryMapReadImpl,
+    .fileMemoryMapWrite = fileMemoryMapWriteImpl,
+
+    .processExecutableOpen = processExecutableOpenImpl,
+    .processExecutablePath = processExecutablePathImpl,
+    .lockStderr = lockStderrImpl,
+    .tryLockStderr = tryLockStderrImpl,
+    .unlockStderr = unlockStderrImpl,
+    .processCurrentPath = processCurrentPathImpl,
+    .processSetCurrentDir = processSetCurrentDirImpl,
+    .processSetCurrentPath = processSetCurrentPathImpl,
+    .processReplace = processReplaceImpl,
+    .processSpawn = processSpawnImpl,
+    .inheritParentDir = inheritParentDirImpl,
+    .inheritParentFile = inheritParentFileImpl,
+    .childWait = childWaitImpl,
+    .childKill = childKillImpl,
+
+    .progressParentFile = progressParentFileImpl,
+
+    .now = nowImpl,
+    .clockResolution = clockResolutionImpl,
+    .sleep = sleepImpl,
+
+    .random = randomImpl,
+    .randomSecure = randomSecureImpl,
+
+    .netListenIp = netListenIpImpl,
+    // [vendor-patch] 0.18-dev 从 VTable 移除了 accept 条目：accept 改经
+    // operate(Operation.net_accept) 通用路径分发（见 operateInner）。
+    .netBindIp = netBindIpImpl,
+    .netConnectIp = netConnectIpImpl,
+    .netListenUnix = netListenUnixImpl,
+    .netConnectUnix = netConnectUnixImpl,
+    .netSocketCreatePair = netSocketCreatePairImpl,
+    .netWriteFile = netWriteFileImpl,
+    .netClose = netCloseImpl,
+    .netShutdown = netShutdownImpl,
+    .netInterfaceNameResolve = netInterfaceNameResolveImpl,
+    .netInterfaceName = netInterfaceNameImpl,
+    .netLookup = netLookupImpl,
+};
+
+// ---------------------------------------------------------------------------
+// VTable stubs. Every function below is intentionally a `@panic("TODO: …")`.
+// ---------------------------------------------------------------------------
+
+/// Delegate target for vtable methods that are pure OS calls with no event-loop
+/// integration. Only safe for methods that don't open or return backend-owned
+/// handles/futures.
+fn globalIo() Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn crashHandlerImpl(_: ?*anyopaque) void {
+    coro.crashHandler();
+    // Two markers, deliberately: the runtime's keeps panic-message I/O off the
+    // event loop, the stderr one lets the panic handler take over a lock the
+    // crashing thread's own task holds.
+    runtime_mod.markCrashed();
+    stderr.markCrashed();
+}
+
+fn asyncImpl(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) ?*Io.AnyFuture {
+    return concurrentImpl(userdata, result.len, result_alignment, context, context_alignment, start) catch {
+        // Couldn't schedule asynchronously - run synchronously and return null.
+        start(context.ptr, result.ptr);
+        return null;
+    };
+}
+
+fn concurrentImpl(
+    userdata: ?*anyopaque,
+    result_len: usize,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) Io.ConcurrentError!*Io.AnyFuture {
+    if (userdata == null) return error.ConcurrencyUnavailable;
+    const rt, const mode = decodeUserdata(userdata);
+    const awaitable = switch (mode) {
+        .regular => &(spawnTask(rt, result_len, result_alignment, context, context_alignment, .{ .regular = start }, null, .auto) catch
+            return error.ConcurrencyUnavailable).awaitable,
+        .blocking => &(spawnBlockingTask(rt, result_len, result_alignment, context, context_alignment, .{ .regular = start }, null, .{ .reserve_thread = true }) catch
+            return error.ConcurrencyUnavailable).awaitable,
+    };
+    return @ptrCast(awaitable);
+}
+
+fn awaitOrCancel(any_future: *Io.AnyFuture, result: []u8, should_cancel: bool) void {
+    const awaitable: *Awaitable = @ptrCast(@alignCast(any_future));
+
+    if (should_cancel and !awaitable.hasResult()) {
+        awaitable.cancel();
+    }
+
+    _ = select.waitUntilComplete(awaitable);
+
+    @memcpy(result, awaitable.getResultSlice());
+
+    awaitable.release();
+}
+
+fn awaitImpl(_: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
+    awaitOrCancel(any_future, result, false);
+}
+
+fn cancelImpl(_: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
+    awaitOrCancel(any_future, result, true);
+}
+
+fn groupAsyncImpl(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) void {
+    if (userdata == null) {
+        start(context.ptr);
+        return;
+    }
+    const rt, const mode = decodeUserdata(userdata);
+    const g = Group.fromStd(group);
+    switch (mode) {
+        .regular => groupSpawnTask(g, rt, context, context_alignment, start, .auto) catch {
+            start(context.ptr);
+        },
+        .blocking => groupSpawnBlockingTask(g, rt, context, context_alignment, start, .{ .reserve_thread = true }) catch {
+            start(context.ptr);
+            return;
+        },
+    }
+}
+
+fn groupConcurrentImpl(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) Io.ConcurrentError!void {
+    if (userdata == null) return error.ConcurrencyUnavailable;
+    const rt, const mode = decodeUserdata(userdata);
+    const g = Group.fromStd(group);
+    switch (mode) {
+        .regular => groupSpawnTask(g, rt, context, context_alignment, start, .auto) catch
+            return error.ConcurrencyUnavailable,
+        .blocking => groupSpawnBlockingTask(g, rt, context, context_alignment, start, .{ .reserve_thread = true }) catch
+            return error.ConcurrencyUnavailable,
+    }
+}
+
+fn groupAwaitImpl(_: ?*anyopaque, group: *Io.Group, _: *anyopaque) Io.Cancelable!void {
+    return Group.fromStd(group).wait();
+}
+
+fn groupCancelImpl(_: ?*anyopaque, group: *Io.Group, _: *anyopaque) void {
+    Group.fromStd(group).cancel();
+}
+
+fn recancelImpl(_: ?*anyopaque) void {
+    getCurrentTask().recancel();
+}
+
+fn swapCancelProtectionImpl(_: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+    switch (new) {
+        .blocked => {
+            beginShield();
+            return .unblocked;
+        },
+        .unblocked => {
+            endShield();
+            return .blocked;
+        },
+    }
+}
+
+fn checkCancelImpl(_: ?*anyopaque) Io.Cancelable!void {
+    try checkCancel();
+}
+
+fn futexWaitImpl(_: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+    Futex.waitTimeoutClock(ptr, expected, .fromStd(timeout), .fromStdTimeout(timeout)) catch |err| switch (err) {
+        error.Timeout => return,
+        error.Canceled => return error.Canceled,
+    };
+}
+
+fn futexWaitUncancelableImpl(_: ?*anyopaque, ptr: *const u32, expected: u32) void {
+    beginShield();
+    defer endShield();
+    Futex.wait(ptr, expected) catch unreachable;
+}
+
+fn futexWakeImpl(_: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+    Futex.wake(ptr, max_waiters);
+}
+
+fn operateImpl(_: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    return operateInner(operation, .none, .awake) catch |err| switch (err) {
+        error.Canceled => error.Canceled,
+        error.Timeout => unreachable,
+    };
+}
+
+fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Clock) (Io.Cancelable || common.Timeoutable)!Io.Operation.Result {
+    switch (operation) {
+        .file_read_streaming => |*o| return .{ .file_read_streaming = result: {
+            const n = fileReadStreamingImpl(o.file, o.data, timeout, clock) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => |e| return e,
+                else => |e| break :result e,
+            };
+            break :result n;
+        } },
+        .file_write_streaming => |*o| return .{ .file_write_streaming = result: {
+            const n = fileWriteStreamingImpl(o.file, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => |e| return e,
+                else => |e| break :result e,
+            };
+            break :result n;
+        } },
+        .device_io_control => |*o| return .{ .device_io_control = result: {
+            var op = if (builtin.os.tag == .windows)
+                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.in, o.out)
+            else
+                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.arg);
+            try timedWaitForIoClock(&op.c, timeout, clock);
+            break :result try op.getResult();
+        } },
+        .net_receive => |*o| return .{
+            .net_receive = result: {
+                if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and !hasControl(o.message_buffer) and os_net.has_recvmmsg) {
+                    break :result netReceiveMmsg(o, timeout, clock) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        error.Timeout => |e| return e,
+                    };
+                }
+                netReceiveImpl(o.socket_handle, &o.message_buffer[0], o.data_buffer, o.flags, false, timeout, clock) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    error.Timeout => |e| return e,
+                    error.WouldBlock => unreachable,
+                    else => |e| break :result .{ e, 0 },
+                };
+                break :result netReceiveMore(o);
+            },
+        },
+        .net_send => |*o| return .{ .net_send = try netSendOpImpl(o.socket_handle, o.messages, o.flags, timeout, clock) },
+        .net_read => |*o| return .{ .net_read = result: {
+            const n = netReadOpImpl(o.socket_handle, o.data, timeout, clock) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => |e| return e,
+                else => |e| break :result e,
+            };
+            break :result .{ .data_len = n };
+        } },
+        .net_write => |*o| return .{ .net_write = result: {
+            const n = netWriteOpImpl(o.socket_handle, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => |e| return e,
+                else => |e| break :result e,
+            };
+            break :result n;
+        } },
+        // [vendor-patch] 0.18-dev: std Server.accept 经 operate 下发，复用同步实现；
+        // Canceled 不在 NetAccept.Result 错误集内，作为操作级错误上抛，其余错误直接嵌入。
+        .net_accept => |*o| {
+            const socket = netAcceptImpl(null, o.socket_handle, o.options) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => |e| return .{ .net_accept = e },
+            };
+            return .{ .net_accept = socket };
+        },
+    }
+}
+
+/// Read from `file` at its current position into `data`, advancing the
+/// position. Returns `error.EndOfStream` on EOF (OS returned 0 bytes).
+fn fileReadStreamingImpl(
+    file: Io.File,
+    data: []const []u8,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.Operation.FileReadStreaming.Error || Io.Cancelable || common.Timeoutable)!usize {
+    var iovecs: [max_iovecs_len]os_fs.iovec = undefined;
+    var count: usize = 0;
+    for (data) |buf| {
+        if (count == iovecs.len) break;
+        if (buf.len != 0) {
+            iovecs[count] = os_net.iovecFromSlice(buf);
+            count += 1;
+        }
+    }
+    if (count == 0) return 0;
+
+    var op = ev.FileReadStreaming.init(stdIoHandleToZio(file.handle), .{ .iovecs = iovecs[0..count] });
+    op.pollable = flagsReadPollable(&file.flags);
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    const n = op.getResult() catch |err| switch (err) {
+        error.BrokenPipe, error.Unseekable => return error.Unexpected,
+        else => |e| return e,
+    };
+    return if (n == 0) error.EndOfStream else n;
+}
+
+/// Write from `header` / `data` (with `splat` repetition of the last slice)
+/// to `file` at its current position, advancing the position.
+fn fileWriteStreamingImpl(
+    file: Io.File,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.Operation.FileWriteStreaming.Error || Io.Cancelable || common.Timeoutable)!usize {
+    var slices: [max_iovecs_len][]const u8 = undefined;
+    var splat_buf: [64]u8 = undefined;
+    const n = fillBuf(&slices, header, data, splat, &splat_buf);
+    if (n == 0) return 0;
+
+    var iovecs: [max_iovecs_len]os_fs.iovec_const = undefined;
+    const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
+
+    var op = ev.FileWriteStreaming.init(stdIoHandleToZio(file.handle), wbuf);
+    op.pollable = flagsReadPollable(&file.flags);
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    return op.getResult() catch |err| switch (err) {
+        error.Unseekable => error.Unexpected,
+        else => |e| e,
+    };
+}
+
+/// Data for a single concurrent batch operation.
+/// Tagged union matching Io.Operation, holding the ev completion struct and any auxiliary data.
+const BatchCompletionData = union(Io.Operation.Tag) {
+    file_read_streaming: struct {
+        op: ev.FileReadStreaming,
+        iovecs: [max_iovecs_len]os_fs.iovec,
+    },
+    file_write_streaming: struct {
+        op: ev.FileWriteStreaming,
+        iovecs: [max_iovecs_len]os_fs.iovec_const,
+        splat_buf: [8]u8,
+    },
+    device_io_control: if (builtin.os.tag == .windows) struct {
+        op: ev.DeviceIoControl,
+        out: []u8,
+    } else struct {
+        op: ev.DeviceIoControl,
+    },
+    net_receive: struct {
+        op: ev.NetRecvMsg,
+        iov: os_net.iovec,
+        addr_storage: zio_net.Address,
+        addr_len: os_net.socklen_t,
+        message_buffer: *Io.net.IncomingMessage,
+        data_buffer: []u8,
+    },
+    net_send: struct {
+        op: ev.NetSendMsg,
+        iov: os_net.iovec_const,
+        addr_storage: zio_net.IpAddress,
+        addr_len: os_net.socklen_t,
+        message: *Io.net.OutgoingMessage,
+    },
+    // [vendor-patch] 0.18-dev 在 Io.Operation.Tag 新增 net_accept；tagged union
+    // 字段顺序必须与 enum 声明一致（位于 net_send 与 net_read 之间）。
+    net_accept: struct {
+        op: ev.NetAccept,
+        addr_storage: zio_net.Address,
+        addr_len: os_net.socklen_t,
+    },
+    net_read: struct {
+        op: ev.NetRecv,
+        iovecs: [max_iovecs_len]os_net.iovec,
+    },
+    net_write: struct {
+        op: ev.NetSend,
+        iovecs: [max_iovecs_len]os_net.iovec_const,
+        splat_buf: [8]u8,
+    },
+
+    fn getCompletion(self: *BatchCompletionData) *ev.Completion {
+        return switch (self.*) {
+            .file_read_streaming => |*d| &d.op.c,
+            .file_write_streaming => |*d| &d.op.c,
+            .device_io_control => |*d| &d.op.c,
+            .net_receive => |*d| &d.op.c,
+            .net_send => |*d| &d.op.c,
+            .net_accept => |*d| &d.op.c,
+            .net_read => |*d| &d.op.c,
+            .net_write => |*d| &d.op.c,
+        };
+    }
+};
+
+/// Flags stored in the low bits of the `BatchCompletionData` pointer in `pending.userdata[0]`.
+const batch_ready_flag: usize = 1;
+const batch_canceled_flag: usize = 2;
+const batch_flags_mask: usize = batch_ready_flag | batch_canceled_flag;
+
+comptime {
+    const Userdata = Io.Operation.Storage.Pending.Userdata;
+    const Result = Io.Operation.Result;
+    std.debug.assert(@sizeOf(Result) <= @sizeOf(Userdata) - @sizeOf(usize));
+    std.debug.assert(@alignOf(Result) <= @alignOf(usize));
+    std.debug.assert(@alignOf(BatchCompletionData) > batch_flags_mask);
+}
+
+/// State for concurrent batch operations, stored in batch.userdata.
+/// Pool is only accessed from await thread (no mutex needed).
+/// Callback signals completion via ready flag in pending.userdata, then bumps
+/// `signaled` and wakes the waiter via futex.
+const BatchState = struct {
+    pool: MemoryPool(BatchCompletionData),
+    allocator: std.mem.Allocator,
+    batch: *Io.Batch,
+    /// Number of callbacks done with the state, wrapping.
+    signaled: std.atomic.Value(u32),
+    /// Number of ready operations drained by the await thread, wrapping.
+    drained: u32,
+
+    fn init(allocator: std.mem.Allocator, batch: *Io.Batch) BatchState {
+        return .{
+            .pool = MemoryPool(BatchCompletionData).init(allocator),
+            .allocator = allocator,
+            .batch = batch,
+            .signaled = std.atomic.Value(u32).init(0),
+            .drained = 0,
+        };
+    }
+
+    fn deinit(self: *BatchState) void {
+        self.pool.deinit();
+    }
+};
+
+fn batchAwaitAsyncImpl(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
+    var tail_index = batch.completed.tail;
+    defer batch.completed.tail = tail_index;
+    var index = batch.submitted.head;
+    errdefer batch.submitted.head = index;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const submission = &storage.submission;
+        const next_index = submission.node.next;
+        const result = try operateImpl(userdata, submission.operation);
+
+        switch (tail_index) {
+            .none => batch.completed.head = index,
+            else => |ti| batch.storage[ti.toIndex()].completion.node.next = index,
+        }
+        storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        tail_index = index;
+        index = next_index;
+    }
+    batch.submitted = .{ .head = .none, .tail = .none };
+}
+
+fn batchAwaitConcurrentImpl(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+    // Specialized path: exactly one submitted operation, none in flight.
+    const only = batch.submitted.head;
+    if (only != .none and only == batch.submitted.tail and batch.pending.head == .none) {
+        const storage = &batch.storage[only.toIndex()];
+        const operation = storage.submission.operation;
+
+        const result = try operateInner(operation, .fromStd(timeout), .fromStdTimeout(timeout));
+
+        batch.submitted = .empty;
+        storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        if (batch.completed.tail != .none) {
+            batch.storage[batch.completed.tail.toIndex()].completion.node.next = only;
+        } else {
+            batch.completed.head = only;
+        }
+        batch.completed.tail = only;
+        return;
+    }
+
+    // Nothing to do if no submissions and nothing pending
+    if (batch.submitted.head == .none and batch.pending.head == .none) return;
+
+    const rt, _ = decodeUserdata(userdata);
+
+    // Get or create batch state (stored in batch.userdata)
+    const state: *BatchState = if (batch.userdata) |ptr|
+        @ptrCast(@alignCast(ptr))
+    else blk: {
+        const s = rt.allocator.create(BatchState) catch return error.ConcurrencyUnavailable;
+        s.* = BatchState.init(rt.allocator, batch);
+        batch.userdata = s;
+        break :blk s;
+    };
+
+    const executor = getCurrentExecutor();
+
+    // Submit all pending operations
+    var index = batch.submitted.head;
+    errdefer batch.submitted.head = index;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const submission = storage.submission;
+        const next_index = submission.node.next;
+
+        if (isEmptyStreamingRead(submission.operation)) {
+            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = .{ .file_read_streaming = 0 } } };
+            if (batch.completed.tail != .none) {
+                batch.storage[batch.completed.tail.toIndex()].completion.node.next = index;
+            } else {
+                batch.completed.head = index;
+            }
+            batch.completed.tail = index;
+            index = next_index;
+            continue;
+        }
+
+        // Allocate completion data from pool
+        const data = state.pool.create() catch return error.ConcurrencyUnavailable;
+
+        // Initialize the ev operation based on operation type
+        const completion = initBatchOperation(data, submission.operation);
+
+        // Set up callback - store state pointer in completion userdata
+        completion.userdata = state;
+        completion.callback = batchCompletionCallback;
+        completion.group.userdata = index.toIndex(); // Store batch index
+
+        // Move from submitted to pending
+        // userdata layout:
+        //   [0]: data pointer (BatchCompletionData*) with `batch_flags_mask` bits as flags
+        //   [1..]: result (Io.Operation.Result), unset if canceled
+        storage.* = .{ .pending = .{
+            .node = .{ .prev = batch.pending.tail, .next = .none },
+            .tag = submission.operation,
+            .userdata = undefined,
+        } };
+        @as(*usize, @ptrCast(&storage.pending.userdata[0])).* = @intFromPtr(data); // no flags = not ready
+
+        if (batch.pending.tail != .none) {
+            batch.storage[batch.pending.tail.toIndex()].pending.node.next = index;
+        } else {
+            batch.pending.head = index;
+        }
+        batch.pending.tail = index;
+
+        // Submit to loop
+        executor.loopAdd(completion);
+
+        index = next_index;
+    }
+    batch.submitted = .{ .head = .none, .tail = .none };
+
+    const deadline = timeout.toDeadline(rt.io());
+
+    // Wait loop: drain ready items, check for completions, wait if needed
+    while (true) {
+        const signaled = state.signaled.load(.acquire);
+        batchDrainReady(batch, state);
+
+        // Return if we have completions or nothing pending
+        if (batch.completed.head != .none or batch.pending.head == .none) return;
+
+        // Wait for another callback to finish
+        Futex.waitTimeoutClock(&state.signaled.raw, signaled, .fromStd(deadline), .fromStdTimeout(deadline)) catch |err| switch (err) {
+            error.Timeout => {
+                // Drain one more time before returning timeout
+                batchDrainReady(batch, state);
+                if (batch.completed.head != .none) return;
+                return error.Timeout;
+            },
+            error.Canceled => {
+                batchCancelPending(batch, state);
+                return error.Canceled;
+            },
+        };
+    }
+}
+
+fn isEmptyStreamingRead(operation: Io.Operation) bool {
+    switch (operation) {
+        .file_read_streaming => |o| {
+            for (o.data) |buf| {
+                if (buf.len != 0) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Initialize a BatchCompletionData from an Io.Operation
+fn initBatchOperation(data: *BatchCompletionData, operation: Io.Operation) *ev.Completion {
+    switch (operation) {
+        .file_read_streaming => |*o| {
+            data.* = .{ .file_read_streaming = .{
+                .op = undefined,
+                .iovecs = undefined,
+            } };
+            var count: usize = 0;
+            for (o.data) |buf| {
+                if (count == max_iovecs_len) break;
+                if (buf.len != 0) {
+                    data.file_read_streaming.iovecs[count] = os_net.iovecFromSlice(buf);
+                    count += 1;
+                }
+            }
+            data.file_read_streaming.op = ev.FileReadStreaming.init(
+                stdIoHandleToZio(o.file.handle),
+                .{ .iovecs = data.file_read_streaming.iovecs[0..count] },
+            );
+            data.file_read_streaming.op.pollable = flagsReadPollable(&o.file.flags);
+            return &data.file_read_streaming.op.c;
+        },
+        .file_write_streaming => |*o| {
+            data.* = .{ .file_write_streaming = .{
+                .op = undefined,
+                .iovecs = undefined,
+                .splat_buf = undefined,
+            } };
+            var slices: [max_iovecs_len][]const u8 = undefined;
+            const n = fillBuf(&slices, o.header, o.data, o.splat, &data.file_write_streaming.splat_buf);
+            const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &data.file_write_streaming.iovecs);
+            data.file_write_streaming.op = ev.FileWriteStreaming.init(
+                stdIoHandleToZio(o.file.handle),
+                wbuf,
+            );
+            data.file_write_streaming.op.pollable = flagsReadPollable(&o.file.flags);
+            return &data.file_write_streaming.op.c;
+        },
+        .device_io_control => |*o| {
+            if (builtin.os.tag == .windows) {
+                data.* = .{ .device_io_control = .{
+                    .op = ev.DeviceIoControl.init(
+                        stdIoHandleToZio(o.file.handle),
+                        o.code,
+                        o.in,
+                        o.out,
+                    ),
+                    .out = o.out,
+                } };
+            } else {
+                data.* = .{ .device_io_control = .{
+                    .op = ev.DeviceIoControl.init(
+                        stdIoHandleToZio(o.file.handle),
+                        o.code,
+                        o.arg,
+                    ),
+                } };
+            }
+            return &data.device_io_control.op.c;
+        },
+        .net_receive => |*o| {
+            const zio_flags: os_net.RecvFlags = .{
+                .peek = o.flags.peek,
+                .oob = o.flags.oob,
+                .trunc = o.flags.trunc,
+            };
+            const has_control = o.message_buffer[0].control.len != 0;
+            data.* = .{ .net_receive = .{
+                .op = undefined,
+                .iov = os_net.iovecFromSlice(o.data_buffer),
+                .addr_storage = undefined,
+                .addr_len = @sizeOf(zio_net.Address),
+                .message_buffer = &o.message_buffer[0],
+                .data_buffer = o.data_buffer,
+            } };
+            data.net_receive.op = ev.NetRecvMsg.init(
+                stdIoHandleToZio(o.socket_handle),
+                .{ .iovecs = (&data.net_receive.iov)[0..1] },
+                zio_flags,
+                &data.net_receive.addr_storage.any,
+                &data.net_receive.addr_len,
+                if (has_control) o.message_buffer[0].control else null,
+            );
+            return &data.net_receive.op.c;
+        },
+        .net_send => |*o| {
+            // One completion is one sendmsg, so only the first message goes out
+            // here and the result reports 1. Partial counts are contractual, so
+            // the caller re-submits the rest; `net_receive` above does the same.
+            const msg = &o.messages[0];
+            data.* = .{ .net_send = .{
+                .op = undefined,
+                .iov = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]),
+                .addr_storage = stdIoIpToZio(msg.address.*),
+                .addr_len = undefined,
+                .message = msg,
+            } };
+            data.net_send.addr_len = sockAddrLen(&data.net_send.addr_storage.any);
+            data.net_send.op = ev.NetSendMsg.init(
+                stdIoHandleToZio(o.socket_handle),
+                .{ .iovecs = (&data.net_send.iov)[0..1] },
+                zioSendFlags(o.flags),
+                &data.net_send.addr_storage.any,
+                data.net_send.addr_len,
+                if (msg.control.len != 0) msg.control else null,
+            );
+            return &data.net_send.op.c;
+        },
+        .net_read => |*o| {
+            data.* = .{ .net_read = .{ .op = undefined, .iovecs = undefined } };
+            data.net_read.op = ev.NetRecv.init(
+                stdIoHandleToZio(o.socket_handle),
+                ev.ReadBuf.fromSlices(o.data, &data.net_read.iovecs),
+                .{},
+            );
+            return &data.net_read.op.c;
+        },
+        .net_write => |*o| {
+            data.* = .{ .net_write = .{
+                .op = undefined,
+                .iovecs = undefined,
+                .splat_buf = undefined,
+            } };
+            var slices: [max_iovecs_len][]const u8 = undefined;
+            const n = fillBuf(&slices, o.header, o.data, o.splat, &data.net_write.splat_buf);
+            data.net_write.op = ev.NetSend.init(
+                stdIoHandleToZio(o.socket_handle),
+                ev.WriteBuf.fromSlices(slices[0..n], &data.net_write.iovecs),
+                .{},
+            );
+            return &data.net_write.op.c;
+        },
+        // [vendor-patch] 0.18-dev: 批量路径同样支持 accept。
+        .net_accept => |*o| {
+            data.* = .{ .net_accept = .{
+                .op = undefined,
+                .addr_storage = undefined,
+                .addr_len = @sizeOf(zio_net.Address),
+            } };
+            data.net_accept.op = ev.NetAccept.init(
+                stdIoHandleToZio(o.socket_handle),
+                &data.net_accept.addr_storage.any,
+                &data.net_accept.addr_len,
+            );
+            return &data.net_accept.op.c;
+        },
+    }
+}
+
+/// Callback when a batch operation completes.
+/// Stores result in userdata, sets ready flag (and canceled flag if the operation was
+/// canceled) in the data pointer, signals waiter via futex.
+/// Once the waiter sees the ready flag, the batch storage may be reused, and once
+/// `signaled` catches up with `drained`, `batchCancelImpl` may free the state.
+fn batchCompletionCallback(_: *ev.Loop, completion: *ev.Completion) void {
+    const state: *BatchState = @ptrCast(@alignCast(completion.userdata.?));
+    const batch = state.batch;
+    const batch_index: u32 = @intCast(completion.group.userdata);
+
+    // Get the pending storage and userdata
+    const storage = &batch.storage[batch_index];
+    const userdata = &storage.pending.userdata;
+
+    const data_ptr = @as(*const usize, @ptrCast(&userdata[0])).*;
+    const canceled = if (completion.err) |err| err == error.Canceled else false;
+
+    var flags = batch_ready_flag;
+    if (canceled) {
+        flags |= batch_canceled_flag;
+    } else {
+        // Store result in userdata[1..] (after data pointer)
+        const data: *BatchCompletionData = @ptrFromInt(data_ptr);
+        const result = extractBatchResult(data, storage.pending.tag);
+        @as(*Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).* = result;
+    }
+
+    // Set flags in the data pointer (release to ensure result is visible)
+    @atomicStore(usize, @as(*usize, @ptrCast(&userdata[0])), data_ptr | flags, .release);
+
+    // Signal waiter, `state` may be freed after the increment
+    _ = state.signaled.fetchAdd(1, .release);
+    Futex.wake(&state.signaled.raw, 1);
+}
+
+/// Extract result from completed BatchCompletionData
+fn extractBatchResult(data: *BatchCompletionData, tag: Io.Operation.Tag) Io.Operation.Result {
+    return switch (tag) {
+        .file_read_streaming => .{ .file_read_streaming = blk: {
+            const n = data.file_read_streaming.op.getResult() catch |err| switch (err) {
+                error.BrokenPipe, error.Canceled, error.Unseekable => break :blk error.Unexpected,
+                else => |e| break :blk e,
+            };
+            break :blk if (n == 0) error.EndOfStream else n;
+        } },
+        .file_write_streaming => .{ .file_write_streaming = blk: {
+            break :blk data.file_write_streaming.op.getResult() catch |err| switch (err) {
+                error.Canceled, error.Unseekable => error.Unexpected,
+                else => |e| e,
+            };
+        } },
+        .device_io_control => .{ .device_io_control = data.device_io_control.op.getResult() catch unreachable },
+        .net_receive => .{
+            .net_receive = blk: {
+                const result = data.net_receive.op.getResult() catch |err| break :blk .{ recvMsgErrToReceiveErr(err), 0 };
+                // Populate the message buffer with received data
+                data.net_receive.message_buffer.* = .{
+                    .from = senderAddrToStdIo(&data.net_receive.addr_storage.any, data.net_receive.addr_len),
+                    .data = data.net_receive.data_buffer[0..@min(result.len, data.net_receive.data_buffer.len)],
+                    .control = data.net_receive.message_buffer.control[0..result.controllen],
+                    .flags = decodeIncomingFlags(result.flags),
+                };
+                break :blk .{ null, 1 };
+            },
+        },
+        .net_send => .{ .net_send = blk: {
+            const sent = data.net_send.op.getResult() catch |err| break :blk .{ sendErrToSocketSendErr(err), 0 };
+            data.net_send.message.data_len = sent;
+            break :blk .{ null, 1 };
+        } },
+        .net_read => .{
+            .net_read = if (data.net_read.op.getResult()) |n| .{ .data_len = n } else |err| recvErrToReadErr(err),
+        },
+        .net_write => .{
+            .net_write = data.net_write.op.getResult() catch |err| sendErrToWriteErr(err),
+        },
+        // [vendor-patch] 0.18-dev: accept 结果提取。新 payload 错误集没有
+        // WouldBlock/FileDescriptorNotASocket/OperationNotSupported/Canceled，前三个归入
+        // Unexpected；Canceled 到不了这里（已取消条目在 drain 阶段提前回收）。
+        // ConnectionAborted（对端中途断开）本身是合法结果，由调用方重试。
+        .net_accept => .{ .net_accept = blk: {
+            const handle = data.net_accept.op.getResult() catch |err| break :blk switch (err) {
+                error.WouldBlock,
+                error.FileDescriptorNotASocket,
+                error.OperationNotSupported,
+                error.Canceled,
+                => error.Unexpected,
+                else => |e| e,
+            };
+            const peer = data.net_accept.addr_storage;
+            switch (peer.any.family) {
+                os_net.AF.INET, os_net.AF.INET6 => os_net.setNoDelay(handle, true) catch {},
+                else => {},
+            }
+            break :blk .{
+                .handle = handle,
+                .address = switch (peer.any.family) {
+                    os_net.AF.INET, os_net.AF.INET6 => zioIpToStdIo(peer.ip),
+                    else => .{ .ip4 = .loopback(0) },
+                },
+            };
+        } },
+    };
+}
+
+/// Drain ready items: scan pending list, move ready items to completed, and canceled
+/// items to unused, since canceled operations are not reported by `Io.Batch.next`.
+/// Called only from the await thread, so no lock needed for list manipulation.
+fn batchDrainReady(batch: *Io.Batch, state: *BatchState) void {
+    var index = batch.pending.head;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const userdata = &storage.pending.userdata;
+        const next_index = storage.pending.node.next;
+
+        // Check ready flag (acquire to see result)
+        const data_ptr = @atomicLoad(usize, @as(*usize, @ptrCast(&userdata[0])), .acquire);
+        if (data_ptr & batch_ready_flag == 0) {
+            index = next_index;
+            continue;
+        }
+
+        // Get data pointer (mask off flags) and free it
+        const data: *BatchCompletionData = @ptrFromInt(data_ptr & ~batch_flags_mask);
+        state.pool.destroy(data);
+        state.drained +%= 1;
+
+        // Remove from pending list
+        const pending = &storage.pending;
+        if (pending.node.prev != .none) {
+            batch.storage[pending.node.prev.toIndex()].pending.node.next = pending.node.next;
+        } else {
+            batch.pending.head = pending.node.next;
+        }
+        if (pending.node.next != .none) {
+            batch.storage[pending.node.next.toIndex()].pending.node.prev = pending.node.prev;
+        } else {
+            batch.pending.tail = pending.node.prev;
+        }
+
+        if (data_ptr & batch_canceled_flag != 0) {
+            // Add to unused list
+            const tail_index = batch.unused.tail;
+            if (tail_index != .none) {
+                batch.storage[tail_index.toIndex()].unused.next = index;
+            } else {
+                batch.unused.head = index;
+            }
+            storage.* = .{ .unused = .{ .prev = tail_index, .next = .none } };
+            batch.unused.tail = index;
+
+            index = next_index;
+            continue;
+        }
+
+        // Get result from userdata[1..]
+        const result = @as(*const Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).*;
+
+        // Add to completed list
+        storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        if (batch.completed.tail != .none) {
+            batch.storage[batch.completed.tail.toIndex()].completion.node.next = index;
+        } else {
+            batch.completed.head = index;
+        }
+        batch.completed.tail = index;
+
+        index = next_index;
+    }
+}
+
+/// Cancel all pending batch operations and wait for them to complete
+fn batchCancelPending(batch: *Io.Batch, state: *BatchState) void {
+    // First drain any ready items
+    batchDrainReady(batch, state);
+
+    // Cancel all pending operations (only those not yet ready)
+    const executor = getCurrentExecutor();
+    var index = batch.pending.head;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const userdata = &storage.pending.userdata;
+        // Only cancel if not already ready
+        const data_ptr = @atomicLoad(usize, @as(*usize, @ptrCast(&userdata[0])), .acquire);
+        if (data_ptr & batch_ready_flag == 0) {
+            const data: *BatchCompletionData = @ptrFromInt(data_ptr);
+            const completion = data.getCompletion();
+            executor.loopCancel(completion);
+        }
+        index = storage.pending.node.next;
+    }
+
+    // Wait for all cancellations to complete
+    while (true) {
+        const signaled = state.signaled.load(.acquire);
+        batchDrainReady(batch, state);
+        if (batch.pending.head == .none) break;
+        Futex.waitUncancelable(&state.signaled.raw, signaled);
+    }
+}
+
+fn batchCancelImpl(_: ?*anyopaque, batch: *Io.Batch) void {
+    // Get state if it exists
+    const state: *BatchState = @ptrCast(@alignCast(batch.userdata orelse return));
+
+    // Drain any ready items first
+    batchDrainReady(batch, state);
+
+    // If there are pending operations, cancel them and wait
+    if (batch.pending.head != .none) {
+        batchCancelPending(batch, state);
+    }
+
+    // Wait for callbacks that set the ready flag but have not signaled yet
+    while (true) {
+        const signaled = state.signaled.load(.acquire);
+        if (signaled == state.drained) break;
+        Futex.waitUncancelable(&state.signaled.raw, signaled);
+    }
+
+    state.deinit();
+    const allocator = state.allocator;
+    allocator.destroy(state);
+    batch.userdata = null;
+    batch.pending = .{ .head = .none, .tail = .none };
+}
+
+fn dirCreateDirImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirError!void {
+    var op = ev.DirCreateDir.init(stdIoHandleToZio(dir.handle), sub_path, permissionsToZioMode(permissions));
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn permissionsToZioMode(permissions: Io.File.Permissions) os_fs.mode_t {
+    if (builtin.os.tag == .windows) return 0;
+    return permissions.toMode();
+}
+
+fn resolveSetTimestamp(t: Io.File.SetTimestamp) os_fs.SetTimestamp {
+    return switch (t) {
+        .unchanged => .unchanged,
+        .now => .now,
+        .new => |ts| .{ .new = ts.nanoseconds },
+    };
+}
+
+fn dirCreateDirPathImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirPathError!Io.Dir.CreatePathStatus {
+    var it = Io.Dir.path.componentIterator(sub_path);
+    var status: Io.Dir.CreatePathStatus = .existed;
+    var component = it.last() orelse return error.BadPathName;
+    while (true) {
+        var op = ev.DirCreateDir.init(stdIoHandleToZio(dir.handle), component.path, permissionsToZioMode(permissions));
+        try waitForIo(&op.c);
+        if (op.getResult()) |_| {
+            status = .created;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                const kind = try filePathKind(dir, component.path);
+                if (kind != .directory) return error.NotDir;
+            },
+            error.FileNotFound => {
+                component = it.previous() orelse return error.FileNotFound;
+                continue;
+            },
+            else => |e| return e,
+        }
+        component = it.next() orelse return status;
+    }
+}
+
+fn filePathKind(dir: Io.Dir, sub_path: []const u8) Io.Dir.StatFileError!Io.File.Kind {
+    var op = ev.FileStat.init(stdIoHandleToZio(dir.handle), sub_path, .{ .follow_symlinks = false });
+    try waitForIo(&op.c);
+    const info = op.getResult() catch |err| return statFileErrToStdErr(err);
+    return zioKindToStdIoKind(info.kind);
+}
+
+fn dirCreateDirPathOpenImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions, options: Io.Dir.OpenOptions) Io.Dir.CreateDirPathOpenError!Io.Dir {
+    return dirOpenDirImpl(null, dir, sub_path, options) catch |err| switch (err) {
+        error.FileNotFound => {
+            _ = try dirCreateDirPathImpl(null, dir, sub_path, permissions);
+            return dirOpenDirImpl(null, dir, sub_path, options);
+        },
+        else => |e| return e,
+    };
+}
+
+fn dirOpenDirImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenOptions) Io.Dir.OpenError!Io.Dir {
+    var op = ev.DirOpen.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .follow_symlinks = options.follow_symlinks,
+        .iterate = options.iterate,
+    });
+    try waitForIo(&op.c);
+    const fd = op.getResult() catch |err| return dirOpenErrToStdErr(err);
+    return .{ .handle = fd };
+}
+
+fn dirOpenErrToStdErr(err: ev.DirOpen.Error) Io.Dir.OpenError {
+    return switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.PermissionDenied => error.PermissionDenied,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.NoDevice => error.NoDevice,
+        error.FileNotFound => error.FileNotFound,
+        error.NameTooLong => error.NameTooLong,
+        error.SystemResources => error.SystemResources,
+        error.NotDir => error.NotDir,
+        error.BadPathName => error.BadPathName,
+        error.NetworkNotFound => error.NetworkNotFound,
+        error.Canceled => error.Canceled,
+        error.Unsupported => error.Unexpected,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn dirStatImpl(_: ?*anyopaque, dir: Io.Dir) Io.Dir.StatError!Io.Dir.Stat {
+    const handle = stdIoHandleToZio(dir.handle);
+    // On POSIX, Io.Dir.cwd().handle is AT_FDCWD — fstat() doesn't accept it, so
+    // route through fstatat(".") in that case. Real handles (including Windows
+    // cwd) go through fstat() directly, which avoids the \\?\ path pitfalls of
+    // resolving "." against a handle's canonicalized path.
+    const use_path: ?[]const u8 = if (builtin.os.tag != .windows and handle == os_fs.cwd()) "." else null;
+    var op = ev.FileStat.init(handle, use_path, .{});
+    try waitForIo(&op.c);
+    const info = op.getResult() catch |err| return fileStatErrToStdErr(err);
+    return statInfoToStdIo(info);
+}
+
+fn dirStatFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
+    var op = ev.FileStat.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    const info = op.getResult() catch |err| return statFileErrToStdErr(err);
+    return statInfoToStdIo(info);
+}
+
+fn dirAccessImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.AccessOptions) Io.Dir.AccessError!void {
+    var op = ev.DirAccess.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .read = options.read,
+        .write = options.write,
+        .execute = options.execute,
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn openErrToFileErr(err: ev.FileOpen.Error) Io.File.OpenError {
+    return switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.PermissionDenied => error.PermissionDenied,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.NoDevice => error.NoDevice,
+        error.FileNotFound => error.FileNotFound,
+        error.NameTooLong => error.NameTooLong,
+        error.SystemResources => error.SystemResources,
+        error.FileTooBig => error.FileTooBig,
+        error.IsDir => error.IsDir,
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.NotDir => error.NotDir,
+        error.PathAlreadyExists => error.PathAlreadyExists,
+        error.DeviceBusy => error.DeviceBusy,
+        error.FileLocksNotSupported => error.FileLocksUnsupported,
+        error.BadPathName => error.BadPathName,
+        error.NetworkNotFound => error.NetworkNotFound,
+        error.FileBusy => error.FileBusy,
+        error.Canceled => error.Canceled,
+        error.Unsupported => error.Unexpected,
+        error.InvalidUtf8,
+        error.InvalidWtf8,
+        error.ProcessNotFound,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn stdIoModeToZio(mode: Io.Dir.OpenFileOptions.Mode) os_fs.FileOpenMode {
+    return switch (mode) {
+        .read_only => .read_only,
+        .write_only => .write_only,
+        .read_write => .read_write,
+    };
+}
+
+/// Apply the lock requested by open/create options after the fd is obtained.
+/// LockError coerces into OpenError, so failures propagate directly.
+///
+/// TODO: on BSDs/macOS, O_EXLOCK/O_SHLOCK let us acquire the lock atomically as
+/// part of the open syscall (plumbed through the ev FileOpen/FileCreate flags).
+/// Doing it inline there would save this second syscall and close the brief
+/// window where the file is open but not yet locked. For now we always lock as
+/// a separate step on all platforms.
+fn applyOpenLock(file: Io.File, lock: Io.File.Lock, nonblocking: bool) Io.File.OpenError!void {
+    if (lock == .none) return;
+    if (nonblocking) {
+        if (!try fileTryLockImpl(null, file, lock)) return error.WouldBlock;
+    } else {
+        try fileLockImpl(null, file, lock);
+    }
+}
+
+fn dirCreateFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+    var op = ev.FileCreate.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .read = options.read,
+        .truncate = options.truncate,
+        .exclusive = options.exclusive,
+        .resolve_beneath = options.resolve_beneath,
+        .mode = permissionsToZioMode(options.permissions),
+    });
+    try waitForIo(&op.c);
+    const result = op.getResult() catch |err| return openErrToFileErr(err);
+    var file: Io.File = undefined;
+    file.handle = result.fd;
+    flagsWritePollable(&file.flags, result.pollable);
+    errdefer fileCloseImpl(null, &.{file});
+    try applyOpenLock(file, options.lock, options.lock_nonblocking);
+    return file;
+}
+
+fn dirCreateFileAtomicImpl(_: ?*anyopaque, dir: Io.Dir, dest_path: []const u8, options: Io.Dir.CreateFileAtomicOptions) Io.Dir.CreateFileAtomicError!Io.File.Atomic {
+    if (Io.Dir.path.dirname(dest_path)) |dirname| {
+        const new_dir = if (options.make_path)
+            dirCreateDirPathOpenImpl(null, dir, dirname, .default_dir, .{}) catch |err| switch (err) {
+                error.IsDir,
+                error.Streaming,
+                error.DiskQuota,
+                error.PathAlreadyExists,
+                error.LinkQuotaExceeded,
+                error.PipeBusy,
+                error.FileTooBig,
+                error.FileLocksUnsupported,
+                error.DeviceBusy,
+                => return error.Unexpected,
+                else => |e| return e,
+            }
+        else
+            try dirOpenDirImpl(null, dir, dirname, .{});
+        errdefer dirCloseImpl(null, &.{new_dir});
+        return atomicFileInit(Io.Dir.path.basename(dest_path), options.permissions, new_dir, true);
+    }
+    return atomicFileInit(dest_path, options.permissions, dir, false);
+}
+
+fn atomicFileInit(
+    dest_basename: []const u8,
+    permissions: Io.File.Permissions,
+    dir: Io.Dir,
+    close_dir_on_deinit: bool,
+) Io.Dir.CreateFileAtomicError!Io.File.Atomic {
+    while (true) {
+        var random_integer: u64 = undefined;
+        randomImpl(null, std.mem.asBytes(&random_integer));
+        const tmp_sub_path = std.fmt.hex(random_integer);
+        const file = dirCreateFileImpl(null, dir, &tmp_sub_path, .{
+            .permissions = permissions,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists, error.DeviceBusy, error.FileBusy => continue,
+            error.IsDir, error.FileTooBig, error.FileLocksUnsupported, error.PipeBusy => return error.Unexpected,
+            else => |e| return e,
+        };
+        return .{
+            .file = file,
+            .file_basename_hex = random_integer,
+            .dest_sub_path = dest_basename,
+            .file_open = true,
+            .file_exists = true,
+            .close_dir_on_deinit = close_dir_on_deinit,
+            .dir = dir,
+        };
+    }
+}
+
+fn dirOpenFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+    var op = ev.FileOpen.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .mode = stdIoModeToZio(options.mode),
+        .allow_directory = options.allow_directory,
+        .follow_symlinks = options.follow_symlinks,
+        .path_only = options.path_only,
+        .allow_ctty = options.allow_ctty,
+        .resolve_beneath = options.resolve_beneath,
+    });
+    try waitForIo(&op.c);
+    const result = op.getResult() catch |err| return openErrToFileErr(err);
+    var file: Io.File = undefined;
+    file.handle = result.fd;
+    flagsWritePollable(&file.flags, result.pollable);
+    errdefer fileCloseImpl(null, &.{file});
+    try applyOpenLock(file, options.lock, options.lock_nonblocking);
+    return file;
+}
+
+fn dirCloseImpl(_: ?*anyopaque, dirs: []const Io.Dir) void {
+    var i: usize = 0;
+    while (i < dirs.len) {
+        var ops: [8]ev.DirClose = undefined;
+        var group = ev.Group.init(.gather);
+        const n = @min(ops.len, dirs.len - i);
+        for (0..n) |j| {
+            ops[j] = ev.DirClose.init(stdIoHandleToZio(dirs[i + j].handle));
+            group.add(&ops[j].c);
+        }
+        waitForIoUncancelable(&group.c);
+        i += n;
+    }
+}
+
+fn dirReadImpl(_: ?*anyopaque, r: *Io.Dir.Reader, entries: []Io.Dir.Entry) Io.Dir.Reader.Error!usize {
+    var entry_index: usize = 0;
+    // Create iterator once to preserve name_index across entries (Windows).
+    // Fields are updated in the loop as r.index/r.end change.
+    var it = os_fs.DirEntryIterator.init(r.buffer, r.index, r.end);
+
+    while (entry_index < entries.len) {
+        if (r.end - r.index == 0) {
+            if (entry_index > 0) break;
+            if (r.state == .finished) return 0;
+
+            const restart = r.state == .reset;
+
+            var op = ev.DirRead.init(stdIoHandleToZio(r.dir.handle), r.buffer, restart);
+            try waitForIo(&op.c);
+            const n = try op.getResult();
+            r.state = .reading;
+            if (n == 0) {
+                r.state = .finished;
+                return 0;
+            }
+            r.index = 0;
+            r.end = n;
+            it.index = 0;
+            it.end = n;
+        } else {
+            it.index = r.index;
+            it.end = r.end;
+        }
+
+        const entry = it.next() orelse {
+            r.index = it.index;
+            if (it.hasPending()) {
+                std.debug.assert(entry_index > 0);
+                break;
+            }
+            continue;
+        };
+        r.index = it.index;
+
+        entries[entry_index] = .{
+            .name = entry.name,
+            .kind = zioKindToStdIoKind(entry.kind),
+            .inode = entry.inode,
+        };
+        entry_index += 1;
+    }
+    return entry_index;
+}
+
+fn dirRealPathImpl(_: ?*anyopaque, dir: Io.Dir, out_buffer: []u8) Io.Dir.RealPathError!usize {
+    var op = ev.DirRealPath.init(stdIoHandleToZio(dir.handle), out_buffer);
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+fn dirRealPathFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, out_buffer: []u8) Io.Dir.RealPathFileError!usize {
+    var op = ev.DirRealPathFile.init(stdIoHandleToZio(dir.handle), sub_path, out_buffer);
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+fn dirDeleteFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8) Io.Dir.DeleteFileError!void {
+    var op = ev.DirDeleteFile.init(stdIoHandleToZio(dir.handle), sub_path);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirDeleteDirImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8) Io.Dir.DeleteDirError!void {
+    var op = ev.DirDeleteDir.init(stdIoHandleToZio(dir.handle), sub_path);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirRenameImpl(_: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8) Io.Dir.RenameError!void {
+    var op = ev.DirRename.init(stdIoHandleToZio(old_dir.handle), old_sub_path, stdIoHandleToZio(new_dir.handle), new_sub_path);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirRenamePreserveImpl(_: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8) Io.Dir.RenamePreserveError!void {
+    var op = ev.DirRenamePreserve.init(stdIoHandleToZio(old_dir.handle), old_sub_path, stdIoHandleToZio(new_dir.handle), new_sub_path);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirSymLinkImpl(_: ?*anyopaque, dir: Io.Dir, target_path: []const u8, sym_link_path: []const u8, flags: Io.Dir.SymLinkFlags) Io.Dir.SymLinkError!void {
+    var op = ev.DirSymLink.init(stdIoHandleToZio(dir.handle), target_path, sym_link_path, .{
+        .is_directory = flags.is_directory,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirReadLinkImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, buffer: []u8) Io.Dir.ReadLinkError!usize {
+    var op = ev.DirReadLink.init(stdIoHandleToZio(dir.handle), sub_path, buffer);
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+fn dirSetOwnerImpl(_: ?*anyopaque, dir: Io.Dir, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.Dir.SetOwnerError!void {
+    var op = ev.DirSetOwner.init(stdIoHandleToZio(dir.handle), owner, group);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirSetFileOwnerImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, owner: ?Io.File.Uid, group: ?Io.File.Gid, options: Io.Dir.SetFileOwnerOptions) Io.Dir.SetFileOwnerError!void {
+    var op = ev.DirSetFileOwner.init(stdIoHandleToZio(dir.handle), sub_path, owner, group, .{
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirSetPermissionsImpl(_: ?*anyopaque, dir: Io.Dir, permissions: Io.Dir.Permissions) Io.Dir.SetPermissionsError!void {
+    var op = ev.DirSetPermissions.init(stdIoHandleToZio(dir.handle), permissionsToZioMode(permissions));
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirSetFilePermissionsImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.File.Permissions, options: Io.Dir.SetFilePermissionsOptions) Io.Dir.SetFilePermissionsError!void {
+    var op = ev.DirSetFilePermissions.init(stdIoHandleToZio(dir.handle), sub_path, permissionsToZioMode(permissions), .{
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirSetTimestampsImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.SetTimestampsOptions) Io.Dir.SetTimestampsError!void {
+    var op = ev.DirSetFileTimestamps.init(stdIoHandleToZio(dir.handle), sub_path, .{
+        .atime = resolveSetTimestamp(options.access_timestamp),
+        .mtime = resolveSetTimestamp(options.modify_timestamp),
+    }, .{ .follow_symlinks = options.follow_symlinks });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn dirHardLinkImpl(_: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8, options: Io.Dir.HardLinkOptions) Io.Dir.HardLinkError!void {
+    var op = ev.DirHardLink.init(stdIoHandleToZio(old_dir.handle), old_sub_path, stdIoHandleToZio(new_dir.handle), new_sub_path, .{
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileStatImpl(_: ?*anyopaque, file: Io.File) Io.File.StatError!Io.File.Stat {
+    var op = ev.FileStat.init(stdIoHandleToZio(file.handle), null, .{});
+    try waitForIo(&op.c);
+    const info = op.getResult() catch |err| return fileStatErrToStdErr(err);
+    return statInfoToStdIo(info);
+}
+
+fn fileLengthImpl(_: ?*anyopaque, file: Io.File) Io.File.LengthError!u64 {
+    var op = ev.FileStat.init(stdIoHandleToZio(file.handle), null, .{});
+    try waitForIo(&op.c);
+    const info = op.getResult() catch |err| return fileStatErrToStdErr(err);
+    return info.size;
+}
+
+fn fileStatErrToStdErr(err: ev.FileStat.Error) Io.File.StatError {
+    return switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        // Should not happen for an already-open fd or dir handle.
+        error.InvalidFileDescriptor,
+        error.FileNotFound,
+        error.NameTooLong,
+        error.BadPathName,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn statFileErrToStdErr(err: ev.FileStat.Error) Io.Dir.StatFileError {
+    return switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        error.FileNotFound => error.FileNotFound,
+        error.NameTooLong => error.NameTooLong,
+        error.BadPathName => error.BadPathName,
+        error.NotDir => error.NotDir,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.InvalidFileDescriptor,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn statInfoToStdIo(info: os_fs.FileStatInfo) Io.File.Stat {
+    return .{
+        .inode = info.inode,
+        .nlink = @intCast(info.nlink),
+        .size = info.size,
+        .permissions = zioModeToPermissions(info.mode),
+        .kind = zioKindToStdIoKind(info.kind),
+        .block_size = info.block_size,
+        .atime = .{ .nanoseconds = info.atime },
+        .mtime = .{ .nanoseconds = info.mtime },
+        .ctime = .{ .nanoseconds = info.ctime },
+    };
+}
+
+fn zioModeToPermissions(mode: os_fs.mode_t) Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        // Zio's FileStatInfo.mode is always 0 on Windows — attributes aren't
+        // captured, so fall back to the default.
+        .windows => .default_file,
+        else => .fromMode(mode),
+    };
+}
+
+fn zioKindToStdIoKind(kind: os_fs.FileKind) Io.File.Kind {
+    return switch (kind) {
+        .block_device => .block_device,
+        .character_device => .character_device,
+        .directory => .directory,
+        .named_pipe => .named_pipe,
+        .sym_link => .sym_link,
+        .file => .file,
+        .unix_domain_socket => .unix_domain_socket,
+        .whiteout => .whiteout,
+        .door => .door,
+        .event_port => .event_port,
+        .unknown => .unknown,
+    };
+}
+
+fn fileCloseImpl(_: ?*anyopaque, files: []const Io.File) void {
+    var i: usize = 0;
+    while (i < files.len) {
+        var ops: [8]ev.FileClose = undefined;
+        var group = ev.Group.init(.gather);
+        const n = @min(ops.len, files.len - i);
+        for (0..n) |j| {
+            ops[j] = ev.FileClose.init(stdIoHandleToZio(files[i + j].handle));
+            group.add(&ops[j].c);
+        }
+        waitForIoUncancelable(&group.c);
+        i += n;
+    }
+}
+
+fn fileWritePositionalImpl(_: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+    if (positionalUnsupported(file)) return error.Unseekable;
+
+    var slices: [max_iovecs_len][]const u8 = undefined;
+    var splat_buf: [64]u8 = undefined;
+    const n = fillBuf(&slices, header, data, splat, &splat_buf);
+    if (n == 0) return 0;
+
+    var iovecs: [max_iovecs_len]os_fs.iovec_const = undefined;
+    const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
+
+    var op = ev.FileWrite.init(stdIoHandleToZio(file.handle), wbuf, offset);
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+fn fileReadPositionalImpl(_: ?*anyopaque, file: Io.File, data: []const []u8, offset: u64) Io.File.ReadPositionalError!usize {
+    if (positionalUnsupported(file)) return error.Unseekable;
+
+    var iovecs: [max_iovecs_len]os_fs.iovec = undefined;
+    var count: usize = 0;
+    for (data) |buf| {
+        if (count == iovecs.len) break;
+        if (buf.len != 0) {
+            iovecs[count] = os_net.iovecFromSlice(buf);
+            count += 1;
+        }
+    }
+    if (count == 0) return 0;
+
+    var op = ev.FileRead.init(stdIoHandleToZio(file.handle), .{ .iovecs = iovecs[0..count] }, offset);
+    try waitForIo(&op.c);
+    return op.getResult() catch |err| switch (err) {
+        error.BrokenPipe => error.Unexpected,
+        else => |e| e,
+    };
+}
+
+fn fileSeekByImpl(_: ?*anyopaque, file: Io.File, offset: i64) Io.File.SeekError!void {
+    return os_fs.fileSeekBy(stdIoHandleToZio(file.handle), offset);
+}
+
+fn fileSeekToImpl(_: ?*anyopaque, file: Io.File, offset: u64) Io.File.SeekError!void {
+    return os_fs.fileSeekTo(stdIoHandleToZio(file.handle), offset);
+}
+
+fn fileSyncImpl(_: ?*anyopaque, file: Io.File) Io.File.SyncError!void {
+    var op = ev.FileSync.init(stdIoHandleToZio(file.handle), .{});
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileIsTtyImpl(_: ?*anyopaque, file: Io.File) Io.Cancelable!bool {
+    return os_fs.isTty(stdIoHandleToZio(file.handle));
+}
+
+fn fileEnableAnsiEscapeCodesImpl(userdata: ?*anyopaque, file: Io.File) Io.File.EnableAnsiEscapeCodesError!void {
+    // Turning the mode on for a Windows console is the one thing this does that
+    // is not a query, and it goes through the console driver protocol that std
+    // implements; keep delegating there. On POSIX there is nothing to enable,
+    // so the whole operation is just the terminal-device check.
+    if (builtin.os.tag == .windows) {
+        const io = globalIo();
+        return io.vtable.fileEnableAnsiEscapeCodes(io.userdata, file);
+    }
+    _ = userdata;
+    if (!os_fs.supportsAnsiEscapeCodes(stdIoHandleToZio(file.handle))) return error.NotTerminalDevice;
+}
+
+fn fileSupportsAnsiEscapeCodesImpl(_: ?*anyopaque, file: Io.File) Io.Cancelable!bool {
+    return os_fs.supportsAnsiEscapeCodes(stdIoHandleToZio(file.handle));
+}
+
+fn fileSetLengthImpl(_: ?*anyopaque, file: Io.File, new_length: u64) Io.File.SetLengthError!void {
+    var op = ev.FileSetSize.init(stdIoHandleToZio(file.handle), new_length);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileSetOwnerImpl(_: ?*anyopaque, file: Io.File, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.File.SetOwnerError!void {
+    var op = ev.FileSetOwner.init(stdIoHandleToZio(file.handle), owner, group);
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileSetPermissionsImpl(_: ?*anyopaque, file: Io.File, permissions: Io.File.Permissions) Io.File.SetPermissionsError!void {
+    var op = ev.FileSetPermissions.init(stdIoHandleToZio(file.handle), permissionsToZioMode(permissions));
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileSetTimestampsImpl(_: ?*anyopaque, file: Io.File, options: Io.File.SetTimestampsOptions) Io.File.SetTimestampsError!void {
+    var op = ev.FileSetTimestamps.init(stdIoHandleToZio(file.handle), .{
+        .atime = resolveSetTimestamp(options.access_timestamp),
+        .mtime = resolveSetTimestamp(options.modify_timestamp),
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileLockImpl(_: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockError!void {
+    if (lock == .none) {
+        fileUnlockImpl(null, file);
+        return;
+    }
+
+    var backoff_ms: u64 = 10;
+    while (true) {
+        if (try fileTryLockImpl(null, file, lock)) return;
+        try runtime_mod.sleep(.fromMilliseconds(backoff_ms));
+        backoff_ms = @min(backoff_ms * 13 / 10, 500);
+    }
+}
+
+fn fileTryLockImpl(_: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockError!bool {
+    const op: os_fs.FileLockOp = switch (lock) {
+        .none => .unlock,
+        .shared => .shared,
+        .exclusive => .exclusive,
+    };
+    while (true) {
+        os_fs.fileLock(stdIoHandleToZio(file.handle), op, .non_blocking) catch |err| switch (err) {
+            error.Interrupted => continue,
+            error.WouldBlock => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+}
+
+fn fileUnlockImpl(_: ?*anyopaque, file: Io.File) void {
+    while (true) {
+        os_fs.fileLock(stdIoHandleToZio(file.handle), .unlock, .blocking) catch |err| switch (err) {
+            error.Interrupted, error.WouldBlock => continue,
+            else => {},
+        };
+        return;
+    }
+}
+
+fn fileDowngradeLockImpl(_: ?*anyopaque, file: Io.File) Io.File.DowngradeLockError!void {
+    while (true) {
+        os_fs.fileLockDowngrade(stdIoHandleToZio(file.handle)) catch |err| switch (err) {
+            error.Interrupted, error.WouldBlock => continue,
+            else => return error.Unexpected,
+        };
+        return;
+    }
+}
+
+fn fileRealPathImpl(_: ?*anyopaque, file: Io.File, out_buffer: []u8) Io.File.RealPathError!usize {
+    var op = ev.FileRealPath.init(stdIoHandleToZio(file.handle), out_buffer);
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+fn fileHardLinkImpl(_: ?*anyopaque, file: Io.File, new_dir: Io.Dir, new_sub_path: []const u8, options: Io.File.HardLinkOptions) Io.File.HardLinkError!void {
+    var op = ev.FileHardLink.init(stdIoHandleToZio(file.handle), stdIoHandleToZio(new_dir.handle), new_sub_path, .{
+        .follow_symlinks = options.follow_symlinks,
+    });
+    try waitForIo(&op.c);
+    try op.getResult();
+}
+
+fn fileMemoryMapCreateImpl(_: ?*anyopaque, _: Io.File, _: Io.File.MemoryMap.CreateOptions) Io.File.MemoryMap.CreateError!Io.File.MemoryMap {
+    @panic("fileMemoryMapCreate: not supported");
+}
+
+fn fileMemoryMapDestroyImpl(_: ?*anyopaque, _: *Io.File.MemoryMap) void {
+    @panic("fileMemoryMapDestroy: not supported");
+}
+
+fn fileMemoryMapSetLengthImpl(_: ?*anyopaque, _: *Io.File.MemoryMap, _: usize) Io.File.MemoryMap.SetLengthError!void {
+    @panic("fileMemoryMapSetLength: not supported");
+}
+
+fn fileMemoryMapReadImpl(_: ?*anyopaque, _: *Io.File.MemoryMap) Io.File.ReadPositionalError!void {
+    @panic("fileMemoryMapRead: not supported");
+}
+
+fn fileMemoryMapWriteImpl(_: ?*anyopaque, _: *Io.File.MemoryMap) Io.File.WritePositionalError!void {
+    @panic("fileMemoryMapWrite: not supported");
+}
+
+/// The allocator for temporary buffers in vtable calls that also have to work
+/// through `debug_io`, which has no runtime behind it.
+fn scratchAllocator(userdata: ?*anyopaque) std.mem.Allocator {
+    if (userdata == null) return std.heap.c_allocator;
+    const rt, _ = decodeUserdata(userdata);
+    return rt.allocator;
+}
+
+fn processExecutableOpenImpl(_: ?*anyopaque, _: Io.Dir.OpenFileOptions) std.process.OpenExecutableError!Io.File {
+    @panic("processExecutableOpen: not supported");
+}
+
+fn processExecutablePathImpl(_: ?*anyopaque, buffer: []u8) std.process.ExecutablePathError!usize {
+    switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .visionos => return os_process.getExecutablePath(buffer),
+        // Windows (PEB), the BSDs (sysctl), and the argv0-only systems still go
+        // through std until they are implemented natively.
+        else => {
+            const io = globalIo();
+            return io.vtable.processExecutablePath(io.userdata, buffer);
+        },
+    }
+}
+
+fn lockStderrImpl(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    return stderr.lock(.{ .userdata = userdata, .vtable = &vtable }, terminal_mode);
+}
+
+fn tryLockStderrImpl(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
+    return stderr.tryLock(.{ .userdata = userdata, .vtable = &vtable }, terminal_mode);
+}
+
+fn unlockStderrImpl(_: ?*anyopaque) void {
+    stderr.unlock();
+}
+
+fn processCurrentPathImpl(userdata: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
+    return os_process.getCurrentPath(scratchAllocator(userdata), buffer) catch |err| switch (err) {
+        error.NameTooLong => error.NameTooLong,
+        error.CurrentDirUnlinked => error.CurrentDirUnlinked,
+        error.Canceled => error.Canceled,
+        // CurrentPathError has neither member, so a directory we are not
+        // allowed to read the path of, and a failed allocation, both have to
+        // come out as Unexpected.
+        error.AccessDenied, error.SystemResources => error.Unexpected,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn processSetCurrentDirImpl(userdata: ?*anyopaque, dir: Io.Dir) std.process.SetCurrentDirError!void {
+    return os_process.setCurrentDir(scratchAllocator(userdata), stdIoHandleToZio(dir.handle)) catch |err| switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.NotDir => error.NotDir,
+        error.InputOutput => error.FileSystem,
+        error.BadPathName => error.BadPathName,
+        error.Canceled => error.Canceled,
+        // SetCurrentDirError has no SystemResources.
+        error.SystemResources, error.Unexpected => error.Unexpected,
+    };
+}
+
+fn processSetCurrentPathImpl(userdata: ?*anyopaque, path: []const u8) std.process.SetCurrentPathError!void {
+    return os_process.setCurrentPath(scratchAllocator(userdata), path) catch |err| switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.NameTooLong => error.NameTooLong,
+        error.FileNotFound => error.FileNotFound,
+        error.NotDir => error.NotDir,
+        error.BadPathName => error.BadPathName,
+        error.InputOutput => error.FileSystem,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+// TODO: implement using our own execve wrapper
+fn processReplaceImpl(userdata: ?*anyopaque, options: std.process.ReplaceOptions) std.process.ReplaceError {
+    var threaded = processThreaded(scratchAllocator(userdata));
+    defer threaded.deinit();
+    const io = threaded.io();
+    return io.vtable.processReplace(io.userdata, options);
+}
+
+fn processEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) {
+        return .{ .block = .global };
+    }
+    if (builtin.link_libc) {
+        const slice = std.mem.sliceTo(std.c.environ, null);
+        return .{ .block = .{ .slice = @ptrCast(slice) } };
+    }
+    return .empty;
+}
+
+/// An `Io.Threaded` to delegate process operations to. Unlike
+/// `Io.Threaded.init`, this does not install process-wide SIGIO and SIGPIPE
+/// handlers.
+// TODO(zig-0.17): use `Io.Threaded.init` if it no longer installs signal
+// handlers, or drop this once process operations are implemented natively.
+fn processThreaded(allocator: std.mem.Allocator) Io.Threaded {
+    const environ = processEnviron();
+    var threaded: Io.Threaded = .init_single_threaded;
+    threaded.allocator = allocator;
+    threaded.environ_initialized = environ.block.isEmpty();
+    threaded.environ = .{ .process_environ = environ };
+    return threaded;
+}
+
+// TODO: implement using our own posix_spawn/fork+exec wrapper
+fn processSpawnImpl(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    var threaded = processThreaded(scratchAllocator(userdata));
+    defer threaded.deinit();
+    const io = threaded.io();
+    // TODO: pass the progress node through once spawning is native; Threaded
+    // registers the progress pipe with its own Io, which Progress asserts against.
+    var threaded_options = options;
+    threaded_options.progress_node = .none;
+    var child = try io.vtable.processSpawn(io.userdata, threaded_options);
+    setChildPipesNonblocking(&child);
+    return child;
+}
+
+fn inheritParentDirImpl(_: ?*anyopaque, handle: Io.Dir.Handle) Io.InheritParentHandleError!Io.Dir {
+    const io = globalIo();
+    return io.vtable.inheritParentDir(io.userdata, handle);
+}
+
+fn inheritParentFileImpl(_: ?*anyopaque, handle: Io.File.Handle, flags: Io.File.Flags) Io.InheritParentHandleError!Io.File {
+    const io = globalIo();
+    return io.vtable.inheritParentFile(io.userdata, handle, flags);
+}
+
+fn setChildPipesNonblocking(child: *std.process.Child) void {
+    if (builtin.os.tag == .windows) return;
+    if (child.stdin) |f| os_posix.setNonblocking(f.handle) catch {};
+    if (child.stdout) |f| os_posix.setNonblocking(f.handle) catch {};
+    if (child.stderr) |f| os_posix.setNonblocking(f.handle) catch {};
+}
+
+fn childWaitImpl(_: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+    return process_impl.childWait(child);
+}
+
+fn childKillImpl(_: ?*anyopaque, child: *std.process.Child) void {
+    process_impl.childKill(child);
+}
+
+fn progressParentFileImpl(userdata: ?*anyopaque) std.Progress.ParentFileError!Io.File {
+    // TODO: the inherited handle is an overlapped pipe that is not associated
+    // with our IOCP port, so writes through the thread pool fail with WouldBlock.
+    if (builtin.os.tag == .windows) return error.EnvironmentVariableMissing;
+    var threaded = processThreaded(scratchAllocator(userdata));
+    defer threaded.deinit();
+    const io = threaded.io();
+    var file = try io.vtable.progressParentFile(io.userdata);
+    file.flags = .{ .nonblocking = false };
+    return file;
+}
+
+fn nowImpl(_: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+    const ts = time.Timestamp.now(.fromStd(clock));
+    return .{ .nanoseconds = @intCast(ts.toNanoseconds()) };
+}
+
+fn clockResolutionImpl(_: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
+    const res = time.Clock.resolution(.fromStd(clock)) orelse return error.ClockUnavailable;
+    return .{ .nanoseconds = @intCast(res.toNanoseconds()) };
+}
+
+fn sleepImpl(_: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+    // A zero-length duration has nothing to time: don't arm a loop timer
+    // just to yield. This makes `Io.sleep(io, .{ .duration = .zero })` the
+    // portable way std.Io code spells "yield". `.none` has no time bound at
+    // all, so it falls through to the ordinary path below and blocks forever
+    // (until canceled), same as every other Timeout consumer.
+    if (timeout == .duration and timeout.duration.raw.nanoseconds <= 0) {
+        return runtime_mod.yield();
+    }
+    var waiter: Waiter = .init();
+    // Nothing ever signals this waiter, so the timeout firing is the sleep
+    // finishing.
+    waiter.timedWaitClock(1, .fromStd(timeout), .fromStdTimeout(timeout), .allow_cancel) catch |err| switch (err) {
+        error.Timeout => {},
+        error.Canceled => return error.Canceled,
+    };
+}
+
+fn randomImpl(_: ?*anyopaque, buffer: []u8) void {
+    random_mod.random(buffer);
+}
+
+fn randomSecureImpl(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+    return random_mod.randomSecure(buffer);
+}
+
+fn stdIoIpToZio(addr: Io.net.IpAddress) zio_net.IpAddress {
+    return switch (addr) {
+        .ip4 => |ip4| zio_net.IpAddress.initIp4(ip4.bytes, ip4.port),
+        .ip6 => |ip6| zio_net.IpAddress.initIp6(ip6.bytes, ip6.port, ip6.flow, ip6.interface.index),
+    };
+}
+
+fn zioIpToStdIo(addr: zio_net.IpAddress) Io.net.IpAddress {
+    return switch (addr.any.family) {
+        std.posix.AF.INET => .{ .ip4 = .{
+            .bytes = @bitCast(addr.in.addr),
+            .port = std.mem.bigToNative(u16, addr.in.port),
+        } },
+        std.posix.AF.INET6 => .{ .ip6 = .{
+            .bytes = addr.in6.addr,
+            .port = std.mem.bigToNative(u16, addr.in6.port),
+            .flow = addr.in6.flowinfo,
+            .interface = .{ .index = addr.in6.scope_id },
+        } },
+        else => unreachable,
+    };
+}
+
+fn senderAddrToStdIo(addr: *const os_net.sockaddr, len: os_net.socklen_t) Io.net.IpAddress {
+    const sender = zio_net.Address.fromPosix(addr, len);
+    return switch (sender.any.family) {
+        os_net.AF.INET, os_net.AF.INET6 => zioIpToStdIo(sender.ip),
+        else => .{ .ip4 = .loopback(0) },
+    };
+}
+
+fn sockAddrLen(addr: *const os_net.sockaddr) os_net.socklen_t {
+    return switch (addr.family) {
+        std.posix.AF.INET => @sizeOf(os_net.sockaddr.in),
+        std.posix.AF.INET6 => @sizeOf(os_net.sockaddr.in6),
+        else => unreachable,
+    };
+}
+
+fn stdIoHandleToZio(h: Io.net.Socket.Handle) os_net.fd_t {
+    return if (@typeInfo(os_net.fd_t) == .pointer) @ptrCast(h) else h;
+}
+
+const OpenOrCancel = os_net.OpenError || common.Cancelable;
+const BindOrCancel = os_net.BindError || common.Cancelable;
+const ListenOrCancel = os_net.ListenError || common.Cancelable;
+const ConnectOrCancel = os_net.ConnectError || common.Cancelable;
+const AcceptOrCancel = os_net.AcceptError || common.Cancelable;
+
+/// Map zio socket-open errors into the subset of std.Io listen/connect errors
+/// they can surface through.
+fn openErrToListenErr(err: OpenOrCancel) Io.net.IpAddress.ListenError {
+    return switch (err) {
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.ProtocolNotSupported => error.ProtocolUnsupportedBySystem,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.PermissionDenied => error.Unexpected,
+        error.Canceled => error.Canceled,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn bindErrToListenErr(err: BindOrCancel) Io.net.IpAddress.ListenError {
+    return switch (err) {
+        error.AddressInUse => error.AddressInUse,
+        error.AddressUnavailable => error.AddressUnavailable,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        // TODO: map `error.AccessDenied` through once `ListenError` has it. Binding a
+        // privileged port without the permission to do so is a normal error, not
+        // something unexpected. Still missing from the set as of 0.17.0-dev.1464,
+        // waiting on https://codeberg.org/ziglang/zig/pulls/36307.
+        error.AccessDenied,
+        error.FileDescriptorNotASocket,
+        error.SymLinkLoop,
+        error.NameTooLong,
+        error.FileNotFound,
+        error.NotDir,
+        error.ReadOnlyFileSystem,
+        error.InputOutput,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn listenErrToListenErr(err: ListenOrCancel) Io.net.IpAddress.ListenError {
+    return switch (err) {
+        error.AddressInUse => error.AddressInUse,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.OperationNotSupported => error.SocketModeUnsupported,
+        error.Canceled => error.Canceled,
+        error.AlreadyConnected,
+        error.FileDescriptorNotASocket,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn netListenIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ListenOptions) Io.net.IpAddress.ListenError!Io.net.Socket {
+    const zio_addr = stdIoIpToZio(address.*);
+
+    // Thin adapter over the native zio.net.Socket API: it already opens
+    // nonblocking, writes the actual bound address back into socket.address, and
+    // its error unions line up with the *ErrToListenErr mappers (which include
+    // cancellation). This keeps reuse (and everything else) in one place.
+    var socket = zio_net.Socket.open(.fromStd(options.mode), .fromPosix(zio_addr.any.family), .fromStd(options.protocol)) catch |err| return openErrToListenErr(err);
+    errdefer socket.close();
+
+    if (options.reuse_address) {
+        socket.setReuseAddress(true) catch return error.OptionUnsupported;
+        // Preserve std.Io's existing behavior: reuse_address also enables
+        // SO_REUSEPORT where the platform supports it, best-effort.
+        socket.setReusePort(true) catch {};
+    }
+
+    socket.bind(.{ .ip = zio_addr }) catch |err| return bindErrToListenErr(err);
+    socket.listen(options.kernel_backlog) catch |err| return listenErrToListenErr(err);
+
+    return .{
+        .handle = socket.handle,
+        .address = zioIpToStdIo(socket.address.ip),
+    };
+}
+
+/// `ConnectionAborted` stays in `AcceptError` because the error set is std's, but
+/// zio never returns it: a connection that left the accept queue before we got to
+/// it says nothing about the listener, so the next one is taken instead.
+fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
+    while (true) {
+        var peer_addr: zio_net.Address = undefined;
+        var peer_addr_len: os_net.socklen_t = @sizeOf(zio_net.Address);
+
+        var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, &peer_addr_len);
+        try waitForIo(&op.c);
+        const handle = op.getResult() catch |err| switch (err) {
+            error.ConnectionAborted => continue,
+            // [vendor-patch] 0.18-dev AcceptError 已不含 WouldBlock；completion 触发后
+            // 仍遇 EWOULDBLOCK 视为伪唤醒，重新等待。
+            error.WouldBlock => continue,
+            error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
+            error.SystemResources => return error.SystemResources,
+            error.SocketNotListening => return error.SocketNotListening,
+            error.ProtocolFailure => return error.ProtocolFailure,
+            error.BlockedByFirewall => return error.BlockedByFirewall,
+            error.NetworkDown => return error.NetworkDown,
+            error.Canceled => return error.Canceled,
+            error.FileDescriptorNotASocket,
+            error.OperationNotSupported,
+            error.Unexpected,
+            => return error.Unexpected,
+        };
+
+        switch (peer_addr.any.family) {
+            os_net.AF.INET, os_net.AF.INET6 => os_net.setNoDelay(handle, true) catch {},
+            else => {},
+        }
+
+        return .{
+            .handle = handle,
+            .address = switch (peer_addr.any.family) {
+                os_net.AF.INET, os_net.AF.INET6 => zioIpToStdIo(peer_addr.ip),
+                // std.Io.net.Socket.address is an IpAddress; use an IPv4 loopback
+                // placeholder for Unix peers, matching std.Io.UnixAddress.listen.
+                else => .{ .ip4 = .loopback(0) },
+            },
+        };
+    }
+}
+
+fn openErrToBindErr(err: OpenOrCancel) Io.net.IpAddress.BindError {
+    return switch (err) {
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.ProtocolNotSupported => error.ProtocolUnsupportedBySystem,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.PermissionDenied => error.Unexpected,
+        error.Canceled => error.Canceled,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn bindErrToBindErr(err: BindOrCancel) Io.net.IpAddress.BindError {
+    return switch (err) {
+        error.AddressInUse => error.AddressInUse,
+        error.AddressUnavailable => error.AddressUnavailable,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        // TODO: same as in `bindErrToListenErr`, map `error.AccessDenied` through
+        // once `BindError` has it.
+        error.AccessDenied,
+        error.FileDescriptorNotASocket,
+        error.SymLinkLoop,
+        error.NameTooLong,
+        error.FileNotFound,
+        error.NotDir,
+        error.ReadOnlyFileSystem,
+        error.InputOutput,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn netBindIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.BindOptions) Io.net.IpAddress.BindError!Io.net.Socket {
+    const zio_addr = stdIoIpToZio(address.*);
+
+    var open_op = ev.NetOpen.init(.fromPosix(zio_addr.any.family), .fromStd(options.mode), if (options.protocol) |p| .fromStd(p) else .ip, .{ .nonblocking = true });
+    try waitForIo(&open_op.c);
+    const handle = open_op.getResult() catch |err| return openErrToBindErr(err);
+    errdefer {
+        var close_op = ev.NetClose.init(handle);
+        waitForIoUncancelable(&close_op.c);
+    }
+
+    if (options.ip6_only) |ip6_only| {
+        if (zio_addr.any.family != os_net.AF.INET6) return error.OptionUnsupported;
+        const value: c_int = @intFromBool(ip6_only);
+        // IPV6_V6ONLY optname: 26 on Linux, 27 on BSD/macOS/Windows.
+        const v6only: u32 = switch (builtin.os.tag) {
+            .linux => 26,
+            else => 27,
+        };
+        os_net.setsockopt(handle, os_net.IPPROTO.IPV6, v6only, std.mem.asBytes(&value)) catch
+            return error.OptionUnsupported;
+    }
+
+    if (options.allow_broadcast) {
+        if (@hasDecl(os_net.SO, "BROADCAST")) {
+            const value: c_int = 1;
+            os_net.setsockopt(handle, os_net.SOL.SOCKET, os_net.SO.BROADCAST, std.mem.asBytes(&value)) catch
+                return error.OptionUnsupported;
+        } else {
+            return error.OptionUnsupported;
+        }
+    }
+
+    var bind_addr = zio_addr;
+    var addr_len = sockAddrLen(&bind_addr.any);
+    var bind_op = ev.NetBind.init(handle, &bind_addr.any, &addr_len);
+    try waitForIo(&bind_op.c);
+    bind_op.getResult() catch |err| return bindErrToBindErr(err);
+
+    return .{
+        .handle = handle,
+        .address = zioIpToStdIo(bind_addr),
+    };
+}
+
+fn openErrToConnectErr(err: OpenOrCancel) Io.net.IpAddress.ConnectError {
+    return switch (err) {
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.ProtocolNotSupported => error.ProtocolUnsupportedBySystem,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.PermissionDenied => error.AccessDenied,
+        error.Canceled => error.Canceled,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn connectErrToConnectErr(err: ConnectOrCancel) Io.net.IpAddress.ConnectError {
+    return switch (err) {
+        error.AccessDenied => error.AccessDenied,
+        error.AddressUnavailable => error.AddressUnavailable,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.WouldBlock => error.WouldBlock,
+        error.ConnectionPending => error.ConnectionPending,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.Timeout => error.Timeout,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.HostUnreachable => error.HostUnreachable,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.Canceled => error.Canceled,
+        error.AddressInUse,
+        error.AlreadyConnected,
+        error.FileDescriptorNotASocket,
+        error.FileNotFound,
+        error.SymLinkLoop,
+        error.NameTooLong,
+        error.NotDir,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn netConnectIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
+    const zio_addr = stdIoIpToZio(address.*);
+
+    var open_op = ev.NetOpen.init(.fromPosix(zio_addr.any.family), .fromStd(options.mode), if (options.protocol) |p| .fromStd(p) else .ip, .{ .nonblocking = true });
+    try waitForIo(&open_op.c);
+    const handle = open_op.getResult() catch |err| return openErrToConnectErr(err);
+    errdefer {
+        var close_op = ev.NetClose.init(handle);
+        waitForIoUncancelable(&close_op.c);
+    }
+
+    const addr_len = sockAddrLen(&zio_addr.any);
+    var connect_op = ev.NetConnect.init(handle, &zio_addr.any, addr_len);
+    try timedWaitForIoClock(&connect_op.c, .fromStd(options.timeout), .fromStdTimeout(options.timeout));
+    connect_op.getResult() catch |err| return connectErrToConnectErr(err);
+
+    if (options.mode == .stream and (options.protocol orelse .tcp) == .tcp) {
+        os_net.setNoDelay(handle, true) catch {};
+    }
+
+    return .{
+        .handle = handle,
+        .address = zioIpToStdIo(zio_addr),
+    };
+}
+
+fn netListenUnixImpl(
+    _: ?*anyopaque,
+    address: *const Io.net.UnixAddress,
+    options: Io.net.UnixAddress.ListenOptions,
+) Io.net.UnixAddress.ListenError!Io.net.Socket.Handle {
+    if (comptime !zio_net.has_unix_sockets) return error.AddressFamilyUnsupported;
+
+    const unix_addr = zio_net.UnixAddress.init(address.path) catch |err| switch (err) {
+        error.NameTooLong => return error.AddressUnavailable,
+    };
+
+    const server = zio_net.UnixAddress.listen(unix_addr, .{
+        .kernel_backlog = options.kernel_backlog,
+    }) catch |err| return switch (err) {
+        error.AddressFamilyUnsupported, error.ProtocolNotSupported => error.AddressFamilyUnsupported,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.PermissionDenied => error.PermissionDenied,
+        error.AccessDenied => error.AccessDenied,
+        error.AddressInUse => error.AddressInUse,
+        error.AddressUnavailable => error.AddressUnavailable,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.FileNotFound => error.FileNotFound,
+        error.NotDir => error.NotDir,
+        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.NetworkDown => error.NetworkDown,
+        error.Canceled => error.Canceled,
+        error.FileDescriptorNotASocket,
+        error.NameTooLong,
+        error.InputOutput,
+        error.AlreadyConnected,
+        error.OperationNotSupported,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+
+    return server.socket.handle;
+}
+
+fn netConnectUnixImpl(
+    _: ?*anyopaque,
+    address: *const Io.net.UnixAddress,
+) Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle {
+    if (comptime !zio_net.has_unix_sockets) return error.AddressFamilyUnsupported;
+
+    const unix_addr = zio_net.UnixAddress.init(address.path) catch |err| switch (err) {
+        error.NameTooLong => return error.FileNotFound,
+    };
+
+    const stream = zio_net.UnixAddress.connect(unix_addr, .{}) catch |err| return switch (err) {
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.ProtocolNotSupported => error.ProtocolUnsupportedBySystem,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.PermissionDenied => error.PermissionDenied,
+        error.AccessDenied => error.AccessDenied,
+        error.SymLinkLoop => error.SymLinkLoop,
+        error.FileNotFound => error.FileNotFound,
+        error.NotDir => error.NotDir,
+        error.WouldBlock => error.WouldBlock,
+        error.NetworkDown => error.NetworkDown,
+        error.Canceled => error.Canceled,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.AlreadyConnected,
+        error.ConnectionPending,
+        error.ConnectionResetByPeer,
+        error.Timeout,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.FileDescriptorNotASocket,
+        error.NameTooLong,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+
+    return stream.socket.handle;
+}
+
+fn netSocketCreatePairImpl(_: ?*anyopaque, options: Io.net.Socket.CreatePairOptions) Io.net.Socket.CreatePairError![2]Io.net.Socket {
+    const domain: os_net.Domain = switch (options.family) {
+        .ip4 => .ipv4,
+        .ip6 => .ipv6,
+    };
+    const socket_type: os_net.Type = .fromStd(options.mode);
+    const protocol: os_net.Protocol = if (options.protocol) |p| .fromStd(p) else .ip;
+
+    const fds = try os_net.socketpair(domain, socket_type, protocol, .{ .nonblocking = true });
+
+    // socketpair sockets are AF_UNIX in practice (AF_INET/INET6 fail with
+    // PROTONOSUPPORT on Linux). The Socket.address field is an IpAddress, so
+    // there's no meaningful value for an unnamed Unix socket — use an IPv4
+    // loopback placeholder, matching the netAccept fallback.
+    return .{
+        .{ .handle = fds[0], .address = .{ .ip4 = .loopback(0) } },
+        .{ .handle = fds[1], .address = .{ .ip4 = .loopback(0) } },
+    };
+}
+
+fn sendErrToSocketSendErr(err: ev.NetSendMsg.Error) Io.net.Socket.SendError {
+    return switch (err) {
+        error.MessageTooBig => error.MessageOversize,
+        error.SystemResources => error.SystemResources,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.HostUnreachable => error.HostUnreachable,
+        error.NetworkDown => error.NetworkDown,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.FastOpenAlreadyInProgress => error.FastOpenAlreadyInProgress,
+        error.ConnectionResetByPeer, error.ConnectionAborted => error.ConnectionResetByPeer,
+        // std.Io has no send error for a kernel connection timeout (ETIMEDOUT);
+        // surface the dead connection as a reset, the actionable signal for callers.
+        error.ConnectionTimedOut => error.ConnectionResetByPeer,
+        error.SocketNotConnected, error.BrokenPipe => error.SocketUnconnected,
+        error.AccessDenied => error.AccessDenied,
+        error.Canceled => error.Canceled,
+        error.WouldBlock,
+        error.FileDescriptorNotASocket,
+        error.OperationNotSupported,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn zioSendFlags(flags: Io.net.SendFlags) os_net.SendFlags {
+    return .{
+        .confirm = flags.confirm,
+        .dont_route = flags.dont_route,
+        .eor = flags.eor,
+        .oob = flags.oob,
+        .fastopen = flags.fastopen,
+    };
+}
+
+/// Sends each message in turn, reporting how many made it. A partial count is
+/// part of the contract, so a caller that gets fewer than it passed re-submits
+/// the rest; that is what lets the batch path below send just one.
+fn netSendOpImpl(
+    handle: Io.net.Socket.Handle,
+    messages: []Io.net.OutgoingMessage,
+    flags: Io.net.SendFlags,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.Cancelable || common.Timeoutable)!Io.Operation.NetSend.Result {
+    const zio_flags = zioSendFlags(flags);
+
+    for (messages, 0..) |*msg, i| {
+        const zio_addr = stdIoIpToZio(msg.address.*);
+        const iovec = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
+
+        var op = ev.NetSendMsg.init(
+            stdIoHandleToZio(handle),
+            .{ .iovecs = (&iovec)[0..1] },
+            zio_flags,
+            &zio_addr.any,
+            sockAddrLen(&zio_addr.any),
+            if (msg.control.len != 0) msg.control else null,
+        );
+        try timedWaitForIoClock(&op.c, timeout, clock);
+        const sent = op.getResult() catch |err| return .{ sendErrToSocketSendErr(err), i };
+        msg.data_len = sent;
+    }
+    return .{ null, messages.len };
+}
+
+fn netReadOpImpl(
+    handle: Io.net.Socket.Handle,
+    data: [][]u8,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.Operation.NetRead.Error || Io.Cancelable || common.Timeoutable)!usize {
+    if (data.len == 0) return 0;
+    var iovecs: [max_iovecs_len]os_net.iovec = undefined;
+    var op = ev.NetRecv.init(stdIoHandleToZio(handle), ev.ReadBuf.fromSlices(data, &iovecs), .{});
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    return op.getResult() catch |err| return recvErrToReadErr(err);
+}
+
+fn recvErrToReadErr(err: ev.NetRecv.Error) Io.Operation.NetRead.Error {
+    return switch (err) {
+        error.ConnectionResetByPeer, error.ConnectionAborted => error.ConnectionResetByPeer,
+        // ETIMEDOUT means the connection died (retransmits exhausted), not that a
+        // read deadline elapsed; std.Io.Stream.Reader has no timed-out-connection
+        // variant, so report it as a broken connection rather than a Timeout.
+        error.ConnectionTimedOut => error.ConnectionResetByPeer,
+        error.SocketNotConnected, error.SocketShutdown => error.SocketUnconnected,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.Canceled,
+        error.WouldBlock,
+        error.ConnectionRefused,
+        error.FileDescriptorNotASocket,
+        error.OperationNotSupported,
+        error.MessageOversize,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.NetworkUnreachable,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn recvMsgErrToReceiveErr(err: ev.NetRecvMsg.Error) Io.net.Socket.ReceiveError {
+    return switch (err) {
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.ConnectionTimedOut => error.ConnectionResetByPeer,
+        error.SocketNotConnected, error.SocketShutdown, error.ConnectionAborted => error.SocketUnconnected,
+        error.NetworkDown => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.MessageOversize => error.MessageOversize,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        // On datagram sockets, an ICMP "port unreachable" response to a prior
+        // send is surfaced as ECONNREFUSED on the next receive.
+        error.ConnectionRefused => error.PortUnreachable,
+        error.Canceled => error.Canceled,
+        error.WouldBlock,
+        error.FileDescriptorNotASocket,
+        error.OperationNotSupported,
+        error.NetworkUnreachable,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn decodeIncomingFlags(raw: u32) Io.net.IncomingMessage.Flags {
+    switch (builtin.os.tag) {
+        .windows => {
+            // Windows WSAMSG.dwFlags uses a different bit layout than POSIX
+            // msghdr.flags and doesn't distinguish most of these. Match
+            // std.Io.Threaded's Windows behavior: report all-zero output flags.
+            return .{ .eor = false, .trunc = false, .ctrunc = false, .oob = false, .errqueue = false };
+        },
+        else => {
+            const MSG = std.posix.MSG;
+            return .{
+                .eor = (raw & MSG.EOR) != 0,
+                .trunc = (raw & MSG.TRUNC) != 0,
+                .ctrunc = (raw & MSG.CTRUNC) != 0,
+                .oob = (raw & MSG.OOB) != 0,
+                .errqueue = if (@hasDecl(MSG, "ERRQUEUE")) (raw & MSG.ERRQUEUE) != 0 else false,
+            };
+        },
+    }
+}
+
+fn hasControl(messages: []const Io.net.IncomingMessage) bool {
+    for (messages) |m| {
+        if (m.control.len != 0) return true;
+    }
+    return false;
+}
+
+const max_mmsg_slots = 64;
+
+fn netReceiveMmsg(
+    o: *const Io.Operation.NetReceive,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (common.Cancelable || common.Timeoutable)!Io.Operation.NetReceive.Result {
+    var n = @min(o.message_buffer.len, max_mmsg_slots);
+    var chunk = o.data_buffer.len / n;
+    while (chunk == 0 and n > 1) {
+        n -= 1;
+        chunk = o.data_buffer.len / n;
+    }
+    if (chunk == 0) return .{ null, 0 };
+
+    var slots: [max_mmsg_slots]ev.NetRecvMmsg.Slot = undefined;
+    for (0..n) |i| {
+        const start = i * chunk;
+        const end = if (i + 1 == n) o.data_buffer.len else start + chunk;
+        slots[i] = .{ .data = o.data_buffer[start..end] };
+    }
+
+    const zio_flags: os_net.RecvFlags = .{
+        .peek = o.flags.peek,
+        .oob = o.flags.oob,
+        .trunc = o.flags.trunc,
+    };
+
+    var op = ev.NetRecvMmsg.init(
+        stdIoHandleToZio(o.socket_handle),
+        slots[0..n],
+        zio_flags,
+    );
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    const count = op.getResult() catch |err| {
+        return .{ recvMsgErrToReceiveErr(err), 0 };
+    };
+
+    for (0..count) |i| {
+        o.message_buffer[i] = .{
+            .from = senderAddrToStdIo(@ptrCast(&slots[i].addr), slots[i].addr_len),
+            .data = slots[i].data[0..slots[i].received_len],
+            .control = &.{},
+            .flags = decodeIncomingFlags(slots[i].msg_flags),
+        };
+    }
+
+    if (op.drain_error) |err| return .{ recvMsgErrToReceiveErr(err), count };
+
+    if (!op.drained and count > 0 and count < o.message_buffer.len) {
+        const more = netReceiveMoreLoop(o, count);
+        return .{ more[0], count + more[1] };
+    }
+
+    return .{ null, count };
+}
+
+/// Fill the slots after the first one with whatever the kernel already holds.
+/// The first receive waited for the socket; these never do (`dontwait`), so
+/// the count only grows by datagrams that were queued when the call ran.
+/// Returns the `net_receive` result for a first message that has already
+/// landed in `message_buffer[0]`.
+///
+/// Each message gets the whole remaining data buffer, as in std.Io.Threaded,
+/// so a datagram larger than what is left is truncated; sizing the buffer is
+/// the caller's job. The loop stops when the slots or the buffer run out or
+/// the queue is empty. A message already received must be reported, so an
+/// error after that point rides along in the tuple with the count, and a
+/// cancellation is re-armed for the next cancellation point instead of being
+/// returned. Peeking is excluded, since every slot would see the same
+/// datagram, and so is `trunc`: it reports the full datagram length, which
+/// the ever-shorter tail cannot hold and the caller could not have sized for.
+fn netReceiveMore(o: *const Io.Operation.NetReceive) Io.Operation.NetReceive.Result {
+    if (!ev.Backend.supports_recv_dontwait or o.flags.peek or o.flags.trunc) return .{ null, 1 };
+    const extra = netReceiveMoreLoop(o, 1);
+    return .{ extra[0], 1 + extra[1] };
+}
+
+fn netReceiveMoreLoop(o: *const Io.Operation.NetReceive, start: usize) Io.Operation.NetReceive.Result {
+    var count: usize = 0;
+    var data_i: usize = 0;
+    for (o.message_buffer[0..start]) |m| data_i += m.data.len;
+    for (o.message_buffer[start..]) |*message| {
+        const remaining = o.data_buffer[data_i..];
+        if (remaining.len == 0) break;
+        netReceiveImpl(o.socket_handle, message, remaining, o.flags, true, .none, .awake) catch |err| switch (err) {
+            error.WouldBlock => break,
+            error.Canceled => {
+                runtime_mod.recancel();
+                break;
+            },
+            error.Timeout => unreachable,
+            else => |e| return .{ e, count },
+        };
+        count += 1;
+        data_i += message.data.len;
+    }
+    return .{ null, count };
+}
+
+/// Receive a single datagram, filling `message` with its metadata and returning
+/// the received bytes as a sub-slice of `data_buffer`. Mirrors std.Io.Threaded's
+/// netReceivePosix: one recvmsg per call. With `dontwait` the operation reports
+/// an empty queue as `error.WouldBlock` instead of waiting for readiness.
+fn netReceiveImpl(
+    socket_handle: Io.net.Socket.Handle,
+    message: *Io.net.IncomingMessage,
+    data_buffer: []u8,
+    flags: Io.net.ReceiveFlags,
+    dontwait: bool,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.net.Socket.ReceiveError || error{WouldBlock} || common.Timeoutable)!void {
+    const zio_flags: os_net.RecvFlags = .{
+        .peek = flags.peek,
+        .oob = flags.oob,
+        .trunc = flags.trunc,
+        .dontwait = dontwait,
+    };
+    var storage: zio_net.Address = undefined;
+    var addr_len: os_net.socklen_t = @sizeOf(zio_net.Address);
+    var iov = os_net.iovecFromSlice(data_buffer);
+    const has_control = message.control.len != 0;
+    var op = ev.NetRecvMsg.init(
+        stdIoHandleToZio(socket_handle),
+        .{ .iovecs = (&iov)[0..1] },
+        zio_flags,
+        &storage.any,
+        &addr_len,
+        if (has_control) message.control else null,
+    );
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    const result = op.getResult() catch |err| switch (err) {
+        error.WouldBlock => return if (dontwait) error.WouldBlock else error.Unexpected,
+        else => |e| return recvMsgErrToReceiveErr(e),
+    };
+    message.* = .{
+        .from = senderAddrToStdIo(&storage.any, addr_len),
+        // With flags.trunc on Linux, result.len is the full datagram length,
+        // which may exceed data_buffer.len; flags.trunc in the message tells.
+        .data = data_buffer[0..@min(result.len, data_buffer.len)],
+        .control = if (has_control) message.control[0..result.controllen] else message.control,
+        .flags = decodeIncomingFlags(result.flags),
+    };
+}
+
+fn sendErrToWriteErr(err: ev.NetSend.Error) Io.Operation.NetWrite.Error {
+    return switch (err) {
+        error.ConnectionResetByPeer, error.ConnectionAborted => error.ConnectionResetByPeer,
+        error.ConnectionTimedOut => error.ConnectionResetByPeer,
+        error.SocketNotConnected, error.BrokenPipe => error.SocketUnconnected,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.HostUnreachable => error.HostUnreachable,
+        error.NetworkDown => error.NetworkDown,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.FastOpenAlreadyInProgress => error.FastOpenAlreadyInProgress,
+        error.SystemResources => error.SystemResources,
+        // Cancellation reaches the caller from the wait, not from the result,
+        // so seeing it here means the operation ended some other way. Same
+        // reasoning as `recvErrToReadErr`.
+        error.Canceled,
+        error.WouldBlock,
+        error.AccessDenied,
+        error.FileDescriptorNotASocket,
+        error.MessageTooBig,
+        error.OperationNotSupported,
+        error.Unexpected,
+        => error.Unexpected,
+    };
+}
+
+fn netWriteOpImpl(
+    handle: Io.net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) (Io.Operation.NetWrite.Error || Io.Cancelable || common.Timeoutable)!usize {
+    var slices: [max_iovecs_len][]const u8 = undefined;
+    var splat_buf: [64]u8 = undefined;
+    const n = fillBuf(&slices, header, data, splat, &splat_buf);
+    if (n == 0) return 0;
+
+    var iovecs: [max_iovecs_len]os_net.iovec_const = undefined;
+    const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
+
+    var op = ev.NetSend.init(stdIoHandleToZio(handle), wbuf, .{});
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    return op.getResult() catch |err| return sendErrToWriteErr(err);
+}
+
+fn netWriteFileImpl(
+    _: ?*anyopaque,
+    handle: Io.net.Socket.Handle,
+    header: []const u8,
+    file_reader: *Io.File.Reader,
+    limit: Io.Limit,
+) Io.net.Stream.Writer.WriteFileError!usize {
+    // `NetSendFile` reads at an explicit offset and leaves the kernel's file
+    // position alone, which a streaming reader relies on.
+    if (file_reader.mode != .positional) return error.Unimplemented;
+    if (positionalUnsupported(file_reader.file)) return error.Unimplemented;
+
+    // Bytes already in hand go out first, as a plain send; the caller loops
+    // back for the file body.
+    const reader_buffered = limit.slice(file_reader.interface.buffered());
+    if (header.len != 0 or reader_buffered.len != 0) {
+        const n = netWriteOpImpl(handle, header, &.{reader_buffered}, 1, .none, .awake) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| return e,
+        };
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    if (limit == .nothing) return 0;
+    if (file_reader.size) |size| {
+        if (file_reader.pos >= size) return error.EndOfStream;
+    }
+
+    // The reader's buffer is empty here, so the fallback loop can borrow it.
+    const buffer = file_reader.interface.buffer;
+    if (ev.Backend.capability(.net_send_file) != .yes and buffer.len == 0) return error.Unimplemented;
+
+    var op = ev.NetSendFile.init(
+        stdIoHandleToZio(handle),
+        file_reader.file.handle,
+        file_reader.pos,
+        @backingInt(limit),
+        .{ buffer, &.{} },
+    );
+    try waitForIo(&op.c);
+    const n = op.getResult() catch |err| switch (err) {
+        // A reader starts positional even on a pipe and learns otherwise
+        // here, before anything was sent; same recovery as std's
+        // `readVecPositional`.
+        error.Unseekable => {
+            file_reader.mode = file_reader.mode.toStreaming();
+            const pos = file_reader.pos;
+            if (pos != 0) {
+                file_reader.pos = 0;
+                file_reader.seekBy(@intCast(pos)) catch {
+                    file_reader.mode = .failure;
+                    return error.ReadFailed;
+                };
+            }
+            return error.Unimplemented;
+        },
+        error.InputOutput, error.IsDir, error.NotOpenForReading => |e| {
+            file_reader.err = e;
+            return error.ReadFailed;
+        },
+        else => |e| return sendErrToWriteErr(@errorCast(e)),
+    };
+    if (n == 0) return error.EndOfStream;
+    file_reader.pos += n;
+    return n;
+}
+
+fn netCloseImpl(_: ?*anyopaque, sockets: []const Io.net.Socket) void {
+    var i: usize = 0;
+    while (i < sockets.len) {
+        var ops: [8]ev.NetClose = undefined;
+        var group = ev.Group.init(.gather);
+        const n = @min(ops.len, sockets.len - i);
+        for (0..n) |j| {
+            ops[j] = ev.NetClose.init(stdIoHandleToZio(sockets[i + j].handle));
+            group.add(&ops[j].c);
+        }
+        waitForIoUncancelable(&group.c);
+        i += n;
+    }
+}
+
+fn shutdownErrToStdErr(err: ev.NetShutdown.Error) Io.net.ShutdownError {
+    return switch (err) {
+        error.SocketUnconnected => error.SocketUnconnected,
+        error.ConnectionAborted => error.ConnectionAborted,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.NetworkDown => error.NetworkDown,
+        error.Canceled => error.Canceled,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
+fn netShutdownImpl(_: ?*anyopaque, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) Io.net.ShutdownError!void {
+    const zio_how: os_net.ShutdownHow = switch (how) {
+        .recv => .receive,
+        .send => .send,
+        .both => .both,
+    };
+    var op = ev.NetShutdown.init(stdIoHandleToZio(handle), zio_how);
+    try waitForIo(&op.c);
+    op.getResult() catch |err| return shutdownErrToStdErr(err);
+}
+
+fn netInterfaceNameResolveImpl(_: ?*anyopaque, name: *const Io.net.Interface.Name) Io.net.Interface.Name.ResolveError!Io.net.Interface {
+    // Windows resolves names through iphlpapi, which std already wraps; keep
+    // delegating there until it is implemented natively.
+    if (builtin.os.tag == .windows) {
+        const io = globalIo();
+        return io.vtable.netInterfaceNameResolve(io.userdata, name);
+    }
+    const index = try os_net.interfaceNameToIndex(&name.bytes);
+    return .{ .index = index };
+}
+
+fn netInterfaceNameImpl(_: ?*anyopaque, interface: Io.net.Interface) Io.net.Interface.NameError!Io.net.Interface.Name {
+    // std only implements this for Windows (Linux/libc both panic there), so on
+    // POSIX we implement it ourselves and only delegate on Windows.
+    if (builtin.os.tag == .windows) {
+        const io = globalIo();
+        return io.vtable.netInterfaceName(io.userdata, interface);
+    }
+    var buf: [os_net.IF_NAMESIZE]u8 = undefined;
+    const len = try os_net.interfaceIndexToName(interface.index, &buf);
+    return Io.net.Interface.Name.fromSlice(buf[0..len]) catch return error.NameTooLong;
+}
+
+fn netLookupImpl(
+    userdata: ?*anyopaque,
+    host_name: Io.net.HostName,
+    resolved: *Io.Queue(Io.net.HostName.LookupResult),
+    options: Io.net.HostName.LookupOptions,
+) Io.net.HostName.LookupError!void {
+    const rt, _ = decodeUserdata(userdata);
+    const io = fromRuntime(rt, .regular);
+    defer resolved.close(io);
+
+    // Sized for the largest answer the resolver can return: both families
+    // plus one canonical-name entry.
+    var storage: [2 * zio_dns.max_addrs_per_family + 1]zio_dns.LookupResult = undefined;
+    const count = zio_dns.lookup(&storage, .{
+        .name = host_name.bytes,
+        .port = options.port,
+        .family = if (options.family) |f| switch (f) {
+            .ip4 => .ipv4,
+            .ip6 => .ipv6,
+        } else null,
+        .canonical_name_buffer = options.canonical_name_buffer,
+    }) catch |err| return dnsLookupErrToStdErr(err);
+
+    for (storage[0..count]) |entry| switch (entry) {
+        .address => |addr| {
+            resolved.putOne(io, .{ .address = zioIpToStdIo(addr) }) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => unreachable,
+            };
+        },
+        .canonical_name => |name| {
+            if (name.bytes.len > Io.net.HostName.max_len) return error.InvalidDnsCnameRecord;
+            resolved.putOne(io, .{ .canonical_name = .{ .bytes = name.bytes } }) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => unreachable,
+            };
+        },
+    };
+}
+
+fn dnsLookupErrToStdErr(err: zio_dns.LookupError) Io.net.HostName.LookupError {
+    return switch (err) {
+        error.UnknownHostName => error.UnknownHostName,
+        error.NameServerFailure, error.TemporaryNameServerFailure => error.NameServerFailure,
+        error.HostLacksNetworkAddresses => error.NoAddressReturned,
+        error.AddressFamilyUnsupported => error.AddressFamilyUnsupported,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemResources, error.OutOfMemory => error.SystemResources,
+        error.Canceled => error.Canceled,
+        error.Unexpected, error.ServiceUnavailable, error.NoThreadPool, error.RuntimeShutdown => error.Unexpected,
+    };
+}
+
+test {
+    _ = process_impl;
+}
+
+/// The same fixture the `fs.zig` tests use, handing its directory out as an
+/// `Io.Dir` through `stdDir`.
+const TestDirFixture = zio_fs.TestDirFixture;
+
+test "Runtime.io / Runtime.fromIo round-trip" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const value = rt.io();
+    try std.testing.expect(value.vtable == &vtable);
+    try std.testing.expectEqual(rt, Runtime.fromIo(value).?);
+}
+
+test "Runtime.fromIo answers null for a std.Io from another backend" {
+    // Same contents, different address: identity of the vtable pointer is
+    // what marks a zio-backed `std.Io`, not what the table contains. A `var`
+    // copy guarantees storage distinct from the real vtable's.
+    var foreign_vtable = vtable;
+    const foreign: Io = .{ .userdata = null, .vtable = &foreign_vtable };
+    try std.testing.expectEqual(null, Runtime.fromIo(foreign));
+}
+
+test "Runtime.fromIo answers null for debug_io" {
+    // zio's own vtable, but no runtime behind it: the userdata check is what
+    // stops this from being cast into a *Runtime.
+    try std.testing.expectEqual(null, Runtime.fromIo(debug_io));
+}
+
+test "io: async/await returns task result" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn doubleIt(x: i32) i32 {
+            return x * 2;
+        }
+
+        fn run(io: Io) !void {
+            var future = io.async(doubleIt, .{21});
+            const value = future.await(io);
+            try std.testing.expectEqual(@as(i32, 42), value);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: Io.Mutex lock/unlock serializes tasks" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const State = struct {
+        mutex: Io.Mutex = .init,
+        counter: u32 = 0,
+    };
+
+    const Worker = struct {
+        fn bump(io: Io, s: *State) !void {
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                try s.mutex.lock(io);
+                s.counter += 1;
+                s.mutex.unlock(io);
+            }
+        }
+
+        fn run(io: Io) !void {
+            var s: State = .{};
+            var group: Io.Group = .init;
+            group.async(io, bump, .{ io, &s });
+            group.async(io, bump, .{ io, &s });
+            group.async(io, bump, .{ io, &s });
+            try group.await(io);
+            try std.testing.expectEqual(@as(u32, 300), s.counter);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: Io.Condition wakes waiter after signal" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const State = struct {
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        ready: bool = false,
+    };
+
+    const Worker = struct {
+        fn producer(io: Io, s: *State) !void {
+            try s.mutex.lock(io);
+            defer s.mutex.unlock(io);
+            s.ready = true;
+            s.cond.signal(io);
+        }
+
+        fn consumer(io: Io, s: *State, observed: *bool) !void {
+            try s.mutex.lock(io);
+            defer s.mutex.unlock(io);
+            while (!s.ready) try s.cond.wait(io, &s.mutex);
+            observed.* = true;
+        }
+
+        fn run(io: Io) !void {
+            var s: State = .{};
+            var observed = false;
+            var group: Io.Group = .init;
+            group.async(io, consumer, .{ io, &s, &observed });
+            group.async(io, producer, .{ io, &s });
+            try group.await(io);
+            try std.testing.expect(observed);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: Io.Semaphore limits concurrent workers" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Shared = struct {
+        sem: Io.Semaphore = .{ .permits = 2 },
+        active: std.atomic.Value(u32) = .init(0),
+        peak: std.atomic.Value(u32) = .init(0),
+    };
+
+    const Worker = struct {
+        fn work(io: Io, shared: *Shared) !void {
+            try shared.sem.wait(io);
+            defer shared.sem.post(io);
+
+            const current = shared.active.fetchAdd(1, .acq_rel) + 1;
+            // Track peak concurrency.
+            var peak = shared.peak.load(.monotonic);
+            while (current > peak) {
+                peak = shared.peak.cmpxchgWeak(peak, current, .acq_rel, .monotonic) orelse break;
+            }
+            _ = shared.active.fetchSub(1, .acq_rel);
+        }
+
+        fn run(io: Io) !void {
+            var shared: Shared = .{};
+            var group: Io.Group = .init;
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                group.async(io, work, .{ io, &shared });
+            }
+            try group.await(io);
+            try std.testing.expect(shared.peak.load(.acquire) <= 2);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: processExecutablePath returns a non-empty path" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.executablePath(io, &buf);
+    try std.testing.expect(len > 0);
+}
+
+test "io: progressParentFile reads ZIG_PROGRESS" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const result = io.vtable.progressParentFile(io.userdata);
+    if (builtin.os.tag == .windows or !builtin.link_libc) {
+        try std.testing.expectError(error.EnvironmentVariableMissing, result);
+        return;
+    }
+    const value = std.mem.span(std.c.getenv("ZIG_PROGRESS") orelse {
+        try std.testing.expectError(error.EnvironmentVariableMissing, result);
+        return;
+    });
+    const fd = std.fmt.parseInt(u31, value, 10) catch {
+        try std.testing.expectError(error.UnrecognizedFormat, result);
+        return;
+    };
+    const file = try result;
+    try std.testing.expectEqual(fd, file.handle);
+    try std.testing.expectEqual(null, flagsReadPollable(&file.flags));
+}
+
+test "io: debug_io answers process paths without a runtime" {
+    // std asks debug_io for the executable path while it symbolizes a panic
+    // trace, which can happen before any runtime exists.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.executablePath(debug_io, &buf);
+    try std.testing.expect(len > 0);
+
+    const cwd_len = try std.process.currentPath(debug_io, &buf);
+    try std.testing.expect(cwd_len > 0);
+}
+
+test "io: processCurrentPath agrees with the working directory" {
+    if (builtin.os.tag == .netbsd) return error.SkipZigTest; // no realPath to compare against
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    try std.testing.expect(len > 0);
+
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = Io.Dir.cwd().realPath(io, &real_buf) catch |err| switch (err) {
+        error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqualStrings(real_buf[0..real_len], buf[0..len]);
+}
+
+test "io: processSetCurrentPath and processSetCurrentDir move the working directory" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const sub_path = "test_io_set_current_dir";
+
+    // Remember where we started, so the move can be undone by path even after
+    // the working directory is somewhere else.
+    var original_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const original = original_buf[0..try std.process.currentPath(io, &original_buf)];
+
+    try dir.createDir(io, sub_path, .default_dir);
+
+    {
+        var sub = try dir.openDir(io, sub_path, .{});
+        defer sub.close(io);
+        errdefer std.process.setCurrentPath(io, original) catch {};
+
+        // Once by handle, and back, then once by path, so both entry points
+        // move the working directory.
+        try std.process.setCurrentDir(io, sub);
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try std.process.currentPath(io, &buf);
+        try std.testing.expect(std.mem.endsWith(u8, buf[0..len], sub_path));
+    }
+
+    try std.process.setCurrentPath(io, original);
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    try std.testing.expectEqualStrings(original, buf[0..len]);
+
+    // The cwd handle names the directory we are in, so moving to it is a no-op
+    // rather than an error, even where it is a sentinel and not a descriptor.
+    try std.process.setCurrentDir(io, .cwd());
+}
+
+test "io: file isTty is false for a pipe" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // On Windows this is a named pipe, which is also what an MSYS2/Cygwin pty
+    // is, so it goes through the name check that tells the two apart.
+    const fds = try os_fs.pipe();
+    var read_file: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
+    var write_file: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = true } };
+    defer read_file.close(io);
+    defer write_file.close(io);
+
+    try std.testing.expect(!try io.vtable.fileIsTty(io.userdata, read_file));
+    try std.testing.expect(!try io.vtable.fileSupportsAnsiEscapeCodes(io.userdata, read_file));
+}
+
+test "io: file isTty is true for a terminal" {
+    // A pty master is a terminal on Linux, but not on the BSDs, where the
+    // terminal is the slave side and opening it takes the whole grantpt dance.
+    // CI has no terminal attached to the test process to use instead.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const tty_handle = os_fs.openat(std.testing.allocator, os_fs.cwd(), "/dev/ptmx", .{ .mode = .read_write }) catch
+        return error.SkipZigTest;
+    var tty_file: Io.File = .{ .handle = tty_handle, .flags = .{ .nonblocking = false } };
+    defer tty_file.close(io);
+
+    try std.testing.expect(try io.vtable.fileIsTty(io.userdata, tty_file));
+    try std.testing.expect(try io.vtable.fileSupportsAnsiEscapeCodes(io.userdata, tty_file));
+}
+
+test "io: now returns monotonically increasing awake timestamps" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const a = Io.Timestamp.now(io, .awake);
+    try io.sleep(.fromMilliseconds(5), .awake);
+    const b = Io.Timestamp.now(io, .awake);
+    try std.testing.expect(b.nanoseconds >= a.nanoseconds + 5 * std.time.ns_per_ms);
+}
+
+test "io: clockResolution reports a granularity for every clock" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    for ([_]Io.Clock{ .real, .awake, .boot, .cpu_process, .cpu_thread }) |clock| {
+        const res = Io.Clock.resolution(clock, io) catch |err| {
+            if (err == error.ClockUnavailable) continue;
+            return err;
+        };
+        try std.testing.expect(res.nanoseconds > 0);
+    }
+}
+
+test "io: cpu-time clocks are monotonic" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // Note: we only assert monotonicity. We can't assert the clock advances by
+    // a given amount, since some platforms (Windows) account CPU time in coarse
+    // scheduler ticks that may not register a short burst at all.
+    for ([_]Io.Clock{ .cpu_process, .cpu_thread }) |clock| {
+        _ = Io.Clock.resolution(clock, io) catch |err| {
+            if (err == error.ClockUnavailable) continue;
+            return err;
+        };
+
+        const before = Io.Timestamp.now(io, clock);
+
+        var x: u64 = 0;
+        for (0..2_000_000) |i| x +%= i *% 2654435761;
+        std.mem.doNotOptimizeAway(x);
+
+        const after = Io.Timestamp.now(io, clock);
+        try std.testing.expect(after.nanoseconds >= before.nanoseconds);
+    }
+}
+
+test "io: random fills buffer with varying bytes" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var buf: [64]u8 = @splat(0);
+    io.random(&buf);
+    // Probabilistically asserts we actually filled the buffer.
+    var nonzero: usize = 0;
+    for (buf) |b| if (b != 0) {
+        nonzero += 1;
+    };
+    try std.testing.expect(nonzero > 32);
+}
+
+test "io: randomSecure fills buffer with varying bytes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var buf: [64]u8 = @splat(0);
+    try io.randomSecure(&buf);
+    var nonzero: usize = 0;
+    for (buf) |b| if (b != 0) {
+        nonzero += 1;
+    };
+    try std.testing.expect(nonzero > 32);
+}
+
+test "io: sleep with duration returns after delay" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sw = time.Stopwatch.start();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expect(sw.read().toMilliseconds() >= 20);
+}
+
+test "io: sleep honors boot and real clocks" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    for ([_]Io.Clock{ .boot, .real }) |clock| {
+        var sw = time.Stopwatch.start();
+        try io.sleep(.fromMilliseconds(20), clock);
+        try std.testing.expect(sw.read().toMilliseconds() >= 20);
+    }
+}
+
+test "io: sleep until an absolute realtime deadline" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // A deadline carries the realtime epoch (ns since 1970); fromStd must keep
+    // it as an absolute deadline rather than mixing it with the monotonic clock.
+    const deadline: Io.Clock.Timestamp = .fromNow(io, .{
+        .raw = .fromMilliseconds(20),
+        .clock = .real,
+    });
+
+    var sw = time.Stopwatch.start();
+    try deadline.wait(io);
+    try std.testing.expect(sw.read().toMilliseconds() >= 20);
+}
+
+test "io: sleep is cancelable" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn sleeper(io: Io, observed: *Io.Cancelable!void) void {
+            observed.* = io.sleep(.fromSeconds(60), .awake);
+        }
+
+        fn run(io: Io) !void {
+            var observed: Io.Cancelable!void = {};
+            var future = io.async(sleeper, .{ io, &observed });
+            try io.sleep(.fromMilliseconds(10), .awake);
+            future.cancel(io);
+            try std.testing.expectError(error.Canceled, observed);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP listen/connect/accept handshake" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn connector(io: Io, address: *const Io.net.IpAddress, result: *Io.net.IpAddress.ConnectError!Io.net.Stream) void {
+            result.* = Io.net.IpAddress.connect(address, io, .{ .mode = .stream });
+        }
+
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(
+                &.{ .ip4 = .loopback(0) },
+                io,
+                .{ .reuse_address = true },
+            );
+            defer server.deinit(io);
+
+            var connect_result: Io.net.IpAddress.ConnectError!Io.net.Stream = undefined;
+            var future = io.async(connector, .{ io, &server.socket.address, &connect_result });
+            defer future.cancel(io);
+
+            const accepted = try server.accept(io);
+            defer accepted.close(io);
+
+            future.await(io);
+            const client = try connect_result;
+            defer client.close(io);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP connected and accepted streams have Nagle's algorithm disabled" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn connector(io: Io, address: *const Io.net.IpAddress, result: *Io.net.IpAddress.ConnectError!Io.net.Stream) void {
+            result.* = Io.net.IpAddress.connect(address, io, .{ .mode = .stream });
+        }
+
+        fn noDelay(stream: Io.net.Stream) !bool {
+            const socket: zio_net.Socket = .{ .handle = stdIoHandleToZio(stream.socket.handle), .address = undefined };
+            return socket.getNoDelay();
+        }
+
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{});
+            defer server.deinit(io);
+
+            var connect_result: Io.net.IpAddress.ConnectError!Io.net.Stream = undefined;
+            var future = io.async(connector, .{ io, &server.socket.address, &connect_result });
+            defer future.cancel(io);
+
+            const accepted = try server.accept(io);
+            defer accepted.close(io);
+
+            future.await(io);
+            const client = try connect_result;
+            defer client.close(io);
+
+            try std.testing.expect(try noDelay(accepted));
+            try std.testing.expect(try noDelay(client));
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP connect times out at a realtime deadline" {
+    // Linux drops SYNs once the accept queue is full, so the connect hangs.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(
+                &.{ .ip4 = .loopback(0) },
+                io,
+                .{ .reuse_address = true, .kernel_backlog = 0 },
+            );
+            defer server.deinit(io);
+
+            const queued = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            defer queued.close(io);
+
+            const deadline: Io.Clock.Timestamp = .fromNow(io, .{
+                .raw = .fromMilliseconds(50),
+                .clock = .real,
+            });
+            var sw = time.Stopwatch.start();
+            const result = Io.net.IpAddress.connect(&server.socket.address, io, .{
+                .mode = .stream,
+                .timeout = .{ .deadline = deadline },
+            });
+            if (result) |stream| {
+                stream.close(io);
+                return error.SkipZigTest;
+            } else |err| {
+                try std.testing.expectEqual(error.Timeout, err);
+            }
+            try std.testing.expect(sw.read().toMilliseconds() < 2000);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP read/write/shutdown round-trip" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn echoer(io: Io, server: *Io.net.Server) !void {
+            const peer = try server.accept(io);
+            defer peer.close(io);
+
+            var recv_buf: [256]u8 = undefined;
+            var reader = peer.reader(io, &recv_buf);
+
+            var send_buf: [256]u8 = undefined;
+            var writer = peer.writer(io, &send_buf);
+
+            // Echo until EOF.
+            while (true) {
+                const n = reader.interface.stream(&writer.interface, .limited(64)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => return err,
+                };
+                if (n == 0) break;
+                try writer.interface.flush();
+            }
+            try peer.shutdown(io, .send);
+        }
+
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(
+                &.{ .ip4 = .loopback(0) },
+                io,
+                .{ .reuse_address = true },
+            );
+            defer server.deinit(io);
+
+            var echo_err: anyerror!void = {};
+            var future = io.async(struct {
+                fn call(io2: Io, s: *Io.net.Server, out: *anyerror!void) void {
+                    out.* = echoer(io2, s);
+                }
+            }.call, .{ io, &server, &echo_err });
+
+            const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            defer client.close(io);
+
+            var send_buf: [64]u8 = undefined;
+            var writer = client.writer(io, &send_buf);
+            try writer.interface.writeAll("hello ");
+            try writer.interface.writeAll("world");
+            try writer.interface.flush();
+            try client.shutdown(io, .send);
+
+            var recv_buf: [64]u8 = undefined;
+            var reader = client.reader(io, &recv_buf);
+            var out: [32]u8 = undefined;
+            const got = try reader.interface.readSliceShort(&out);
+            try std.testing.expectEqualStrings("hello world", out[0..got]);
+
+            future.await(io);
+            try echo_err;
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+/// Sends `header` and up to `limit` bytes of `file_reader` over a loopback TCP
+/// connection with `sendFileAll`, and returns what the peer received.
+fn testSendFileOverTcp(io: Io, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit) ![]u8 {
+    const Receiver = struct {
+        fn run(io2: Io, server: *Io.net.Server, out: *anyerror![]u8) void {
+            out.* = receive(io2, server);
+        }
+
+        fn receive(io2: Io, server: *Io.net.Server) ![]u8 {
+            const peer = try server.accept(io2);
+            defer peer.close(io2);
+            var recv_buf: [256]u8 = undefined;
+            var reader = peer.reader(io2, &recv_buf);
+            return reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+        }
+    };
+
+    var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var received: anyerror![]u8 = error.Unexpected;
+    var future = io.async(Receiver.run, .{ io, &server, &received });
+    defer future.cancel(io);
+
+    const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+    defer client.close(io);
+    var send_buf: [64]u8 = undefined;
+    var writer = client.writer(io, &send_buf);
+    try writer.interface.writeAll(header);
+    _ = try writer.interface.sendFileAll(file_reader, limit);
+    try writer.interface.flush();
+    try client.shutdown(io, .send);
+
+    future.await(io);
+    return received;
+}
+
+test "io: net TCP sendFileAll sends buffered header and file range" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Worker = struct {
+        fn run(io: Io, dir: Io.Dir) !void {
+            var data: [40_000]u8 = undefined;
+            for (&data, 0..) |*b, i| b.* = @intCast(i % 251);
+            const file = try dir.createFile(io, "sendfile", .{ .read = true });
+            defer file.close(io);
+            try file.writePositionalAll(io, &data, 0);
+            var file_buf: [256]u8 = undefined;
+            var file_reader = file.reader(io, &file_buf);
+            try file_reader.seekTo(100);
+
+            const received = try testSendFileOverTcp(io, "HDR", &file_reader, .limited(30_000));
+            defer std.testing.allocator.free(received);
+            try std.testing.expectEqualStrings("HDR", received[0..3]);
+            try std.testing.expectEqualSlices(u8, data[100..30_100], received[3..]);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{ rt.io(), tmp.dir });
+    try handle.join();
+}
+
+test "io: net TCP sendFileAll falls back to reading from a pipe" {
+    // Windows pipes are never positional, so they don't reach the `Unseekable` path.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            const fds = try os_fs.pipe();
+            const read_file: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
+            defer read_file.close(io);
+            {
+                const write_file: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = true } };
+                defer write_file.close(io);
+                try write_file.writeStreamingAll(io, "pipe data");
+            }
+
+            var file_buf: [256]u8 = undefined;
+            var file_reader = read_file.reader(io, &file_buf);
+            const received = try testSendFileOverTcp(io, "", &file_reader, .unlimited);
+            defer std.testing.allocator.free(received);
+            try std.testing.expectEqualStrings("pipe data", received);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net Unix listen/connect/accept round-trip" {
+    if (!zio_net.has_unix_sockets) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn connector(io: Io, address: *const Io.net.UnixAddress, result: *Io.net.UnixAddress.ConnectError!Io.net.Stream) void {
+            result.* = Io.net.UnixAddress.connect(address, io);
+        }
+
+        fn run(io: Io) !void {
+            const path = "test_io_net_unix.sock";
+            (Io.Dir.cwd()).deleteFile(io, path) catch {};
+            defer (Io.Dir.cwd()).deleteFile(io, path) catch {};
+
+            const address = try Io.net.UnixAddress.init(path);
+            var server = try address.listen(io, .{});
+            defer server.deinit(io);
+
+            var connect_result: Io.net.UnixAddress.ConnectError!Io.net.Stream = undefined;
+            var future = io.async(connector, .{ io, &address, &connect_result });
+            defer future.cancel(io);
+
+            const accepted = try server.accept(io);
+            defer accepted.close(io);
+
+            future.await(io);
+            const client = try connect_result;
+            defer client.close(io);
+
+            var send_buf: [32]u8 = undefined;
+            var writer = client.writer(io, &send_buf);
+            try writer.interface.writeAll("ping");
+            try writer.interface.flush();
+            try client.shutdown(io, .send);
+
+            var recv_buf: [32]u8 = undefined;
+            var reader = accepted.reader(io, &recv_buf);
+            var out: [8]u8 = undefined;
+            const got = try reader.interface.readSliceShort(&out);
+            try std.testing.expectEqualStrings("ping", out[0..got]);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net receive on a Unix datagram socket" {
+    if (!zio_net.has_unix_sockets or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const fds = try os_net.socketpair(.unix, .dgram, .ip, .{ .nonblocking = true });
+    defer for (fds) |fd| os_net.close(fd);
+
+    const path = "test_io_net_unix_dgram.sock";
+    (Io.Dir.cwd()).deleteFile(io, path) catch {};
+    defer (Io.Dir.cwd()).deleteFile(io, path) catch {};
+    const sender_addr = try zio_net.UnixAddress.init(path);
+    try os_net.bind(fds[0], &sender_addr.any, @sizeOf(os_net.sockaddr.un));
+
+    const iov = os_net.iovecConstFromSlice("hello");
+    _ = try os_net.send(fds[0], (&iov)[0..1], .{});
+
+    const socket: Io.net.Socket = .{ .handle = fds[1], .address = .{ .ip4 = .loopback(0) } };
+    var buf: [16]u8 = undefined;
+    const message = try socket.receive(io, &buf);
+    try std.testing.expectEqualStrings("hello", message.data);
+}
+
+test "io: net Unix connect to a path with no listener is refused" {
+    if (!zio_net.has_unix_sockets) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            const path = "test_io_net_unix_refused.sock";
+            (Io.Dir.cwd()).deleteFile(io, path) catch {};
+            defer (Io.Dir.cwd()).deleteFile(io, path) catch {};
+
+            const address = try Io.net.UnixAddress.init(path);
+
+            // Leave a stale socket file behind: the path exists, but nothing is
+            // listening on it any more, so connecting has to be refused.
+            var server = try address.listen(io, .{});
+            server.deinit(io);
+
+            try std.testing.expectError(error.ConnectionRefused, Io.net.UnixAddress.connect(&address, io));
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net UDP bind assigns ephemeral port" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var socket = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer socket.close(io);
+
+    try std.testing.expect(socket.address.ip4.port != 0);
+}
+
+test "io: net createPair for AF_INET fails with OperationUnsupported" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // socketpair(2) only supports AF_UNIX on Linux/macOS; the std.Io API
+    // exposes AF_INET/INET6 via the family option. The kernel rejects it.
+    // This test pins down the error path so createPair stays wired correctly.
+    try std.testing.expectError(error.OperationUnsupported, Io.net.Socket.createPair(io, .{}));
+}
+
+test "io: net UDP send single datagram succeeds" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    try sender.send(io, &receiver.address, "hello");
+}
+
+test "io: net UDP send to an address of another family fails with AddressFamilyUnsupported" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    try std.testing.expectError(error.AddressFamilyUnsupported, sender.send(io, &.{ .ip6 = .loopback(9) }, "hello"));
+}
+
+test "io: net UDP sendMany delivers multiple datagrams" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    const payloads = [_][]const u8{ "one", "two", "three" };
+    var messages: [payloads.len]Io.net.OutgoingMessage = undefined;
+    for (&messages, payloads) |*m, p| {
+        m.* = .{ .address = &receiver.address, .data_ptr = p.ptr, .data_len = p.len };
+    }
+
+    try sender.sendMany(io, &messages, .{});
+
+    for (&messages, payloads) |m, p| {
+        try std.testing.expectEqual(p.len, m.data_len);
+    }
+}
+
+test "io: netLookup resolves numeric IPv4" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const host: Io.net.HostName = try .init("127.0.0.1");
+    var buf: [32]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);
+    try Io.net.HostName.lookup(host, io, &queue, .{ .port = 8080 });
+
+    var got_address = false;
+    while (queue.getOneUncancelable(io)) |entry| switch (entry) {
+        .address => |addr| {
+            got_address = true;
+            try std.testing.expectEqual(@as(u16, 8080), addr.getPort());
+            try std.testing.expectEqual(Io.net.IpAddress.Family.ip4, @as(Io.net.IpAddress.Family, addr));
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    try std.testing.expect(got_address);
+}
+
+test "io: netLookup returns canonical name when buffer provided" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // Use "localhost" rather than a numeric IP: macOS getaddrinfo skips
+    // AI_CANONNAME for numeric inputs.
+    const host: Io.net.HostName = try .init("localhost");
+    var buf: [32]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);
+    var canon_buf: [Io.net.HostName.max_len]u8 = undefined;
+    try Io.net.HostName.lookup(host, io, &queue, .{
+        .port = 0,
+        .canonical_name_buffer = &canon_buf,
+    });
+
+    var got_canonical = false;
+    while (queue.getOneUncancelable(io)) |entry| switch (entry) {
+        .address => {},
+        .canonical_name => |name| {
+            got_canonical = true;
+            try std.testing.expect(name.bytes.len > 0);
+        },
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    try std.testing.expect(got_canonical);
+}
+
+test "io: file create/open/close" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_create_open_close.txt";
+
+    var created = try dir.createFile(io, file_path, .{});
+    created.close(io);
+
+    var opened = try dir.openFile(io, file_path, .{});
+    opened.close(io);
+}
+
+test "io: file lock/unlock and re-acquire" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_lock.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    defer file.close(io);
+
+    try file.lock(io, .exclusive);
+    file.unlock(io);
+
+    // Re-acquire after unlock.
+    try file.lock(io, .exclusive);
+    file.unlock(io);
+}
+
+test "io: file tryLock fails while held by another handle" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_trylock.txt";
+
+    var a = try dir.createFile(io, file_path, .{});
+    defer a.close(io);
+    var b = try dir.openFile(io, file_path, .{ .mode = .read_write });
+    defer b.close(io);
+
+    // flock is keyed on the open file description, so two separate opens of the
+    // same file contend even within one process.
+    try std.testing.expect(try a.tryLock(io, .exclusive));
+    try std.testing.expect(!try b.tryLock(io, .exclusive));
+    a.unlock(io);
+    try std.testing.expect(try b.tryLock(io, .exclusive));
+    b.unlock(io);
+}
+
+test "io: file lock blocks until holder releases" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_lock_blocks.txt";
+
+    var holder = try dir.createFile(io, file_path, .{});
+    defer holder.close(io);
+    var waiter = try dir.openFile(io, file_path, .{ .mode = .read_write });
+    defer waiter.close(io);
+
+    try holder.lock(io, .exclusive);
+
+    const S = struct {
+        fn releaser(io_: Io, h: *Io.File) void {
+            io_.sleep(.fromMilliseconds(30), .awake) catch {};
+            h.unlock(io_);
+        }
+    };
+    var future = io.async(S.releaser, .{ io, &holder });
+    defer future.cancel(io);
+
+    // Blocks via the backoff loop until the releaser unlocks ~30ms later.
+    try waiter.lock(io, .exclusive);
+    waiter.unlock(io);
+}
+
+test "io: file downgradeLock exclusive to shared" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_downgrade.txt";
+
+    var a = try dir.createFile(io, file_path, .{});
+    defer a.close(io);
+    var b = try dir.openFile(io, file_path, .{ .mode = .read_write });
+    defer b.close(io);
+
+    try a.lock(io, .exclusive);
+    // While a holds exclusive, b cannot even take a shared lock.
+    try std.testing.expect(!try b.tryLock(io, .shared));
+
+    try a.downgradeLock(io);
+    // After downgrade, b can share but still cannot take exclusive.
+    try std.testing.expect(try b.tryLock(io, .shared));
+    try std.testing.expect(!try b.tryLock(io, .exclusive));
+    b.unlock(io);
+    a.unlock(io);
+}
+
+test "io: createFile lock option blocks a second nonblocking lock" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_open_lock.txt";
+
+    // Create the file already holding an exclusive lock.
+    var a = try dir.createFile(io, file_path, .{ .lock = .exclusive });
+    defer a.close(io);
+
+    // A second open requesting a non-blocking exclusive lock cannot get it and
+    // fails the open with WouldBlock (the fd is closed on the way out).
+    try std.testing.expectError(error.WouldBlock, dir.openFile(io, file_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }));
+}
+
+test "io: file open returns FileNotFound for missing file" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    try std.testing.expectError(
+        error.FileNotFound,
+        dir.openFile(io, "definitely-not-a-real-file-xyz123.txt", .{}),
+    );
+}
+
+test "io: file positional read/write round-trip" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_positional_rw.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectEqual(5, try file.writePositional(io, &.{"HELLO"}, 0));
+    try std.testing.expectEqual(5, try file.writePositional(io, &.{"WORLD"}, 10));
+
+    var buf: [5]u8 = undefined;
+    try std.testing.expectEqual(5, try file.readPositional(io, &.{&buf}, 0));
+    try std.testing.expectEqualStrings("HELLO", &buf);
+    try std.testing.expectEqual(5, try file.readPositional(io, &.{&buf}, 10));
+    try std.testing.expectEqualStrings("WORLD", &buf);
+}
+
+test "io: file streaming read advances position and reports EOF" {
+    // On Windows, zio opens files with FILE_FLAG_OVERLAPPED (for IOCP). Such
+    // handles have no implicit file position, so ReadFile/WriteFile without an
+    // OVERLAPPED struct fails with INVALID_PARAMETER. Streaming requires
+    // per-handle position tracking which we don't implement.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_read_streaming.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectEqual(10, try file.writePositional(io, &.{"HELLOWORLD"}, 0));
+
+    var buf1: [5]u8 = undefined;
+    try std.testing.expectEqual(5, try file.readStreaming(io, &.{&buf1}));
+    try std.testing.expectEqualStrings("HELLO", &buf1);
+
+    var buf2: [5]u8 = undefined;
+    try std.testing.expectEqual(5, try file.readStreaming(io, &.{&buf2}));
+    try std.testing.expectEqualStrings("WORLD", &buf2);
+
+    var buf3: [5]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, file.readStreaming(io, &.{&buf3}));
+}
+
+test "io: file streaming write advances position and appends" {
+    // See note on Windows in the streaming-read test above.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_write_streaming.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectEqual(5, try file.writeStreaming(io, "HELLO", &.{}, 1));
+    try std.testing.expectEqual(6, try file.writeStreaming(io, "", &.{ " ", "WORLD" }, 1));
+    try std.testing.expectEqual(3, try file.writeStreaming(io, "", &.{"!"}, 3));
+
+    try std.testing.expectEqual(14, try file.length(io));
+
+    var buf: [14]u8 = undefined;
+    try std.testing.expectEqual(14, try file.readPositional(io, &.{&buf}, 0));
+    try std.testing.expectEqualStrings("HELLO WORLD!!!", &buf);
+}
+
+test "io: file seek moves the streaming position" {
+    // See note on Windows in the streaming-read test above: without an implicit
+    // file position there is nothing for a seek to move.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_seek.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectEqual(10, try file.writePositional(io, &.{"HELLOWORLD"}, 0));
+
+    var buf: [5]u8 = undefined;
+    try io.vtable.fileSeekTo(io.userdata, file, 5);
+    try std.testing.expectEqual(5, try file.readStreaming(io, &.{&buf}));
+    try std.testing.expectEqualStrings("WORLD", &buf);
+
+    // The read above left the position at the end of the file.
+    try io.vtable.fileSeekBy(io.userdata, file, -10);
+    try std.testing.expectEqual(5, try file.readStreaming(io, &.{&buf}));
+    try std.testing.expectEqualStrings("HELLO", &buf);
+
+    // No signed file offset can represent this, so it is not a position the
+    // file can be moved to.
+    try std.testing.expectError(error.Unseekable, io.vtable.fileSeekTo(io.userdata, file, std.math.maxInt(u64)));
+
+    // Seeking before the start of the file leaves the position untouched.
+    try io.vtable.fileSeekTo(io.userdata, file, 0);
+    try std.testing.expectError(error.Unseekable, io.vtable.fileSeekBy(io.userdata, file, -1));
+    try std.testing.expectEqual(5, try file.readStreaming(io, &.{&buf}));
+    try std.testing.expectEqualStrings("HELLO", &buf);
+}
+
+test "io: file seek on a pipe reports Unseekable" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const fds = try os_fs.pipe();
+    var read_file: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
+    var write_file: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = true } };
+    defer read_file.close(io);
+    defer write_file.close(io);
+
+    try std.testing.expectError(error.Unseekable, io.vtable.fileSeekTo(io.userdata, read_file, 0));
+    try std.testing.expectError(error.Unseekable, io.vtable.fileSeekBy(io.userdata, read_file, 1));
+}
+
+test "io: streaming read/write over a pollable (pipe) fd" {
+    // A pipe is non-seekable, so streaming I/O over it cannot use positional
+    // read/write. On io_uring/iocp the backend handles it natively; on
+    // epoll/kqueue/poll the loop must route it through the readiness poll path
+    // (classifyFd -> backend.submit) rather than the thread pool.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const fds = try os_fs.pipe();
+    var read_file: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
+    var write_file: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = true } };
+    defer read_file.close(io);
+    defer write_file.close(io);
+
+    // Small enough to fit the pipe buffer, so the write completes without a
+    // reader draining it first.
+    try std.testing.expectEqual(5, try write_file.writeStreaming(io, "HELLO", &.{}, 1));
+
+    var buf: [5]u8 = undefined;
+    try std.testing.expectEqual(5, try read_file.readStreaming(io, &.{&buf}));
+    try std.testing.expectEqualStrings("HELLO", &buf);
+}
+
+test "io: file length/sync/setLength" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_length_sync.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectEqual(0, try file.length(io));
+
+    _ = try file.writePositional(io, &.{"1234567890"}, 0);
+    try std.testing.expectEqual(10, try file.length(io));
+
+    try file.sync(io);
+
+    try file.setLength(io, 4);
+    try std.testing.expectEqual(4, try file.length(io));
+
+    try file.setLength(io, 20);
+    try std.testing.expectEqual(20, try file.length(io));
+}
+
+test "io: file/dir stat and dir statFile" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_stat.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    _ = try file.writePositional(io, &.{"hello"}, 0);
+
+    const file_stat = try file.stat(io);
+    try std.testing.expectEqual(Io.File.Kind.file, file_stat.kind);
+    try std.testing.expectEqual(@as(u64, 5), file_stat.size);
+
+    const at_stat = try dir.statFile(io, file_path, .{});
+    try std.testing.expectEqual(Io.File.Kind.file, at_stat.kind);
+    try std.testing.expectEqual(@as(u64, 5), at_stat.size);
+    try std.testing.expectEqual(file_stat.inode, at_stat.inode);
+
+    const dir_path = "test_io_stat_dir";
+    try dir.createDir(io, dir_path, .default_dir);
+    var sub_dir = try dir.openDir(io, dir_path, .{});
+    defer sub_dir.close(io);
+    const dir_stat = try sub_dir.stat(io);
+    try std.testing.expectEqual(Io.File.Kind.directory, dir_stat.kind);
+}
+
+test "io: dir symLink and readLink" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const target = "test_io_symlink_target.txt";
+    const link = "test_io_symlink_link";
+
+    var file = try dir.createFile(io, target, .{});
+    file.close(io);
+
+    try dir.symLink(io, target, link, .{});
+
+    var buffer: [256]u8 = undefined;
+    const n = try dir.readLink(io, link, &buffer);
+    try std.testing.expectEqualStrings(target, buffer[0..n]);
+}
+
+test "io: dir statFile follow_symlinks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const target = "test_io_stat_symlink_target.txt";
+    const link = "test_io_stat_symlink_link";
+
+    var file = try dir.createFile(io, target, .{});
+    file.close(io);
+
+    try dir.symLink(io, target, link, .{});
+
+    const followed = try dir.statFile(io, link, .{ .follow_symlinks = true });
+    try std.testing.expectEqual(Io.File.Kind.file, followed.kind);
+
+    const not_followed = try dir.statFile(io, link, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(Io.File.Kind.sym_link, not_followed.kind);
+}
+
+test "io: dir hardLink" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const original = "test_io_hardlink_original.txt";
+    const link = "test_io_hardlink_link.txt";
+
+    var file = try dir.createFile(io, original, .{});
+    _ = try file.writePositional(io, &.{"linked"}, 0);
+    file.close(io);
+
+    try Io.Dir.hardLink(dir, original, dir, link, io, .{});
+
+    var opened = try dir.openFile(io, link, .{});
+    defer opened.close(io);
+    var buf: [16]u8 = undefined;
+    const n = try opened.readPositional(io, &.{&buf}, 0);
+    try std.testing.expectEqualStrings("linked", buf[0..n]);
+}
+
+test "io: dir access" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_access.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    file.close(io);
+
+    try dir.access(io, file_path, .{ .read = true });
+    try dir.access(io, file_path, .{ .write = true });
+    try std.testing.expectError(error.FileNotFound, dir.access(io, "nonexistent_io_access_xyz.txt", .{ .read = true }));
+}
+
+test "io: dir rename" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const old_path = "test_io_rename_old.txt";
+    const new_path = "test_io_rename_new.txt";
+
+    var file = try dir.createFile(io, old_path, .{});
+    file.close(io);
+
+    try dir.rename(old_path, dir, new_path, io);
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, old_path, .{}));
+    var moved = try dir.openFile(io, new_path, .{});
+    moved.close(io);
+
+    try std.testing.expectError(error.FileNotFound, dir.rename(old_path, dir, new_path, io));
+}
+
+test "io: dir renamePreserve" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const old_path = "test_io_rename_preserve_old.txt";
+    const new_path = "test_io_rename_preserve_new.txt";
+
+    var file = try dir.createFile(io, old_path, .{});
+    file.close(io);
+
+    // Rename to a free path — should succeed.
+    try dir.renamePreserve(old_path, dir, new_path, io);
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, old_path, .{}));
+    var moved = try dir.openFile(io, new_path, .{});
+    moved.close(io);
+
+    // Rename onto an existing destination — should fail.
+    var file2 = try dir.createFile(io, old_path, .{});
+    file2.close(io);
+    try std.testing.expectError(error.PathAlreadyExists, dir.renamePreserve(old_path, dir, new_path, io));
+}
+
+test "io: dir create/delete" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "test_io_dir_create_delete";
+
+    try dir.createDir(io, dir_path, .default_dir);
+    try std.testing.expectError(error.PathAlreadyExists, dir.createDir(io, dir_path, .default_dir));
+    try dir.deleteDir(io, dir_path);
+    try std.testing.expectError(error.FileNotFound, dir.deleteDir(io, dir_path));
+}
+
+test "io: deleteFile on a directory returns IsDir" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "test_io_deletefile_on_dir";
+
+    try dir.createDir(io, dir_path, .default_dir);
+    try std.testing.expectError(error.IsDir, dir.deleteFile(io, dir_path));
+}
+
+test "io: openDir on a file returns NotDir" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_opendir_on_file";
+
+    var file = try dir.createFile(io, file_path, .{});
+    file.close(io);
+
+    try std.testing.expectError(error.NotDir, dir.openDir(io, file_path, .{}));
+    try std.testing.expectError(error.NotDir, dir.openDir(io, file_path, .{ .iterate = true }));
+}
+
+test "io: dir createDirPath creates nested directories" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const sep = Io.Dir.path.sep_str;
+    const nested_path = "test_io_createDirPath" ++ sep ++ "a" ++ sep ++ "b" ++ sep ++ "c";
+    const base_path = "test_io_createDirPath";
+
+    // Clean up from previous failed runs.
+    dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a" ++ sep ++ "b" ++ sep ++ "c") catch {};
+    dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a" ++ sep ++ "b") catch {};
+    dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a") catch {};
+    dir.deleteDir(io, base_path) catch {};
+
+    defer {
+        dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a" ++ sep ++ "b" ++ sep ++ "c") catch {};
+        dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a" ++ sep ++ "b") catch {};
+        dir.deleteDir(io, "test_io_createDirPath" ++ sep ++ "a") catch {};
+        dir.deleteDir(io, base_path) catch {};
+    }
+
+    // Create nested path from scratch.
+    const status = try dir.createDirPathStatus(io, nested_path, .default_dir);
+    try std.testing.expectEqual(Io.Dir.CreatePathStatus.created, status);
+
+    // Verify it exists.
+    var sub = try dir.openDir(io, nested_path, .{});
+    sub.close(io);
+
+    // Creating again should return .existed.
+    const status2 = try dir.createDirPathStatus(io, nested_path, .default_dir);
+    try std.testing.expectEqual(Io.Dir.CreatePathStatus.existed, status2);
+}
+
+test "io: dir createDirPath with a dot-prefixed path" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const sep = Io.Dir.path.sep_str;
+    // The component iterator yields "." as its own component, so this is also
+    // the path zio itself asks the OS to create. Regression test for #714.
+    const nested_path = "." ++ sep ++ "test_io_dot_path" ++ sep ++ "admin";
+
+    defer {
+        dir.deleteDir(io, nested_path) catch {};
+        dir.deleteDir(io, "test_io_dot_path") catch {};
+    }
+
+    try std.testing.expectEqual(Io.Dir.CreatePathStatus.created, try dir.createDirPathStatus(io, nested_path, .default_dir));
+    try std.testing.expectEqual(Io.Dir.CreatePathStatus.existed, try dir.createDirPathStatus(io, nested_path, .default_dir));
+
+    var sub = try dir.openDir(io, nested_path, .{});
+    sub.close(io);
+}
+
+test "io: dir createDirPathOpen creates and opens" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const sep = Io.Dir.path.sep_str;
+    const nested_path = "test_io_createDirPathOpen" ++ sep ++ "x" ++ sep ++ "y";
+    const base_path = "test_io_createDirPathOpen";
+
+    // Clean up from previous failed runs.
+    dir.deleteDir(io, "test_io_createDirPathOpen" ++ sep ++ "x" ++ sep ++ "y") catch {};
+    dir.deleteDir(io, "test_io_createDirPathOpen" ++ sep ++ "x") catch {};
+    dir.deleteDir(io, base_path) catch {};
+
+    defer {
+        dir.deleteDir(io, "test_io_createDirPathOpen" ++ sep ++ "x" ++ sep ++ "y") catch {};
+        dir.deleteDir(io, "test_io_createDirPathOpen" ++ sep ++ "x") catch {};
+        dir.deleteDir(io, base_path) catch {};
+    }
+
+    // Create and open nested path.
+    var sub = try dir.createDirPathOpen(io, nested_path, .{});
+    sub.close(io);
+
+    // Should be able to open it again.
+    var sub2 = try dir.openDir(io, nested_path, .{});
+    sub2.close(io);
+}
+
+test "io: dir open/close from a thread that is not a task" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "sub";
+    try dir.createDir(io, dir_path, .default_dir);
+
+    // A plain OS thread runs no task, so operations it submits through `io`
+    // take the blocking path. `Io.Dir.close` batches its handles into a gather
+    // group, which that path has to accept the same way it does file and
+    // socket close batches.
+    const Worker = struct {
+        fn run(worker_io: Io, parent: Io.Dir, path: []const u8, err_out: *?anyerror) void {
+            const sub = parent.openDir(worker_io, path, .{}) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            sub.close(worker_io);
+        }
+    };
+
+    var worker_err: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ io, dir, dir_path, &worker_err });
+    thread.join();
+    if (worker_err) |err| return err;
+}
+
+test "io: dir iterate over files" {
+    // NetBSD's getdirentries can return dirents with either 32-bit or
+    // 64-bit d_fileno depending on the filesystem, shifting all field
+    // offsets. Skip until we implement auto-detection.
+    if (builtin.os.tag == .netbsd) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "test_io_dir_iterate";
+    // Clean up from previous failed runs.
+    dir.deleteDir(io, dir_path) catch {};
+
+    try dir.createDir(io, dir_path, .default_dir);
+
+    // Create a few files in the directory.
+    {
+        var sub = try dir.openDir(io, dir_path, .{ .iterate = true });
+        defer sub.close(io);
+
+        const file_names = [_][]const u8{ "a.txt", "b.txt", "c.txt" };
+        for (file_names) |name| {
+            var f = try sub.createFile(io, name, .{});
+            f.close(io);
+        }
+        defer for (file_names) |name| sub.deleteFile(io, name) catch {};
+
+        var it = sub.iterate();
+        var found: usize = 0;
+        var all_entries: [64]Io.Dir.Entry = undefined;
+        while (try it.next(io)) |entry| {
+            if (found >= all_entries.len) break;
+            all_entries[found] = entry;
+            found += 1;
+        }
+        try std.testing.expectEqual(3, found);
+        for (all_entries[0..found]) |entry| {
+            try std.testing.expect(entry.kind == .file);
+            try std.testing.expect(std.mem.eql(u8, entry.name, "a.txt") or
+                std.mem.eql(u8, entry.name, "b.txt") or
+                std.mem.eql(u8, entry.name, "c.txt"));
+        }
+    }
+    // sub's deferred cleanup (file deletion + close) has now run.
+    try dir.deleteDir(io, dir_path);
+}
+
+test "io: dir read error does not rewind the reader" {
+    // See comment on dir iterate over files above.
+    if (builtin.os.tag == .netbsd) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "test_io_dir_read_error";
+
+    try dir.createDir(io, dir_path, .default_dir);
+    var sub = try dir.openDir(io, dir_path, .{ .iterate = true });
+    defer sub.close(io);
+
+    var file = try sub.createFile(io, "a.txt", .{});
+    file.close(io);
+
+    var buffer: [Io.Dir.Reader.min_buffer_len]u8 align(@alignOf(usize)) = undefined;
+    var reader: Io.Dir.Reader = .init(sub, &buffer);
+    var entries: [1]Io.Dir.Entry = undefined;
+    try std.testing.expectEqual(1, try reader.read(io, &entries));
+
+    const Canceled = struct {
+        fn read(inner_io: Io, r: *Io.Dir.Reader, result: *Io.Dir.Reader.Error!usize) void {
+            inner_io.sleep(.fromSeconds(60), .awake) catch {};
+            inner_io.recancel();
+            var buf: [1]Io.Dir.Entry = undefined;
+            result.* = r.read(inner_io, &buf);
+        }
+    };
+    var result: Io.Dir.Reader.Error!usize = 0;
+    var future = io.async(Canceled.read, .{ io, &reader, &result });
+    try io.sleep(.fromMilliseconds(10), .awake);
+    future.cancel(io);
+    try std.testing.expectError(error.Canceled, result);
+
+    try std.testing.expectEqual(0, try reader.read(io, &entries));
+}
+
+test "io: dir iterate empty directory" {
+    // See comment on dir iterate over files above.
+    if (builtin.os.tag == .netbsd) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dir_path = "test_io_dir_iterate_empty";
+
+    try dir.createDir(io, dir_path, .default_dir);
+
+    var sub = try dir.openDir(io, dir_path, .{ .iterate = true });
+    defer sub.close(io);
+
+    var it = sub.iterate();
+    var found2: usize = 0;
+    var all_entries2: [64]Io.Dir.Entry = undefined;
+    while (try it.next(io)) |entry| {
+        if (found2 >= all_entries2.len) break;
+        all_entries2[found2] = entry;
+        found2 += 1;
+    }
+    try std.testing.expectEqual(0, found2);
+}
+
+test "io: file setPermissions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_set_permissions.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    defer file.close(io);
+
+    try file.setPermissions(io, .fromMode(0o444));
+    try file.setPermissions(io, .fromMode(0o644));
+}
+
+test "io: file setOwner accepts null uid/gid as no-op" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_set_owner.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    defer file.close(io);
+
+    try file.setOwner(io, null, null);
+}
+
+test "io: file setTimestamps round-trip" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_set_timestamps.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    defer file.close(io);
+
+    const atime: i96 = 1_700_000_000 * std.time.ns_per_s;
+    const mtime: i96 = 1_700_000_123 * std.time.ns_per_s;
+    try file.setTimestamps(io, .{
+        .access_timestamp = .{ .new = .{ .nanoseconds = atime } },
+        .modify_timestamp = .{ .new = .{ .nanoseconds = mtime } },
+    });
+
+    try file.setTimestampsNow(io);
+}
+
+test "io: dir setFilePermissions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_dir_set_file_permissions.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    file.close(io);
+
+    try dir.setFilePermissions(io, file_path, .fromMode(0o444), .{});
+    try dir.setFilePermissions(io, file_path, .fromMode(0o644), .{});
+}
+
+test "io: dir setTimestamps round-trip" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_dir_set_timestamps.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    file.close(io);
+
+    const atime: i96 = 1_700_000_000 * std.time.ns_per_s;
+    const mtime: i96 = 1_700_000_123 * std.time.ns_per_s;
+    try dir.setTimestamps(io, file_path, .{
+        .access_timestamp = .{ .new = .{ .nanoseconds = atime } },
+        .modify_timestamp = .{ .new = .{ .nanoseconds = mtime } },
+    });
+
+    try dir.setTimestamps(io, file_path, .{
+        .access_timestamp = .now,
+        .modify_timestamp = .now,
+    });
+}
+
+test "io: setting timestamps to now needs only write permission" {
+    // macOS refuses futimens on a /dev/null the caller doesn't own, even with
+    // UTIME_NOW, and there is no other file a non-root test can write but not own.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const cwd = Io.Dir.cwd();
+    cwd.setTimestamps(io, "/dev/null", .{
+        .access_timestamp = .now,
+        .modify_timestamp = .now,
+    }) catch |err| switch (err) {
+        error.AccessDenied, error.ReadOnlyFileSystem => return error.SkipZigTest,
+        else => |e| return e,
+    };
+
+    var file = try cwd.openFile(io, "/dev/null", .{ .mode = .write_only });
+    defer file.close(io);
+    try file.setTimestampsNow(io);
+}
+
+test "io: dir realPath and realPathFile" {
+    if (builtin.os.tag == .netbsd) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_dir_realpath.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    file.close(io);
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = dir.realPath(io, &cwd_buf) catch |err| switch (err) {
+        error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expect(cwd_len > 0);
+
+    var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_len = try dir.realPathFile(io, file_path, &file_buf);
+    try std.testing.expect(file_len > cwd_len);
+    try std.testing.expectEqualStrings(cwd_buf[0..cwd_len], file_buf[0..cwd_len]);
+    try std.testing.expect(std.mem.endsWith(u8, file_buf[0..file_len], file_path));
+}
+
+test "io: file realPath" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_file_realpath.txt";
+
+    var file = try dir.createFile(io, file_path, .{});
+    defer file.close(io);
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = file.realPath(io, &buf) catch |err| switch (err) {
+        error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expect(std.mem.endsWith(u8, buf[0..len], file_path));
+}
+
+test "io: file hardLink" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const original = "test_io_file_hardlink_original.txt";
+    const link = "test_io_file_hardlink_link.txt";
+
+    var file = try dir.createFile(io, original, .{});
+    defer file.close(io);
+    _ = try file.writePositional(io, &.{"linked"}, 0);
+
+    file.hardLink(io, dir, link, .{}) catch |err| switch (err) {
+        error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var opened = try dir.openFile(io, link, .{});
+    defer opened.close(io);
+    var buf: [16]u8 = undefined;
+    const n = try opened.readPositional(io, &.{&buf}, 0);
+    try std.testing.expectEqualStrings("linked", buf[0..n]);
+}
+
+test "io: group runs spawned tasks to completion" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn bump(counter: *std.atomic.Value(u32)) void {
+            _ = counter.fetchAdd(1, .acq_rel);
+        }
+
+        fn run(io: Io) !void {
+            var counter: std.atomic.Value(u32) = .init(0);
+            var group: Io.Group = .init;
+            group.async(io, bump, .{&counter});
+            group.async(io, bump, .{&counter});
+            group.async(io, bump, .{&counter});
+            try group.await(io);
+            try std.testing.expectEqual(@as(u32, 3), counter.load(.acquire));
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: operateTimeout net_receive succeeds when data is ready" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    try sender.send(io, &receiver.address, "hello");
+
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [16]u8 = undefined;
+    const result = try io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{},
+    } }, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const err, const n = result.net_receive;
+    try std.testing.expectEqual(null, err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqualStrings("hello", msg.data);
+}
+
+test "io: receiveManyTimeout reports an error that follows the first message" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime !@hasDecl(ev.Backend, "selectedEngine")) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    // Readiness backends report the pending reset before reading any data.
+    if (rt.main_executor.loop.backend.selectedEngine() != .io_uring) return error.SkipZigTest;
+
+    const addr = try zio_net.IpAddress.parseIp4("127.0.0.1", 0);
+    const server = try addr.listen(.{});
+    defer server.close();
+    const client = try server.socket.address.ip.connect(.{});
+    const conn = try server.accept(.{});
+    defer conn.close();
+
+    try client.writeAll("aaa", .none);
+    const linger: extern struct { onoff: c_int, linger: c_int } = .{ .onoff = 1, .linger = 0 };
+    try os_net.setsockopt(client.socket.handle, os_net.SOL.SOCKET, os_net.SO.LINGER, std.mem.asBytes(&linger));
+    client.close();
+
+    var messages: [2]Io.net.IncomingMessage = @splat(.init);
+    var buf: [64]u8 = undefined;
+    const result = try io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = conn.socket.handle,
+        .message_buffer = &messages,
+        .data_buffer = &buf,
+        .flags = .{},
+    } }, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const err, const n = result.net_receive;
+    try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, error.ConnectionResetByPeer), err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqualStrings("aaa", messages[0].data);
+}
+
+test "io: receiveManyTimeout gives a lone datagram the whole buffer without recvmmsg" {
+    // With recvmmsg the buffer is split between the slots up front; without
+    // it, each receive gets what is left of the buffer.
+    if (os_net.has_recvmmsg) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    const payload: [1000]u8 = @splat('x');
+    try sender.send(io, &receiver.address, &payload);
+
+    var messages: [8]Io.net.IncomingMessage = @splat(.init);
+    var buf: [1500]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+    const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+    try std.testing.expectEqual(null, err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqual(payload.len, messages[0].data.len);
+    try std.testing.expect(!messages[0].flags.trunc);
+}
+
+test "io: receiveManyTimeout returns every datagram already queued" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    try sender.send(io, &receiver.address, "one");
+    try sender.send(io, &receiver.address, "two");
+    try sender.send(io, &receiver.address, "three");
+
+    var messages: [8]Io.net.IncomingMessage = @splat(.init);
+    var buf: [64]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+    const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+    try std.testing.expectEqual(null, err);
+    if (!ev.Backend.supports_recv_dontwait) {
+        try std.testing.expectEqual(1, n);
+        return;
+    }
+    // Linux loopback delivery finishes inside send, so all three are queued
+    // when the first receive returns. Other kernels hand loopback packets to
+    // an input thread, so later datagrams may still be in flight; drain them
+    // across calls and check the total and the order instead.
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(3, n);
+    const expected = [_][]const u8{ "one", "two", "three" };
+    var seen: usize = 0;
+    for (messages[0..n]) |*message| {
+        try std.testing.expectEqualStrings(expected[seen], message.data);
+        seen += 1;
+    }
+    while (seen < expected.len) {
+        const more_err, const more = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+        try std.testing.expectEqual(null, more_err);
+        try std.testing.expect(more > 0);
+        for (messages[0..more]) |*message| {
+            try std.testing.expectEqualStrings(expected[seen], message.data);
+            seen += 1;
+        }
+    }
+
+    // The queue is empty now, so a multi-slot receive waits like a single one.
+    const err2, const n2 = receiver.receiveManyTimeout(io, &messages, &buf, .{}, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
+    try std.testing.expect(err2.? == error.Timeout);
+    try std.testing.expectEqual(0, n2);
+}
+
+test "io: receiveManyTimeout stops when the data buffer is full" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    try sender.send(io, &receiver.address, "aaa");
+    try sender.send(io, &receiver.address, "bbb");
+    try sender.send(io, &receiver.address, "ccc");
+
+    // 6-byte buffer, 2 message slots: each slot gets 3 bytes, enough for
+    // exactly two datagrams. The third stays queued.
+    var messages: [2]Io.net.IncomingMessage = @splat(.init);
+    var buf: [6]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+    const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+    try std.testing.expectEqual(null, err);
+    try std.testing.expect(n >= 1);
+    try std.testing.expectEqualStrings("aaa", messages[0].data);
+
+    // The remaining datagram(s) are still in the queue.
+    const err2, const n2 = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+    try std.testing.expectEqual(null, err2);
+    try std.testing.expect(n2 >= 1);
+}
+
+test "io: operateTimeout net_receive times out when no data arrives" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.Timeout, io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{},
+    } }, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }));
+}
+
+test "io: batch awaitAsync executes operations linearly" {
+    // file_read_streaming uses iovec which doesn't work on Windows regular files
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const file_path = "test_io_batch.txt";
+
+    var file = try dir.createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
+
+    // Write some data
+    const data = "hello batch";
+    _ = try file.writePositional(io, &.{data}, 0);
+
+    // Use batch to read it back
+    var read_buf: [32]u8 = undefined;
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch = Io.Batch.init(&storage);
+    _ = batch.add(.{ .file_read_streaming = .{ .file = file, .data = &.{&read_buf} } });
+
+    try batch.awaitAsync(io);
+
+    const completion = batch.next().?;
+    try std.testing.expectEqual(@as(u32, 0), completion.index);
+    const n = try completion.result.file_read_streaming;
+    try std.testing.expectEqualStrings(data, read_buf[0..n]);
+}
+
+test "io: batch awaitConcurrent with empty batch returns immediately" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch = Io.Batch.init(&storage);
+
+    // Empty batch should return immediately without error
+    try batch.awaitConcurrent(io, .{ .none = {} });
+}
+
+test "io: createFileAtomic link" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dest_path = "test_io_atomic_file.txt";
+
+    var af = try dir.createFileAtomic(io, dest_path, .{});
+    defer af.deinit(io);
+
+    _ = try af.file.writePositional(io, &.{"hello atomic"}, 0);
+
+    try af.link(io);
+
+    const content = try dir.readFileAlloc(io, dest_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("hello atomic", content);
+}
+
+test "io: createFileAtomic replace" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dest_path = "test_io_atomic_replace.txt";
+
+    // Create initial file.
+    var f = try dir.createFile(io, dest_path, .{});
+    _ = try f.writePositional(io, &.{"original"}, 0);
+    f.close(io);
+
+    // Replace atomically.
+    var af = try dir.createFileAtomic(io, dest_path, .{ .replace = true });
+    defer af.deinit(io);
+
+    _ = try af.file.writePositional(io, &.{"replaced"}, 0);
+
+    try af.replace(io);
+
+    const content = try dir.readFileAlloc(io, dest_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("replaced", content);
+}
+
+test "io: createFileAtomic with make_path" {
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+    const io = t.rt.io();
+
+    const dir = t.stdDir();
+    const dest_path = "test_io_atomic_nested/subdir/file.txt";
+    defer {
+        dir.deleteFile(io, dest_path) catch {};
+        dir.deleteDir(io, "test_io_atomic_nested/subdir") catch {};
+        dir.deleteDir(io, "test_io_atomic_nested") catch {};
+    }
+
+    // Clean up from previous runs.
+    dir.deleteFile(io, dest_path) catch {};
+    dir.deleteDir(io, "test_io_atomic_nested/subdir") catch {};
+    dir.deleteDir(io, "test_io_atomic_nested") catch {};
+
+    var af = try dir.createFileAtomic(io, dest_path, .{ .make_path = true });
+    defer af.deinit(io);
+
+    _ = try af.file.writePositional(io, &.{"nested atomic"}, 0);
+
+    try af.link(io);
+
+    const content = try dir.readFileAlloc(io, dest_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("nested atomic", content);
+}
+
+test "io: batch awaitConcurrent with two net_receive operations" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // Create two UDP sockets
+    var sock1 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock1.close(io);
+    var sock2 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock2.close(io);
+
+    // Create a sender socket
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    // Send data to both sockets
+    try sender.send(io, &sock1.address, "hello1");
+    try sender.send(io, &sock2.address, "hello2");
+
+    // Set up batch with receive operations for both sockets
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+
+    var msg1: Io.net.IncomingMessage = .init;
+    var buf1: [16]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = sock1.handle,
+        .message_buffer = (&msg1)[0..1],
+        .data_buffer = &buf1,
+        .flags = .{},
+    } });
+
+    var msg2: Io.net.IncomingMessage = .init;
+    var buf2: [16]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = sock2.handle,
+        .message_buffer = (&msg2)[0..1],
+        .data_buffer = &buf2,
+        .flags = .{},
+    } });
+
+    // Wait for at least one completion
+    try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+    // Get first completion
+    const completion1 = batch.next();
+    try std.testing.expect(completion1 != null);
+    const err1, const n1 = completion1.?.result.net_receive;
+    try std.testing.expectEqual(null, err1);
+    try std.testing.expectEqual(1, n1);
+
+    // Wait for second completion
+    try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+    // Get second completion
+    const completion2 = batch.next();
+    try std.testing.expect(completion2 != null);
+    const err2, const n2 = completion2.?.result.net_receive;
+    try std.testing.expectEqual(null, err2);
+    try std.testing.expectEqual(1, n2);
+
+    // Verify both messages received (order may vary)
+    const received1 = msg1.data;
+    const received2 = msg2.data;
+    try std.testing.expect(
+        (std.mem.eql(u8, received1, "hello1") and std.mem.eql(u8, received2, "hello2")) or
+            (std.mem.eql(u8, received1, "hello2") and std.mem.eql(u8, received2, "hello1")),
+    );
+
+    // Clean up
+    batch.cancel(io);
+}
+
+test "io: batch awaitConcurrent file_read_streaming into empty buffers returns 0" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const fds = try os_fs.pipe();
+    var read_file: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
+    var write_file: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = true } };
+    defer read_file.close(io);
+    defer write_file.close(io);
+
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    defer batch.cancel(io);
+
+    var empty: [0]u8 = .{};
+    const data: []const []u8 = &.{&empty};
+    _ = batch.add(.{ .file_read_streaming = .{ .file = read_file, .data = data } });
+    _ = batch.add(.{ .file_read_streaming = .{ .file = read_file, .data = data } });
+
+    var completed: usize = 0;
+    while (completed < 2) {
+        try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+        while (batch.next()) |completion| {
+            try std.testing.expectEqual(0, try completion.result.file_read_streaming);
+            completed += 1;
+        }
+    }
+}
+
+test "io: batch awaitConcurrent with a net_send operation" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+
+    // The destination comes from the message, so this also pins that the batch
+    // path copies the address into its own storage: the op holds a pointer to
+    // it for as long as the send is in flight.
+    const payload = "batched";
+    var out: [1]Io.net.OutgoingMessage = .{.{
+        .address = &receiver.address,
+        .data_ptr = payload,
+        .data_len = payload.len,
+        .control = &.{},
+    }};
+    _ = batch.add(.{ .net_send = .{
+        .socket_handle = sender.handle,
+        .messages = &out,
+        .flags = .{},
+    } });
+
+    try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+    const completion = batch.next();
+    try std.testing.expect(completion != null);
+    const err, const n = completion.?.result.net_send;
+    try std.testing.expectEqual(null, err);
+    // One completion is one sendmsg, so exactly one message goes out.
+    try std.testing.expectEqual(1, n);
+
+    // Bounded, so a send that goes to the wrong address fails here instead of
+    // parking the suite forever.
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [32]u8 = undefined;
+    const received = try io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{},
+    } }, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const recv_err, _ = received.net_receive;
+    try std.testing.expectEqual(null, recv_err);
+    try std.testing.expectEqualStrings(payload, msg.data);
+
+    batch.cancel(io);
+}
+
+test "io: batch awaitConcurrent with a net_write operation" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const expected = "head:midababab";
+
+    const Worker = struct {
+        fn sink(io: Io, server: *Io.net.Server, out: *anyerror!void) void {
+            out.* = collect(io, server);
+        }
+
+        fn collect(io: Io, server: *Io.net.Server) !void {
+            const peer = try server.accept(io);
+            defer peer.close(io);
+
+            var recv_buf: [64]u8 = undefined;
+            var reader = peer.reader(io, &recv_buf);
+            var got: [64]u8 = undefined;
+            const n = try reader.interface.readSliceShort(&got);
+            try std.testing.expectEqualStrings(expected, got[0..n]);
+        }
+
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{});
+            defer server.deinit(io);
+
+            var sink_err: anyerror!void = {};
+            var future = io.async(sink, .{ io, &server, &sink_err });
+            defer future.cancel(io);
+
+            const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            defer client.close(io);
+
+            var storage: [1]Io.Operation.Storage = undefined;
+            var batch: Io.Batch = .init(&storage);
+
+            // header + data + splat, so the batch path's own fillBuf and
+            // splat_buf are what assemble the iovecs.
+            const data: []const []const u8 = &.{ "mid", "ab" };
+            _ = batch.add(.{ .net_write = .{
+                .socket_handle = client.socket.handle,
+                .header = "head:",
+                .data = data,
+                .splat = 3,
+            } });
+
+            try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+            const completion = batch.next();
+            try std.testing.expect(completion != null);
+            const written = try completion.?.result.net_write;
+            try std.testing.expectEqual(expected.len, written);
+
+            batch.cancel(io);
+            try client.shutdown(io, .send);
+
+            future.await(io);
+            try sink_err;
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: batch awaitConcurrent times out when no data arrives" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    defer batch.cancel(io);
+
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [16]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{},
+    } });
+
+    // Should timeout since no data arrives
+    try std.testing.expectError(error.Timeout, batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }));
+}
+
+test "io: operateTimeout net_receive with trunc clamps a datagram larger than the buffer" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    const payload: [200]u8 = @splat('x');
+    try sender.send(io, &receiver.address, &payload);
+
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [100]u8 = undefined;
+    const result = try io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{ .trunc = true },
+    } }, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const err, const n = result.net_receive;
+    try std.testing.expectEqual(null, err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqual(buf.len, msg.data.len);
+    try std.testing.expect(msg.flags.trunc);
+}
+
+test "io: batch net_receive with trunc clamps a datagram larger than the buffer" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    const payload: [200]u8 = @splat('x');
+    try sender.send(io, &receiver.address, &payload);
+
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    defer batch.cancel(io);
+
+    var msg: Io.net.IncomingMessage = .init;
+    var buf: [100]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = receiver.handle,
+        .message_buffer = (&msg)[0..1],
+        .data_buffer = &buf,
+        .flags = .{ .trunc = true },
+    } });
+
+    try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const completion = batch.next() orelse return error.TestUnexpectedResult;
+    const err, const n = completion.result.net_receive;
+    try std.testing.expectEqual(null, err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqual(buf.len, msg.data.len);
+    try std.testing.expect(msg.flags.trunc);
+}
+
+test "io: batch cancel does not report canceled operations" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sock1 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock1.close(io);
+    var sock2 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock2.close(io);
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    defer batch.cancel(io);
+
+    var msg1: Io.net.IncomingMessage = .init;
+    var buf1: [16]u8 = undefined;
+    var msg2: Io.net.IncomingMessage = .init;
+    var buf2: [16]u8 = undefined;
+
+    for (0..2) |_| {
+        batch.addAt(0, .{ .net_receive = .{
+            .socket_handle = sock1.handle,
+            .message_buffer = (&msg1)[0..1],
+            .data_buffer = &buf1,
+            .flags = .{},
+        } });
+        batch.addAt(1, .{ .net_receive = .{
+            .socket_handle = sock2.handle,
+            .message_buffer = (&msg2)[0..1],
+            .data_buffer = &buf2,
+            .flags = .{},
+        } });
+
+        // Only the first socket gets data
+        try sender.send(io, &sock1.address, "hello");
+        try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+        const completion = batch.next().?;
+        try std.testing.expectEqual(0, completion.index);
+        const err, const n = completion.result.net_receive;
+        try std.testing.expectEqual(null, err);
+        try std.testing.expectEqual(1, n);
+        try std.testing.expectEqualStrings("hello", msg1.data);
+
+        // The second operation is canceled, so it must not show up, and both
+        // slots must be available to `addAt` again
+        batch.cancel(io);
+        try std.testing.expect(batch.next() == null);
+    }
+}
+
+test "io: concurrent cross-executor cancel of N blocked recvmsg fibers is UAF-free" {
+    const N = 8;
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const S = struct {
+        const Fut = Io.Future((Io.Cancelable || Io.ConcurrentError)!void);
+
+        const Ctx = struct {
+            ready: Io.Semaphore = .{ .permits = 0 },
+            canceled: std.atomic.Value(u32) = .init(0),
+        };
+
+        fn bareRecv(cio: Io, ctx: *Ctx) (Io.Cancelable || Io.ConcurrentError)!void {
+            var addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            const socket = Io.net.IpAddress.bind(&addr, cio, .{ .mode = .dgram }) catch return;
+            defer socket.close(cio);
+            var data_buf: [2048]u8 = undefined;
+            var ctrl_buf: [256]u8 align(8) = undefined;
+            // The poll backend on Windows receives through the synchronous
+            // Winsock path, which has no control messages and rejects a
+            // control buffer at the first attempt.
+            const control_unsupported = builtin.os.tag == .windows and ev.backend == .poll;
+            var messages = [_]Io.net.IncomingMessage{.{
+                .from = undefined,
+                .data = undefined,
+                .control = if (control_unsupported) &.{} else &ctrl_buf,
+                .flags = undefined,
+            }};
+            ctx.ready.post(cio);
+            const maybe_err, _ = socket.receiveManyTimeout(cio, &messages, &data_buf, .{}, .none);
+            if (maybe_err) |e| switch (e) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+        }
+
+        fn cancelOne(cio: Io, ctx: *Ctx, fut: *Fut) void {
+            if (fut.cancel(cio)) |_| {} else |e| {
+                if (e == error.Canceled) _ = ctx.canceled.fetchAdd(1, .release);
+            }
+        }
+    };
+
+    var ctx: S.Ctx = .{};
+
+    var futs: [N]S.Fut = undefined;
+    for (&futs) |*f| f.* = try Io.concurrent(io, S.bareRecv, .{ io, &ctx });
+
+    // Wait until all N fibers have reached receiveManyTimeout, then let them park.
+    for (0..N) |_| try ctx.ready.wait(io);
+    try io.sleep(.fromMilliseconds(20), .awake);
+
+    var group: Io.Group = .init;
+    for (&futs) |*f| try group.concurrent(io, S.cancelOne, .{ io, &ctx, f });
+    group.await(io) catch {};
+
+    try std.testing.expectEqual(N, ctx.canceled.load(.acquire));
+}
+
+test "io: blockingIo concurrent dispatches to thread pool" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    const S = struct {
+        fn work() i32 {
+            return 42;
+        }
+    };
+
+    var fut = try Io.concurrent(bio, S.work, .{});
+    try std.testing.expectEqual(42, fut.await(bio));
+}
+
+test "io: blockingIo group concurrent dispatches to thread pool" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    var done = std.atomic.Value(bool).init(false);
+
+    const S = struct {
+        fn work(flag: *std.atomic.Value(bool)) void {
+            flag.store(true, .release);
+        }
+    };
+
+    var group: Io.Group = .init;
+    try group.concurrent(bio, S.work, .{&done});
+    group.await(bio) catch {};
+
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "io: fromIo round-trips through blockingIo" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+
+    const bio = rt.blockingIo();
+    try std.testing.expectEqual(rt, Runtime.fromIo(bio).?);
+
+    const aio = rt.io();
+    try std.testing.expectEqual(rt, Runtime.fromIo(aio).?);
+}
+
+test "io: blockingIo gets and sets the current path" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(bio, &buf);
+    try std.testing.expect(len > 0);
+    try std.process.setCurrentPath(bio, buf[0..len]);
+}
+
+test "io: debug_io gets and sets the current path" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(debug_io, &buf);
+    try std.testing.expect(len > 0);
+    try std.process.setCurrentPath(debug_io, buf[0..len]);
+}
+
+test "io: blockingIo spawns a child process" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/c", "exit 0" }
+    else
+        &.{"true"};
+    var child = try std.process.spawn(bio, .{ .argv = argv });
+    const term = try child.wait(bio);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "io: blockingIo batch awaitConcurrent with two operations" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    var sock1 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, bio, .{ .mode = .dgram });
+    defer sock1.close(bio);
+    var sock2 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, bio, .{ .mode = .dgram });
+    defer sock2.close(bio);
+    try sock1.send(bio, &sock2.address, "hello");
+
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    defer batch.cancel(bio);
+
+    var msg1: Io.net.IncomingMessage = .init;
+    var buf1: [16]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = sock1.handle,
+        .message_buffer = (&msg1)[0..1],
+        .data_buffer = &buf1,
+        .flags = .{},
+    } });
+    var msg2: Io.net.IncomingMessage = .init;
+    var buf2: [16]u8 = undefined;
+    _ = batch.add(.{ .net_receive = .{
+        .socket_handle = sock2.handle,
+        .message_buffer = (&msg2)[0..1],
+        .data_buffer = &buf2,
+        .flags = .{},
+    } });
+
+    try batch.awaitConcurrent(bio, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+    const completion = batch.next() orelse return error.TestUnexpectedResult;
+    const err, const n = completion.result.net_receive;
+    try std.testing.expectEqual(null, err);
+    try std.testing.expectEqual(1, n);
+    try std.testing.expectEqualStrings("hello", msg2.data);
+}
+
+test "io: blockingIo netLookup resolves numeric IPv4" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+    const bio = rt.blockingIo();
+
+    const host: Io.net.HostName = try .init("127.0.0.1");
+    var buf: [32]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);
+    try Io.net.HostName.lookup(host, bio, &queue, .{ .port = 8080 });
+
+    var got_address = false;
+    while (queue.getOneUncancelable(bio)) |entry| switch (entry) {
+        .address => |addr| {
+            got_address = true;
+            try std.testing.expectEqual(@as(u16, 8080), addr.getPort());
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    try std.testing.expect(got_address);
+}

@@ -1,0 +1,1539 @@
+const std = @import("std");
+const builtin = @import("builtin");
+
+// Type aliases
+pub const DWORD = std.os.windows.DWORD;
+pub const LPCWSTR = std.os.windows.LPCWSTR;
+pub const BOOL = std.os.windows.BOOL;
+pub const HANDLE = std.os.windows.HANDLE;
+pub const LPVOID = std.os.windows.LPVOID;
+pub const LARGE_INTEGER = std.os.windows.LARGE_INTEGER;
+pub const ULONG = std.os.windows.ULONG;
+pub const ULONG_PTR = std.os.windows.ULONG_PTR;
+pub const SECURITY_ATTRIBUTES = std.os.windows.SECURITY_ATTRIBUTES;
+pub const PVOID = std.os.windows.PVOID;
+pub const SIZE_T = std.os.windows.SIZE_T;
+pub const NTSTATUS = std.os.windows.NTSTATUS;
+pub const BOOLEAN = std.os.windows.BOOLEAN;
+pub const IO_STATUS_BLOCK = std.os.windows.IO_STATUS_BLOCK;
+pub const FILE_BOTH_DIR_INFORMATION = std.os.windows.FILE_BOTH_DIR_INFORMATION;
+
+/// FILE_INFORMATION_CLASS enum (removed from std.os.windows in Zig 0.16).
+/// Values match the Windows DDK NtQueryDirectoryFile API.
+pub const FILE_INFORMATION_CLASS = enum(c_int) {
+    FileDirectoryInformation = 1,
+    FileFullDirectoryInformation = 2,
+    FileBothDirectoryInformation = 3,
+    FileBasicInformation = 4,
+    FileStandardInformation = 5,
+    FileInternalInformation = 6,
+    FileEaInformation = 7,
+    FileAccessInformation = 8,
+    FileNameInformation = 9,
+    FileRenameInformation = 10,
+    FileLinkInformation = 11,
+    FileNamesInformation = 12,
+    FileDispositionInformation = 13,
+    FilePositionInformation = 14,
+    FileFullEaInformation = 15,
+    FileModeInformation = 16,
+    FileAlignmentInformation = 17,
+    FileAllInformation = 18,
+    FileAllocationInformation = 19,
+    FileEndOfFileInformation = 20,
+    FileAlternateNameInformation = 21,
+    FileStreamInformation = 22,
+    FilePipeInformation = 23,
+    FilePipeLocalInformation = 24,
+    FilePipeRemoteInformation = 25,
+    FileMailslotQueryInformation = 26,
+    FileMailslotSetInformation = 27,
+    FileCompressionInformation = 28,
+    FileObjectIdInformation = 29,
+    FileCompletionInformation = 30,
+    FileMoveClusterInformation = 31,
+    FileQuotaInformation = 32,
+    FileReparsePointInformation = 33,
+    FileNetworkOpenInformation = 34,
+    FileAttributeTagInformation = 35,
+    FileTrackingInformation = 36,
+    FileIdBothDirectoryInformation = 37,
+    FileIdFullDirectoryInformation = 38,
+    FileValidDataLengthInformation = 39,
+    FileShortNameInformation = 40,
+    FileIoCompletionNotificationInformation = 41,
+    FileIoStatusBlockRangeInformation = 42,
+    FileIoPriorityHintInformation = 43,
+    FileSfioReserveInformation = 44,
+    FileSfioVolumeInformation = 45,
+    FileHardLinkInformation = 46,
+    FileProcessIdsUsingFileInformation = 47,
+    FileNormalizedNameInformation = 48,
+    FileNetworkPhysicalNameInformation = 49,
+    FileIdGlobalTxDirectoryInformation = 50,
+    FileIsRemoteDeviceInformation = 51,
+    FileAttributeCacheInformation = 52,
+    FileNumaNodeInformation = 53,
+    FileStandardLinkInformation = 54,
+    FileRemoteProtocolInformation = 55,
+    FileMaximumInformation = 56,
+};
+pub const WCHAR = std.os.windows.WCHAR;
+pub const PAPCFUNC = *const fn (ULONG_PTR) callconv(.winapi) void;
+pub const HANDLER_ROUTINE = *const fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
+
+// OVERLAPPED structure (removed from std.os.windows in Zig 0.16)
+pub const OVERLAPPED = extern struct {
+    Internal: ULONG_PTR,
+    InternalHigh: ULONG_PTR,
+    DUMMYUNIONNAME: extern union {
+        DUMMYSTRUCTNAME: extern struct {
+            Offset: DWORD,
+            OffsetHigh: DWORD,
+        },
+        Pointer: ?PVOID,
+    },
+    hEvent: ?HANDLE,
+};
+
+pub const OVERLAPPED_ENTRY = extern struct {
+    lpCompletionKey: ULONG_PTR,
+    lpOverlapped: ?*OVERLAPPED,
+    Internal: ULONG_PTR,
+    dwNumberOfBytesTransferred: DWORD,
+};
+
+// Constants
+pub const TRUE: BOOL = BOOL.TRUE;
+pub const FALSE: BOOL = .FALSE;
+pub const NAME_MAX = std.os.windows.NAME_MAX;
+pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
+pub const INFINITE: DWORD = 0xFFFFFFFF;
+
+/// Sentinel value representing the current working directory.
+/// Similar to POSIX AT_FDCWD. This is not a real handle - it must be
+/// detected and handled specially in path resolution functions.
+pub const FDCWD: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -100))));
+
+// DuplicateHandle options
+pub const DUPLICATE_SAME_ACCESS: DWORD = 2;
+
+// Console control events
+pub const CTRL_C_EVENT: DWORD = 0;
+pub const CTRL_CLOSE_EVENT: DWORD = 2;
+
+// Generic access rights
+pub const GENERIC_READ: DWORD = 0x80000000;
+pub const GENERIC_WRITE: DWORD = 0x40000000;
+pub const GENERIC_EXECUTE: DWORD = 0x20000000;
+pub const GENERIC_ALL: DWORD = 0x10000000;
+
+// File share modes
+pub const FILE_SHARE_READ: DWORD = 0x00000001;
+pub const FILE_SHARE_WRITE: DWORD = 0x00000002;
+pub const FILE_SHARE_DELETE: DWORD = 0x00000004;
+
+// Creation disposition
+pub const CREATE_NEW: DWORD = 1;
+pub const CREATE_ALWAYS: DWORD = 2;
+pub const OPEN_EXISTING: DWORD = 3;
+pub const OPEN_ALWAYS: DWORD = 4;
+
+// File attributes
+pub const FILE_ATTRIBUTE_READONLY: DWORD = 0x1;
+pub const FILE_ATTRIBUTE_HIDDEN: DWORD = 0x2;
+pub const FILE_ATTRIBUTE_SYSTEM: DWORD = 0x4;
+pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
+pub const FILE_ATTRIBUTE_ARCHIVE: DWORD = 0x20;
+pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x400;
+
+// File flags
+pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+pub const FILE_FLAG_OPEN_REPARSE_POINT: DWORD = 0x00200000;
+pub const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
+pub const FILE_FLAG_NO_BUFFERING: DWORD = 0x20000000;
+
+// MoveFileEx flags
+pub const MOVEFILE_COPY_ALLOWED = 2;
+pub const MOVEFILE_CREATE_HARDLINK = 16;
+pub const MOVEFILE_DELAY_UNTIL_REBOOT = 4;
+pub const MOVEFILE_FAIL_IF_NOT_TRACKABLE = 32;
+pub const MOVEFILE_REPLACE_EXISTING = 1;
+pub const MOVEFILE_WRITE_THROUGH = 8;
+
+// File functions
+pub extern "kernel32" fn MoveFileExW(
+    lpExistingFileName: LPCWSTR,
+    lpNewFileName: LPCWSTR,
+    dwFlags: DWORD,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CreateDirectoryW(
+    lpPathName: LPCWSTR,
+    lpSecurityAttributes: ?*SECURITY_ATTRIBUTES,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn RemoveDirectoryW(
+    lpPathName: LPCWSTR,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CreateFileW(
+    lpFileName: LPCWSTR,
+    dwDesiredAccess: DWORD,
+    dwShareMode: DWORD,
+    lpSecurityAttributes: ?*SECURITY_ATTRIBUTES,
+    dwCreationDisposition: DWORD,
+    dwFlagsAndAttributes: DWORD,
+    hTemplateFile: ?HANDLE,
+) callconv(.winapi) HANDLE;
+
+pub extern "kernel32" fn ReadFile(
+    hFile: HANDLE,
+    lpBuffer: [*]u8,
+    nNumberOfBytesToRead: DWORD,
+    lpNumberOfBytesRead: ?*DWORD,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn WriteFile(
+    hFile: HANDLE,
+    lpBuffer: [*]const u8,
+    nNumberOfBytesToWrite: DWORD,
+    lpNumberOfBytesWritten: ?*DWORD,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn FlushFileBuffers(
+    hFile: HANDLE,
+) callconv(.winapi) BOOL;
+
+pub const LOCKFILE_FAIL_IMMEDIATELY: DWORD = 0x00000001;
+pub const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 0x00000002;
+
+pub extern "kernel32" fn LockFileEx(
+    hFile: HANDLE,
+    dwFlags: DWORD,
+    dwReserved: DWORD,
+    nNumberOfBytesToLockLow: DWORD,
+    nNumberOfBytesToLockHigh: DWORD,
+    lpOverlapped: *OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn UnlockFileEx(
+    hFile: HANDLE,
+    dwReserved: DWORD,
+    nNumberOfBytesToUnlockLow: DWORD,
+    nNumberOfBytesToUnlockHigh: DWORD,
+    lpOverlapped: *OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetFileSizeEx(
+    hFile: HANDLE,
+    lpFileSize: *LARGE_INTEGER,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetFileInformationByHandle(
+    hFile: HANDLE,
+    lpFileInformation: *BY_HANDLE_FILE_INFORMATION,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetFileAttributesW(
+    lpFileName: LPCWSTR,
+) callconv(.winapi) DWORD;
+
+pub const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFFFFFF;
+
+pub extern "kernel32" fn SetFilePointerEx(
+    hFile: HANDLE,
+    liDistanceToMove: LARGE_INTEGER,
+    lpNewFilePointer: ?*LARGE_INTEGER,
+    dwMoveMethod: DWORD,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn SetEndOfFile(
+    hFile: HANDLE,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn SetFileTime(
+    hFile: HANDLE,
+    lpCreationTime: ?*const FILETIME,
+    lpLastAccessTime: ?*const FILETIME,
+    lpLastWriteTime: ?*const FILETIME,
+) callconv(.winapi) BOOL;
+
+pub const FILE_BEGIN: DWORD = 0;
+pub const FILE_CURRENT: DWORD = 1;
+pub const FILE_END: DWORD = 2;
+
+/// Returns true if `handle` is not seekable (pipe, socket, character device),
+/// in which case only streaming (positionless, zero-offset overlapped) I/O works
+/// and positional I/O is unavailable. Mirrors the POSIX lseek/ESPIPE probe: a
+/// no-op seek to the current position fails on non-seekable handles.
+///
+/// Only returns true when SetFilePointerEx fails with INVALID_FUNCTION — the
+/// canonical Windows error for "this handle type does not support seeking".
+/// Other failures (e.g. INVALID_PARAMETER, ACCESS_DENIED) are treated as
+/// seekable since the handle may still support positional I/O.
+pub fn isPollable(handle: HANDLE) bool {
+    if (SetFilePointerEx(handle, 0, null, FILE_CURRENT) != FALSE) {
+        return false;
+    }
+    return GetLastError() == .INVALID_FUNCTION;
+}
+
+// File time structures
+pub const FILETIME = extern struct {
+    dwLowDateTime: DWORD,
+    dwHighDateTime: DWORD,
+};
+
+pub const BY_HANDLE_FILE_INFORMATION = extern struct {
+    dwFileAttributes: DWORD,
+    ftCreationTime: FILETIME,
+    ftLastAccessTime: FILETIME,
+    ftLastWriteTime: FILETIME,
+    dwVolumeSerialNumber: DWORD,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+    nNumberOfLinks: DWORD,
+    nFileIndexHigh: DWORD,
+    nFileIndexLow: DWORD,
+};
+
+/// 100-nanosecond intervals between 1601 and 1970
+const EPOCH_DIFF: i64 = 116444736000000000;
+
+/// Convert Windows FILETIME to nanoseconds since Unix epoch.
+/// FILETIME is 100-nanosecond intervals since January 1, 1601.
+/// Unix epoch is January 1, 1970.
+pub fn fileTimeToNanos(ft: FILETIME) i64 {
+    const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return (ticks - EPOCH_DIFF) * 100;
+}
+
+/// Convert nanoseconds since Unix epoch to Windows FILETIME.
+pub fn nanosToFileTime(nanos: i96) FILETIME {
+    const ticks: u64 = @intCast(@divFloor(nanos, 100) + EPOCH_DIFF);
+    return .{
+        .dwLowDateTime = @truncate(ticks),
+        .dwHighDateTime = @truncate(ticks >> 32),
+    };
+}
+
+// IOCP functions
+pub extern "kernel32" fn CreateIoCompletionPort(
+    FileHandle: HANDLE,
+    ExistingCompletionPort: ?HANDLE,
+    CompletionKey: ULONG_PTR,
+    NumberOfConcurrentThreads: DWORD,
+) callconv(.winapi) ?HANDLE;
+
+pub extern "kernel32" fn GetQueuedCompletionStatusEx(
+    CompletionPort: HANDLE,
+    lpCompletionPortEntries: [*]OVERLAPPED_ENTRY,
+    ulCount: ULONG,
+    ulNumEntriesRemoved: *ULONG,
+    dwMilliseconds: DWORD,
+    fAlertable: BOOL,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetOverlappedResult(
+    hFile: HANDLE,
+    lpOverlapped: *OVERLAPPED,
+    lpNumberOfBytesTransferred: *DWORD,
+    bWait: BOOL,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CancelIoEx(
+    hFile: HANDLE,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn DuplicateHandle(
+    hSourceProcessHandle: HANDLE,
+    hSourceHandle: HANDLE,
+    hTargetProcessHandle: HANDLE,
+    lpTargetHandle: *HANDLE,
+    dwDesiredAccess: DWORD,
+    bInheritHandle: BOOL,
+    dwOptions: DWORD,
+) callconv(.winapi) BOOL;
+
+// Thread/process functions
+pub extern "kernel32" fn GetCurrentThread() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+
+// APC functions
+pub extern "kernel32" fn QueueUserAPC(
+    pfnAPC: PAPCFUNC,
+    hThread: HANDLE,
+    dwData: ULONG_PTR,
+) callconv(.winapi) DWORD;
+
+// Waitable timer functions. The completion routine is delivered as a user-mode
+// APC to the thread that armed the timer, so it runs while that thread sits in
+// an alertable wait (e.g. GetQueuedCompletionStatusEx with fAlertable=TRUE).
+pub const PTIMERAPCROUTINE = *const fn (
+    lpArgToCompletionRoutine: ?*anyopaque,
+    dwTimerLowValue: DWORD,
+    dwTimerHighValue: DWORD,
+) callconv(.winapi) void;
+
+/// High-resolution timer flag for CreateWaitableTimerExW (Windows 10 1803+).
+pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: DWORD = 0x00000002;
+/// Full access rights for a waitable timer object.
+pub const TIMER_ALL_ACCESS: DWORD = 0x1F0003;
+
+pub extern "kernel32" fn CreateWaitableTimerExW(
+    lpTimerAttributes: ?*SECURITY_ATTRIBUTES,
+    lpTimerName: ?LPCWSTR,
+    dwFlags: DWORD,
+    dwDesiredAccess: DWORD,
+) callconv(.winapi) ?HANDLE;
+
+pub extern "kernel32" fn SetWaitableTimer(
+    hTimer: HANDLE,
+    lpDueTime: *const LARGE_INTEGER,
+    lPeriod: i32,
+    pfnCompletionRoutine: ?PTIMERAPCROUTINE,
+    lpArgToCompletionRoutine: ?*anyopaque,
+    fResume: BOOL,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CancelWaitableTimer(
+    hTimer: HANDLE,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn Sleep(
+    dwMilliseconds: DWORD,
+) callconv(.winapi) void;
+
+pub extern "kernel32" fn SwitchToThread() callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn SleepEx(
+    dwMilliseconds: DWORD,
+    bAlertable: BOOL,
+) callconv(.winapi) DWORD;
+
+// Thread synchronization functions (Windows 8+)
+// Use ntdll versions to avoid linking against synchronization.lib
+pub extern "ntdll" fn RtlWaitOnAddress(
+    Address: ?*const anyopaque,
+    CompareAddress: ?*const anyopaque,
+    AddressSize: SIZE_T,
+    Timeout: ?*const LARGE_INTEGER,
+) callconv(.winapi) NTSTATUS;
+
+pub extern "ntdll" fn RtlWakeAddressSingle(
+    Address: ?*const anyopaque,
+) callconv(.winapi) void;
+
+pub extern "ntdll" fn RtlWakeAddressAll(
+    Address: ?*const anyopaque,
+) callconv(.winapi) void;
+
+// SRWLOCK synchronization (Windows Vista+)
+pub const SRWLOCK = extern struct {
+    ptr: ?*anyopaque,
+};
+
+pub const SRWLOCK_INIT: SRWLOCK = .{ .ptr = null };
+
+pub extern "kernel32" fn InitializeSRWLock(
+    SRWLock: *SRWLOCK,
+) callconv(.winapi) void;
+
+pub extern "kernel32" fn AcquireSRWLockExclusive(
+    SRWLock: *SRWLOCK,
+) callconv(.winapi) void;
+
+pub extern "kernel32" fn TryAcquireSRWLockExclusive(
+    SRWLock: *SRWLOCK,
+) callconv(.winapi) BOOLEAN;
+
+pub extern "kernel32" fn ReleaseSRWLockExclusive(
+    SRWLock: *SRWLOCK,
+) callconv(.winapi) void;
+
+// CONDITION_VARIABLE synchronization (Windows Vista+)
+pub const CONDITION_VARIABLE = extern struct {
+    ptr: ?*anyopaque,
+};
+
+pub const CONDITION_VARIABLE_INIT: CONDITION_VARIABLE = .{ .ptr = null };
+
+pub extern "kernel32" fn InitializeConditionVariable(
+    ConditionVariable: *CONDITION_VARIABLE,
+) callconv(.winapi) void;
+
+pub extern "kernel32" fn SleepConditionVariableSRW(
+    ConditionVariable: *CONDITION_VARIABLE,
+    SRWLock: *SRWLOCK,
+    dwMilliseconds: DWORD,
+    Flags: ULONG,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn WakeConditionVariable(
+    ConditionVariable: *CONDITION_VARIABLE,
+) callconv(.winapi) void;
+
+pub extern "kernel32" fn WakeAllConditionVariable(
+    ConditionVariable: *CONDITION_VARIABLE,
+) callconv(.winapi) void;
+
+// Console functions
+pub extern "kernel32" fn SetConsoleCtrlHandler(
+    HandlerRoutine: ?HANDLER_ROUTINE,
+    Add: BOOL,
+) callconv(.winapi) BOOL;
+
+// Directory functions (ntdll)
+pub extern "ntdll" fn NtQueryDirectoryFile(
+    FileHandle: HANDLE,
+    Event: ?HANDLE,
+    ApcRoutine: ?*anyopaque,
+    ApcContext: ?*anyopaque,
+    IoStatusBlock: *IO_STATUS_BLOCK,
+    FileInformation: [*]u8,
+    Length: ULONG,
+    FileInformationClass: FILE_INFORMATION_CLASS,
+    ReturnSingleEntry: BOOLEAN,
+    FileName: ?*anyopaque,
+    RestartScan: BOOLEAN,
+) callconv(.winapi) NTSTATUS;
+
+// Time functions (ntdll)
+pub extern "ntdll" fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER;
+pub extern "ntdll" fn RtlQueryPerformanceCounter(PerformanceCounter: *LARGE_INTEGER) callconv(.winapi) BOOL;
+pub extern "ntdll" fn RtlQueryPerformanceFrequency(PerformanceFrequency: *LARGE_INTEGER) callconv(.winapi) BOOL;
+
+// Stack management (ntdll)
+pub const INITIAL_TEB = extern struct {
+    OldStackBase: PVOID,
+    OldStackLimit: PVOID,
+    StackBase: PVOID,
+    StackLimit: PVOID,
+    StackAllocationBase: PVOID,
+};
+
+pub extern "ntdll" fn RtlCreateUserStack(
+    CommittedStackSize: SIZE_T,
+    MaximumStackSize: SIZE_T,
+    ZeroBits: ULONG_PTR,
+    PageSize: SIZE_T,
+    ReserveAlignment: ULONG_PTR,
+    InitialTeb: *INITIAL_TEB,
+) callconv(.winapi) NTSTATUS;
+
+pub extern "ntdll" fn RtlFreeUserStack(
+    StackAllocationBase: PVOID,
+) callconv(.winapi) void;
+
+// Handle management
+pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+
+// Process wait
+pub const WAIT_OBJECT_0: DWORD = 0x00000000;
+
+pub extern "kernel32" fn WaitForSingleObject(
+    hHandle: HANDLE,
+    dwMilliseconds: DWORD,
+) callconv(.winapi) DWORD;
+
+pub extern "kernel32" fn GetExitCodeProcess(
+    hProcess: HANDLE,
+    lpExitCode: *DWORD,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn PostQueuedCompletionStatus(
+    CompletionPort: HANDLE,
+    dwNumberOfBytesTransferred: DWORD,
+    dwCompletionKey: ULONG_PTR,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) BOOL;
+
+pub const WAITORTIMERCALLBACK = *const fn (PVOID, BOOLEAN) callconv(.winapi) void;
+
+pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
+
+pub extern "kernel32" fn RegisterWaitForSingleObject(
+    phNewWaitObject: *HANDLE,
+    hObject: HANDLE,
+    Callback: WAITORTIMERCALLBACK,
+    Context: ?PVOID,
+    dwMilliseconds: ULONG,
+    dwFlags: ULONG,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn UnregisterWaitEx(
+    WaitHandle: HANDLE,
+    CompletionEvent: ?HANDLE,
+) callconv(.winapi) BOOL;
+
+// File deletion
+pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CreatePipe(
+    hReadPipe: *HANDLE,
+    hWritePipe: *HANDLE,
+    lpPipeAttributes: ?*SECURITY_ATTRIBUTES,
+    nSize: DWORD,
+) callconv(.winapi) BOOL;
+
+// Named pipe constants
+pub const PIPE_ACCESS_INBOUND: DWORD = 0x00000001;
+pub const PIPE_ACCESS_OUTBOUND: DWORD = 0x00000002;
+pub const PIPE_TYPE_BYTE: DWORD = 0x00000000;
+pub const PIPE_WAIT: DWORD = 0x00000000;
+pub const PIPE_REJECT_REMOTE_CLIENTS: DWORD = 0x00000008;
+
+pub extern "kernel32" fn CreateNamedPipeW(
+    lpName: LPCWSTR,
+    dwOpenMode: DWORD,
+    dwPipeMode: DWORD,
+    nMaxInstances: DWORD,
+    nOutBufferSize: DWORD,
+    nInBufferSize: DWORD,
+    nDefaultTimeOut: DWORD,
+    lpSecurityAttributes: ?*SECURITY_ATTRIBUTES,
+) callconv(.winapi) HANDLE;
+
+const PipeCounterInt = usize;
+var pipe_counter: std.atomic.Value(PipeCounterInt) = std.atomic.Value(PipeCounterInt).init(0);
+
+pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
+
+/// Create an anonymous pipe with overlapped I/O support.
+/// Returns [read_handle, write_handle].
+pub fn pipe() !([2]HANDLE) {
+    // Generate unique pipe name
+    const counter = pipe_counter.fetchAdd(1, .monotonic);
+    const pid = GetCurrentProcessId();
+    var name_buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "\\\\.\\pipe\\zio-{d}-{d}", .{ pid, counter }, 0) catch unreachable;
+
+    // Convert to wide string
+    var wide_name: [256:0]WCHAR = undefined;
+    const wide_len = MultiByteToWideChar(CP_UTF8, 0, name.ptr, @intCast(name.len), &wide_name, wide_name.len - 1);
+    if (wide_len == 0) return error.Unexpected;
+    wide_name[@intCast(wide_len)] = 0;
+
+    // Create unidirectional named pipe (read end) with overlapped support
+    const read_handle = CreateNamedPipeW(
+        &wide_name,
+        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        1, // nMaxInstances
+        4096, // nOutBufferSize
+        4096, // nInBufferSize
+        120 * 1000, // nDefaultTimeOut (120 seconds)
+        null,
+    );
+
+    if (read_handle == INVALID_HANDLE_VALUE) {
+        return error.Unexpected;
+    }
+    errdefer _ = CloseHandle(read_handle);
+
+    // Connect to the pipe (write end)
+    const write_handle = CreateFileW(
+        &wide_name,
+        GENERIC_WRITE,
+        0, // no sharing
+        null,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        null,
+    );
+
+    if (write_handle == INVALID_HANDLE_VALUE) {
+        return error.Unexpected;
+    }
+
+    return .{ read_handle, write_handle };
+}
+
+// Current directory
+pub extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: ?[*]WCHAR) callconv(.winapi) DWORD;
+pub extern "kernel32" fn SetCurrentDirectoryW(lpPathName: [*:0]const WCHAR) callconv(.winapi) BOOL;
+
+// Console
+pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) callconv(.winapi) BOOL;
+
+/// Console mode bit for interpreting ANSI escape sequences in written output.
+pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+
+// Handle queries used to recognize an MSYS2/Cygwin pty (ntdll)
+pub extern "ntdll" fn NtQueryInformationFile(
+    FileHandle: HANDLE,
+    IoStatusBlock: *IO_STATUS_BLOCK,
+    FileInformation: [*]u8,
+    Length: ULONG,
+    FileInformationClass: FILE_INFORMATION_CLASS,
+) callconv(.winapi) NTSTATUS;
+
+pub extern "ntdll" fn NtQueryVolumeInformationFile(
+    FileHandle: HANDLE,
+    IoStatusBlock: *IO_STATUS_BLOCK,
+    FsInformation: *anyopaque,
+    Length: ULONG,
+    FsInformationClass: FS_INFORMATION_CLASS,
+) callconv(.winapi) NTSTATUS;
+
+/// Only the one class we query; values match the Windows DDK.
+pub const FS_INFORMATION_CLASS = enum(c_int) {
+    FileFsDeviceInformation = 4,
+};
+
+pub const FILE_FS_DEVICE_INFORMATION = extern struct {
+    DeviceType: ULONG,
+    Characteristics: ULONG,
+};
+
+pub const FILE_DEVICE_NAMED_PIPE: ULONG = 0x00000011;
+
+pub const FILE_NAME_INFORMATION = extern struct {
+    FileNameLength: ULONG,
+    FileName: [1]WCHAR,
+};
+
+// Path utilities (shlwapi)
+pub extern "shlwapi" fn PathIsRelativeW(pszPath: LPCWSTR) callconv(.winapi) BOOL;
+
+// File path resolution
+pub extern "kernel32" fn GetFinalPathNameByHandleW(
+    hFile: HANDLE,
+    lpszFilePath: [*]WCHAR,
+    cchFilePath: DWORD,
+    dwFlags: DWORD,
+) callconv(.winapi) DWORD;
+
+// GetFinalPathNameByHandle flags
+pub const FILE_NAME_NORMALIZED: DWORD = 0x0;
+pub const VOLUME_NAME_DOS: DWORD = 0x0;
+
+// Code page constants
+pub const CP_UTF8: DWORD = 65001;
+
+pub extern "kernel32" fn MultiByteToWideChar(
+    CodePage: DWORD,
+    dwFlags: DWORD,
+    lpMultiByteStr: [*]const u8,
+    cbMultiByte: c_int,
+    lpWideCharStr: ?[*]WCHAR,
+    cchWideChar: c_int,
+) callconv(.winapi) c_int;
+
+// Re-export helper functions from std.os.windows
+pub const peb = std.os.windows.peb;
+
+// Win32 error codes (copied from Zig std)
+pub const Win32Error = @import("windows/win32error.zig").Win32Error;
+
+/// Query the performance counter (monotonic clock ticks).
+pub fn QueryPerformanceCounter() u64 {
+    var result: LARGE_INTEGER = undefined;
+    std.debug.assert(RtlQueryPerformanceCounter(&result) != .FALSE);
+    return @bitCast(result);
+}
+
+/// Query the performance counter frequency (ticks per second).
+pub fn QueryPerformanceFrequency() u64 {
+    var result: LARGE_INTEGER = undefined;
+    std.debug.assert(RtlQueryPerformanceFrequency(&result) != .FALSE);
+    return @bitCast(result);
+}
+
+pub extern "kernel32" fn GetProcessTimes(
+    hProcess: HANDLE,
+    lpCreationTime: *FILETIME,
+    lpExitTime: *FILETIME,
+    lpKernelTime: *FILETIME,
+    lpUserTime: *FILETIME,
+) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetThreadTimes(
+    hThread: HANDLE,
+    lpCreationTime: *FILETIME,
+    lpExitTime: *FILETIME,
+    lpKernelTime: *FILETIME,
+    lpUserTime: *FILETIME,
+) callconv(.winapi) BOOL;
+
+// Error handling
+pub extern "kernel32" fn GetLastError() callconv(.winapi) Win32Error;
+
+/// Custom WinsockError enum for compatibility between Zig 0.15 and 0.16.
+/// Zig 0.15 uses WSAE* prefix, Zig 0.16 uses E* prefix.
+/// We define our own with consistent naming (using 0.16 style).
+pub const WinsockError = enum(u16) {
+    /// No error
+    SUCCESS = 0,
+    /// Specified event object handle is invalid.
+    INVALID_HANDLE = 6,
+    /// Insufficient memory available.
+    NOT_ENOUGH_MEMORY = 8,
+    /// One or more parameters are invalid.
+    INVALID_PARAMETER = 87,
+    /// Overlapped operation aborted.
+    OPERATION_ABORTED = 995,
+    /// Overlapped I/O event object not in signaled state.
+    IO_INCOMPLETE = 996,
+    /// The application has initiated an overlapped operation that cannot be completed immediately.
+    IO_PENDING = 997,
+    /// Interrupted function call.
+    EINTR = 10004,
+    /// File handle is not valid.
+    EBADF = 10009,
+    /// Permission denied.
+    EACCES = 10013,
+    /// Bad address.
+    EFAULT = 10014,
+    /// Invalid argument.
+    EINVAL = 10022,
+    /// Too many open files.
+    EMFILE = 10024,
+    /// Resource temporarily unavailable.
+    EWOULDBLOCK = 10035,
+    /// Operation now in progress.
+    EINPROGRESS = 10036,
+    /// Operation already in progress.
+    EALREADY = 10037,
+    /// Socket operation on nonsocket.
+    ENOTSOCK = 10038,
+    /// Destination address required.
+    EDESTADDRREQ = 10039,
+    /// Message too long.
+    EMSGSIZE = 10040,
+    /// Protocol wrong type for socket.
+    EPROTOTYPE = 10041,
+    /// Bad protocol option.
+    ENOPROTOOPT = 10042,
+    /// Protocol not supported.
+    EPROTONOSUPPORT = 10043,
+    /// Socket type not supported.
+    ESOCKTNOSUPPORT = 10044,
+    /// Operation not supported.
+    EOPNOTSUPP = 10045,
+    /// Protocol family not supported.
+    EPFNOSUPPORT = 10046,
+    /// Address family not supported by protocol family.
+    EAFNOSUPPORT = 10047,
+    /// Address already in use.
+    EADDRINUSE = 10048,
+    /// Cannot assign requested address.
+    EADDRNOTAVAIL = 10049,
+    /// Network is down.
+    ENETDOWN = 10050,
+    /// Network is unreachable.
+    ENETUNREACH = 10051,
+    /// Network dropped connection on reset.
+    ENETRESET = 10052,
+    /// Software caused connection abort.
+    ECONNABORTED = 10053,
+    /// Connection reset by peer.
+    ECONNRESET = 10054,
+    /// No buffer space available.
+    ENOBUFS = 10055,
+    /// Socket is already connected.
+    EISCONN = 10056,
+    /// Socket is not connected.
+    ENOTCONN = 10057,
+    /// Cannot send after socket shutdown.
+    ESHUTDOWN = 10058,
+    /// Connection timed out.
+    ETIMEDOUT = 10060,
+    /// Connection refused.
+    ECONNREFUSED = 10061,
+    /// No route to host.
+    EHOSTUNREACH = 10065,
+    /// Network subsystem is unavailable.
+    SYSNOTREADY = 10091,
+    /// Winsock.dll version out of range.
+    VERNOTSUPPORTED = 10092,
+    /// Successful WSAStartup not yet performed.
+    NOTINITIALISED = 10093,
+    /// Graceful shutdown in progress.
+    EDISCON = 10101,
+    /// Class type not found.
+    TYPE_NOT_FOUND = 10109,
+    /// Host not found (DNS).
+    HOST_NOT_FOUND = 11001,
+    /// Nonauthoritative host not found (DNS).
+    TRY_AGAIN = 11002,
+    /// This is a nonrecoverable error (DNS).
+    NO_RECOVERY = 11003,
+    /// Valid name, no data record of requested type (DNS).
+    NO_DATA = 11004,
+    _,
+};
+
+pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) WinsockError;
+
+// ============================================================================
+// Winsock types and functions
+// ============================================================================
+
+pub const WORD = std.os.windows.WORD;
+pub const SHORT = std.os.windows.SHORT;
+pub const INT = std.os.windows.INT;
+
+pub const SOCKET = *opaque {};
+pub const INVALID_SOCKET: SOCKET = @ptrFromInt(std.math.maxInt(usize));
+pub const SOCKET_ERROR: i32 = -1;
+
+pub const ADDRESS_FAMILY = u16;
+pub const socklen_t = u32;
+
+pub const sockaddr = extern struct {
+    family: ADDRESS_FAMILY,
+    data: [14]u8,
+
+    pub const SS_MAXSIZE = 128;
+
+    pub const storage = extern struct {
+        family: ADDRESS_FAMILY align(8),
+        padding: [SS_MAXSIZE - @sizeOf(ADDRESS_FAMILY)]u8 = undefined,
+    };
+
+    pub const in = extern struct {
+        family: ADDRESS_FAMILY = AF.INET,
+        port: u16,
+        addr: u32,
+        zero: [8]u8 = @splat(0),
+    };
+
+    pub const in6 = extern struct {
+        family: ADDRESS_FAMILY = AF.INET6,
+        port: u16,
+        flowinfo: u32 = 0,
+        addr: [16]u8,
+        scope_id: u32 = 0,
+    };
+
+    pub const un = extern struct {
+        family: ADDRESS_FAMILY = AF.UNIX,
+        path: [108]u8,
+    };
+};
+
+// WSABUF structure for WSARecv/WSASend (removed from std.os.windows.ws2_32 in Zig 0.16).
+// Aliased to std.os.windows.AFD.WSABUF(.@"var") so it is compatible with the std.Io.Reader
+// APIs (writableVectorWsa) that use that same type.
+pub const WSABUF = std.os.windows.AFD.WSABUF(.@"var");
+
+pub const LPWSAOVERLAPPED_COMPLETION_ROUTINE = *const fn (
+    dwError: DWORD,
+    cbTransferred: DWORD,
+    lpOverlapped: *OVERLAPPED,
+    dwFlags: DWORD,
+) callconv(.winapi) void;
+
+// WSAMSG structures for WSARecvMsg/WSASendMsg
+// WSABUF with optional buf pointer for Control field
+pub const WSABUF_nullable = extern struct {
+    len: ULONG,
+    buf: ?[*]u8,
+};
+
+pub const WSAMSG = extern struct {
+    name: ?*sockaddr,
+    namelen: i32,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: u32,
+    Control: WSABUF_nullable,
+    dwFlags: u32,
+};
+
+pub const WSAMSG_const = extern struct {
+    name: ?*const sockaddr,
+    namelen: i32,
+    lpBuffers: [*]const WSABUF,
+    dwBufferCount: u32,
+    Control: WSABUF_nullable,
+    dwFlags: u32,
+};
+
+pub const pollfd = extern struct {
+    fd: SOCKET,
+    events: SHORT,
+    revents: SHORT,
+};
+
+pub const WSADESCRIPTION_LEN = 256;
+pub const WSASYS_STATUS_LEN = 128;
+
+pub const WSADATA = if (@sizeOf(usize) == @sizeOf(u64))
+    extern struct {
+        wVersion: WORD,
+        wHighVersion: WORD,
+        iMaxSockets: u16,
+        iMaxUdpDg: u16,
+        lpVendorInfo: ?*u8,
+        szDescription: [WSADESCRIPTION_LEN + 1]u8,
+        szSystemStatus: [WSASYS_STATUS_LEN + 1]u8,
+    }
+else
+    extern struct {
+        wVersion: WORD,
+        wHighVersion: WORD,
+        szDescription: [WSADESCRIPTION_LEN + 1]u8,
+        szSystemStatus: [WSASYS_STATUS_LEN + 1]u8,
+        iMaxSockets: u16,
+        iMaxUdpDg: u16,
+        lpVendorInfo: ?*u8,
+    };
+
+// Poll events
+pub const POLL = struct {
+    pub const RDNORM: SHORT = 256;
+    pub const RDBAND: SHORT = 512;
+    pub const PRI: SHORT = 1024;
+    pub const WRNORM: SHORT = 16;
+    pub const WRBAND: SHORT = 32;
+    pub const ERR: SHORT = 1;
+    pub const HUP: SHORT = 2;
+    pub const NVAL: SHORT = 4;
+    pub const IN: SHORT = RDNORM | RDBAND;
+    pub const OUT: SHORT = WRNORM;
+};
+
+// Message flags
+pub const MSG = struct {
+    pub const OOB: u32 = 1;
+    pub const PEEK: u32 = 2;
+    pub const WAITALL: u32 = 8;
+};
+
+// Shutdown modes
+pub const SD_RECEIVE: i32 = 0;
+pub const SD_SEND: i32 = 1;
+pub const SD_BOTH: i32 = 2;
+
+// Socket flags
+pub const WSA_FLAG_OVERLAPPED: u32 = 1;
+
+// ioctlsocket commands
+pub const FIONBIO: i32 = -2147195266;
+
+// Address info flags
+pub const AI = packed struct(u32) {
+    PASSIVE: bool = false,
+    CANONNAME: bool = false,
+    NUMERICHOST: bool = false,
+    NUMERICSERV: bool = false,
+    DNS_ONLY: bool = false,
+    _5: u3 = 0,
+    ALL: bool = false,
+    _9: u1 = 0,
+    ADDRCONFIG: bool = false,
+    V4MAPPED: bool = false,
+    _12: u2 = 0,
+    NON_AUTHORITATIVE: bool = false,
+    SECURE: bool = false,
+    RETURN_PREFERRED_NAMES: bool = false,
+    FQDN: bool = false,
+    FILESERVER: bool = false,
+    DISABLE_IDN_ENCODING: bool = false,
+    _20: u10 = 0,
+    RESOLUTION_HANDLE: bool = false,
+    EXTENDED: bool = false,
+};
+
+// ADDRINFOEXW structure for GetAddrInfoExW
+pub const ADDRINFOEXW = extern struct {
+    ai_flags: i32,
+    ai_family: i32,
+    ai_socktype: i32,
+    ai_protocol: i32,
+    ai_addrlen: usize,
+    ai_canonname: ?[*:0]const u16,
+    ai_addr: ?*sockaddr,
+    ai_blob: ?*anyopaque,
+    ai_bloblen: usize,
+    ai_provider: ?*GUID,
+    ai_next: ?*ADDRINFOEXW,
+};
+
+pub const LPLOOKUPSERVICE_COMPLETION_ROUTINE = *const fn (DWORD, DWORD, ?*OVERLAPPED) callconv(.winapi) void;
+
+pub const NS_DNS: DWORD = 12;
+pub const WSA_IO_PENDING: i32 = 997;
+
+pub extern "ws2_32" fn GetAddrInfoExW(
+    pName: ?[*:0]const u16,
+    pServiceName: ?[*:0]const u16,
+    dwNameSpace: DWORD,
+    lpNspId: ?*anyopaque,
+    hints: ?*const ADDRINFOEXW,
+    ppResult: *?*ADDRINFOEXW,
+    timeout: ?*anyopaque,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?LPLOOKUPSERVICE_COMPLETION_ROUTINE,
+    lpNameHandle: ?*HANDLE,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn GetAddrInfoExCancel(
+    lpHandle: *HANDLE,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn FreeAddrInfoExW(
+    pAddrInfoEx: *ADDRINFOEXW,
+) callconv(.winapi) void;
+
+// Winsock functions
+pub extern "ws2_32" fn WSAStartup(
+    wVersionRequired: WORD,
+    lpWSAData: *WSADATA,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSAPoll(
+    fdArray: [*]pollfd,
+    fds: u32,
+    timeout: i32,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn shutdown(s: SOCKET, how: i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSASocketW(
+    af: i32,
+    type_: i32,
+    protocol: i32,
+    lpProtocolInfo: ?*anyopaque,
+    g: u32,
+    dwFlags: u32,
+) callconv(.winapi) SOCKET;
+
+pub extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: i32, argp: *u32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn bind(s: SOCKET, name: *const sockaddr, namelen: i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn listen(s: SOCKET, backlog: i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn connect(s: SOCKET, name: *const sockaddr, namelen: i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn accept(s: SOCKET, addr: ?*sockaddr, addrlen: ?*i32) callconv(.winapi) SOCKET;
+
+pub extern "ws2_32" fn getsockname(s: SOCKET, name: *sockaddr, namelen: *i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn getsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]u8, optlen: *i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSARecv(
+    s: SOCKET,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesRecvd: ?*u32,
+    lpFlags: *u32,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSASend(
+    s: SOCKET,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesSent: ?*u32,
+    dwFlags: u32,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSARecvFrom(
+    s: SOCKET,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesRecvd: ?*u32,
+    lpFlags: *u32,
+    lpFrom: ?*sockaddr,
+    lpFromlen: ?*i32,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSASendTo(
+    s: SOCKET,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesSent: ?*u32,
+    dwFlags: u32,
+    lpTo: ?*const sockaddr,
+    iToLen: i32,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn setsockopt(
+    s: SOCKET,
+    level: i32,
+    optname: u32,
+    optval: ?[*]const u8,
+    optlen: i32,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSAIoctl(
+    s: SOCKET,
+    dwIoControlCode: DWORD,
+    lpvInBuffer: ?*const anyopaque,
+    cbInBuffer: DWORD,
+    lpvOutBuffer: ?*anyopaque,
+    cbOutBuffer: DWORD,
+    lpcbBytesReturned: *DWORD,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn WSAGetOverlappedResult(
+    s: SOCKET,
+    lpOverlapped: *OVERLAPPED,
+    lpcbTransfer: *DWORD,
+    fWait: BOOL,
+    lpdwFlags: *DWORD,
+) callconv(.winapi) BOOL;
+
+// GUID type
+pub const GUID = extern struct {
+    Data1: u32,
+    Data2: u16,
+    Data3: u16,
+    Data4: [8]u8,
+};
+
+// Address families
+pub const AF = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const UNIX: u16 = 1;
+    pub const INET: u16 = 2;
+    pub const INET6: u16 = 23;
+};
+
+// Socket types
+pub const SOCK = struct {
+    pub const STREAM: i32 = 1;
+    pub const DGRAM: i32 = 2;
+    pub const RAW: i32 = 3;
+    pub const RDM: i32 = 4;
+    pub const SEQPACKET: i32 = 5;
+};
+
+// Socket option levels
+pub const SOL = struct {
+    pub const SOCKET: i32 = 0xffff;
+};
+
+// Socket options (SOL_SOCKET level)
+pub const SO = struct {
+    pub const REUSEADDR: i32 = 0x0004;
+    pub const KEEPALIVE: i32 = 0x0008;
+    pub const SNDBUF: i32 = 0x1001;
+    pub const RCVBUF: i32 = 0x1002;
+    pub const ERROR: i32 = 0x1007;
+    pub const TYPE: i32 = 0x1008;
+};
+
+// TCP options (IPPROTO_TCP level)
+pub const TCP = struct {
+    pub const NODELAY: i32 = 0x0001;
+};
+
+// Winsock-specific socket options
+pub const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700b;
+pub const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
+
+// WSAIoctl codes
+pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xc8000006;
+
+/// Errors that can occur when converting a path to wide string.
+pub const PathToWideError = error{
+    SystemResources,
+    NameTooLong,
+    Unexpected,
+};
+
+/// Converts a (dir_handle, UTF-8 path) pair to an absolute null-terminated wide string.
+/// If dir is FDCWD, the path is converted directly (kernel32 APIs resolve against CWD).
+/// Otherwise, resolves the path relative to the directory handle.
+/// Caller must free the returned slice with the same allocator.
+pub fn pathToWide(allocator: std.mem.Allocator, dir: HANDLE, path: []const u8) PathToWideError![:0]WCHAR {
+    // Convert path to wide first - we need this in all cases
+    const path_wide = try utf8ToWide(allocator, path);
+
+    // If CWD or path is absolute, just return the converted path
+    if (dir == FDCWD or PathIsRelativeW(path_wide) == FALSE) {
+        return path_wide;
+    }
+    defer allocator.free(path_wide);
+
+    // Non-CWD with relative path: get directory path, then join
+
+    // Get the directory's absolute path
+    // Start with a reasonable buffer, grow if needed
+    var dir_buf: [512]WCHAR = undefined;
+    var dir_path: []const WCHAR = undefined;
+    var heap_dir_buf: ?[]WCHAR = null;
+    defer if (heap_dir_buf) |buf| allocator.free(buf);
+
+    var result = GetFinalPathNameByHandleW(dir, &dir_buf, dir_buf.len, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (result == 0) {
+        return switch (GetLastError()) {
+            .NOT_ENOUGH_MEMORY => error.SystemResources,
+            else => error.Unexpected,
+        };
+    } else if (result > dir_buf.len) {
+        // Buffer too small, allocate on heap
+        heap_dir_buf = allocator.alloc(WCHAR, result) catch return error.SystemResources;
+        result = GetFinalPathNameByHandleW(dir, heap_dir_buf.?.ptr, @intCast(heap_dir_buf.?.len), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (result == 0) {
+            return switch (GetLastError()) {
+                .NOT_ENOUGH_MEMORY => error.SystemResources,
+                else => error.Unexpected,
+            };
+        } else if (result > heap_dir_buf.?.len) {
+            return error.Unexpected; // Buffer size changed between calls
+        }
+        dir_path = heap_dir_buf.?[0..result];
+    } else {
+        dir_path = dir_buf[0..result];
+    }
+
+    // A handle on a drive or share root canonicalizes with a trailing separator
+    // ("\\?\C:\"), unlike every other directory. Drop it so the join adds exactly
+    // one separator; joinRelative puts it back if the path resolves to the root.
+    if (dir_path.len > 0 and dir_path[dir_path.len - 1] == '\\') {
+        dir_path = dir_path[0 .. dir_path.len - 1];
+    }
+
+    // dir_path comes from GetFinalPathNameByHandleW with FILE_NAME_NORMALIZED, so
+    // it carries the \\?\ prefix. That prefix tells Win32 to pass the path to the
+    // object manager verbatim, where "." and ".." are ordinary (and rejected) name
+    // components and repeated separators are empty ones, so the join resolves them.
+    //
+    // Each component costs its own length plus one separator, and only the ones
+    // the join eliminates make the result shorter, so this bound is exact for a
+    // path that needs no resolution -- the common case, which then avoids a copy.
+    const max_len = dir_path.len + 1 + path_wide.len;
+    const buf = allocator.allocSentinel(WCHAR, max_len, 0) catch return error.SystemResources;
+    const joined_len = joinRelative(dir_path, path_wide, buf);
+    if (joined_len == max_len) return buf;
+
+    defer allocator.free(buf);
+    const joined = allocator.allocSentinel(WCHAR, joined_len, 0) catch return error.SystemResources;
+    @memcpy(joined, buf[0..joined_len]);
+    return joined;
+}
+
+/// Writes the relative `rel` appended to the normalized absolute `base` into
+/// `out`, resolving ".", ".." and empty components the way the kernel would for a
+/// path without the \\?\ prefix. A ".." that would escape `base`'s root is
+/// dropped, matching how POSIX resolves "/..". `base` must not end in a
+/// separator. `out` must have room for `base.len + 1 + rel.len` code units;
+/// returns how many were written.
+fn joinRelative(base: []const WCHAR, rel: []const WCHAR, out: []WCHAR) usize {
+    const dot = std.unicode.utf8ToUtf16LeStringLiteral(".");
+    const dot_dot = std.unicode.utf8ToUtf16LeStringLiteral("..");
+
+    const root = rootLength(base);
+    const root_len = root orelse base.len;
+    var len = base.len;
+    @memcpy(out[0..base.len], base);
+
+    var it = std.mem.tokenizeScalar(WCHAR, rel, '\\');
+    while (it.next()) |component| {
+        if (std.mem.eql(WCHAR, component, dot)) continue;
+        if (std.mem.eql(WCHAR, component, dot_dot)) {
+            if (len > root_len) {
+                const parent = std.mem.lastIndexOfScalar(WCHAR, out[0..len], '\\') orelse root_len;
+                len = @max(parent, root_len);
+            }
+            continue;
+        }
+        out[len] = '\\';
+        @memcpy(out[len + 1 ..][0..component.len], component);
+        len += 1 + component.len;
+    }
+
+    // "\\?\C:" names the volume rather than its root directory, so a path that
+    // resolved all the way back to the root keeps a trailing separator.
+    if (root != null and len == root_len) {
+        out[len] = '\\';
+        len += 1;
+    }
+    return len;
+}
+
+/// Length of the leading part of `path` that ".." must never pop through: the
+/// drive in \\?\C:\dir, or the share in \\?\UNC\server\share\dir, without the
+/// separator that follows it. Null if `path` is not a \\?\ path of either shape,
+/// in which case it has no root to speak of and is treated as indivisible.
+fn rootLength(path: []const WCHAR) ?usize {
+    const dos_prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\");
+    const unc_prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\UNC\\");
+    if (!std.mem.startsWith(WCHAR, path, dos_prefix)) return null;
+
+    if (std.mem.startsWith(WCHAR, path, unc_prefix)) {
+        const server_end = std.mem.indexOfScalarPos(WCHAR, path, unc_prefix.len, '\\') orelse return null;
+        return std.mem.indexOfScalarPos(WCHAR, path, server_end + 1, '\\') orelse path.len;
+    }
+
+    if (path.len < dos_prefix.len + 2 or path[dos_prefix.len + 1] != ':') return null;
+    return dos_prefix.len + 2;
+}
+
+/// Converts UTF-8 string to null-terminated wide string.
+/// Caller must free the returned slice with the same allocator.
+fn utf8ToWide(allocator: std.mem.Allocator, utf8: []const u8) PathToWideError![:0]WCHAR {
+    if (utf8.len == 0) {
+        return allocator.allocSentinel(WCHAR, 0, 0) catch return error.SystemResources;
+    }
+
+    // Get required buffer size
+    const len = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        utf8.ptr,
+        @intCast(utf8.len),
+        null,
+        0,
+    );
+    if (len <= 0) {
+        return switch (GetLastError()) {
+            .INSUFFICIENT_BUFFER => error.NameTooLong,
+            else => error.Unexpected,
+        };
+    }
+
+    // Allocate and convert
+    const wide = allocator.allocSentinel(WCHAR, @intCast(len), 0) catch return error.SystemResources;
+    const result = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        utf8.ptr,
+        @intCast(utf8.len),
+        wide.ptr,
+        len,
+    );
+    if (result <= 0) {
+        allocator.free(wide);
+        return switch (GetLastError()) {
+            .INSUFFICIENT_BUFFER => error.NameTooLong,
+            else => error.Unexpected,
+        };
+    }
+
+    // Normalize forward slashes to backslashes.
+    for (wide) |*c| {
+        if (c.* == '/') c.* = '\\';
+    }
+
+    return wide;
+}
+
+pub const GetRandomError = @import("base.zig").GetRandomError;
+const syscall_cancel = @import("syscall_cancel.zig");
+
+// ProcessPrng is the modern, documented system CSPRNG entry point (the same one
+// Go/Rust/Chromium/BoringSSL use). It reads from the per-CPU AES-CTR-DRBG and
+// always returns TRUE. A future improvement is the async IOCP path through
+// \Device\CNG (IOCTL_KSEC_GEN_RANDOM); for now we run this on the thread pool.
+// Returns a Win32 BOOL; declared as the ABI-identical c_int so the result can
+// be compared directly (std's BOOL is a distinct Bool(c_int) type). ProcessPrng
+// is documented to always return TRUE.
+pub extern "bcryptprimitives" fn ProcessPrng(pbData: [*]u8, cbData: SIZE_T) callconv(.winapi) c_int;
+
+/// Fill `buffer` with cryptographically secure random bytes from the OS.
+/// Blocking primitive; async callers run it on a thread-pool worker.
+///
+/// The `Cancelable` error is included only to keep `os.getrandom`'s type uniform
+/// with the POSIX implementation; ProcessPrng is not cancelable, so `Canceled` is
+/// never actually returned here.
+pub fn getrandom(buffer: []u8) (GetRandomError || syscall_cancel.Cancelable)!void {
+    if (buffer.len == 0) return;
+    if (ProcessPrng(buffer.ptr, buffer.len) == 0) return error.EntropyUnavailable;
+}
+
+fn testJoinRelative(base: []const u8, rel: []const u8, expected: []const u8) !void {
+    var base_buf: [256]WCHAR = undefined;
+    var rel_buf: [256]WCHAR = undefined;
+    var out_buf: [512]WCHAR = undefined;
+    const base_w = base_buf[0..try std.unicode.utf8ToUtf16Le(&base_buf, base)];
+    const rel_w = rel_buf[0..try std.unicode.utf8ToUtf16Le(&rel_buf, rel)];
+
+    const len = joinRelative(base_w, rel_w, &out_buf);
+    try std.testing.expect(len <= base_w.len + 1 + rel_w.len);
+
+    var utf8_buf: [512]u8 = undefined;
+    const utf8 = utf8_buf[0..try std.unicode.utf16LeToUtf8(&utf8_buf, out_buf[0..len])];
+    try std.testing.expectEqualStrings(expected, utf8);
+}
+
+test "windows: joinRelative resolves dot components under the \\\\?\\ prefix" {
+    try testJoinRelative("\\\\?\\C:\\base", "data", "\\\\?\\C:\\base\\data");
+    try testJoinRelative("\\\\?\\C:\\base", ".\\data", "\\\\?\\C:\\base\\data");
+    try testJoinRelative("\\\\?\\C:\\base", ".\\data\\.\\admin", "\\\\?\\C:\\base\\data\\admin");
+    try testJoinRelative("\\\\?\\C:\\base", "data\\\\admin", "\\\\?\\C:\\base\\data\\admin");
+    try testJoinRelative("\\\\?\\C:\\base", "data\\", "\\\\?\\C:\\base\\data");
+    try testJoinRelative("\\\\?\\C:\\base", ".", "\\\\?\\C:\\base");
+}
+
+test "windows: joinRelative resolves dotdot without escaping the root" {
+    try testJoinRelative("\\\\?\\C:\\base\\sub", "..\\data", "\\\\?\\C:\\base\\data");
+    try testJoinRelative("\\\\?\\C:\\base", "..\\data", "\\\\?\\C:\\data");
+    try testJoinRelative("\\\\?\\C:\\base", "..\\..\\..\\data", "\\\\?\\C:\\data");
+    try testJoinRelative("\\\\?\\C:\\base", "sub\\..\\..\\..\\data", "\\\\?\\C:\\data");
+    try testJoinRelative("\\\\?\\UNC\\server\\share\\dir", "..\\..\\..\\data", "\\\\?\\UNC\\server\\share\\data");
+}
+
+test "windows: joinRelative keeps the separator on a path that resolves to the root" {
+    // A drive-root handle canonicalizes to "\\?\C:\"; pathToWide trims the
+    // trailing separator, and joining must not leave "\\?\C:", which names the
+    // volume rather than its root directory.
+    try testJoinRelative("\\\\?\\C:", "data", "\\\\?\\C:\\data");
+    try testJoinRelative("\\\\?\\C:", ".\\data", "\\\\?\\C:\\data");
+    try testJoinRelative("\\\\?\\C:", ".", "\\\\?\\C:\\");
+    try testJoinRelative("\\\\?\\C:\\base", "..", "\\\\?\\C:\\");
+    try testJoinRelative("\\\\?\\UNC\\server\\share", "data", "\\\\?\\UNC\\server\\share\\data");
+    try testJoinRelative("\\\\?\\UNC\\server\\share\\dir", "..", "\\\\?\\UNC\\server\\share\\");
+}
+
+test "windows: pathToWide joins onto a drive-root handle without doubling the separator" {
+    const root = CreateFileW(
+        std.unicode.utf8ToUtf16LeStringLiteral("C:\\"),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        null,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        null,
+    );
+    if (root == INVALID_HANDLE_VALUE) return error.SkipZigTest;
+    defer _ = CloseHandle(root);
+
+    // A root handle is the one directory GetFinalPathNameByHandleW canonicalizes
+    // with a trailing separator ("\\?\C:\").
+    const joined = try pathToWide(std.testing.allocator, root, "Windows");
+    defer std.testing.allocator.free(joined);
+
+    var utf8_buf: [512]u8 = undefined;
+    const utf8 = utf8_buf[0..try std.unicode.utf16LeToUtf8(&utf8_buf, joined)];
+    try std.testing.expectEqualStrings("\\\\?\\C:\\Windows", utf8);
+}
+
+test "windows: rootLength" {
+    const cases = .{
+        .{ "\\\\?\\C:\\base\\sub", "\\\\?\\C:" },
+        .{ "\\\\?\\C:", "\\\\?\\C:" },
+        .{ "\\\\?\\UNC\\server\\share\\dir", "\\\\?\\UNC\\server\\share" },
+        .{ "\\\\?\\UNC\\server\\share", "\\\\?\\UNC\\server\\share" },
+    };
+    inline for (cases) |case| {
+        const path = std.unicode.utf8ToUtf16LeStringLiteral(case[0]);
+        const root = std.unicode.utf8ToUtf16LeStringLiteral(case[1]);
+        try std.testing.expectEqual(root.len, rootLength(path));
+    }
+
+    // Not a \\?\ path, and a \\?\ path with no drive or share to anchor on.
+    try std.testing.expectEqual(null, rootLength(std.unicode.utf8ToUtf16LeStringLiteral("C:\\base")));
+    try std.testing.expectEqual(null, rootLength(std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\Volume{0}\\base")));
+}
