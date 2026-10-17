@@ -172,9 +172,23 @@ pub const RequestState = struct {
         };
         self.user_data = new_node;
     }
+
+    /// 推荐入口：取得类型 T 的请求级载体；不存在时在请求 arena 上分配（零值初始化）
+    /// 并挂链，同类型永远返回同一指针（幂等）。相比手写 create+set，
+    /// payload 由框架分配在 arena 上，消除「挂栈上临时变量」的悬垂风险。
+    pub fn slot(self: *RequestState, comptime T: type) !*T {
+        if (self.getUserData(T)) |existing| return existing;
+        const fresh = try self.arena.create(T);
+        fresh.* = std.mem.zeroes(T);
+        errdefer self.arena.destroy(fresh);
+        try self.setUserData(T, fresh);
+        return fresh;
+    }
 };
 
 /// 用户数据槽位 — 按类型索引的不透明指针。
+/// 键用 @typeName 字符串比较：同形状的匿名类型在编译器层就是同一类型实体，
+/// 不存在冲突；指针式键（`&T`）在本编译器上 comptime 地址不保证运行时唯一，已否决。
 pub const UserData = struct {
     key: []const u8,
     ptr: *anyopaque,
@@ -413,6 +427,32 @@ test "RequestState.setUserData / getUserData by type" {
     try std.testing.expectEqual(@as(u32, 42), state.getUserData(AuthInfo).?.user_id);
     try std.testing.expectEqualStrings("abc123", state.getUserData(Session).?.session_id);
     try std.testing.expect(state.getUserData(struct { missing: void }) == null);
+}
+
+test "RequestState.slot auto-allocates on arena and is idempotent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+
+    const SlotTarget = struct { hits: u32 = 0, name: []const u8 = "" };
+
+    const a = try state.slot(SlotTarget);
+    a.hits = 3;
+    a.name = "warm";
+
+    // 幂等：同类型永远同一槽位的同一指针，写入对后续 get/slot 可见
+    const b = try state.slot(SlotTarget);
+    try std.testing.expect(a == b);
+    try std.testing.expectEqual(@as(u32, 3), state.getUserData(SlotTarget).?.hits);
+    try std.testing.expectEqualStrings("warm", b.name);
+
+    // 新类型零值初始化
+    const Other = struct { n: u32 };
+    const c = try state.slot(Other);
+    try std.testing.expectEqual(@as(u32, 0), c.n);
+    try std.testing.expect(state.getUserData(Other) == c);
 }
 
 test "Context.param delegates to state.path_params" {
