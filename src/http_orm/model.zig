@@ -445,7 +445,7 @@ test "modelSchemaWith 运行期调用同样安全" {
         username: []const u8,
         org_id: u64,
     };
-    const schema = modelSchemaWith(Rec, "recs", .{ .unique = &.{ &.{"username"} } });
+    const schema = modelSchemaWith(Rec, "recs", .{ .unique = &.{&.{"username"}} });
     clobberStack(64);
     try std.testing.expectEqual(true, schema.field("username").?.constraints.unique);
     try std.testing.expectEqualStrings("recs", schema.table_name);
@@ -457,7 +457,7 @@ test "ModelWith 声明单字段唯一" {
         username: []const u8,
         email: []const u8,
     };
-    const M = ModelWith(U, "users", .{ .unique = &.{ &.{"username"} } });
+    const M = ModelWith(U, "users", .{ .unique = &.{&.{"username"}} });
     try std.testing.expectEqual(true, M.Schema.field("username").?.constraints.unique);
     try std.testing.expectEqual(false, M.Schema.field("email").?.constraints.unique);
     // id 仍然照旧是主键
@@ -472,7 +472,7 @@ test "ModelWith 声明联合唯一" {
         org_id: u64 = 0,
         email: []const u8,
     };
-    const M = ModelWith(U, "users", .{ .unique = &.{ &.{ "org_id", "email" } } });
+    const M = ModelWith(U, "users", .{ .unique = &.{&.{ "org_id", "email" }} });
     // 联合组**不**标 field-level unique：否则单字段校验会拒掉「同 org 不同 email」
     try std.testing.expectEqual(false, M.Schema.field("org_id").?.constraints.unique);
     try std.testing.expectEqual(false, M.Schema.field("email").?.constraints.unique);

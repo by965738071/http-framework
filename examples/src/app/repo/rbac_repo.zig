@@ -51,7 +51,9 @@ pub const RbacRepository = struct {
         const rows = try self.db.user_roles.all(self.db.allocator);
         defer self.db.user_roles.freeRows(self.db.allocator, rows);
         var n: usize = 0;
-        for (rows) |r| { if (r.role_id == role_id) n += 1; }
+        for (rows) |r| {
+            if (r.role_id == role_id) n += 1;
+        }
         return n;
     }
 

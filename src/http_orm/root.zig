@@ -164,7 +164,7 @@ test "ORM 唯一约束：重复插入被拒 / 不同值可插 / 删后可重插�
         username: []const u8,
         email: []const u8,
     };
-    const UserModel = ModelWith(User, "orm_uniq_crud", .{ .unique = &.{ &.{"username"} } });
+    const UserModel = ModelWith(User, "orm_uniq_crud", .{ .unique = &.{&.{"username"}} });
     const Store = UserModel.Store;
 
     var store = try Store.open(allocator, io, ".test_data");
@@ -234,7 +234,7 @@ test "ORM 联合唯一：(org_id, email) 组合重复才拒绝（F-01）" {
         org_id: u64 = 0,
         email: []const u8,
     };
-    const M = ModelWith(Member, "orm_uniq_composite", .{ .unique = &.{ &.{ "org_id", "email" } } });
+    const M = ModelWith(Member, "orm_uniq_composite", .{ .unique = &.{&.{ "org_id", "email" }} });
     const Store = M.Store;
 
     var store = try Store.open(allocator, io, ".test_data");
@@ -286,7 +286,7 @@ test "ORM 唯一约束：NULL 不参与比较（SQL 语义）" {
         id: u64 = 0,
         code: ?[]const u8,
     };
-    const M = ModelWith(Item, "orm_uniq_null", .{ .unique = &.{ &.{"code"} } });
+    const M = ModelWith(Item, "orm_uniq_null", .{ .unique = &.{&.{"code"}} });
     const Store = M.Store;
 
     var store = try Store.open(allocator, io, ".test_data");

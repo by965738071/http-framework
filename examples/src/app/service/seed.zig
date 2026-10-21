@@ -76,12 +76,10 @@ const ROLE_SEEDS = [_]RoleSeed{
         .description = "管理部门与成员，不能删除组织、不能删除角色",
         .builtin = true,
         .permissions = &.{
-            "user:view", "user:create", "user:update", "user:reset-password",
-            "user:assign-role", "user:unlock",
-            "org:view", "org:create", "org:update", "org:move",
-            "role:view", "role:assign",
-            "log:view",
-            "approval:view", "approval:create", "approval:review",
+            "user:view",        "user:create",   "user:update",     "user:reset-password",
+            "user:assign-role", "user:unlock",   "org:view",        "org:create",
+            "org:update",       "org:move",      "role:view",       "role:assign",
+            "log:view",         "approval:view", "approval:create", "approval:review",
         },
     },
     .{

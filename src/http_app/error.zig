@@ -61,7 +61,7 @@ pub const AppError = struct {
         inline for (@typeInfo(http.Status).@"enum".field_names) |name| {
             if (self.status == @field(http.Status, name)) return name;
         }
-        return std.fmt.bufPrint(buf, "status_{d}", .{@intFromEnum(self.status)}) catch "unknown_status";
+        return std.fmt.bufPrint(buf, "status_{d}", .{@backingInt(self.status)}) catch "unknown_status";
     }
 
     /// 默认渲染：JSON 包络（Issue 4），与成功侧 JSON 响应格式对称，前端拦截器
@@ -205,7 +205,7 @@ test "AppError.codeName 由 status tag 名派生，未知值回退 status_<n>" {
     try std.testing.expectEqualStrings("bad_request", AppError.badRequest("x").codeName(&buf));
     try std.testing.expectEqualStrings("internal_server_error", AppError.internal("x").codeName(&buf));
     // Status 非穷举：未知值不得触 safety panic（旧实现用 @tagName 会 panic）。
-    const odd = AppError{ .status = @enumFromInt(599), .message = "x" };
+    const odd = AppError{ .status = @fromBackingInt(@intCast(599)), .message = "x" };
     try std.testing.expectEqualStrings("status_599", odd.codeName(&buf));
 }
 
@@ -252,8 +252,7 @@ test "ErrorRenderer 默认渲染 JSON 包络，render 钩子可覆盖（Issue 4�
     // ErrorRenderer 置了缓冲模式，真实链路里由外层统一 flush；测试里自己补。
     try res1.flush();
     const written1 = buf1[0..w1.end];
-    try std.testing.expect(std.mem.indexOf(u8, written1,
-        "{\"ok\":false,\"error\":{\"code\":\"unauthorized\",\"message\":\"login required\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written1, "{\"ok\":false,\"error\":{\"code\":\"unauthorized\",\"message\":\"login required\"}}") != null);
     // 状态码仍是 401（包络只换 body，不改 status line）。
     try std.testing.expect(std.mem.indexOf(u8, written1, "401") != null);
 

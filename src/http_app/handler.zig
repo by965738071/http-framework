@@ -53,8 +53,10 @@ pub const Handler = union(enum) {
         const Ptr = @TypeOf(ptr);
         const info = @typeInfo(Ptr);
         // 只接受可变的单元素指针：用 `Ptr == *child` 一个判据同时拒绝
-        // *const T（会把 const 洗掉）、[*]T/[]T 等非 one 指针——
-        // 0.17 的 Pointer 元类型已没有 is_const 字段。
+        // *const T（会把 const 洗掉）、[*]T/[]T 等非 one 指针、sentinel/
+        // align/volatile/allowzero 变体。不用查 attrs.@"const"（0.18-dev 里
+        // const 性已从旧版平铺的 is_const 字段挪进该嵌套结构）：只查它
+        // 挡不住其余变体，类型相等判据一个条件全覆盖。
         if (info != .pointer or info.pointer.size != .one or Ptr != *info.pointer.child) {
             @compileError("initSingleton expects a mutable single-item pointer (e.g. &handler_instance), got " ++ @typeName(Ptr));
         }

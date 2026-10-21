@@ -33,7 +33,9 @@ pub const OrgRepository = struct {
         const rows = try self.db.orgs.all(self.db.allocator);
         defer self.db.orgs.freeRows(self.db.allocator, rows);
         var n: usize = 0;
-        for (rows) |r| { if (r.parent_id == parent_id) n += 1; }
+        for (rows) |r| {
+            if (r.parent_id == parent_id) n += 1;
+        }
         return n;
     }
 
@@ -47,7 +49,9 @@ pub const OrgRepository = struct {
         const rows = try self.db.users.all(self.db.allocator);
         defer self.db.users.freeRows(self.db.allocator, rows);
         var n: usize = 0;
-        for (rows) |r| { if (r.org_id == org_id) n += 1; }
+        for (rows) |r| {
+            if (r.org_id == org_id) n += 1;
+        }
         return n;
     }
 

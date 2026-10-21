@@ -40,10 +40,10 @@ pub const RolePermissionRow = struct {
 
 // 角色编码与权限点编码都唯一（理由同 user.Table）。
 pub const RoleTable = framework.orm.ModelWith(RoleRow, "roles", .{
-    .unique = &.{ &.{"code"} },
+    .unique = &.{&.{"code"}},
 });
 pub const PermissionTable = framework.orm.ModelWith(PermissionRow, "permissions", .{
-    .unique = &.{ &.{"code"} },
+    .unique = &.{&.{"code"}},
 });
 pub const UserRoleTable = framework.orm.Model(UserRoleRow, "user_roles");
 pub const RolePermissionTable = framework.orm.Model(RolePermissionRow, "role_permissions");

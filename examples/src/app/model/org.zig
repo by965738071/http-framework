@@ -18,7 +18,7 @@ pub const Row = struct {
 
 /// 组织编码唯一（理由同 user.Table：唯一性是数据层的职责，不该靠 service 预查）。
 pub const Table = framework.orm.ModelWith(Row, "orgs", .{
-    .unique = &.{ &.{"code"} },
+    .unique = &.{&.{"code"}},
 });
 pub const Store = Table.Store;
 
