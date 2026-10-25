@@ -9,6 +9,7 @@ const std = @import("std");
 const http = std.http;
 const Handler = @import("http_app").Handler;
 const RequestState = @import("http_app").RequestState;
+const PathParams = @import("http_app").PathParams;
 
 /// 路由分组的标识 = `Router.groups` 里的下标。
 ///
@@ -28,9 +29,11 @@ pub const Route = struct {
 };
 
 /// 单个 pattern 里参数段（`:param` / `*catch_all`）的个数上限。
-/// 与 router 的 MAX_PATH_SEGMENTS 同量级：参数再多 PathParams 也装不下，
-/// 与其让匹配时静默丢参数，不如注册时直接拒绝。
-const MAX_PATTERN_SEGMENTS = 64;
+/// 必须等于 PathParams.CAP：参数槽装不下时匹配只会 `put` 失败 → 放弃分支
+/// → 永久 404。若上限比 CAP 大，17~64 个参数的 pattern 能注册成功却永远
+/// 匹配不到——正是下面 insert 注释里「与其匹配时静默丢参数，不如注册时
+/// 直接拒绝」要防的情形，所以直接绑定到 CAP 这个单一事实来源。
+const MAX_PATTERN_PARAMS = PathParams.CAP;
 
 const Node = struct {
     segment: []const u8 = "",
@@ -133,7 +136,7 @@ pub const Trie = struct {
         var it = std.mem.splitScalar(u8, pattern, '/');
         var first = true;
         var saw_catch_all = false;
-        var names: [MAX_PATTERN_SEGMENTS][]const u8 = undefined;
+        var names: [MAX_PATTERN_PARAMS][]const u8 = undefined;
         var n: usize = 0;
         while (it.next()) |seg| {
             if (first) {
@@ -226,9 +229,11 @@ pub const Trie = struct {
         allowed_count: u8 = 0,
     };
 
-    pub fn match(self: *const Trie, method: http.Method, path: []const u8, state: *RequestState, alloc: std.mem.Allocator) MatchResult {
+    /// 匹配路径。参数绑定写进 `state.path_params`（内联数组，不分配），
+    /// 所以不需要分配器。
+    pub fn match(self: *const Trie, method: http.Method, path: []const u8, state: *RequestState) MatchResult {
         var result = MatchResult{};
-        self.matchNode(self.root, path, method, state, alloc, &result);
+        self.matchNode(self.root, path, method, state, &result);
         return result;
     }
 
@@ -238,7 +243,6 @@ pub const Trie = struct {
         remaining: []const u8,
         method: http.Method,
         state: *RequestState,
-        alloc: std.mem.Allocator,
         result: *MatchResult,
     ) void {
         // 到达路径末尾
@@ -266,11 +270,11 @@ pub const Trie = struct {
             //   path.len > 0 → 连续 '/'（"//a"），跳过错段继续匹配。
             //   path.len == 0 → 路径已到末尾且带尾斜杠（"/static/"），见下。
             if (path.len > 0) {
-                self.matchNode(node, path, method, state, alloc, result);
+                self.matchNode(node, path, method, state, result);
                 return;
             }
             // 先按「路径结束」在本节点结算（尾斜杠容错：/hello/ 命中 /hello）。
-            self.matchNode(node, "", method, state, alloc, result);
+            self.matchNode(node, "", method, state, result);
             if (result.route != null or result.pattern_matched) return;
             // 本节点没命中，再给 *catch_all 一次「空剩余路径」的机会：否则
             // /static/ 会 404 而 /static/x 能命中，与上面的尾斜杠容错自相矛盾。
@@ -278,7 +282,7 @@ pub const Trie = struct {
                 if (child.catch_all_name) |name| {
                     const saved = state.path_params.len;
                     state.path_params.put(name, "") catch continue;
-                    self.matchNode(child, "", method, state, alloc, result);
+                    self.matchNode(child, "", method, state, result);
                     if (result.route != null or result.pattern_matched) return;
                     state.path_params.len = saved;
                 }
@@ -290,7 +294,7 @@ pub const Trie = struct {
         for (node.children.items) |child| {
             if (child.param_name == null and child.catch_all_name == null) {
                 if (std.mem.eql(u8, child.segment, seg)) {
-                    self.matchNode(child, path[seg_end..], method, state, alloc, result);
+                    self.matchNode(child, path[seg_end..], method, state, result);
                     // pattern_matched 也要停：路径已经精确命中一个有 handler 的节点
                     // （只是 method 不对 → 405）。继续往 :param / *catch_all 回落，
                     // 等于让更低优先级的 pattern 抢走本该 405 的请求，
@@ -309,7 +313,7 @@ pub const Trie = struct {
                 const saved = state.path_params.len;
                 // 参数槽满时宁可放弃这条分支（404），也不要静默返回残缺参数。
                 state.path_params.put(name, seg) catch continue;
-                self.matchNode(child, path[seg_end..], method, state, alloc, result);
+                self.matchNode(child, path[seg_end..], method, state, result);
                 if (result.route != null or result.pattern_matched) return;
                 state.path_params.len = saved;
             }
@@ -320,7 +324,7 @@ pub const Trie = struct {
             if (child.catch_all_name) |name| {
                 const saved = state.path_params.len;
                 state.path_params.put(name, path) catch continue;
-                self.matchNode(child, "", method, state, alloc, result);
+                self.matchNode(child, "", method, state, result);
                 if (result.route != null or result.pattern_matched) return;
                 state.path_params.len = saved;
             }
@@ -373,7 +377,7 @@ test "Trie matches static route" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/hello", &state, allocator);
+    const result = trie.match(.GET, "/hello", &state);
     try std.testing.expect(result.route != null);
 }
 
@@ -389,7 +393,7 @@ test "Trie extracts path params" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/users/42", &state, allocator);
+    const result = trie.match(.GET, "/users/42", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
 }
@@ -406,7 +410,7 @@ test "Trie returns 405 when pattern matches but method doesn't" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.POST, "/items", &state, allocator);
+    const result = trie.match(.POST, "/items", &state);
     try std.testing.expect(result.pattern_matched);
     try std.testing.expect(result.route == null);
     try std.testing.expect(result.allowed_count > 0);
@@ -425,7 +429,7 @@ test "Trie catch_all matches remaining path" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/static/css/app.css", &state, allocator);
+    const result = trie.match(.GET, "/static/css/app.css", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("filepath").?);
 }
@@ -487,7 +491,7 @@ test "Trie: 精确命中但 method 不匹配时不回落到更低优先级的 :p
     // /users/me 是精确命中，但该节点只有 POST → 应 405。
     // 旧实现会继续回落进 /users/:id，把 GET /users/me 交给 :id 的 handler，
     // 顺带把 route_pattern / Allow 也串成 /users/:id。
-    const result = trie.match(.GET, "/users/me", &state, allocator);
+    const result = trie.match(.GET, "/users/me", &state);
     try std.testing.expect(result.route == null);
     try std.testing.expect(result.pattern_matched);
     try std.testing.expectEqualStrings("/users/me", result.pattern);
@@ -509,7 +513,7 @@ test "Trie: catch_all 匹配带尾斜杠的空剩余路径" {
     defer state.deinit();
     // 静态路由允许 /hello/ 命中 /hello，catch_all 也必须允许空剩余路径，
     // 否则 /static/ 404 而 /static/x 命中，两套 trailing slash 语义打架。
-    const result = trie.match(.GET, "/static/", &state, allocator);
+    const result = trie.match(.GET, "/static/", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("", state.path_params.get("filepath").?);
 }
@@ -527,7 +531,7 @@ test "Trie: 裸 * 的 catch_all 参数名取 '*'" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/static/css/app.css", &state, allocator);
+    const result = trie.match(.GET, "/static/css/app.css", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("*").?);
 }
@@ -548,6 +552,33 @@ test "Trie: 非法 pattern 拒绝注册且不残留幽灵节点" {
     try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, "/users/:", .{ .handler = h }));
     // 同一 pattern 内参数名重复
     try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, "/:id/x/:id", .{ .handler = h }));
+}
+
+test "Trie: 参数个数超过 PathParams.CAP 注册时直接拒绝（旧行为：注册成功但永远 404）" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+
+    // CAP+1 个参数：匹配时第 17 个 put 必失败 → 分支被放弃 → 永久 404，
+    // 所以必须在注册时就拒掉。
+    const over = comptime blk: {
+        var p: []const u8 = "/";
+        for (0..PathParams.CAP + 1) |i| p = p ++ std.fmt.comptimePrint(":p{d}/", .{i});
+        break :blk p;
+    };
+    try std.testing.expectError(error.InvalidRoute, trie.insert(.GET, over, .{ .handler = h }));
+
+    // 恰好 CAP 个参数是合法上限，必须能注册。
+    const at_cap = comptime blk: {
+        var p: []const u8 = "/";
+        for (0..PathParams.CAP) |i| p = p ++ std.fmt.comptimePrint(":p{d}/", .{i});
+        break :blk p;
+    };
+    try trie.insert(.GET, at_cap, .{ .handler = h });
 }
 
 test {

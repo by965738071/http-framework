@@ -149,6 +149,9 @@ pub const Server = struct {
     /// 3. 收到信号：置关机标志、cancel accept（accept 返回 Canceled）；
     /// 4. drain 在途连接（限时），仍未退出的再强制 cancel 并回收。
     pub fn run(self: *Server) !void {
+        // setup() 是前置条件：漏调时 acceptLoop 会对 null 解引用 panic
+        // （"unable to unwrap null"，病因不自解释）。显式报错好过 panic。
+        if (self.listener == null) return error.NotSetup;
         var accept_group: zio.Group = .init;
         try accept_group.spawn(acceptLoop, .{self});
         // 无论从哪条路径退出（信号等待失败、wait 报错），在途任务都必须被取消并回收，
@@ -250,6 +253,11 @@ pub const Server = struct {
                 if (self.isShuttingDown()) break;
                 _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
                 std.log.warn("accept error: {s}", .{@errorName(err)});
+                // EMFILE/ENOBUFS 一类错误会让 accept 持续失败：不退避就是
+                // 「wait→accept→post」全速空转，CPU 打满、日志刷屏。
+                // 10ms 退避给错误风暴限频（错误风暴期接受新连接慢 10ms，
+                // 换来的是可预测的 CPU/日志开销）。
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
                 continue;
             };
 

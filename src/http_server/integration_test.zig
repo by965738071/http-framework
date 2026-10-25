@@ -395,7 +395,7 @@ test "request_error 事件：5xx 响应触发 Hook（修复 #1）" {
     // 验证 lifecycle.emit(.request_error) 能被 Hook 收到。这里直接驱动
     // Lifecycle（connection.zig 的实际触发代码与此同形：状态码 >= 500 则 emit）。
     var recorder = EventRecorder{};
-    const hooks = [_]http_app.Hook{http_app.Hook.init(EventRecorder, &recorder)};
+    const hooks = [_]http_app.Hook{http_app.Hook.init(&recorder)};
     const lifecycle = http_app.Lifecycle{ .hooks = &hooks };
 
     // 成功请求：只发 request_end，不发 request_error。

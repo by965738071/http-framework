@@ -11,6 +11,7 @@
 
 pub const Request = @import("context.zig").Request;
 pub const RequestState = @import("context.zig").RequestState;
+pub const PathParams = @import("context.zig").PathParams;
 pub const RequestConfig = @import("context.zig").RequestConfig;
 pub const UserData = @import("context.zig").UserData;
 pub const Context = @import("context.zig").Context;

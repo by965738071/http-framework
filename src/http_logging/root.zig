@@ -22,7 +22,7 @@
 //! // 2a. 作为 Hook 使用（推荐——server 计算 duration/status）
 //! var log_hook = framework.LoggingHook{ .logger = &logger };
 //! const hooks = [_]framework.Hook{
-//!     framework.Hook.init(framework.LoggingHook, &log_hook),
+//!     framework.Hook.init(&log_hook),
 //! };
 //!
 //! // 2b. 或者作为中间件使用（自带 timing，但 error 状态码可能不准）
@@ -736,7 +736,7 @@ pub const LoggingMiddleware = struct {
 /// ```zig
 /// var log_hook = framework.LoggingHook{ .logger = &logger };
 /// const hooks = [_]framework.Hook{
-///     framework.Hook.init(framework.LoggingHook, &log_hook),
+///     framework.Hook.init(&log_hook),
 /// };
 /// server.setLifecycle(.{ .hooks = &hooks });
 /// ```

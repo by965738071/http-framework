@@ -54,6 +54,49 @@ fn isJsonContentType(ct: []const u8) bool {
     return next == ';' or next == ' ' or next == '\t';
 }
 
+/// `Context.failWith` 总是返回 `error.AppError`，但签名是 `!void`；在返回值
+/// 非 void 的函数里（如 `readJsonBody`）用本函数桥接（成功分支不可达）。
+fn failAsError(ctx: *Context, app_err: AppError) anyerror {
+    ctx.failWith(app_err) catch |e| return e;
+    unreachable;
+}
+
+/// 共用的「读 body + JSON 解析」逻辑（此前 `JsonBody` 与 `jsonHandler` 各抄
+/// 一份；项目已经因为三份 percent 解码器漂过一次，不再复制第二份）。
+/// 差异点参数化：
+/// - `empty_msg`：null → 空 body 返回 null（调用方决定透传）；非 null →
+///   空 body `failWith(400, empty_msg)`。
+/// - 超限统一 `keep_alive=false` + 413；解析失败统一 400。
+/// - `error.OutOfMemory` 原样冒泡（不能吞成 400）。
+fn readJsonBody(
+    comptime T: type,
+    ctx: *Context,
+    res: *Response,
+    limit: u64,
+    empty_msg: ?[]const u8,
+) !?*T {
+    const raw = ctx.readBody(ctx.arena, limit) catch |err| switch (err) {
+        error.BodyTooLarge => {
+            // 413 后连接不应继续复用：避免 keep-alive 连接去 drain 超限 body。
+            // keep_alive=false 在 ErrorRenderer flush 时同样生效；即使管道没挂
+            // ErrorRenderer 由连接层兑底，也带着关连接语义。
+            res.keep_alive = false;
+            return failAsError(ctx, AppError.payloadTooLarge("request body too large"));
+        },
+        else => return err,
+    };
+    if (raw.len == 0) {
+        if (empty_msg) |msg| return failAsError(ctx, AppError.badRequest(msg));
+        return null;
+    }
+    const parsed = parseJson(T, ctx.arena, raw) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        // 解析失败统一走 failWith → ErrorRenderer（与框架其它错误路径一致）。
+        return failAsError(ctx, AppError.badRequest("invalid JSON body"));
+    };
+    return parsed;
+}
+
 /// JSON Body 中间件：预解析 application/json 请求体为 typed struct，
 /// 存入 `ctx.user_data` 槽。handler 用 `ctx.getUserData(T)` 取出。
 ///
@@ -98,25 +141,9 @@ pub fn JsonBody(comptime T: type) type {
                 else => {},
             }
 
-            const body = ctx.readBody(ctx.arena, self.limit) catch |err| {
-                if (err == error.BodyTooLarge) {
-                    // 413 后连接不应继续复用：避免 keep-alive 连接去 drain 超限 body，
-                    // 放大连接占用。keep_alive=false 在 ErrorRenderer 渲染 flush 时同样
-                    // 生效；即使无 ErrorRenderer 由连接层兑底，也会带着关连接语义。
-                    res.keep_alive = false;
-                    return ctx.failWith(AppError.payloadTooLarge("request body too large"));
-                }
-                return err;
-            };
-            if (body.len == 0) return next.call(ctx, res);
-
-            const parsed = parseJson(T, ctx.arena, body) catch |err| {
-                // 非解析错误（如 OOM）向上传播，不能吞成 400。
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                // 解析失败：统一走 failWith → ErrorRenderer，不再直写裸响应
-                // （与框架其它错误处理路径一致，结构化渲染/缓冲模式都兼容）。
-                return ctx.failWith(AppError.badRequest("invalid JSON body"));
-            };
+            // 空 body → null 分支透传；超限/非法 JSON/OOM 由共用助手按契约处理。
+            const parsed = (try readJsonBody(T, ctx, res, self.limit, null)) orelse
+                return next.call(ctx, res);
 
             try ctx.setUserData(T, parsed);
             return next.call(ctx, res);
@@ -143,6 +170,8 @@ pub fn JsonBody(comptime T: type) type {
 /// 错误路径与 `JsonBody` 同契约：非 JSON Content-Type → 415；空 body /
 /// 非法 JSON → 400（均 `failWith(AppError)` 冒泡，管道应挂 ErrorRenderer）；
 /// 超限 → 413 且 `keep_alive = false`（防请求走私）；OOM 向上传播。
+/// **缺 Content-Type 头按 JSON 宽容处理**（直接尝试解析，失败回 400），与
+/// examples 手写 `body.json()` 一致；勤勤恳恳显式挂非 JSON 头才回 415。
 /// 未知 JSON 字段宽松忽略（`parseJson` 固定行为）。
 pub fn jsonHandler(
     comptime T: type,
@@ -157,19 +186,8 @@ pub fn jsonHandler(
                     return ctx.failWith(.{ .status = .unsupported_media_type, .message = "expected application/json" });
                 }
             }
-            const raw = ctx.readBody(ctx.arena, limit) catch |err| switch (err) {
-                error.BodyTooLarge => {
-                    // 同 JsonBody：413 后关连接，避免 keep-alive 去 drain 超限 body
-                    res.keep_alive = false;
-                    return ctx.failWith(AppError.payloadTooLarge("request body too large"));
-                },
-                else => return err,
-            };
-            if (raw.len == 0) return ctx.failWith(AppError.badRequest("missing JSON body"));
-            const parsed = parseJson(T, ctx.arena, raw) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return ctx.failWith(AppError.badRequest("invalid JSON body"));
-            };
+            // empty_msg 非 null 时 helper 的 null 分支不可达，.? 安全。
+            const parsed = (try readJsonBody(T, ctx, res, limit, "missing JSON body")).?;
             return handler(parsed, ctx, res);
         }
     };
@@ -216,6 +234,8 @@ pub fn queryHandler(
 /// - `?T`：缺参 → null（即“必填”就是非 optional 字段）
 ///
 /// 其它类型（数组、枚举、嵌套 struct 等）→ 编译期报错。
+/// 带默认值的字段（如 `page: u32 = 1`）同样按必填对待：绑定逐字段赋值，
+/// 不消费声明处的默认值；要可选语义请声明成 `?T`（增强计划见 ROADMAP P2-11）。
 /// 同名重复 key 取第一个。失败时（若传了 `failed_field`）写入出错字段名，
 /// 供调用方生成 “missing/invalid query parameter 'x'” 类消息；分配失败等
 /// 系统错误原样传播（不吞成 400）。

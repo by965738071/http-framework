@@ -23,6 +23,8 @@ const http_protocol = @import("http_protocol");
 pub const Context = http_app.Context;
 pub const Response = http_protocol.Response;
 pub const Next = http_app.Next;
+pub const Handler = http_app.Handler;
+pub const Middleware = http_app.Middleware;
 
 pub const Encoding = enum {
     gzip,
@@ -43,6 +45,20 @@ pub const Encoding = enum {
     }
 };
 
+/// 默认不压缩的 Content-Type 前缀列表（供 static 等无自定义配置的调用方使用）。
+/// 也是 `CompressConfig.skip_content_types` 的默认取值——单一来源，不再两处各抄一份。
+pub const default_skip_types = &[_][]const u8{
+    "image/",
+    "video/",
+    "audio/",
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/octet-stream",
+};
+
 pub const CompressConfig = struct {
     /// 最小压缩 body 大小（字节）。小于此值不压缩。
     min_size: usize = 1024,
@@ -53,18 +69,8 @@ pub const CompressConfig = struct {
     level: flate.Compress.Options = .default,
     /// 支持的编码（按优先级）
     encodings: []const Encoding = &.{ .gzip, .deflate },
-    /// 不压缩的 Content-Type 前缀列表
-    skip_content_types: []const []const u8 = &.{
-        "image/",
-        "video/",
-        "audio/",
-        "application/zip",
-        "application/gzip",
-        "application/x-gzip",
-        "application/x-bzip2",
-        "application/x-xz",
-        "application/octet-stream",
-    },
+    /// 不压缩的 Content-Type 前缀列表（默认 = default_skip_types）
+    skip_content_types: []const []const u8 = default_skip_types,
 };
 
 /// 响应压缩中间件。
@@ -233,19 +239,6 @@ fn shouldCompress(res: *const Response, skip_list: []const []const u8) bool {
     return shouldCompressContentType(content_type, skip_list);
 }
 
-/// 默认不压缩的 Content-Type 前缀列表（供 static 等无自定义配置的调用方使用）。
-pub const default_skip_types = &[_][]const u8{
-    "image/",
-    "video/",
-    "audio/",
-    "application/zip",
-    "application/gzip",
-    "application/x-gzip",
-    "application/x-bzip2",
-    "application/x-xz",
-    "application/octet-stream",
-};
-
 /// 压缩 body，返回 arena 分配的压缩字节。
 fn compress(allocator: std.mem.Allocator, body: []const u8, encoding: Encoding, level: flate.Compress.Options) ![]const u8 {
     // 修复 F12：用会动态增长的 Allocating writer 作为输出缓冲，避免旧的
@@ -385,6 +378,102 @@ test "compress small data might not compress well but doesn't crash" {
     defer allocator.free(compressed);
     // 压缩后可能更大，但不应该崩溃
     try std.testing.expect(compressed.len > 0);
+}
+
+const test_cfg: http_app.RequestConfig = .{}; // 取址用，文件级稳定地址
+
+/// 带自定义请求头的最小 Context/Response 环境（测试专用）。
+/// 用法同 codec 的 `CodecEnv`：`var env: TestEnv(...) = .{};` 后 `begin()`
+/// 就地填充——`ctx`/sink 引用 env 自身，整个结构体不得拷贝（否则悬空）。
+fn TestEnv(comptime head: []const u8) type {
+    return struct {
+        arena: std.heap.ArenaAllocator = undefined,
+        state: http_app.RequestState = undefined,
+        req: http_protocol.Request = undefined,
+        ctx: Context = undefined,
+        buf: [16384]u8 = undefined,
+        writer: std.Io.Writer = undefined,
+        res: Response = undefined,
+
+        fn begin(self: *@This()) void {
+            self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            const a = self.arena.allocator();
+            self.state = .{ .arena = a };
+            self.writer = std.Io.Writer.fixed(&self.buf);
+            self.req = .{
+                .method = .GET,
+                .target = "/",
+                .path = "/",
+                .query = "",
+                .version = .@"HTTP/1.1",
+                .head_bytes = head,
+                .content_type = null,
+                .content_length = null,
+                .transfer_encoding = .none,
+                .body = .none,
+            };
+            self.res = Response.init(std.testing.allocator, http_protocol.Sink.testSink(&self.writer));
+            self.ctx = .{
+                .request = &self.req,
+                .state = &self.state,
+                .config = &test_cfg,
+                .arena = a,
+                .io = undefined,
+            };
+        }
+
+        fn headerValue(self: *const @This(), name: []const u8) ?[]const u8 {
+            for (self.res.headers.items) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+            }
+            return null;
+        }
+    };
+}
+
+test "CompressMiddleware: gzip 客户端 + 超 min_size body → 压缩并挂 Content-Encoding/Vary" {
+    var env: TestEnv("GET / HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n") = .{};
+    env.begin();
+    defer env.res.deinit();
+    defer env.arena.deinit();
+
+    const big_handler = Handler.fromFn(struct {
+        fn handle(_: *Context, res: *Response) !void {
+            // 0.18-dev 已移除 `"ab" ** 3` 重复运算符；用 comptimePrint `<`
+            // 填充语法造 4000B（远高于默认 min_size=1024），结果是静态字节。
+            try res.text(std.fmt.comptimePrint("{s:|<4000}", .{""}));
+        }
+    }.handle);
+
+    var mw = CompressMiddleware{ .config = .{} };
+    try mw.process(&env.ctx, &env.res, Next.root(&[_]Middleware{}, big_handler));
+
+    try std.testing.expectEqualStrings("gzip", env.headerValue("Content-Encoding").?);
+    try std.testing.expectEqualStrings("Accept-Encoding", env.headerValue("Vary").?);
+    // 写出体含 gzip 魔数，且总输出远小于原始 4000B（确认真压缩了）。
+    const written = env.buf[0..env.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1f\x8b") != null);
+    try std.testing.expect(written.len < 1000);
+}
+
+test "CompressMiddleware: body 低于 min_size → 不压缩、不挂 Content-Encoding" {
+    var env: TestEnv("GET / HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n") = .{};
+    env.begin();
+    defer env.res.deinit();
+    defer env.arena.deinit();
+
+    const small_handler = Handler.fromFn(struct {
+        fn handle(_: *Context, res: *Response) !void {
+            try res.text("tiny");
+        }
+    }.handle);
+
+    var mw = CompressMiddleware{ .config = .{} };
+    try mw.process(&env.ctx, &env.res, Next.root(&[_]Middleware{}, small_handler));
+
+    try std.testing.expect(env.headerValue("Content-Encoding") == null);
+    const written = env.buf[0..env.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, written, "tiny") != null);
 }
 
 test {

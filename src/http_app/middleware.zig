@@ -183,6 +183,16 @@ pub const DynPipeline = struct {
     }
 };
 
+/// `Pipeline(N).set` 跳位时填进空洞的直通占位：什么都不做，直接进下一层。
+/// 无状态且无 deinit，文件级单例即可；同值可被 deinitAll 正常去重。
+const SkipMiddleware = struct {
+    pub fn process(_: *SkipMiddleware, ctx: *Context, res: *Response, next: Next) !void {
+        try next.call(ctx, res);
+    }
+};
+var skip_instance: SkipMiddleware = .{};
+const skip_mw: Middleware = Middleware.init(SkipMiddleware, &skip_instance);
+
 /// 编译期固定长度管道 — 栈上数组存储，零堆分配（fix.md §四.8）。
 ///
 /// 适用于中间件栈在编译期已知的场景。与 `DynPipeline` 共用 `Next` 逻辑，
@@ -190,9 +200,9 @@ pub const DynPipeline = struct {
 ///
 /// ```zig
 /// var pipeline = Pipeline(3).init(handler);
-/// pipeline.set(0, Middleware.init(TimingMiddleware, &timing));
-/// pipeline.set(1, Middleware.init(RequestIdMiddleware, &rid));
-/// pipeline.set(2, Middleware.init(ErrorRenderer, &err));
+/// try pipeline.set(0, Middleware.init(TimingMiddleware, &timing));
+/// try pipeline.set(1, Middleware.init(RequestIdMiddleware, &rid));
+/// try pipeline.set(2, Middleware.init(ErrorRenderer, &err));
 /// try pipeline.dispatch(&ctx, &res);
 /// ```
 pub fn Pipeline(comptime N: usize) type {
@@ -214,10 +224,21 @@ pub fn Pipeline(comptime N: usize) type {
             self.len += 1;
         }
 
-        /// 直接设置指定位置的中间件（不检查顺序）。
-        pub fn set(self: *Self, idx: usize, mw: Middleware) void {
+        /// 直接设置指定位置的中间件（不要求顺序）。
+        /// 越界返回 `error.PipelineFull`（旧版无检查：直接写穿数组 → UB）。
+        /// `idx > len` 跳位时，中间的空洞自动填直通占位（不做事、只调 next），
+        /// 避免 `items[0..len]` 里混入未初始化的 Middleware 被 dispatch 读到。
+        /// 覆盖已有位置时旧值被丢弃，其实例不再由框架释放——需要换中间件
+        /// 请重建管道。
+        pub fn set(self: *Self, idx: usize, mw: Middleware) !void {
+            if (idx >= N) return error.PipelineFull;
+            if (idx > self.len) {
+                for (self.len..idx) |i| {
+                    self.items[i] = skip_mw;
+                }
+            }
             self.items[idx] = mw;
-            if (idx + 1 > self.len) self.len = idx + 1;
+            self.len = idx + 1;
         }
 
         pub fn dispatch(self: *Self, ctx: *Context, res: *Response) !void {
@@ -470,11 +491,73 @@ test "Pipeline(N): set 直接指定位置" {
     var t1 = Tag{ .tag = 1 };
 
     var pipeline = Pipeline(2).init(handler);
-    pipeline.set(0, Middleware.init(Tag, &t0));
-    pipeline.set(1, Middleware.init(Tag, &t1));
+    try pipeline.set(0, Middleware.init(Tag, &t0));
+    try pipeline.set(1, Middleware.init(Tag, &t1));
 
     // set 超出当前 len 应更新 len
     try std.testing.expectEqual(@as(usize, 2), pipeline.len);
+
+    // 越界必须报错，而不是写穿数组（修复前无检查 → UB）
+    try std.testing.expectError(error.PipelineFull, pipeline.set(2, Middleware.init(Tag, &t0)));
+}
+
+test "Pipeline(N): set 跳位空洞填直通占位，dispatch 不读到未初始化项" {
+    var hits: u8 = 0;
+    const Tag = struct {
+        hits: *u8,
+        pub fn process(self: *@This(), ctx: *Context, res: *Response, next: Next) !void {
+            self.hits.* += 1;
+            try next.call(ctx, res);
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const handler = Handler.fromFn(struct {
+        fn handle(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.handle);
+
+    var t2 = Tag{ .hits = &hits };
+    var pipeline = Pipeline(3).init(handler);
+    // 直接 set(2)：idx 0/1 是空洞，修复前 dispatch 会把未初始化的
+    // Middleware 当函数指针调 → UB；现在空洞填直通占位。
+    try pipeline.set(2, Middleware.init(Tag, &t2));
+    try std.testing.expectEqual(@as(usize, 3), pipeline.len);
+
+    var state = @import("context.zig").RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+    const cfg = @import("context.zig").RequestConfig{};
+    var req = @import("http_protocol").Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(std.testing.allocator, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+
+    try pipeline.dispatch(&ctx, &res);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..writer.end], "ok") != null);
+    try std.testing.expectEqual(@as(u8, 1), hits);
+    pipeline.deinit();
 }
 
 test "Pipeline(0): 无中间件直接调 handler" {

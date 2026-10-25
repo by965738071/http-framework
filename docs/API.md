@@ -952,7 +952,7 @@ pub const Lifecycle = struct { hooks: []const Hook = &.{} };              // :49
 
 ```zig
 var log_hook = framework.LoggingHook{ .logger = &logger };
-const hooks = [_]framework.Hook{ framework.Hook.init(framework.LoggingHook, &log_hook) };
+const hooks = [_]framework.Hook{ framework.Hook.init(&log_hook) };
 server.setLifecycle(.{ .hooks = &hooks });
 ```
 

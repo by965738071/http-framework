@@ -18,7 +18,7 @@
 const std = @import("std");
 
 pub const Services = struct {
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
     allocator: std.mem.Allocator,
     /// 启动阶段结束后由 `seal()` 置位；置位后 `register` 一律失败。
     sealed: bool = false,

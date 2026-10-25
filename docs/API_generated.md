@@ -37,11 +37,11 @@
 | `Event` | src/http_app/lifecycle.zig:14 | `const Event = enum` |
 | `EventData` | src/http_app/lifecycle.zig:23 | `const EventData = struct` |
 | `Hook` | src/http_app/lifecycle.zig:34 | `const Hook = struct` |
-| `Lifecycle` | src/http_app/lifecycle.zig:49 | `const Lifecycle = struct` |
+| `Lifecycle` | src/http_app/lifecycle.zig:58 | `const Lifecycle = struct` |
 | `Next` | src/http_app/middleware.zig:40 | `const Next = struct` |
 | `Middleware` | src/http_app/middleware.zig:67 | `const Middleware = struct` |
 | `DynPipeline` | src/http_app/middleware.zig:157 | `const DynPipeline = struct` |
-| `Pipeline` | src/http_app/middleware.zig:198 | `fn Pipeline(comptime N: usize) type` |
+| `Pipeline` | src/http_app/middleware.zig:208 | `fn Pipeline(comptime N: usize) type` |
 | `RequestId` | src/http_app/request_id.zig:29 | `const RequestId = struct` |
 | `RequestIdMiddleware` | src/http_app/request_id.zig:38 | `const RequestIdMiddleware = struct` |
 | `Services` | src/http_app/services.zig:20 | `const Services = struct` |
@@ -52,8 +52,8 @@
 | --- | --- | --- |
 | `RouteGroup` | src/http_router/router.zig:57 | `const RouteGroup = struct` |
 | `Router` | src/http_router/router.zig:136 | `const Router = struct` |
-| `Route` | src/http_router/trie.zig:25 | `const Route = struct` |
-| `Trie` | src/http_router/trie.zig:54 | `const Trie = struct` |
+| `Route` | src/http_router/trie.zig:26 | `const Route = struct` |
+| `Trie` | src/http_router/trie.zig:57 | `const Trie = struct` |
 
 ## http_server
 
@@ -101,12 +101,12 @@
 
 | 符号 | 文件:行 | 签名 |
 | --- | --- | --- |
-| `Encoding` | src/http_compress/root.zig:27 | `const Encoding = enum` |
-| `CompressConfig` | src/http_compress/root.zig:46 | `const CompressConfig = struct` |
-| `CompressMiddleware` | src/http_compress/root.zig:77 | `const CompressMiddleware = struct` |
-| `chooseEncoding` | src/http_compress/root.zig:154 | `fn chooseEncoding(accept: []const u8, supported: []const Encoding) ?Encoding` |
-| `shouldCompressContentType` | src/http_compress/root.zig:208 | `fn shouldCompressContentType(content_type: []const u8, skip_list: []const []const u8) bool` |
-| `initStreamingEncoder` | src/http_compress/root.zig:295 | `fn initStreamingEncoder(encoder: *flate.Compress, out: *std.Io.Writer, hist_buf: []u8, encoding: Encoding, level: flate.Compress.Options,) !void` |
+| `Encoding` | src/http_compress/root.zig:29 | `const Encoding = enum` |
+| `CompressConfig` | src/http_compress/root.zig:62 | `const CompressConfig = struct` |
+| `CompressMiddleware` | src/http_compress/root.zig:83 | `const CompressMiddleware = struct` |
+| `chooseEncoding` | src/http_compress/root.zig:160 | `fn chooseEncoding(accept: []const u8, supported: []const Encoding) ?Encoding` |
+| `shouldCompressContentType` | src/http_compress/root.zig:214 | `fn shouldCompressContentType(content_type: []const u8, skip_list: []const []const u8) bool` |
+| `initStreamingEncoder` | src/http_compress/root.zig:288 | `fn initStreamingEncoder(encoder: *flate.Compress, out: *std.Io.Writer, hist_buf: []u8, encoding: Encoding, level: flate.Compress.Options,) !void` |
 
 ## http_static
 
@@ -141,10 +141,10 @@
 | 符号 | 文件:行 | 签名 |
 | --- | --- | --- |
 | `parseJson` | src/http_codec/root.zig:39 | `fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T` |
-| `JsonBody` | src/http_codec/root.zig:75 | `fn JsonBody(comptime T: type) type` |
-| `jsonHandler` | src/http_codec/root.zig:147 | `fn jsonHandler(comptime T: type, comptime handler: fn (*const T, *Context, *Response) anyerror!void, comptime body_limit: ?u64,) Handler` |
-| `queryHandler` | src/http_codec/root.zig:190 | `fn queryHandler(comptime T: type, comptime handler: fn (T, *Context, *Response) anyerror!void,) Handler` |
-| `bindQuery` | src/http_codec/root.zig:222 | `fn bindQuery(comptime T: type, ctx: *const Context, failed_field: ?*[]const u8) !T` |
+| `JsonBody` | src/http_codec/root.zig:118 | `fn JsonBody(comptime T: type) type` |
+| `jsonHandler` | src/http_codec/root.zig:176 | `fn jsonHandler(comptime T: type, comptime handler: fn (*const T, *Context, *Response) anyerror!void, comptime body_limit: ?u64,) Handler` |
+| `queryHandler` | src/http_codec/root.zig:208 | `fn queryHandler(comptime T: type, comptime handler: fn (T, *Context, *Response) anyerror!void,) Handler` |
+| `bindQuery` | src/http_codec/root.zig:242 | `fn bindQuery(comptime T: type, ctx: *const Context, failed_field: ?*[]const u8) !T` |
 
 ## http_multipart
 

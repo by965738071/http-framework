@@ -154,6 +154,9 @@ pub const Server = struct {
     /// 3. 收到信号：置关机标志、cancel accept（阻塞的 accept 被 std 打断）；
     /// 4. drain 在途连接（限时），仍未退出的再强制 cancel 并回收。
     pub fn run(self: *Server) !void {
+        // setup() 是前置条件：漏调时 acceptLoop 会对 null 解引用 panic
+        // （"unable to unwrap null"，病因不自解释）。显式报错好过 panic。
+        if (self.listener == null) return error.NotSetup;
         // 允许同进程内重启：清掉上一轮遗留的关机标志。
         shutdown_requested.store(false, .monotonic);
         installShutdownHandlers();
@@ -228,6 +231,9 @@ pub const Server = struct {
                 if (self.isShuttingDown()) break;
                 _ = self.runtime.accept_errors.fetchAdd(1, .monotonic);
                 std.log.warn("accept error: {s}", .{@errorName(err)});
+                // 与 zio 版同步：EMFILE/ENOBUFS 一类持续失败时退避 10ms，
+                // 避免「wait→accept→post」全速空转打满 CPU、刷屏日志。
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
                 continue;
             };
 
@@ -571,10 +577,32 @@ fn installShutdownHandlers() void {
 }
 
 fn uninstallShutdownHandlers() void {
-    if (comptime is_windows) win.uninstall();
+    if (comptime is_windows) {
+        win.uninstall();
+    } else {
+        // 恢复默认处置（与 Windows 分支对称）。不恢复的话，run() 返回后
+        // SIGINT/SIGTERM 仍被接住：flag 置位但再没人轮询，服务退出的收尾
+        // 阶段按 Ctrl+C 杀不掉进程。同进程再次 run() 会重新 install，
+        // 重启路径不受影响。
+        const dfl: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &dfl, null);
+        std.posix.sigaction(.TERM, &dfl, null);
+    }
 }
 
 test "max_connections=0 is rejected at startup" {
     var config = http_app.NetworkConfig{ .max_connections = 0 };
     try std.testing.expectError(error.MaxConnectionsZero, Listener.init(std.testing.io, &config));
+}
+
+test "run() 在漏调 setup() 时返回 error.NotSetup（而不是 null 解引用 panic）" {
+    var router = try http_router.Router.init(std.testing.allocator);
+    defer router.deinit();
+    var srv = try Server.init(std.testing.allocator, std.testing.io, .{}, &router);
+    defer srv.deinit();
+    try std.testing.expectError(error.NotSetup, srv.run());
 }

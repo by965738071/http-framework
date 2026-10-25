@@ -35,7 +35,16 @@ pub const Hook = struct {
     ptr: *anyopaque,
     callback: *const fn (*anyopaque, Event, *const EventData) void,
 
-    pub fn init(comptime T: type, ptr: *T) Hook {
+    /// 实现类型从实参指针自动推导（同 `Handler.initSingleton` 风格）。
+    /// 只接受可变的单元素指针：`Ptr == *child` 一个判据同时拒绝
+    /// *const T（会把 const 洗掉）、[*]T/[]T 等非 one 指针。
+    pub fn init(ptr: anytype) Hook {
+        const Ptr = @TypeOf(ptr);
+        const info = @typeInfo(Ptr);
+        if (info != .pointer or info.pointer.size != .one or Ptr != *info.pointer.child) {
+            @compileError("Hook.init expects a mutable single-item pointer (e.g. &my_hook), got " ++ @typeName(Ptr));
+        }
+        const T = info.pointer.child;
         const cb = struct {
             fn call(any: *anyopaque, event: Event, data: *const EventData) void {
                 const self: *T = @ptrCast(@alignCast(any));
@@ -70,7 +79,7 @@ test "Lifecycle emits events to all hooks" {
     };
 
     var counter = Counter{};
-    const hooks = [_]Hook{Hook.init(Counter, &counter)};
+    const hooks = [_]Hook{Hook.init(&counter)};
     const lifecycle = Lifecycle{ .hooks = &hooks };
 
     lifecycle.emit(.request_start, .{});
@@ -104,7 +113,7 @@ test "Logger as a Hook implementation" {
 
     var lines = std.ArrayList([]const u8).empty;
     var logger = Logger{ .lines = &lines, .alloc = arena.allocator() };
-    const hooks = [_]Hook{Hook.init(Logger, &logger)};
+    const hooks = [_]Hook{Hook.init(&logger)};
     const lifecycle = Lifecycle{ .hooks = &hooks };
 
     lifecycle.emit(.request_start, .{ .method = .GET, .path = "/hello" });

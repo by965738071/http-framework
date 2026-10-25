@@ -241,7 +241,7 @@ pub const Router = struct {
         // 路径段数上限：matchNode 按段递归（非尾递归），超长路径（如 /a/a/.../a
         // 或 //////...）会击穿协程栈 → 远程 DoS。命中上限时按 404 处理（回应审查 C1）。
         const result: Trie.MatchResult = if (tooManyPathSegments(ctx.request.path)) .{} else blk: {
-            var r = self.trie.match(method, ctx.request.path, ctx.state, ctx.arena);
+            var r = self.trie.match(method, ctx.request.path, ctx.state);
 
             // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
             // std.http 在 HEAD 请求下会自动抑制 body，所以直接跑 GET handler 即可。
@@ -249,7 +249,7 @@ pub const Router = struct {
                 // P2-6：第一次 HEAD 匹配可能在 param 节点写过 path_params（即使未命中
                 // handler）。回退前清空，否则 GET 重试可能叠加上一轮的残留参数。
                 ctx.state.path_params.clear();
-                const get_result = self.trie.match(.GET, ctx.request.path, ctx.state, ctx.arena);
+                const get_result = self.trie.match(.GET, ctx.request.path, ctx.state);
                 if (get_result.route != null) r = get_result;
             }
             break :blk r;

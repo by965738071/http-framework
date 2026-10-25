@@ -435,7 +435,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // 7. 生命周期钩子（日志 Hook——利用 server 计算好的 duration/status）
     var log_hook = framework.LoggingHook{ .logger = &logger };
     const hooks = [_]framework.Hook{
-        framework.Hook.init(framework.LoggingHook, &log_hook),
+        framework.Hook.init(&log_hook),
     };
 
     // 8. 组装服务器

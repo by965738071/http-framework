@@ -538,7 +538,7 @@ logger.info(ctx, "user created", &.{
 });
 // 请求级结构化日志：注册 LoggingHook 到 server lifecycle
 var log_hook = framework.LoggingHook{ .logger = &logger };
-const hooks = [_]framework.Hook{ framework.Hook.init(framework.LoggingHook, &log_hook) };
+const hooks = [_]framework.Hook{ framework.Hook.init(&log_hook) };
 server.setLifecycle(.{ .hooks = &hooks });
 ```
 

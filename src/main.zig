@@ -78,7 +78,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // 5. 生命周期钩子
     var log_hook = framework.LoggingHook{ .logger = &logger };
-    const hooks = [_]framework.Hook{framework.Hook.init(framework.LoggingHook, &log_hook)};
+    const hooks = [_]framework.Hook{framework.Hook.init(&log_hook)};
 
     // 6. 组装并运行 Server（与入口配对：runStd ↔ StdServer，runZio ↔ ZioServer）
     var server = try framework.StdServer.init(allocator, io, config, &router);

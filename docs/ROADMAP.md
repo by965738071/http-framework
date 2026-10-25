@@ -137,6 +137,7 @@
 8. **CI 增强**：bench 阈值回归门、文档链接检查、PR 跑 examples 测试；zig 版本已在 ci.yml 钉死（0.18.0-dev.253，与 vendored zio 配套），升级前跑 zio+windows/linux 交叉编译验证（注释已写明）。
 9. **`groupForPath` 线性扫描优化（F-NEW-1）**：只在 404/405 路径跑的 O(组数) 扫描，收益低，组数很多时再换前缀索引。
 10. **examples 回归测试**：用 http_testing 给 `examples/src/app` 的 handler/中间件补测试（FRICTION 阶段只验证了框架层）。
+11. **query 绑定增强（http_codec 盘点发现）**：`bindQuery` 会把「带默认值的字段」当必填（缺 key 直接 400，`page: u32 = 1` 的默认值永远用不上），也不支持 enum 字段与重复 key 取值成数组。候选：读字段 `default_value`（需兼顾 0.17/0.18 两种 @typeInfo 形状）、enum 按 tag 名绑定、多值 key → `[]const T`。现阶段约束已写进 `bindQuery` doc 注释。
 
 ## 五、明确不做什么（DECISION，重提前先读这里）
 
