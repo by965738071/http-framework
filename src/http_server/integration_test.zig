@@ -636,6 +636,54 @@ test "processRequest：没有 AppError 的未知错误兜底 500 + 关连接" {
     try std.testing.expect(std.mem.indexOf(u8, r.written, "Internal Server Error") != null);
 }
 
+// ── 流式响应：走真实 respondStreaming 路径 ──────────────────────────────
+//
+// http_testing 的捕获型 Sink 覆盖「Next 管道 + 流式捕获」（harness 层），
+// 这里补的是 ConnectionRunner 这一层：Sink.fromHttp 的 startStream 调的是
+// std.http 真实的 respondStreaming，断言的是连接上真正写出的字节。
+
+fn streamHandler(_: *Context, res: *Response) !void {
+    var buf: [256]u8 = undefined;
+    var s = try res.stream(&buf, .{ .content_length = 11, .content_type = "text/plain; charset=utf-8" });
+    try s.writeAll("hello ");
+    try s.writeAll("world");
+    try s.end();
+}
+
+fn chunkedStreamHandler(_: *Context, res: *Response) !void {
+    var buf: [256]u8 = undefined;
+    var s = try res.stream(&buf, .{});
+    try s.writeAll("chunked body");
+    try s.end();
+}
+
+test "流式响应：processRequest 走真实 respondStreaming，状态行/头/body 顺序上 wire" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.GET, "/stream", Handler.fromFn(streamHandler));
+    try router.route(.GET, "/chunked", Handler.fromFn(chunkedStreamHandler));
+
+    // content_length 变体：std 写 content-length 头，body 无分帧
+    var out: [4096]u8 = undefined;
+    const r = try processRequestOnce(allocator, &router, "GET /stream HTTP/1.1\r\n\r\n", &out);
+    try std.testing.expect(r.dispatch_err == null);
+    // 顺序：状态行 → 头 → 空行 → body
+    try std.testing.expect(std.mem.startsWith(u8, r.written, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", extractHeader(r.written, "content-type").?);
+    try std.testing.expectEqualStrings("11", extractHeader(r.written, "content-length").?);
+    const sep = std.mem.indexOf(u8, r.written, "\r\n\r\n").?;
+    try std.testing.expectEqualStrings("hello world", r.written[sep + 4 ..]);
+
+    // 无 content_length 变体：std 退化 transfer-encoding: chunked，帧结构之外
+    // 内容仍可断言（harness 的捕获型 startStream 走的是无分帧的另一条路）
+    var out2: [4096]u8 = undefined;
+    const r2 = try processRequestOnce(allocator, &router, "GET /chunked HTTP/1.1\r\n\r\n", &out2);
+    try std.testing.expect(r2.dispatch_err == null);
+    try std.testing.expectEqualStrings("chunked", extractHeader(r2.written, "transfer-encoding").?);
+    try std.testing.expect(std.mem.indexOf(u8, r2.written, "chunked body") != null);
+}
+
 test "Cookie 值含分号被拒绝（属性注入防护）" {
     const allocator = std.testing.allocator;
     var buf: [256]u8 = undefined;

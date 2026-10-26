@@ -1025,7 +1025,7 @@ test "websocket: client → server text roundtrip (in-memory)" {
     var server_r: std.Io.Reader = .fixed(client_w.written());
     var server_w: std.Io.Writer.Allocating = .init(allocator);
     defer server_w.deinit();
-    var server_ws = framework.WebSocket.initServer(&server_r, &server_w.writer, allocator);
+    var server_ws = framework.WebSocket.initServer(&server_r, &server_w.writer, allocator, std.testing.io);
 
     var msg = try server_ws.receive();
     defer msg.deinit();
@@ -1040,7 +1040,7 @@ test "websocket: server → client binary roundtrip (in-memory)" {
     var send_w: std.Io.Writer.Allocating = .init(allocator);
     defer send_w.deinit();
     var dummy_r: std.Io.Reader = .fixed("");
-    var server_ws = framework.WebSocket.initServer(&dummy_r, &send_w.writer, allocator);
+    var server_ws = framework.WebSocket.initServer(&dummy_r, &send_w.writer, allocator, std.testing.io);
     try server_ws.sendBinary("\x00\x01\x02\xff");
 
     // 客户端接收（客户端不做 mask 校验，直接读）

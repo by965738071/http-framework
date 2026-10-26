@@ -67,6 +67,12 @@ pub const WhereCondition = struct {
     operator: Operator,
     value: FieldValue,
     logic: Logic = .And,
+    /// In/NotIn 专用：成员列表（F-03）。非列表条件恒为 null。
+    /// 语义：字段值（归一化后）命中列表 → In 为真；未命中 → NotIn 为真；
+    /// 字段为 NULL 时两者都为假（SQL 三值逻辑：NULL IN/NOT IN 不可判定）。
+    /// 内存约定：slice 由调用方持有（通常 `var ids = [_]FieldValue{...}` 静态数组），
+    /// QueryBuilder 不拷贝、不释放。空列表：In 恒假、NotIn 恒真（一致于 SQL）。
+    list: ?[]const FieldValue = null,
 };
 
 pub const Logic = enum {
@@ -175,6 +181,64 @@ pub fn QueryBuilder(comptime T: type) type {
         pub fn where(self: *Self, op: Operator, field: []const u8, value: FieldValue) *Self {
             self.appendCondition(op, field, value, .And);
             return self;
+        }
+
+        /// 等值查询，字段名编译期校验（FRICTION F-19）。
+        ///
+        /// `where(.Eq, "filed", ...)`（手滑写错字段名）在 `matches` 里被当成
+        /// 「该行没有这个字段」→ 静默不匹配任何行，调用方拿到空结果还以为
+        /// 真没有 —— 这正是全仓库宁可 `all()` 手过滤的原因之一。本入口要求
+        /// 字段名必须是 `T` 的真实字段（comptime 检查），写错直接编译失败。
+        pub fn whereEq(self: *Self, comptime field: []const u8, value: FieldValue) *Self {
+            comptime if (std.meta.fieldIndex(T, field) == null) {
+                @compileError("QueryBuilder.whereEq: 未知字段「" ++ field ++ "」——" ++
+                    @typeName(T) ++ " 中不存在该字段（where() 传错字段名会静默不匹配任何行）");
+            };
+            return self.where(.Eq, field, value);
+        }
+
+        /// 成员判定 IN（F-03：旧实现 In/NotIn 无列表数据根本无法表达，
+        /// 构建期报死错）。字段名编译期校验；`values` 由调用方持有：
+        /// ```zig
+        /// const ids = [_]FieldValue{ .{ .integer = 1 }, .{ .integer = 3 } };
+        /// _ = qb.whereIn("id", &ids);
+        /// ```
+        pub fn whereIn(self: *Self, comptime field: []const u8, values: []const FieldValue) *Self {
+            comptime if (std.meta.fieldIndex(T, field) == null) {
+                @compileError("QueryBuilder.whereIn: 未知字段「" ++ field ++ "」——" ++
+                    @typeName(T) ++ " 中不存在该字段");
+            };
+            self.appendListCondition(.In, field, values);
+            return self;
+        }
+
+        /// 成员判定 NOT IN（SQL 三值逻辑：字段为 NULL → 不可判定 → 不匹配）。
+        pub fn whereNotIn(self: *Self, comptime field: []const u8, values: []const FieldValue) *Self {
+            comptime if (std.meta.fieldIndex(T, field) == null) {
+                @compileError("QueryBuilder.whereNotIn: 未知字段「" ++ field ++ "」——" ++
+                    @typeName(T) ++ " 中不存在该字段");
+            };
+            self.appendListCondition(.NotIn, field, values);
+            return self;
+        }
+
+        /// 内部：追加一个列表条件，OOM / 超限时记录 build_error（不 panic）。
+        /// 空列表不记录水位之外的问题：In 恒假、NotIn 恒真（SQL 一致），照存。
+        fn appendListCondition(self: *Self, op: Operator, field: []const u8, values: []const FieldValue) void {
+            if (self.build_error != null) return;
+            if (self.conditions.items.len >= MAX_CONDITIONS) {
+                self.build_error = error.TooManyConditions;
+                return;
+            }
+            self.conditions.append(self.allocator, .{
+                .field = field,
+                .operator = op,
+                .value = .{ .integer = 0 }, // In/NotIn 忽略 value，占位可得 tag 均一
+                .logic = .And,
+                .list = values,
+            }) catch |e| {
+                self.build_error = e;
+            };
         }
 
         /// 内部：追加一个条件，OOM / 超限时记录 build_error（不 panic）。
@@ -386,6 +450,44 @@ fn evaluateCondition(comptime T: type, instance: T, cond: WhereCondition, field_
     // 比崩溃更危险）。
     const fv = normalizeFieldValue(field_value);
     const cv = normalizeFieldValue(cond.value);
+
+    // ── In / NotIn：成员判定（F-03）──────────────────────────────
+    // 单值入口（where）仍在上层 appendCondition 拒绝这两个操作符；
+    // 只有 whereIn / whereNotIn 存的 list 条件走到这里。
+    if (cond.operator == .In or cond.operator == .NotIn) {
+        const lst = cond.list orelse return false;
+        if (lst.len == 0) return cond.operator == .NotIn; // 空集：In 恒假 / NotIn 恒真
+        var found = false;
+        for (lst) |item| {
+            const iv = normalizeFieldValue(item);
+            const hit = switch (fv) {
+                .integer => |v| switch (iv) {
+                    .integer => |c| c == v,
+                    .float => |c| c == @as(f64, @floatFromInt(v)),
+                    else => false,
+                },
+                .float => |v| switch (iv) {
+                    .float => |c| c == v,
+                    .integer => |c| v == @as(f64, @floatFromInt(c)),
+                    else => false,
+                },
+                .string => |v| switch (iv) {
+                    .string => |c| std.mem.eql(u8, v, c),
+                    else => false,
+                },
+                .boolean => |v| switch (iv) {
+                    .boolean => |c| c == v,
+                    else => false,
+                },
+                else => false,
+            };
+            if (hit) {
+                found = true;
+                break;
+            }
+        }
+        return if (cond.operator == .In) found else !found;
+    }
 
     return switch (fv) {
         .integer => |v| switch (cv) {

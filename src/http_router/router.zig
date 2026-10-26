@@ -296,7 +296,15 @@ pub const Router = struct {
             route_group = self.groupForPath(ctx.request.path);
         }
 
-        ctx.state.route_pattern = result.pattern;
+        // F-NEW-3：404/405 时 route_pattern 为空（result.pattern == ""），按路由
+        // 聚合的埋点/日志全部退化成高基数原始路径（404 恰恰是最想聚合观察的
+        // 一类）。已算出最长前缀组的话顺手把组前缀填成 route_pattern，让观测
+        // 至少能聚到组前缀这一层。prefix 是注册期的静态字面量。
+        if (result.pattern.len == 0 and route_group != trie_mod.NO_GROUP) {
+            ctx.state.route_pattern = self.groups.items[route_group].prefix;
+        } else {
+            ctx.state.route_pattern = result.pattern;
+        }
 
         // 组级中间件链 = 该组及其所有祖先的 use()，按「外层 → 内层」排列。
         // 分配在请求 arena 上，随请求一起回收。
@@ -1162,4 +1170,48 @@ test "Router.group 拷贝前缀而非借用调用方切片" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ── F-NEW-3：404/405 时 route_pattern 填最长前缀组的 prefix（埋点可聚合）──
+test "404 时 route_pattern 填最长前缀组的 prefix" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const handler = Handler.fromFn(struct {
+        fn h(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.h);
+    var api = try router.group("/api");
+    try api.route(.GET, "/users", handler);
+
+    // dispatch 会把组链等临时数据分配在 ctx.arena 上，用真实 arena 免泄漏
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var state = http_app.RequestState{ .arena = arena };
+    defer state.deinit();
+    const cfg = http_app.RequestConfig{};
+    var req = @import("http_protocol").Request{
+        .method = .GET,
+        .target = "/api/nope",
+        .path = "/api/nope",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "GET /api/nope HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    var ctx = Context{ .request = &req, .state = &state, .config = &cfg, .arena = arena, .io = undefined };
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(arena, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+
+    _ = try router.dispatch(&ctx, &res);
+    // 404（无 pattern 命中）→ route_pattern 应聚到组前缀 /api，而不是空
+    try std.testing.expectEqualStrings("/api", state.route_pattern.?);
 }

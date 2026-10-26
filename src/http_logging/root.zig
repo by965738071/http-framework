@@ -228,10 +228,12 @@ pub const Logger = struct {
 
     pub fn deinit(self: *Logger) void {
         if (self.config.output == .file) {
-            // 持锁关闭：避免关机期并发日志写已关闭的 fd
+            // 持锁关闭：避免关机期并发日志写已关闭的 fd。
+            // 轮转失败（pauseFileWrites）时 fd 已在 rotate 里关闭——再 close 会
+            // 关到（可能已被复用的）无关句柄，必须跳过。
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            self.file.close(self.io);
+            if (!self.file_paused) self.file.close(self.io);
         }
         if (self.owned_path) |p| {
             self.allocator.free(p);
@@ -667,24 +669,56 @@ fn writeTextEscaped(writer: *std.Io.Writer, s: []const u8) !void {
     }
 }
 
-/// JSON 字符串转义（RFC 8259）
+/// JSON 字符串转义（RFC 8259）。s 可能包含非 UTF-8 字节（如 request.path 是
+/// 调用方拼装的原始字节，未保证合法编码）——非法序列按 U+FFFD 替换，否则严格
+/// 的 JSON consumers 会拒绝整行，日志不可解析（与库内「worst case 整行丢失」
+/// 的容错目标一致）。
 fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeAll("\"");
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
         switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
+            '"' => {
+                try writer.writeAll("\\\"");
+                i += 1;
+            },
+            '\\' => {
+                try writer.writeAll("\\\\");
+                i += 1;
+            },
+            '\n' => {
+                try writer.writeAll("\\n");
+                i += 1;
+            },
+            '\r' => {
+                try writer.writeAll("\\r");
+                i += 1;
+            },
+            '\t' => {
+                try writer.writeAll("\\t");
+                i += 1;
+            },
             0...8, 11, 12, 14...31 => {
                 const hex = "0123456789abcdef";
                 var esc: [6]u8 = .{ '\\', 'u', '0', '0', '0', '0' };
                 esc[4] = hex[c >> 4];
                 esc[5] = hex[c & 0xf];
                 try writer.writeAll(&esc);
+                i += 1;
             },
-            else => try writer.writeAll(&[1]u8{c}),
+            else => {
+                const n = std.unicode.utf8ByteSequenceLength(c) catch 0;
+                if (n == 0 or i + n > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + n])) {
+                    // 非法/截断的 UTF-8 起始字节：U+FFFD 替换，只消费本字节
+                    // （后续字节若另起序列会继续校验）。
+                    try writer.writeAll("\\uFFFD");
+                    i += 1;
+                } else {
+                    try writer.writeAll(s[i .. i + n]);
+                    i += n;
+                }
+            },
         }
     }
     try writer.writeAll("\"");
@@ -1176,4 +1210,12 @@ test "formatJson includes request context when ctx provided" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "writeJsonString 把非 UTF-8 字节替换成 U+FFFD（回归：raw path 会让 JSONL 整行不可解析）" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeJsonString(&writer, "/a\xFF\x80zé");
+    // 0xFF、0x80 → \uFFFD；valid UTF-8 é 保留
+    try std.testing.expectEqualStrings("\"/a\\uFFFD\\uFFFDz\xc3\xa9\"", writer.buffered());
 }

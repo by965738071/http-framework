@@ -98,8 +98,10 @@ pub const CompressMiddleware = struct {
         // 启用缓冲模式——让 handler 的响应延迟到我们压缩之后
         res.setBuffered();
 
-        // Vary: Accept-Encoding（让缓存正确处理）
-        _ = res.header("Vary", "Accept-Encoding") catch {};
+        // 注意：Vary 不在此处预先写入——后续可能因 min/max_size、已有
+        // Content-Encoding、Content-Type 白名单外等条件跳过压缩，响应实际
+        // 不随 Accept-Encoding 变化；提前写 Vary 会让缓存多做无谓的内容
+        // 协商。Vary 只在真正发送压缩体时写入（见下方成功分支）。
 
         try next.call(ctx, res);
 
@@ -147,6 +149,7 @@ pub const CompressMiddleware = struct {
         // 只有压缩后更小才替换
         if (compressed.len < body.len) {
             _ = res.replacePendingBody(compressed);
+            _ = res.header("Vary", "Accept-Encoding") catch {};
             _ = res.header("Content-Encoding", encoding.headerValue()) catch {};
         }
 

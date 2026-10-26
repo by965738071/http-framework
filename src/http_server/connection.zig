@@ -169,7 +169,6 @@ pub const ConnectionRunner = struct {
         const req_config = http_app.RequestConfig{
             .trust_proxy = self.config.body.trust_proxy_headers,
             .body_size_limit = self.config.body.size_limit,
-            .lazy_read_size = self.config.body.lazy_read_size,
         };
 
         var ctx = http_app.Context{

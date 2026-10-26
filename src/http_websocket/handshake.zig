@@ -257,8 +257,6 @@ pub fn upgrade(
             writer: *std.Io.Writer,
             allocator: std.mem.Allocator,
         ) anyerror!void {
-            _ = io;
-
             // 1. 写 101 Switching Protocols 握手响应（直写裸 writer，不经 Sink）。
             var accept_buf: [ACCEPT_KEY_LEN]u8 = undefined;
             const accept_value = try computeAcceptKey(u.key, &accept_buf);
@@ -271,13 +269,14 @@ pub fn upgrade(
             );
             try writer.flush();
 
-            // 2. 构造 WebSocket 连接对象，交给用户回调。
-            var ws = connection.WebSocket.initServer(reader, writer, allocator);
+            // 2. 构造 WebSocket 连接对象，交给用户回调。io 必须传给 initServer：
+            // 服务端推送任务与 auto-pong 并发写同一 writer 需要持锁（M19）。
+            var ws = connection.WebSocket.initServer(reader, writer, allocator, io);
             try handlerFn(&ws, u.user);
         }
     }.run;
 
-    ctx.hijackWith(UpgradeCtx, uc, runFn);
+    try ctx.hijackWith(UpgradeCtx, uc, runFn);
     return true;
 }
 

@@ -48,6 +48,7 @@ pub const Lifecycle = @import("lifecycle.zig").Lifecycle;
 pub const Arenas = @import("arena.zig").Arenas;
 
 pub const Services = @import("services.zig").Services;
+pub const nowMs = @import("util.zig").nowMs;
 
 const std = @import("std");
 test {

@@ -87,7 +87,7 @@ pub const WebSocket = struct {
     /// 发送互斥锁（修复 M19）：服务端推送任务与 receive() 内自动 pong/close
     /// 可能并发写同一个 writer，字节流交错会破坏帧边界。send() 全程持锁，
     /// 保证单帧的 encode+flush 原子完成（相对其他发送方）。
-    /// io 为 null（仅单元测试）时无并发前提，跳过加锁。
+    /// io 为 null（无调度器的单元测试裸 writer）时无并发前提，跳过加锁。
     send_mutex: std.Io.Mutex = .init,
 
     const Self = @This();
@@ -100,8 +100,19 @@ pub const WebSocket = struct {
     pub const MAX_FRAMES_PER_MESSAGE: usize = 65536;
 
     /// 服务端模式构造（发送不 mask）。
-    pub fn initServer(reader: *std.Io.Reader, writer: *std.Io.Writer, allocator: std.mem.Allocator) Self {
-        return .{ .reader = reader, .writer = writer, .allocator = allocator };
+    ///
+    /// **io 必须传真实调度器**（生产里是 zio runtime）：服务端推送任务与
+    /// receive() 内的 auto-pong/close 并发写同一 writer，send() 要靠持锁保证
+    /// 帧边界原子。旧实现 io=null 导致锁是死代码、生产路径可交错写坏帧。
+    /// 只有裸的单元测试（无多任务并发）才允许传 std.testing.io 之外的无调度
+    /// 场景——测试统一传 std.testing.io。
+    pub fn initServer(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) Self {
+        return .{ .reader = reader, .writer = writer, .allocator = allocator, .io = io };
     }
 
     /// 客户端模式构造（发送时 mask）。
@@ -173,12 +184,15 @@ pub const WebSocket = struct {
     }
 
     /// 用指定数字状态码发送 close 帧（内部用,不做 CloseCode enum 约束）。
+    /// closed 只在 close 帧成功发出后置位：旧实现先置位再 send，send 瞬时
+    /// 失败会把唯一一次 close 握手机会烧进幂等分支，客户端收不到任何 close
+    /// 帧就断连（无握手关闭）。失败后上层可重试 close()。
     fn closeWithCode(self: *Self, code: u16) !void {
         if (self.closed) return;
-        self.closed = true;
         var buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &buf, code, .big);
         try self.send(.close, &buf);
+        self.closed = true;
     }
 
     /// 发送 ping（控制帧，payload ≤ 125）。
@@ -210,13 +224,13 @@ pub const WebSocket = struct {
         // 后续合法的 close 会被幂等分支吞掉。
         if (reason.len > 123) return error.ControlFramePayloadTooLong;
 
-        self.closed = true;
-
-        // close payload = code(2) + reason；控制帧上限 125，减去 2 字节 code 后 reason ≤ 123
+        // 所有校验通过后才 send；closed 置位在 send 成功之后 —— send 瞬时
+        // 失败（如 EPIPE 恢复）不烧掉重试机会（原因同 closeWithCode）。
         var buf: [125]u8 = undefined;
         std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
         @memcpy(buf[2 .. 2 + reason.len], reason);
         try self.send(.close, buf[0 .. 2 + reason.len]);
+        self.closed = true;
     }
 
     /// 阻塞读一个完整的 message。
@@ -281,7 +295,6 @@ pub const WebSocket = struct {
                     }
                     // RFC §7.1.2: 收到 close 后应回一个 close（如果还没发过）。
                     if (!self.closed) {
-                        self.closed = true;
                         // 用对方的 close code 回应（如果有 payload）。无 payload 时发空 close。
                         var reply_buf: [125]u8 = undefined;
                         var reply_len: usize = 0;
@@ -296,7 +309,10 @@ pub const WebSocket = struct {
                             @memcpy(reply_buf[2 .. 2 + rlen], reason[0..rlen]);
                             reply_len = 2 + rlen;
                         }
+                        // closed 在 send 成功后置位（原因同 closeWithCode）；send
+                        // 失败留给上层 close() 重试。返回的 ConnectionClosed 不变。
                         try self.send(.close, reply_buf[0..reply_len]);
+                        self.closed = true;
                     }
                     return error.ConnectionClosed;
                 },
@@ -416,7 +432,7 @@ test "sendText / receive roundtrip (server → client)" {
     var send_w: std.Io.Writer.Allocating = .init(allocator);
     defer send_w.deinit();
     var dummy_r: std.Io.Reader = .fixed("");
-    var server_ws = WebSocket.initServer(&dummy_r, &send_w.writer, allocator);
+    var server_ws = WebSocket.initServer(&dummy_r, &send_w.writer, allocator, std.testing.io);
     try server_ws.sendText("hello world");
     const sent = send_w.written();
 
@@ -446,7 +462,7 @@ test "sendBinary / receive roundtrip (client → server)" {
     var server_r: std.Io.Reader = .fixed(sent);
     var server_w: std.Io.Writer.Allocating = .init(allocator);
     defer server_w.deinit();
-    var server_ws = WebSocket.initServer(&server_r, &server_w.writer, allocator);
+    var server_ws = WebSocket.initServer(&server_r, &server_w.writer, allocator, std.testing.io);
 
     var msg = try server_ws.receive();
     defer msg.deinit();
@@ -468,7 +484,7 @@ test "receive auto-replies to ping with pong" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
 
     // receive 应跳过 ping（自动回 pong），返回 text
     var msg = try ws.receive();
@@ -501,7 +517,7 @@ test "receive auto-replies to close and returns ConnectionClosed" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
 
     try testing.expectError(error.ConnectionClosed, ws.receive());
 
@@ -533,7 +549,7 @@ test "receive assembles fragmented message" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
 
     var msg = try ws.receive();
     defer msg.deinit();
@@ -547,7 +563,7 @@ test "close method sends close frame and is idempotent" {
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
     var dummy_r: std.Io.Reader = .fixed("");
-    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator, std.testing.io);
 
     try ws.close(.normal_closure, "bye");
     // 二次 close 应幂等返回，不重复发帧
@@ -570,7 +586,7 @@ test "close method rejects reserved code 1005 (low-prio)" {
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
     var dummy_r: std.Io.Reader = .fixed("");
-    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator, std.testing.io);
 
     // 1005 (no_status_received) 不得出现在线路上。
     const err = ws.close(@fromBackingInt(@intCast(1005)), "");
@@ -593,7 +609,7 @@ test "peer closing with 1013/1014 is not re-encoded as 1002 (M15)" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
 
     try testing.expectError(error.ConnectionClosed, ws.receive());
 
@@ -612,7 +628,7 @@ test "close rejects non-UTF-8 reason and does not burn the close (M20)" {
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
     var dummy_r: std.Io.Reader = .fixed("");
-    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&dummy_r, &out_w.writer, allocator, std.testing.io);
 
     // 非法 UTF-8 reason → 拒绝，不发帧，不置位 closed
     try testing.expectError(error.InvalidUtf8, ws.close(.policy_violation, "\xff\xfe"));
@@ -642,7 +658,7 @@ test "message over max_message_size closes with 1009 (M21)" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
     ws.max_message_size = 10; // 第三片累计 13 字节 > 10
 
     try testing.expectError(error.MessageTooBig, ws.receive());
@@ -675,7 +691,7 @@ test "zero-length continuation flood is capped (M22)" {
     var r: std.Io.Reader = .fixed(input);
     var out_w: std.Io.Writer.Allocating = .init(allocator);
     defer out_w.deinit();
-    var ws = WebSocket.initServer(&r, &out_w.writer, allocator);
+    var ws = WebSocket.initServer(&r, &out_w.writer, allocator, std.testing.io);
 
     try testing.expectError(error.MessageTooBig, ws.receive());
     // 同样须发 close 1009 告知对端断开原因

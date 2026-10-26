@@ -305,16 +305,21 @@ pub const Response = struct {
         c.name = owned_name;
         c.value = owned_value;
         // path/domain/same_site 也必须校验 CRLF，否则可注入响应头。
+        // 修复 W2：仅查 CRLF/NUL 不够——这些属性是拼进 Set-Cookie 的语义段
+        // （属性分隔符 `;`），Path=/x; Domain=.evil.com 这类值会在一个
+        // Set-Cookie 头里凭空多出一个 Domain 属性（cookie 属性注入）。
+        // 值字段用 validateCookieToken，属性字段用 validateCookieAttribute
+        // （禁 `;`，但放宽 `,`/空格：合法 Path 可含 `/a, b`）。
         if (c.path) |p| {
-            try validateHeaderValue(p);
+            try validateCookieAttribute(p);
             c.path = try self.dupeOwned(p);
         }
         if (c.domain) |d| {
-            try validateHeaderValue(d);
+            try validateCookieAttribute(d);
             c.domain = try self.dupeOwned(d);
         }
         if (c.same_site) |ss| {
-            try validateHeaderValue(ss);
+            try validateCookieAttribute(ss);
             c.same_site = try self.dupeOwned(ss);
         }
         try self.cookies.append(self.allocator, c);
@@ -546,6 +551,17 @@ fn validateCookieToken(s: []const u8) !void {
     for (s) |c| {
         if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
         if (c == ';' or c == ',' or c == ' ' or c == '\t') return error.InvalidCookieValue;
+    }
+}
+
+/// 校验 cookie 属性字段（Path/Domain/SameSite）：在 CRLF/NUL 之外再禁止
+/// `;` —— 属性以 `;` 拼接成一个 Set-Cookie 头行，属性值里出现 `;` 即可
+/// 注入额外属性（如 `Path=/x; Domain=.evil.com`）。`,` 与空格对 Path 是
+/// 合法值（RFC 6265 对 path 无排除字符），放行。
+fn validateCookieAttribute(s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
+        if (c == ';') return error.InvalidCookieAttribute;
     }
 }
 
@@ -878,4 +894,29 @@ test "缓冲模式 status-only 响应：connection 层兜底 text(\"\") + flush 
 }
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "setCookieFull 拒绝含 `;` 的属性值（回归：Path=/x; Domain=.evil.com 属性注入）" {
+    var wbuf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&wbuf);
+    var res = Response.init(std.testing.allocator, Sink.testSink(&writer));
+    defer res.deinit();
+
+    try std.testing.expectError(error.InvalidCookieAttribute, res.setCookieFull(.{
+        .name = "sid",
+        .value = "v",
+        .path = "/x; Domain=.evil.com",
+    }));
+    try std.testing.expectError(error.InvalidCookieAttribute, res.setCookieFull(.{
+        .name = "sid",
+        .value = "v",
+        .domain = "a.com; ",
+    }));
+    try std.testing.expectError(error.InvalidCookieAttribute, res.setCookieFull(.{
+        .name = "sid",
+        .value = "v",
+        .same_site = "Lax; Secure",
+    }));
+    // 合法 Path（含逗号与空格）放行
+    _ = try res.setCookieFull(.{ .name = "sid", .value = "v", .path = "/a, b c" });
 }

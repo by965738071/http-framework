@@ -61,7 +61,10 @@ pub const CorsMiddleware = struct {
             // 配了白名单时响应随 Origin 而变，补 Vary: Origin 防缓存污染。
             // 通配符配置（null 或列表含 "*"）响应不随 Origin 变，无需 Vary。
             // Vary 是多值头，用合并而非 setHeader 盲替换（见 addVaryOrigin）。
-            if (self.config.allowed_origins != null and !self.isWildcardAllow()) addVaryOrigin(res) catch {};
+            // Vary 是多值头，用合并而非 setHeader 盲替换（见 addVaryOrigin）。
+            // 不静默吞错：OOM 时宁可请求 500，也不能让带反射性 CORS 头的可
+            // 缓存响应悄悄丢掉 Vary（跨 origin/编码的缓存投毒面）。
+            if (self.config.allowed_origins != null and !self.isWildcardAllow()) try addVaryOrigin(res);
             try next.call(ctx, res);
             return;
         }

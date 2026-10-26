@@ -60,7 +60,21 @@ pub const PathParams = struct {
                 return;
             }
         }
-        if (self.len >= CAP) return error.TooManyPathParams;
+        // 问题：溢出时旧代码返回无信息的 error.TooManyPathParams，trie 匹配处的
+        // `catch continue` 会把它洗成「放弃分支 → 静默 404」，真正的病因
+        // （不变量被破坏）永远看不到。
+        // 原因：溢出是「不该发生」的不变量违反——注册期已拒绝参数数超过 CAP 的
+        // pattern（trie.zig 的 MAX_PATTERN_PARAMS == CAP，validatePattern 里
+        // `n == names.len` 直接 error.InvalidRoute），单次匹配的 put 次数不可能
+        // 超过 CAP；且 Zig 错误集不能带 payload，错误号天然带不了实际参数数。
+        // 修法：显式 panic 并带实际参数数与 CAP，对齐 zio_server.zig 配对校验的
+        // panic 风格。保留 `!void` 签名不变：调用方（trie 的 catch continue、
+        // 测试的 try）无需任何改动，该错误分支实际已不可达。
+        if (self.len >= CAP) std.debug.panic(
+            "PathParams.put: 第 {d} 个路径参数超出容量上限 CAP={d}" ++
+                "（不变量违反：注册期已拒绝参数数超过 CAP 的 pattern，见 trie.zig MAX_PATTERN_PARAMS）",
+            .{ self.len + 1, CAP },
+        );
         self.keys[self.len] = key;
         self.values[self.len] = value;
         self.len += 1;
@@ -200,7 +214,6 @@ pub const UserData = struct {
 pub const RequestConfig = struct {
     trust_proxy: bool = false,
     body_size_limit: u64 = 0,
-    lazy_read_size: u64 = 0,
 };
 
 /// 完整上下文 — handler / middleware 看到的类型。
@@ -311,6 +324,12 @@ pub const Context = struct {
         return Request.getFormDecodedFrom(self.arena, body, key);
     }
 
+    /// 当前 Unix 时间毫秒（墙钟，FRICTION F-22 收口）。
+    /// 限流等需要单调性的场景用 `std.Io.Timestamp.now(self.io, .awake)`。
+    pub fn nowMs(self: *const Context) i64 {
+        return @import("util.zig").nowMs(self.io);
+    }
+
     /// 便捷方法：中间件通讯槽
     pub fn getUserData(self: *const Context, comptime T: type) ?*T {
         return self.state.getUserData(T);
@@ -332,9 +351,11 @@ pub const Context = struct {
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
         allocator: std.mem.Allocator,
-    ) anyerror!void) void {
+    ) anyerror!void) !void {
         // 重复注册 = bug：先注册的回调会被静默丢弃，永远得不到执行。
-        std.debug.assert(self.state.hijack == null);
+        // 旧实现用 std.debug.assert（ReleaseFast 下变成 no-op、静默丢弃第一个
+        // 回调，后续流程实际悬在半劫持状态）；改为硬错误，调用方 try 即可知。
+        if (self.state.hijack != null) return error.AlreadyHijacked;
         self.state.hijack = .{ .ctx = hijack_ctx, .run = run };
     }
 
@@ -359,7 +380,7 @@ pub const Context = struct {
             writer: *std.Io.Writer,
             allocator: std.mem.Allocator,
         ) anyerror!void,
-    ) void {
+    ) !void {
         const Erased = struct {
             fn erased(
                 hctx: *anyopaque,
@@ -372,7 +393,7 @@ pub const Context = struct {
                 return run(typed, io, reader, writer, allocator);
             }
         };
-        self.hijack(ptr, &Erased.erased);
+        try self.hijack(ptr, &Erased.erased);
     }
 
     /// 便捷方法：发送错误响应（状态码 + 消息文本）。
@@ -694,4 +715,30 @@ test "Context.readBody 超限置 body_too_large（413 自动关连接）" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "hijack 重复注册 → error.AlreadyHijacked（回归：ReleaseFast 下 assert 被编译掉、首回调被静默丢弃）" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const state_ptr = try arena_alloc.create(RequestState);
+    state_ptr.* = .{ .arena = arena_alloc };
+
+    const dummy_request: Request = undefined;
+    const req_config = RequestConfig{};
+    var ctx = Context{
+        .request = &dummy_request,
+        .state = state_ptr,
+        .config = &req_config,
+        .arena = arena_alloc,
+        .io = std.testing.io,
+    };
+    const noop = struct {
+        fn run(_: *anyopaque, _: std.Io, _: *std.Io.Reader, _: *std.Io.Writer, _: std.mem.Allocator) anyerror!void {}
+    }.run;
+    var dummy: u8 = 0;
+    try ctx.hijack(&dummy, &noop);
+    try std.testing.expectError(error.AlreadyHijacked, ctx.hijack(&dummy, &noop));
 }

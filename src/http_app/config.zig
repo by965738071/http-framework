@@ -183,14 +183,6 @@ pub const Config = struct {
 
         // 死开关（planned, not yet effective；现状见 docs/API.md §2.4）：仅非默认值才提醒。
         var dead: usize = 0;
-        if (self.body.lazy_read_size != 0) {
-            std.log.warn("config: body.lazy_read_size is set but not implemented (no effect)", .{});
-            dead += 1;
-        }
-        if (n.idle_timeout_ns != 60_000_000_000) { // 默认值 = NetworkConfig.idle_timeout_ns 默认值
-            std.log.warn("config: network.idle_timeout_ns is not implemented; keep-alive idle is bounded by read_timeout_ns", .{});
-            dead += 1;
-        }
         if (h.access_log_enabled) {
             std.log.warn("config: http.access_log_enabled has no effect; register a LoggingHook/LoggingMiddleware for access logs", .{});
             dead += 1;
@@ -211,9 +203,6 @@ pub const NetworkConfig = struct {
     /// 同时存活的连接上限（背压）。达到后新连接在 accept 前挂起，
     /// 直到有连接结束释放名额。zio 下一个连接只占一个轻量协程，可设很高。
     max_connections: u32 = 1024,
-    /// keep-alive 空闲超时（纳秒）。planned, not yet effective：当前未生效，
-    /// keep-alive 空闲实际由 `read_timeout_ns` 约束；设成非默认值只会触发启动警告。
-    idle_timeout_ns: u64 = 60_000_000_000,
     /// 单次读超时（纳秒）。zio 原生 per-operation timeout（防慢攻击）。
     read_timeout_ns: u64 = 30_000_000_000,
     /// 单次写超时（纳秒）。zio 原生 per-operation timeout。
@@ -239,9 +228,6 @@ pub const HttpConfig = struct {
 
 pub const BodyConfig = struct {
     size_limit: u64 = 10 * 1024 * 1024,
-    /// 请求体延迟读取阈值（字节）。planned, not yet effective：请求体始终整读，
-    /// 设成非默认值只会触发启动警告。
-    lazy_read_size: u64 = 0,
     trust_proxy_headers: bool = false,
 };
 
@@ -275,7 +261,6 @@ test "Config defaults are sensible" {
     try std.testing.expect(cfg.http.keep_alive_enabled);
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), cfg.body.size_limit);
     // 超时默认值（fix.md §二.6）
-    try std.testing.expectEqual(@as(u64, 60_000_000_000), cfg.network.idle_timeout_ns);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.read_timeout_ns);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.write_timeout_ns);
     try std.testing.expectEqual(@as(u64, 30_000_000_000), cfg.network.drain_timeout_ns);
@@ -305,7 +290,6 @@ test "Config.fromEnv overrides leaf fields (flat keys)" {
     try std.testing.expectEqual(@as(u32, 64), cfg.network.max_connections);
     try std.testing.expectEqual(@as(u64, 5_000_000_000), cfg.network.drain_timeout_ns);
     // 未设置的字段保持默认
-    try std.testing.expectEqual(@as(u64, 60_000_000_000), cfg.network.idle_timeout_ns);
     try std.testing.expectEqual(@as(usize, 16 * 1024), cfg.pool.request_arena_retain_bytes);
 }
 

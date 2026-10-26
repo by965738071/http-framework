@@ -69,6 +69,8 @@ pub const Hook = http_app.Hook;
 pub const Lifecycle = http_app.Lifecycle;
 pub const Arenas = http_app.Arenas;
 pub const Services = http_app.Services;
+/// 当前 Unix 时间毫秒（墙钟）。FRICTION F-22 的时间样板收口。
+pub const nowMs = http_app.nowMs;
 
 // ── http_router ──────────────────────────────────────────────
 pub const Router = http_router.Router;

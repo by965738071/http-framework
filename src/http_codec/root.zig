@@ -38,6 +38,7 @@ pub const Handler = http_app.Handler;
 ///   （代价：body 已在 arena 时多一次拷贝，换取公共 API 的输入无关性。）
 pub fn parseJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !*T {
     const result = try allocator.create(T);
+    errdefer allocator.destroy(result);
     result.* = try std.json.parseFromSliceLeaky(T, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,

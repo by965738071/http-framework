@@ -42,8 +42,10 @@
 //! - 驱动深度是「中间件链 + handler」（`Next` 管道），**不含** TCP / accept /
 //!   keep-alive 循环。要驱动到 `ConnectionRunner.processRequest` 那一层，见
 //!   `http_server/integration_test.zig`（用内存 Reader/Writer 喂真实字节）。
-//! - 不支持流式响应（`Response.stream`）：捕获型 Sink 没有实现 `startStream`。
-//!   静态大文件 / Range 这类场景目前只能靠集成测试。
+//! - 支持流式响应（`Response.stream`）：捕获型 Sink 的 `startStream` 会把状态行
+//!   + 头按 `respond` 同一格式写进 wire，body 字节经 `http.BodyWriter` 直接
+//!   透传进同一容器（`.none` state = 无分帧，捕获到的是裸 body 字节），
+//!   `wireBytes()` / `status()` / `header()` / `body()` 对流式响应同样可断言。
 //! - 断言读的是**真正上 wire 的字节**（状态行 + 头 + body），不是 `Response`
 //!   的内部状态——中间件忘了 flush、头在 flush 之后才加，这类问题都会暴露。
 
@@ -70,8 +72,11 @@ pub const AppError = http_app.AppError;
 /// 行为几乎全在头上（request-id / CSP / timing / Set-Cookie）。丢了头就只能断言
 /// body，等于没测。
 ///
-/// 不实现 `startStream`：流式响应会把状态行直接写进 sink、body 走另一条路，
-/// 捕获成一段连续字节反而丢失结构。需要流式时用集成测试。
+/// `startStream` 同为捕获型：状态行 + 头按 `respond` 的同一格式写进 wire，
+/// body 走返回的 `http.BodyWriter`（`.none` state，drain 用 std 的
+/// `noneDrain`）直接透传进同一容器。用 `.none` 而非复刻 std 的 content-length /
+/// chunked 分帧：harness 断言的是「流式响应写出了什么」，裸 body 字节比帧结构
+/// 更可断言（分帧是 std 的职责，集成测试走真实 respondStreaming 路径覆盖）。
 fn capturingSink(writer: *std.Io.Writer) Sink {
     const Ctx = struct {
         fn respond(
@@ -97,8 +102,26 @@ fn capturingSink(writer: *std.Io.Writer) Sink {
             buffer: []u8,
             keep_alive: bool,
         ) anyerror!http.BodyWriter {
-            _ = .{ ptr, status, headers, content_length, buffer, keep_alive };
-            return error.StreamingNotSupportedInHarness;
+            const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
+            try w.print("HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), status.phrase() orelse "Error" });
+            if (content_length) |len| try w.print("content-length: {d}\r\n", .{len});
+            for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+            _ = keep_alive;
+            try w.writeAll("\r\n");
+            // `.none` state：无分帧、无长度计数，body 字节原样进 wire 容器。
+            // drain/sendFile 用 std 的 none* 实现（@fieldParentPtr 回到本
+            // BodyWriter），end() 对 .none 只是 flush，不会写 chunk 终止符。
+            return .{
+                .http_protocol_output = w,
+                .state = .none,
+                .writer = .{
+                    .buffer = buffer,
+                    .vtable = &.{
+                        .drain = http.BodyWriter.noneDrain,
+                        .sendFile = http.BodyWriter.noneSendFile,
+                    },
+                },
+            };
         }
     };
     return .{
@@ -602,6 +625,30 @@ test "中间件链：缓冲模式下 handler 之后追加的头能上 wire" {
 
     try std.testing.expectEqualStrings("/hello", h.body());
     try std.testing.expectEqualStrings("1", h.header("x-after-handler").?);
+}
+
+test "harness：流式响应的状态行/头/body 可断言" {
+    const h = try Harness.init(std.testing.allocator);
+    defer h.deinit();
+    try h.req(.GET, "/stream");
+
+    const handler = Handler.fromFn(struct {
+        fn handle(_: *Context, res: *Response) !void {
+            var buf: [64]u8 = undefined;
+            var s = try res.stream(&buf, .{ .content_length = 11 });
+            try s.writeAll("hello ");
+            try s.writeAll("world");
+            try s.end();
+        }
+    }.handle);
+    try h.runHandler(handler);
+
+    try std.testing.expectEqual(@as(u16, 200), h.statusCode());
+    try std.testing.expectEqualStrings("11", h.header("content-length").?);
+    // Response.stream 默认补的 Content-Type
+    try std.testing.expectEqualStrings("application/octet-stream", h.header("content-type").?);
+    // body 是流式写出的裸字节（无分帧），与 respond 路径同一套断言辅助
+    try std.testing.expectEqualStrings("hello world", h.body());
 }
 
 test {

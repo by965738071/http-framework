@@ -30,7 +30,16 @@
 | F-11 | ✅ 已解决 | 组级 `use` 顺序无关；但 examples 的 `group("")` 写法**保留**（原因见该条） |
 | F-12 | ⚠️ 部分解决 | 中间件链修好了，**响应体**没修 → 剩余部分记在 F-NEW-6 |
 | F-13 | ✅ 已解决 | `RateLimitConfig.exclude_paths`，阈值 600 → 120 |
+| F-19 | ✅ 已解决 | `QueryBuilder.whereEq(comptime field, value)`：字段不存在直接编译失败 |
+| F-03 | ✅ 已解决 | `WhereCondition.list` + `whereIn/whereNotIn(comptime field, values)`：整数/字符串/浮点/布尔成员判定、空集 In 恒假 NotIn 恒真、NULL 不匹配（SQL 三值逻辑） |
+| F-04 | ✅ 已解决（单表内存级） | `store.batch(Ctx, ctx, cb)`：单锁执行多步 insert/update/delete/findById，并发原子（Mutex 不可重入 → 主体抽成 `...Locked` 原语）；持锁 `b.flush()` 单表落盘（tmp+fsync+rename）。崩溃原子/WAL 仍超出（内存模型） |
+| F-05 | ✅ 已解决（最低限） | load 时按当前 schema 对齐存量数据：缺列补 `default_value`（字符串逐字段 dup，避免 setTyped 直改指针的 rodata double-free）、多余键丢弃、首条漂移行打含字段清单的 warn（不拒启动）。CRUD 迁移/加列（ALTER）执行器仍为 F-14 后续范围 |
+| F-21 | ✅ 已解决 | `JsonStore.paginateWhere(gpa, page, per_page, query)`：沿用 where/orderBy，默认补 `id ASC` |
+| F-22 | ✅ 已解决 | `framework.nowMs(io)` + `ctx.nowMs()`（`src/http_app/util.zig`） |
 | F-25 | ✅ 已解决 | `modelSchema` 改用容器级静态存储 |
+| F-NEW-3 | ✅ 已解决 | 404/405 时 `route_pattern` 填最长前缀组的 prefix（`router.zig` dispatch） |
+| F-NEW-5 | ⚠️ 部分解决 | `open()` 现在对存量重复唯一值 `log.warn` 启动期告警（不拒启动）；部分索引 / 大小写不敏感仍未做 |
+| F-NEW-8 | ✅ 已解决 | 唯一键改增量 hash 索引（key 由 store 自持有）：`insert` / `update` / `delete` / `open` / `truncate` / `close` 同步维护，查冲突从 O(唯一约束数 × 行数) 降到 O(1) |
 
 ---
 

@@ -223,7 +223,7 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
         var search_from = pos;
         var part_end: ?usize = null;
         while (part_end == null) {
-            const found = std.mem.indexOfPos(u8, body, search_from, next_delim_search) orelse break;
+            const found = std.mem.indexOfPos(u8, body, search_from, next_delim_search) orelse return error.TruncatedBody;
             // 后继两字节必须是 \r\n 或 --，否则是内容里的边界子串（旧单字节
             // 判断遇 `\rZ`/`-Z` 会假分割），继续向后找。
             if (delimSuffixOk(body, found + next_delim_search.len)) {
@@ -232,7 +232,7 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
                 search_from = found + 1; // 假命中（boundary 是更长 token 的前缀），往后找
             }
         }
-        const pe = part_end orelse break;
+        const pe = part_end.?;
         const part_data = body[pos..pe];
 
         // 解析这个 part
@@ -762,4 +762,16 @@ test "from: body 超 limit → BodyTooLarge" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "from: body 截断（无结束分隔符）→ TruncatedBody，不再静默返回部分表单" {
+    var env: MpEnv = .{};
+    env.begin(.{
+        .content_type = "multipart/form-data; boundary=XX",
+        .body = .{ .buffered = "--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nval" },
+        .content_length = null,
+    });
+    defer env.end();
+
+    try std.testing.expectError(error.TruncatedBody, from(&env.ctx, 1 << 20));
 }

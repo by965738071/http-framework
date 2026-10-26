@@ -36,10 +36,56 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         dirty: bool,
         /// 主键 id -> rows 下标，提供 O(1) 的 findById
         id_index: std.AutoHashMap(u64, usize) = undefined,
+        /// 唯一单字段增量索引：key（store 自持有，allocator 分配）→ 行 id。
+        /// F-NEW-8：旧实现 insert 的 checkUnique 对每个唯一字段全表线性扫描
+        /// O(唯一字段数 × 行数)，高频 update（如 last_login_at）每写必付一次。
+        /// 维护点：open（load 后重建）、insert、update 提交、delete、truncate、close。
+        field_key_maps: []std.StringHashMap(u64) = &.{},
+        /// 唯一联合索引增量索引：组 key（store 自持有）→ 任一行 id
+        index_key_maps: []std.StringHashMap(u64) = &.{},
         /// 保护并发读写（rows、next_id、文件 flush）
         mutex: std.Io.Mutex = .init,
 
         const Self = @This();
+
+        /// 唯一约束相关的 comptime 元数据：单字段/联合索引的映射位次。
+        /// `?usize = null` 表示该字段/索引不是唯一的（无对应 map）。
+        const field_map_idx = blk: {
+            var out: [schema.fields.len]i8 = @splat(-1);
+            var n: i8 = 0;
+            for (schema.fields, 0..) |f, i| {
+                if (f.constraints.unique) {
+                    out[i] = n;
+                    n += 1;
+                }
+            }
+            break :blk out;
+        };
+        const index_map_idx = blk: {
+            var out: [schema.indexes.len]i8 = @splat(-1);
+            var n: i8 = 0;
+            for (schema.indexes, 0..) |idx, i| {
+                if (idx.unique) {
+                    out[i] = n;
+                    n += 1;
+                }
+            }
+            break :blk out;
+        };
+        const unique_field_count: usize = blk: {
+            var n: usize = 0;
+            for (schema.fields) |f| {
+                if (f.constraints.unique) n += 1;
+            }
+            break :blk n;
+        };
+        const unique_index_count: usize = blk: {
+            var n: usize = 0;
+            for (schema.indexes) |idx| {
+                if (idx.unique) n += 1;
+            }
+            break :blk n;
+        };
 
         fn lock(self: *Self) !void {
             return self.mutex.lock(self.io);
@@ -89,6 +135,14 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             };
 
             try self.load();
+            // F-NEW-8/F-NEW-5.1：构建唯一键增量索引（insert/update/delete 从此
+            // O(1) 查冲突）；同时承担「存量脏数据可见性」——发现重复值时
+            // log.warn 并保留首行映射（不拒启动）。
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                errdefer self.destroyUniqueMaps();
+                try self.initUniqueMaps();
+                self.buildUniqueIndexes();
+            }
             return self;
         }
 
@@ -99,6 +153,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         pub fn close(self: *Self) !void {
             try self.lock();
             const flush_err = self.flushUnlocked();
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                self.destroyUniqueMaps();
+            }
             for (self.rows.items) |row| {
                 freeStringFields(T, self.allocator, row);
             }
@@ -162,6 +219,10 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             defer parsed.deinit();
 
             var max_id: u64 = 0;
+            // F-05.1（最低限度迁移）：存量行有 schema 漂移时，只对**该表首条**
+            // 漂移行打一条详细 warn——前 N 行全表 scan 太冗长，且同一份旧数据
+            // 的漂移模式几乎一致；行数本身在 errdefer 语义之外，不影响加载。
+            var schema_diff_warned = false;
             errdefer {
                 // 修复 M3：load 中途失败时释放已加载行的字符串字段，避免汄漏。
                 for (self.rows.items) |row| freeStringFields(T, self.allocator, row);
@@ -170,12 +231,54 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             for (parsed.value) |jrow| {
                 if (jrow != .object) continue;
-                // jsonObjectToType 内部已是泄漏安全的（见其 errdefer）。
-                const row = try jsonObjectToType(T, self.allocator, jrow.object);
+                var row = try jsonObjectToType(T, self.allocator, jrow.object);
                 // 当前行尚未进入 self.rows：若本迭代后续失败（append OOM / 损坏
                 // 数据返回），errdefer 释放该行已 dup 的字符串，避免与外层 errdefer
                 // （只清理已入列行）冲突或泄漏。
                 errdefer freeStringFields(T, self.allocator, row);
+
+                // F-05.1：加载时按当前 schema 对齐（最低限度迁移执行器）。
+                // - 缺失字段：jsonObjectToType 已补成类型零值；若该列在当前
+                //   schema 里有 default_value，再用 applyDefaults 覆盖成 schema
+                //   默认值（只对「JSON 里确实没有该键」的行生效，绝不改写
+                //   存在的正经 0 值数据）。
+                // - 多余字段（Row 里已删除的字段）：jsonObjectToType 按字段名
+                //   精确匹配，多余键自然丢弃；写入时也不会再落盘。
+                // - 漂移本身不拒启动（与 warnDuplicateUniques 同样的放行哲学），
+                //   但第一条漂移行会打一条含具体字段清单的 warn，让「改表没删
+                //   data 重启」这类操作可见，而不是静默变成空值。
+                var needs_defaults = false;
+                inline for (schema.fields) |f| {
+                    if (f.constraints.default_value != null and jrow.object.get(f.name) == null) {
+                        needs_defaults = true;
+                    }
+                }
+                //  // BISECT
+                // F-05.1：applyDefaults 把缺列字段从「类型零值」改成「schema
+                // default_value」。注意 setFieldFromValue 对字符串是**直接改指针、
+                // 不深拷贝**（query.setTyped 的既定约定——insert 路径之后用
+                // dupStringFields 统一收编所有权）。load 只针对「JSON 没有该键」
+                // 的行做一次逐字段 dup；否则 close / 后续 freeStringFields 会去
+                // free schema 里的编译期常量（rodata），在测试 allocator 上不是
+                // panic 而是卡死在分配器内部。
+                if (needs_defaults) {
+                    applyDefaults(&row);
+                    inline for (schema.fields) |f| {
+                        if (f.constraints.default_value != null and jrow.object.get(f.name) == null) {
+                            const FT = @TypeOf(@field(row, f.name));
+                            if (comptime isConstU8Slice(FT)) {
+                                const ds = @field(row, f.name);
+                                if (ds.len > 0) {
+                                    @field(row, f.name) = try self.allocator.dupe(u8, ds);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!schema_diff_warned and (needs_defaults or rowSchemaDiff(T, jrow.object))) {
+                    schema_diff_warned = true;
+                    warnSchemaDiff(T, self.allocator, self.table_name, jrow.object);
+                }
 
                 // M3：统一以行内实际值 getFieldId 建索引/推进 max_id，不再依赖原始
                 // JSON 的 tag；缺失/≤0/重复 id 一律报损坏数据，杜绝索引与行脱同步。
@@ -259,16 +362,25 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 
         // ── CRUD ────────────────────────────────────────
 
+        /// 插入一行（公开入口，加锁）。批量多步写请用 `batch`（单锁，F-04）。
         pub fn insert(self: *Self, row: T) !u64 {
             try self.lock();
             defer self.unlock();
+            return self.insertLocked(row);
+        }
 
+        /// 插入一行（调用方必须已持有锁）——batch 的执行原语。
+        /// F-04：原主体 lock + defer unlock，batch 需要嵌套调用时会第二次
+        /// lockUncancelable 自死锁（std.Io.Mutex 不可重入，与 SessionManager
+        /// 的 dupe-before-return 约定一致），因此把「锁内主体」从「公开加锁
+        /// 入口」里拆出来。
+        fn insertLocked(self: *Self, row: T) !u64 {
             const id = self.next_id;
 
             var new_row = row;
             applyDefaults(&new_row);
             setFieldByIdentifier(T, &new_row, "id", id);
-            // 唯一约束校验（与其它已存在行比较）
+            // 唯一约束校验：O(1) 增量索引查询（F-NEW-8，旧为全表扫描）
             try self.checkUnique(new_row, null);
 
             // 先把两个可失败的容量预留好，之后 append + put 都不会失败。
@@ -276,12 +388,21 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // errdefer 会释放字符串，但行已经进了 self.rows → 之后 flush/close 是 UAF。
             try self.id_index.ensureUnusedCapacity(1);
             try self.rows.ensureUnusedCapacity(self.allocator, 1);
+            // 唯一键索引的登记容量一并预留在「可失败段」内，保证 register
+            // 阶段不可失败（缺一块都会导致索引与行脱同步）。
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                try self.ensureUniqueCapacityRows(1);
+            }
             // 字符串深拷贝到 self.allocator（与 load 的所有权模型一致）。
             // 这是最后一个可失败操作；一旦成功，后续均不会失败。
             try dupStringFields(T, self.allocator, &new_row);
 
             self.rows.appendAssumeCapacity(new_row);
             self.id_index.putAssumeCapacity(id, self.rows.items.len - 1);
+            // 登记唯一键索引（全部可失败操作已在前面完成 / 容量已预留）
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                self.registerRowUniques(new_row, id);
+            }
             self.next_id += 1;
             self.dirty = true;
             return id;
@@ -342,33 +463,39 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         pub fn findById(self: *Self, gpa: std.mem.Allocator, id: u64) !?T {
             try self.lock();
             defer self.unlock();
+            return self.findByIdLocked(gpa, id);
+        }
 
+        /// findById（调用方必须已持有锁）——batch 的原语。
+        fn findByIdLocked(self: *Self, gpa: std.mem.Allocator, id: u64) !?T {
             const idx = self.id_index.get(id) orelse return null;
             var copy = self.rows.items[idx];
             try dupStringFields(T, gpa, &copy);
             return copy;
         }
 
+        /// 批量更新（公开入口，加锁）。多步批量写请用 `batch`（单锁，F-04）。
         pub fn update(self: *Self, query: *QueryBuilder(T)) !usize {
             try query.checkBuildError();
             try self.lock();
-            errdefer self.unlock();
+            defer self.unlock();
+            return self.updateLocked(query);
+        }
 
+        /// 批量更新（调用方必须已持有锁）——batch 的执行原语。
+        fn updateLocked(self: *Self, query: *QueryBuilder(T)) !usize {
             if (query.data == null) {
-                self.unlock();
                 return 0;
             }
 
             // First pass: collect indices of rows that match the query.
-            // We hold the lock via errdefer above, so the early returns below
-            // must call self.unlock() explicitly.
+            // 锁由 wrapper 持有：内部的提前返回不需要自己 unlock。
             var matched_indices = std.ArrayList(usize).empty;
             defer matched_indices.deinit(self.allocator);
             for (self.rows.items, 0..) |row, idx| {
                 if (query.matches(row)) try matched_indices.append(self.allocator, idx);
             }
             if (matched_indices.items.len == 0) {
-                self.unlock();
                 return 0;
             }
 
@@ -512,30 +639,73 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
 
             // Third pass: commit — 调和字符串所有权并整体写回。所有校验均已通过。
+            // 多行原子：先为所有命中行 prepare（全部可能失败，都不动旧值），
+            // 全部成功后才逐行 apply（不可失败）。中途 OOM 不再留下「前几行
+            // 已提交、dirty 未置位、永不落盘」的部分提交状态。
+            var prepared_list = try self.allocator.alloc(std.ArrayList(StringChange), matched_indices.items.len);
+            errdefer {
+                for (prepared_list) |*changes| {
+                    for (changes.items) |c| if (c.new) |s| self.allocator.free(s);
+                    changes.deinit(self.allocator);
+                }
+                self.allocator.free(prepared_list);
+            }
+            for (prepared_list) |*changes| changes.* = .empty;
+
+            for (matched_indices.items, 0..) |idx, j| {
+                const row = self.rows.items[idx];
+                var updated = new_rows.items[j];
+                prepareStringChanges(T, self.allocator, row, &updated, &prepared_list[j]) catch |e| {
+                    // OOM：无行已提交，索引一致，直接上抛。
+                    return e;
+                };
+                new_rows.items[j] = updated;
+            }
+
+            // Prepare 全部成功后：唯一键索引维护同样原子——先逐 map 预留
+            // 足够新 key 的容量（可失败段），综合 commit 阶段才全部不可失败。
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                try self.ensureUniqueCapacityRows(matched_indices.items.len);
+            }
+
             var updated_count: usize = 0;
             for (matched_indices.items, 0..) |idx, j| {
                 const row = self.rows.items[idx];
                 var updated = new_rows.items[j];
-                // 修复 C1/C2：调和字符串字段所有权。对每个发生变化的字符串
-                // 字段：释放旧（已 owned）值、dup 新值入 self.allocator，避免旧值泄漏
-                // 与新值指向调用方内存而悬空。
-                try reconcileStringFields(T, self.allocator, row, &updated);
+                // 唯一键索引：先摘除旧 key（free），提交后挂新 key。row 的字符串
+                // 所有权在 applyStringChanges 中换手，旧 key 的内容在换手前计算。
+                if (unique_field_count > 0 or unique_index_count > 0) {
+                    self.unregisterRowUniques(row);
+                }
+                applyStringChanges(T, self.allocator, row, &updated, prepared_list[j].items);
                 self.rows.items[idx] = updated;
+                if (unique_field_count > 0 or unique_index_count > 0) {
+                    self.registerRowUniques(updated, getFieldId(T, updated));
+                }
                 updated_count += 1;
             }
+
+            // Apply 之后没有任何失败路径：dup'd 字符串已随行结构移入 self.rows，
+            // 这里只回收 prepare 缓冲本身。
+            for (prepared_list) |*changes| changes.deinit(self.allocator);
+            self.allocator.free(prepared_list);
 
             // 修复 C3：dirty 必须在锁内写（其他地方都在锁内访问），
             // 否则与并发 flush 竞态可能丢失一次持久化。
             if (updated_count > 0) self.dirty = true;
-            self.unlock();
             return updated_count;
         }
 
+        /// 批量删除（公开入口，加锁）。多步批量写请用 `batch`（单锁，F-04）。
         pub fn delete(self: *Self, query: *QueryBuilder(T)) !usize {
             try query.checkBuildError();
             try self.lock();
             defer self.unlock();
+            return self.deleteLocked(query);
+        }
 
+        /// 批量删除（调用方必须已持有锁）——batch 的执行原语。
+        fn deleteLocked(self: *Self, query: *QueryBuilder(T)) !usize {
             // First pass: collect indices to delete (preserving ascending order
             // via a reverse scan so the indices array is sorted ascending).
             var to_delete = std.ArrayList(usize).empty;
@@ -560,17 +730,27 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 try kept.append(self.allocator, row);
             }
 
-            // kept 已建好，下面全部不可失败：现在才释放被删行的字符串。
+            // 先确保索引容量（唯一可能失败的步骤）再释放被删行的字符串、
+            // 转移 kept 所有权——旧顺序（swap 之后再 ensureTotalCapacity）
+            // 在 OOM 时触发 errdefer kept.deinit，而 buffer 已归 self.rows，
+            // 造成 store 内 UAF + flush/close 双重释放。
+            try self.id_index.ensureTotalCapacity(std.math.cast(u32, self.rows.items.len - deleted_count) orelse std.math.maxInt(u32));
+
+            // 下面全部不可失败：现在才释放被删行的字符串。
+            // （先从唯一键索引摘除——rows 下标换基前旧值还拿到，step 顺序固定。）
             for (to_delete.items) |idx| {
-                freeStringFields(T, self.allocator, self.rows.items[idx]);
+                const row = self.rows.items[idx];
+                if (unique_field_count > 0 or unique_index_count > 0) {
+                    self.unregisterRowUniques(row);
+                }
+                freeStringFields(T, self.allocator, row);
             }
             self.rows.deinit(self.allocator);
             self.rows = kept;
 
             // Rebuild id_index in one O(N) pass instead of decrementing per row.
-            // 先确保容量足够，再用 putAssumeCapacity 不可失败地重建，避免中途 OOM
+            // 容量已就绪，putAssumeCapacity 不可失败地重建，避免中途 OOM
             // 造成索引半重建 + dirty 仍落盘。
-            try self.id_index.ensureTotalCapacity(std.math.cast(u32, self.rows.items.len) orelse std.math.maxInt(u32));
             self.id_index.clearRetainingCapacity();
             for (self.rows.items, 0..) |row, idx| {
                 self.id_index.putAssumeCapacity(getFieldId(T, row), idx);
@@ -634,6 +814,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             self.rows.clearRetainingCapacity();
             self.id_index.clearRetainingCapacity();
+            // 唯一键索引清空（key 全部 store 自持有，一并释放）
+            if (unique_field_count > 0 or unique_index_count > 0) {
+                self.destroyUniqueMaps();
+                try self.initUniqueMaps();
+            }
             self.next_id = 1;
             self.dirty = true;
         }
@@ -705,6 +890,103 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             return self.findAll(gpa, &qb);
         }
 
+        /// 分页查询（可带 where / orderBy，FRICTION F-21）。
+        ///
+        /// 传入调用方已构建好过滤条件的 QueryBuilder；本方法在其上追加：
+        /// - 条件全部沿用（caller 的 conditions 不被修改）；
+        /// - caller 未给任何 orderBy 时补默认 `id ASC`（保证分页稳定性）；
+        /// - limit / offset 始终由本方法设置（caller 若设了会被覆盖——分页
+        ///   语义里它们就是页大小 / 页起点，不属于过滤器）。
+        ///
+        /// 行内字符串由 `gpa` 拥有，调用方 `freeRows(gpa, rows)`。
+        pub fn paginateWhere(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            page: usize,
+            per_page: usize,
+            query: *QueryBuilder(T),
+        ) ![]T {
+            const offset = std.math.mul(usize, page, per_page) catch {
+                return try gpa.alloc(T, 0);
+            };
+            if (query.order_clauses.items.len == 0) {
+                _ = query.orderBy("id", .Asc);
+            }
+            _ = query.limit(per_page).offset(offset);
+            return self.findAll(gpa, query);
+        }
+
+        // ── batch：单锁多步批量写（F-04）────────────────
+        //
+        // 动机（FRICTION F-04）：`setRolePermissions = 先删全部、再逐条插入`
+        // 这类多步写，每步独立 lock + dirty +（业务层自己）flush——步骤之间存在
+        // 并发穿插窗口，且 K 步 = K 次全表 flush 写放大或「flush 之前崩溃即丢」。
+        //
+        // 约束：std.Io.Mutex 不可重入（与 SessionManager 的 dupe-before-return
+        // 约定一致），所以 batch 不做嵌套加锁，而是把 insert/update/delete 主体
+        // 抽成 `...Locked` 原语，回调在**单次持锁**期间自由组合调用。
+        //
+        // 语义边界（如实声明，不虚构 ACID）：
+        // - **并发原子**：✅ 回调全程持锁，其它请求看不到中间态。
+        // - **崩溃原子**：❌ 仍是内存模型——回调期间崩溃，已执行步骤留在内存且
+        //   dirty 已置位；要落盘请调用 `b.flush()`（复用 tmp+fsync+rename），
+        //   或 batch 后自行 `store.flush()`。真正的崩溃原子需要 WAL/undo log，
+        //   那是 F-14 的后续范围。
+        // - 回调中途出错：已执行的步骤保持已提交（内存），错误上抛。
+        pub const Batch = struct {
+            store: *Self,
+
+            /// 插入一行（同 insert，但不再加锁）。
+            pub fn insert(self: Batch, row: T) !u64 {
+                return self.store.insertLocked(row);
+            }
+
+            /// 批量更新（同 update，但不再加锁）。
+            pub fn update(self: Batch, query: *QueryBuilder(T)) !usize {
+                try query.checkBuildError();
+                return self.store.updateLocked(query);
+            }
+
+            /// 批量删除（同 delete，但不再加锁）。
+            pub fn delete(self: Batch, query: *QueryBuilder(T)) !usize {
+                try query.checkBuildError();
+                return self.store.deleteLocked(query);
+            }
+
+            /// 在持锁状态下落盘（tmp + fsync + rename）。等价于「batch 全部成功
+            /// 后的 flush」，省一次加锁；成功后 dirty 复位。
+            pub fn flush(self: Batch) !void {
+                return self.store.flushUnlocked();
+            }
+
+            /// 深拷贝一行（锁内，等价 findById 的 batch 版）。
+            pub fn findById(self: Batch, gpa: std.mem.Allocator, id: u64) !?T {
+                return self.store.findByIdLocked(gpa, id);
+            }
+        };
+
+        /// 单锁多步批量写。`Ctx` 为回调上下文类型（无可传 `void` + `{}`），
+        /// 回调在持锁期间执行。推荐用法（FRICTION F-04 的 setRolePermissions 场景）：
+        /// ```zig
+        /// try store.batch(null, struct {
+        ///     fn f(_: void, b: *Store.Batch) !void {
+        ///         _ = try b.delete(&del_qb);
+        ///         for (perm_ids) |pid| {
+        ///             _ = try b.insert(.{ .role_id = rid, .permission_id = pid });
+        ///         }
+        ///         try b.flush();
+        ///     }
+        /// }
+        /// ```
+        /// 注意回调读写 QueryBuilder 时它自身的 allocator 不受影响；锁内不要做
+        /// 阻塞 IO 或长时间计算（会阻塞所有并发请求）。
+        pub fn batch(self: *Self, comptime Ctx: type, ctx: Ctx, comptime cb: fn (Ctx, b: *Batch) anyerror!void) anyerror!void {
+            try self.lock();
+            defer self.unlock();
+            var b = Batch{ .store = self };
+            try cb(ctx, &b);
+        }
+
         // ── 内部辅助 ────────────────────────────────
 
         /// 判断两个 FieldValue 是否相等（字符串按内容比较）。
@@ -734,31 +1016,211 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
         }
 
-        /// 校验唯一约束：row 的 unique 字段 / unique index 组合不得与
-        /// （除 except_id 外）其它行冲突。F-01：原先只遍历 `constraints.unique`
-        /// 字段，而 `Model()` 生成的 schema 里没有任何字段标 unique —— 唯一约束
-        /// 对所有非 id 字段完全失效。这里同时覆盖单字段与联合两种声明。
-        fn checkUnique(self: *const Self, row: T, except_id: ?u64) !void {
-            for (schema.fields) |f| {
-                if (!f.constraints.unique) continue;
-                if (query_mod.isFieldNull(T, row, f.name)) continue;
-                const v = query_mod.getFieldValue(T, row, f.name);
-                for (self.rows.items) |other| {
-                    if (except_id != null and getFieldId(T, other) == except_id.?) continue;
-                    if (query_mod.isFieldNull(T, other, f.name)) continue;
-                    if (fieldValuesEqual(v, query_mod.getFieldValue(T, other, f.name))) {
-                        return error.UniqueViolation;
+        /// 初始化唯一键增量索引的 map 数组（open 调用；无唯一约束时是空数组）。
+        fn initUniqueMaps(self: *Self) !void {
+            if (unique_field_count > 0) {
+                self.field_key_maps = try self.allocator.alloc(std.StringHashMap(u64), unique_field_count);
+                for (self.field_key_maps) |*m| m.* = .init(self.allocator);
+            }
+            if (unique_index_count > 0) {
+                self.index_key_maps = try self.allocator.alloc(std.StringHashMap(u64), unique_index_count);
+                for (self.index_key_maps) |*m| m.* = .init(self.allocator);
+            }
+        }
+
+        /// 释放唯一键增量索引的全部资源（close/tableFileErrdefer 调用）。
+        /// key 由 store 分配自持有，逐条释放（与 evictSampled 同约定）。
+        fn destroyUniqueMaps(self: *Self) void {
+            for (self.field_key_maps) |*m| {
+                var it = m.keyIterator();
+                while (it.next()) |k| self.allocator.free(k.*);
+                m.deinit();
+            }
+            self.allocator.free(self.field_key_maps);
+            self.field_key_maps = &.{};
+            for (self.index_key_maps) |*m| {
+                var it = m.keyIterator();
+                while (it.next()) |k| self.allocator.free(k.*);
+                m.deinit();
+            }
+            self.allocator.free(self.index_key_maps);
+            self.index_key_maps = &.{};
+        }
+
+        /// 把一行登记进唯一的 key 索引（insert / update 提交调用）。
+        /// **调用前提**：冲突校验已通过；所有 map 已 ensureUnusedCapacity(1)，
+        /// 登记阶段不可失败。
+        fn registerRowUniques(self: *Self, row: T, id: u64) void {
+            inline for (schema.fields, 0..) |f, fi| {
+                const mi = field_map_idx[fi];
+                if (comptime mi >= 0 and f.constraints.unique) {
+                    const m = &self.field_key_maps[@intCast(mi)];
+                    if (!query_mod.isFieldNull(T, row, f.name)) {
+                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                        const gop = m.getOrPut(key) catch {
+                            self.allocator.free(key);
+                            return;
+                        };
+                        if (gop.found_existing) {
+                            // 校验已拦住；防御性：保留现有映射，丢弃新 key。
+                            self.allocator.free(key);
+                            return;
+                        }
+                        gop.value_ptr.* = id;
                     }
                 }
             }
-            for (schema.indexes) |idx| {
-                if (!idx.unique) continue;
-                if (groupHasNull(row, idx.fields)) continue;
-                for (self.rows.items) |other| {
-                    if (except_id != null and getFieldId(T, other) == except_id.?) continue;
-                    if (groupHasNull(other, idx.fields)) continue;
-                    if (groupEquals(row, other, idx.fields)) return error.UniqueViolation;
+            inline for (schema.indexes, 0..) |idx, ii| {
+                const mi = index_map_idx[ii];
+                if (comptime mi >= 0 and idx.unique) {
+                    const m = &self.index_key_maps[@intCast(mi)];
+                    if (!groupHasNull(row, idx.fields)) {
+                        const key = groupKey(self.allocator, row, idx.fields) catch return;
+                        const gop = m.getOrPut(key) catch {
+                            self.allocator.free(key);
+                            return;
+                        };
+                        if (gop.found_existing) {
+                            self.allocator.free(key);
+                            return;
+                        }
+                        gop.value_ptr.* = id;
+                    }
                 }
+            }
+        }
+
+        /// 把一行从唯一样式索引摘除并释放其 key（update 提交前 / delete 调用）。
+        fn unregisterRowUniques(self: *Self, row: T) void {
+            inline for (schema.fields, 0..) |f, fi| {
+                const mi = field_map_idx[fi];
+                if (comptime mi >= 0 and f.constraints.unique) {
+                    const m = &self.field_key_maps[@intCast(mi)];
+                    if (!query_mod.isFieldNull(T, row, f.name)) {
+                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                        defer self.allocator.free(key);
+                        if (m.fetchRemove(key)) |kv| self.allocator.free(kv.key);
+                    }
+                }
+            }
+            inline for (schema.indexes, 0..) |idx, ii| {
+                const mi = index_map_idx[ii];
+                if (comptime mi >= 0 and idx.unique) {
+                    const m = &self.index_key_maps[@intCast(mi)];
+                    if (!groupHasNull(row, idx.fields)) {
+                        const key = groupKey(self.allocator, row, idx.fields) catch return;
+                        defer self.allocator.free(key);
+                        if (m.fetchRemove(key)) |kv| self.allocator.free(kv.key);
+                    }
+                }
+            }
+        }
+
+        /// 唯一约束校验：O(1) map 查询（F-NEW-8）。row 的 unique 字段 / 唯一索引
+        /// 组合不得与其它行冲突（自己 existing 的 key 允许——update 场景鞍事）。
+        fn checkUnique(self: *const Self, row: T, except_id: ?u64) !void {
+            if (unique_field_count == 0 and unique_index_count == 0) return;
+            var key_draft = std.ArrayList([]u8).empty;
+            defer {
+                for (key_draft.items) |k| self.allocator.free(k);
+                key_draft.deinit(self.allocator);
+            }
+
+            inline for (schema.fields, 0..) |f, fi| {
+                const mi = field_map_idx[fi];
+                if (comptime mi >= 0 and f.constraints.unique) {
+                    if (!query_mod.isFieldNull(T, row, f.name)) {
+                        const key = try fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name));
+                        key_draft.append(self.allocator, key) catch |e| {
+                            self.allocator.free(key);
+                            return e;
+                        };
+                        const m = &self.field_key_maps[@intCast(mi)];
+                        if (m.get(key)) |existing_id| {
+                            if (except_id == null or existing_id != except_id.?) {
+                                return error.UniqueViolation;
+                            }
+                        }
+                    }
+                }
+            }
+            inline for (schema.indexes, 0..) |idx, ii| {
+                const mi = index_map_idx[ii];
+                if (comptime mi >= 0 and idx.unique) {
+                    if (!groupHasNull(row, idx.fields)) {
+                        const key = try groupKey(self.allocator, row, idx.fields);
+                        key_draft.append(self.allocator, key) catch |e| {
+                            self.allocator.free(key);
+                            return e;
+                        };
+                        const m = &self.index_key_maps[@intCast(mi)];
+                        if (m.get(key)) |existing_id| {
+                            if (except_id == null or existing_id != except_id.?) {
+                                return error.UniqueViolation;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// 开启时重建唯一键索引（load 之后调用）。发现存量重复时告警
+        /// 并保留首行映射（warning-only，不拒启动——见 F-NEW-5.1 讨论）。
+        fn buildUniqueIndexes(self: *Self) void {
+            if (unique_field_count == 0 and unique_index_count == 0) return;
+            // 逐 map 预留容量，让 putAssumeCapacity 阶段不可失败。
+            self.ensureUniqueCapacityRows(self.rows.items.len) catch return;
+            for (self.rows.items) |row| {
+                const id = getFieldId(T, row);
+                inline for (schema.fields, 0..) |f, fi| {
+                    const mi = field_map_idx[fi];
+                    if (comptime mi >= 0 and f.constraints.unique) {
+                        if (!query_mod.isFieldNull(T, row, f.name)) {
+                            const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                            const m = &self.field_key_maps[@intCast(mi)];
+                            const gop = m.getOrPut(key) catch {
+                                self.allocator.free(key);
+                                return;
+                            };
+                            if (gop.found_existing) {
+                                std.log.warn("orm: {s} 打开时发现存量数据违反唯一约束（字段 {s} 有重复值）——加载已放行；后续 update/insert 该值会报 UniqueViolation", .{ self.table_name, f.name });
+                                self.allocator.free(key);
+                            } else {
+                                gop.value_ptr.* = id;
+                            }
+                        }
+                    }
+                }
+                inline for (schema.indexes, 0..) |idx, ii| {
+                    const mi = index_map_idx[ii];
+                    if (comptime mi >= 0 and idx.unique) {
+                        if (!groupHasNull(row, idx.fields)) {
+                            const key = groupKey(self.allocator, row, idx.fields) catch return;
+                            const m = &self.index_key_maps[@intCast(mi)];
+                            const gop = m.getOrPut(key) catch {
+                                self.allocator.free(key);
+                                return;
+                            };
+                            if (gop.found_existing) {
+                                std.log.warn("orm: {s} 打开时发现存量数据违反联合唯一约束（索引 {s} 有重复组合）——加载已放行；后续写入会报 UniqueViolation", .{ self.table_name, idx.name });
+                                self.allocator.free(key);
+                            } else {
+                                gop.value_ptr.* = id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// 为唯一索引预留足够容量：此后每行 put（最多一次 per map per row）
+        /// 都不会中途 OOM。
+        fn ensureUniqueCapacityRows(self: *Self, rows: usize) !void {
+            if (unique_field_count > 0) {
+                for (self.field_key_maps) |*m| try m.ensureUnusedCapacity(@intCast(rows));
+            }
+            if (unique_index_count > 0) {
+                for (self.index_key_maps) |*m| try m.ensureUnusedCapacity(@intCast(rows));
             }
         }
 
@@ -855,6 +1317,56 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 }
 
 // ── 序列化辅助 ──────────────────────────────────────
+
+/// 检测单条存量行与当前 Row(T) 结构是否漂移（F-05.1）：
+/// 满足其一即 true —— ① T 有字段而 JSON 里没有（缺列）；
+/// ② JSON 里有 T 不认识的键（多余列，jsonObjectToType 会静默丢弃）。
+fn rowSchemaDiff(comptime T: type, obj: std.json.ObjectMap) bool {
+    const names = @typeInfo(T).@"struct".field_names;
+    inline for (names) |name| {
+        if (obj.get(name) == null) return true;
+    }
+    var it = obj.iterator();
+    outer: while (it.next()) |e| {
+        inline for (names) |name| {
+            if (std.mem.eql(u8, e.key_ptr.*, name)) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// 打印 schema 漂移详情（F-05.1）：缺哪些列、多余哪些键（截断到 64 字符）。
+/// 消息按 warnSchemaDiff 的调用点约定只对该表打一条。
+fn warnSchemaDiff(comptime T: type, allocator: std.mem.Allocator, table_name: []const u8, obj: std.json.ObjectMap) void {
+    const names = @typeInfo(T).@"struct".field_names;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    buf.appendSlice(allocator, "missing=[") catch return;
+    var first = true;
+    inline for (names) |name| {
+        if (obj.get(name) == null) {
+            if (!first) buf.appendSlice(allocator, ", ") catch return;
+            buf.appendSlice(allocator, name) catch return;
+            first = false;
+        }
+    }
+    buf.appendSlice(allocator, "] extra=[") catch return;
+    var it = obj.iterator();
+    var first_extra = true;
+    outer2: while (it.next()) |e| {
+        inline for (names) |name| {
+            if (std.mem.eql(u8, e.key_ptr.*, name)) continue :outer2;
+        }
+        if (!first_extra) buf.appendSlice(allocator, ", ") catch return;
+        const k = if (e.key_ptr.*.len > 64) e.key_ptr.*[0..64] else e.key_ptr.*;
+        buf.appendSlice(allocator, k) catch return;
+        first_extra = false;
+    }
+    buf.appendSlice(allocator, "]") catch return;
+    std.log.warn("orm: {s} 存量数据与当前 Row 结构不一致（缺失字段已按 schema 默认值补齐 / 多余字段已忽略）——{s}；改表结构后建议尽快 flush 让数据归位", .{ table_name, buf.items });
+}
 
 fn jsonObjectToType(comptime T: type, allocator: std.mem.Allocator, obj: std.json.ObjectMap) !T {
     var result: T = undefined;
@@ -1186,56 +1698,60 @@ fn isOptionalConstU8Slice(comptime FT: type) bool {
     };
 }
 
-/// 调和 update 时的字符串所有权（修复 C1/C2）。
-/// 对每个字符串字段（含 optional）：若 updated 的指针与 original 不同（即被覆写为
-/// 调用方内存），则释放 original（已 owned）、把新值 dup 入 allocator。
-/// 未变的字段保留 original 的 owned 指针（updated 与 original 共享）。
-///
-/// 两阶段提交（低危：避免中途 OOM 时旧值已释放、新值未就位的 UAF）：先把所有
-/// 变更的新字符串 dup 到 scratch，全部成功后才统一释放旧值并回写。
-fn reconcileStringFields(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T) !void {
+/// 单个字符串字段的待写回变更：apply 阶段释放旧（owned）值、安装 dup 入 allocator
+/// 的新值。未变的字段不出现在 changes 里（updated 与 original 共享 owned 指针）。
+const StringChange = struct {
+    name: []const u8,
+    is_optional: bool,
+    new: ?[]const u8,
+};
+
+/// 单行 prepare 阶段：dup 所有变更的新值到 changes（每条变更原子：append 失败
+/// 时释放该 dup，旧值尚未动）。全程不动 original / updated 的旧值。
+/// 修复 C1/C2（升级为多行原子版）：调用方只有在所有命中行的 prepare 全部成功
+/// 后才逐行 apply，保证多行 update 要么全部换上新值、要么全部保持旧值——
+/// 旧的单行两阶段实现在多行循环中途 OOM 时会留下「前几行已提交、后几行未提交、
+/// dirty 未置位（永不落盘）」的部分提交状态。
+fn prepareStringChanges(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T, changes: *std.ArrayList(StringChange)) !void {
     const info = switch (@typeInfo(T)) {
         .@"struct" => |s| s,
         else => @compileError("expected struct"),
     };
-
-    const Change = struct {
-        name: []const u8,
-        is_optional: bool,
-        new: ?[]const u8,
-    };
-
-    // Phase 1：dup 所有变更的新值到 scratch，全程不动旧值。
-    var changes = std.ArrayList(Change).empty;
-    defer changes.deinit(allocator);
-    errdefer for (changes.items) |c| if (c.new) |s| allocator.free(s);
 
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime isConstU8Slice(ftype)) {
             const orig_slice = @field(original, fname);
             const new_slice = @field(updated.*, fname);
             if (orig_slice.ptr != new_slice.ptr) {
-                try dupAppendChange(allocator, &changes, fname, false, new_slice);
+                try dupAppendChange(allocator, changes, fname, false, new_slice);
             }
         } else if (comptime isOptionalConstU8Slice(ftype)) {
             const orig_opt = @field(original, fname);
             const new_opt = @field(updated.*, fname);
             switch (orig_opt) {
-                null => if (new_opt) |new_slice| try dupAppendChange(allocator, &changes, fname, true, new_slice),
+                null => if (new_opt) |new_slice| try dupAppendChange(allocator, changes, fname, true, new_slice),
                 else => |orig_slice| switch (new_opt) {
                     null => try changes.append(allocator, .{ .name = fname, .is_optional = true, .new = null }),
                     else => |new_slice| if (orig_slice.ptr != new_slice.ptr) {
-                        try dupAppendChange(allocator, &changes, fname, true, new_slice);
+                        try dupAppendChange(allocator, changes, fname, true, new_slice);
                     },
                 },
             }
         }
     }
+}
 
-    // Phase 2：全部 dup 成功，释放旧值并回写新值（不可失败）。
+/// 单行 apply 阶段：该行的 prepare 已全部成功（dup 均就位），释放旧值并回写
+/// 新值。不可失败。
+fn applyStringChanges(comptime T: type, allocator: std.mem.Allocator, original: T, updated: *T, changes: []const StringChange) void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+
     inline for (info.field_names, info.field_types) |fname, ftype| {
         if (comptime !isConstU8Slice(ftype) and !isOptionalConstU8Slice(ftype)) continue;
-        for (changes.items) |c| {
+        for (changes) |c| {
             if (!std.mem.eql(u8, c.name, fname)) continue;
             if (comptime isConstU8Slice(ftype)) {
                 allocator.free(@field(original, fname));
@@ -2430,4 +2946,281 @@ test "default_value applied on insert" {
     const f = try store.findById(allocator, id);
     defer store.freeRow(allocator, f.?);
     try std.testing.expectEqualStrings("user", f.?.role);
+}
+
+// ── F-21：paginate 可带 where / orderBy ──────────────────────────────
+test "paginateWhere 按 where 过滤分页，默认 id 升序" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, org_id: i64, name: []const u8 };
+    const sch = TableSchema{
+        .table_name = "page_users",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "org_id", .field_type = .integer },
+            .{ .name = "name", .field_type = .string },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    _ = try store.insert(.{ .id = 0, .org_id = 1, .name = "u1" });
+    _ = try store.insert(.{ .id = 0, .org_id = 2, .name = "u2" });
+    _ = try store.insert(.{ .id = 0, .org_id = 1, .name = "u3" });
+
+    var qb = QueryBuilder(U).init(allocator);
+    defer qb.deinit();
+    _ = qb.whereEq("org_id", .{ .integer = 1 });
+    const page = try store.paginateWhere(allocator, 0, 10, &qb);
+    defer store.freeRows(allocator, page);
+    try std.testing.expectEqual(@as(usize, 2), page.len);
+    try std.testing.expectEqualStrings("u1", page[0].name);
+    try std.testing.expectEqualStrings("u3", page[1].name);
+}
+
+// ── F-NEW-5.1：open 时发现存量重复唯一值只告警、不拒启动 ─────────────
+test "open 遇存量重复唯一值放行加载，后续写入仍报 UniqueViolation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, email: []const u8 };
+    const sch = TableSchema{
+        .table_name = "uniq_drift",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "email", .field_type = .string, .constraints = .{ .unique = true } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    // 直接落一个含重复 email 的表文件（模拟线上脏数据）
+    const cwd = std.Io.Dir.cwd();
+    {
+        const data = try allocator.dupe(u8,
+            \\[{"id":1,"email":"a@x.com"},{"id":2,"email":"a@x.com"}]
+        );
+        defer allocator.free(data);
+        const f = try cwd.createFile(io, ".test_data/uniq_drift.json", .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, data);
+    }
+    // open 必须**成功**（ warnDuplicateUniques 只告警不 reject）
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    // 存量 2 行都在（去重改写为正常计数）
+    var cqb = QueryBuilder(U).init(allocator);
+    defer cqb.deinit();
+    _ = cqb.where(.Neq, "id", .{ .integer = 0 });
+    try std.testing.expectEqual(@as(usize, 2), try store.count(&cqb));
+
+    // 相同值再插一行：撞唯一约束（加载放行不应用于写路径）
+    try std.testing.expectError(error.UniqueViolation, store.insert(.{ .id = 0, .email = "a@x.com" }));
+}
+
+// ── F-03：In / NotIn 成员判定 ────────────────────────────────────────
+test "whereIn / whereNotIn 整数与字符串成员判定" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, org_id: i64, role: []const u8 };
+    const sch = TableSchema{
+        .table_name = "in_users",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "org_id", .field_type = .integer },
+            .{ .name = "role", .field_type = .string },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    _ = try store.insert(.{ .id = 0, .org_id = 1, .role = "admin" });
+    _ = try store.insert(.{ .id = 0, .org_id = 2, .role = "operator" });
+    _ = try store.insert(.{ .id = 0, .org_id = 3, .role = "viewer" });
+
+    // IN
+    const org_ids = [_]FieldValue{ .{ .integer = 1 }, .{ .integer = 3 } };
+    var qb = QueryBuilder(U).init(allocator);
+    defer qb.deinit();
+    _ = qb.whereIn("org_id", &org_ids);
+    const rows = try store.findAll(allocator, &qb);
+    defer store.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("admin", rows[0].role);
+    try std.testing.expectEqualStrings("viewer", rows[1].role);
+
+    // NOT IN
+    var qb2 = QueryBuilder(U).init(allocator);
+    defer qb2.deinit();
+    _ = qb2.whereNotIn("org_id", &org_ids);
+    const rows2 = try store.findAll(allocator, &qb2);
+    defer store.freeRows(allocator, rows2);
+    try std.testing.expectEqual(@as(usize, 1), rows2.len);
+    try std.testing.expectEqualStrings("operator", rows2[0].role);
+
+    // 字符串 IN
+    const roles = [_]FieldValue{ .{ .string = "operator" }, .{ .string = "viewer" } };
+    var qb3 = QueryBuilder(U).init(allocator);
+    defer qb3.deinit();
+    _ = qb3.whereIn("role", &roles);
+    const rows3 = try store.findAll(allocator, &qb3);
+    defer store.freeRows(allocator, rows3);
+    try std.testing.expectEqual(@as(usize, 2), rows3.len);
+
+    // 空列表：IN 恒假 / NOT IN 恒真（SQL 语义）
+    var qb4 = QueryBuilder(U).init(allocator);
+    defer qb4.deinit();
+    _ = qb4.whereIn("org_id", &.{});
+    try std.testing.expectEqual(@as(usize, 0), try store.count(&qb4));
+    var qb5 = QueryBuilder(U).init(allocator);
+    defer qb5.deinit();
+    _ = qb5.whereNotIn("org_id", &.{});
+    try std.testing.expectEqual(@as(usize, 3), try store.count(&qb5));
+}
+
+// ── F-04：单锁多步批量写 ─────────────────────────────────────────────
+test "batch 单锁多步批量写：setRolePermissions 式删后插 + 持锁 flush" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Perm = struct { id: u64 = 0, role_id: i64, code: []const u8 };
+    const sch = TableSchema{
+        .table_name = "batch_role_perms",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "role_id", .field_type = .integer },
+            .{ .name = "code", .field_type = .string },
+        },
+    };
+    const Store = JsonStore(Perm, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    _ = try store.insert(.{ .id = 0, .role_id = 7, .code = "old.a" });
+    _ = try store.insert(.{ .id = 0, .role_id = 7, .code = "old.b" });
+    _ = try store.insert(.{ .id = 0, .role_id = 8, .code = "keep.a" });
+
+    var del_qb = QueryBuilder(Perm).init(allocator);
+    defer del_qb.deinit();
+    _ = del_qb.whereEq("role_id", .{ .integer = 7 });
+
+    const Ctx = struct { dqb: *QueryBuilder(Perm) };
+    const migrator = struct {
+        fn f(c: Ctx, b: *Store.Batch) anyerror!void {
+            // 全删该角色旧权限，再插两条新权限，然后持锁 flush——全程单锁。
+            const n = try b.delete(c.dqb);
+            try std.testing.expectEqual(@as(usize, 2), n);
+            _ = try b.insert(.{ .id = 0, .role_id = 7, .code = "new.a" });
+            _ = try b.insert(.{ .id = 0, .role_id = 7, .code = "new.b" });
+            try b.flush();
+        }
+    }.f;
+    try store.batch(Ctx, Ctx{ .dqb = &del_qb }, migrator);
+
+    // flush 已落盘（dirty 复位）；随后 close 不再触发第二落盘也能对得上。
+    try std.testing.expectEqual(@as(usize, 3), try store.countAll());
+    const new_u = (try store.findBy(allocator, "code", "new.a")).?;
+    defer store.freeRow(allocator, new_u);
+    try std.testing.expectEqual(@as(i64, 7), new_u.role_id);
+    try std.testing.expect(store.dirty == false);
+}
+
+test "batch 回调出错：错误上抛、锁释放、store 可继续使用" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, email: []const u8 };
+    const sch = TableSchema{
+        .table_name = "batch_err",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "email", .field_type = .string, .constraints = .{ .unique = true } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+
+    const f = struct {
+        fn g(_: void, b: *Store.Batch) anyerror!void {
+            _ = try b.insert(.{ .id = 0, .email = "a@x.com" });
+            // 第二条撞唯一约束：错误从原语冒出、穿 batch 上抛
+            _ = try b.insert(.{ .id = 0, .email = "a@x.com" });
+            return error.Unreachable;
+        }
+    }.g;
+    try std.testing.expectError(error.UniqueViolation, store.batch(void, {}, f));
+
+    // 锁已释放（继续可写不死锁），已执行步骤保持（内存可见性按 F-04 语义）
+    _ = try store.insert(.{ .id = 0, .email = "b@x.com" });
+    try std.testing.expectEqual(@as(usize, 2), try store.countAll());
+}
+
+// ── F-05.1：最低限度迁移执行器（schema 漂移对齐 + 告警） ──────────────
+test "load 时按当前 schema 对齐旧数据：缺列补默认值、多余键丢弃、warn 一次" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, email: []const u8, role: []const u8 = "viewer" };
+    const sch = TableSchema{
+        .table_name = "legacy_migration",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true, .auto_increment = true } },
+            .{ .name = "email", .field_type = .string, .constraints = .{ .unique = true } },
+            .{ .name = "role", .field_type = .string, .constraints = .{ .default_value = FieldValue{ .string = "member" } } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+
+    // 手工写一份「旧 schema」数据：旧行没有 role 列（新列），还有已删除的 legacy 列
+    const legacy_rows = "[{\"id\":1,\"email\":\"a@x.com\",\"legacy\":\"x\"},{\"id\":2,\"email\":\"b@x.com\"}]";
+    {
+        const cwd = std.Io.Dir.cwd();
+        const path = try std.fmt.allocPrint(allocator, ".test_data/legacy_migration.json", .{});
+        defer allocator.free(path);
+        const f = try cwd.createFile(io, path, .{ .truncate = true });
+        defer f.close(io);
+        var wb: [512]u8 = undefined;
+        var w = f.writer(io, wb[0..]);
+        try w.interface.writeAll(legacy_rows);
+        try w.flush();
+    }
+    // 结束后删除遗留文件，避免污染共享 .test_data（其他测试 open 同表名）。
+    defer std.Io.Dir.cwd().deleteFile(io, ".test_data/legacy_migration.json") catch {};
+
+    var store = try Store.open(allocator, io, ".test_data");
+    defer store.close() catch {};
+
+    // 缺列：role 补成 schema default_value（"member"，而非类型零值 ""）
+    const r1 = (try store.findById(allocator, 1)).?;
+    defer store.freeRow(allocator, r1);
+    try std.testing.expectEqualStrings("a@x.com", r1.email);
+    try std.testing.expectEqualStrings("member", r1.role);
+
+    const r2 = (try store.findById(allocator, 2)).?;
+    defer store.freeRow(allocator, r2);
+    try std.testing.expectEqualStrings("b@x.com", r2.email);
+    try std.testing.expectEqualStrings("member", r2.role);
+
+    // 存在的 0 值数据不被默认值改写：补齐只针对「JSON 里没有该键」的行
+    const rows = try store.all(allocator);
+    defer store.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+
+    // 把补齐后的数据落盘，再次打开 → 不再漂移（下一轮 load 无 warn）
+    store.dirty = true;
+    try store.flush();
+    var reopened = try Store.open(allocator, io, ".test_data");
+    defer reopened.close() catch {};
+    const rr = (try reopened.findById(allocator, 1)).?;
+    defer reopened.freeRow(allocator, rr);
+    try std.testing.expectEqualStrings("member", rr.role);
 }

@@ -147,10 +147,8 @@ fn notFoundHandler(_: *framework.Context, res: *framework.Response) !void {
 
 > **配置启动期校验**：`server.setup()` 会调 `Config.validate()`——取值越界（端口/超时/
 > buffer 为 0 等）逐条报原因后拒绝启动；“能设置、不报错，但不改变行为”的死开关
-> （`body.lazy_read_size`、`network.idle_timeout_ns`（keep-alive 空闲实际由
-> `network.read_timeout_ns` 约束）、`http.access_log_enabled`（要访问日志请注册
-> `LoggingHook`/`LoggingMiddleware`））默认只打 warn，`http.strict_config=true` 时升级为
-> 启动失败（CI 推荐）。
+> （`http.access_log_enabled`（要访问日志请注册 `LoggingHook`/`LoggingMiddleware`））
+> 默认只打 warn，`http.strict_config=true` 时升级为启动失败（CI 推荐）。
 
 > **切换运行时后端**：入口改两行即可 —— `framework.runZio(gpa, appMain)` →
 > `framework.runStd(gpa, appMain)`，`framework.ZioServer` → `framework.StdServer`，其余组装代码不动。
@@ -385,8 +383,9 @@ try router.use(framework.Middleware.init(framework.SecurityHeaders, &security));
 var cors = framework.CorsMiddleware{ .config = .{} };
 try router.use(framework.Middleware.init(framework.CorsMiddleware, &cors));
 
-// 限流（窗口内超过上限返回 429 + Retry-After）
-var rate = framework.RateLimiter.init(allocator, io, .{
+// 限流（窗口内超过上限返回 429 + Retry-After；window_seconds=0 / max_requests=0
+// 是启动期 error.InvalidConfig——ReleaseFast 下也不会静默失效）
+var rate = try framework.RateLimiter.init(allocator, io, .{
     .window_seconds = 60,
     .max_requests = 100,
     .per_ip = false, // per_ip=true 需在 Config.body 开 trust_proxy_headers
@@ -508,7 +507,9 @@ fn onWs(ws: *framework.WebSocket, conns: *usize) anyerror!void {
 `wsNotificationsHandler` 则传服务容器指针，两者都是正例。）
 
 底层 API 也可单独使用：`framework.wsComputeAcceptKey`（计算 Accept）、
-`framework.WebSocket.initServer/initClient`（连接级读写）、`framework.wsEncodeFrame/wsDecodeFrame`（单帧编解码）。
+`framework.WebSocket.initServer/initClient`（连接级读写；initServer 需传真实
+调度器 io —— send() 靠持锁保证推送任务与 auto-pong 不交错写坏帧）、
+`framework.wsEncodeFrame/wsDecodeFrame`（单帧编解码）。
 
 ### 静态文件服务
 

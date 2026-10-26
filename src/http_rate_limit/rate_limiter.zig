@@ -70,11 +70,17 @@ pub const RateLimiter = struct {
         window_start: i96, // 修复 P1：统一用 i96
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: RateLimitConfig) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: RateLimitConfig) !Self {
         // window_seconds=0 是致命的手误：窗口长度 0 意味着每条记录在写入的
         // 同一纳秒就已过期——isRateLimitedLocked 恒为 false、updateRecordLocked
-        // 每次重置、maybeCleanupLocked 立刻回收，限流器静默失效且无任何报错。
-        std.debug.assert(config.window_seconds > 0);
+        // 每次重置、maybeCleanupLocked 立刻回收，限流器**静默失效**且无任何报错
+        // ——一个为了防 DoS 而存在的防线被直接关掉。旧实现用
+        // std.debug.assert 表达这个约定，ReleaseFast/ReleaseSmall 下被编译掉，
+        // 生产构建里 0 窗口照样静默失效。这里改为运行时检查（无法构造出失效的
+        // 限流器）；max_requests=0 也一并拒绝（语义上 = 每窗口全拒，几乎必是
+        // 手误，启动即失败比吞掉所有请求好排查）。
+        if (config.window_seconds == 0) return error.InvalidConfig;
+        if (config.max_requests == 0) return error.InvalidConfig;
         return .{
             .config = config,
             .allocator = allocator,
@@ -346,7 +352,7 @@ fn writeRateLimitHeaders(res: *Response, snap: RateLimiter.Snapshot) !void {
 // ===========================================================================
 
 test "RateLimiter within limit not rate-limited" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 5,
         .per_ip = false,
@@ -364,7 +370,7 @@ test "RateLimiter within limit not rate-limited" {
 }
 
 test "RateLimiter exceeding limit is rate-limited" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 3,
         .per_ip = false,
@@ -381,7 +387,7 @@ test "RateLimiter exceeding limit is rate-limited" {
 }
 
 test "RateLimiter window expiry resets limit" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 1,
         .max_requests = 2,
         .per_ip = false,
@@ -399,7 +405,7 @@ test "RateLimiter window expiry resets limit" {
 }
 
 test "RateLimiter multiple identifiers are independent" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 2,
         .per_ip = false,
@@ -461,7 +467,7 @@ test "trust_proxy=true: X-Real-IP 优先于 X-Forwarded-For" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Real-IP: 10.0.0.1\r\nX-Forwarded-For: 192.168.0.1, 10.0.0.2\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = true });
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = true });
     defer rl.deinit();
     var buf: [64]u8 = undefined;
     const id = rl.getIdentifier(&ctx, &buf);
@@ -474,7 +480,7 @@ test "M8: X-Forwarded-For 从右向左取（不再取最左易伪造值）" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Forwarded-For: 192.168.0.1, 10.0.0.2\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = true });
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = true });
     defer rl.deinit();
     var buf: [64]u8 = undefined;
     // 无可信代理列表：取最右值（最近一跳代理写入的唯一可信地址）
@@ -488,7 +494,7 @@ test "M8: X-Forwarded-For 跳过可信代理取真正客户端" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Forwarded-For: 192.168.0.1, 203.0.113.10, 10.0.0.2\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .per_ip = true,
         .trust_proxy = true,
         .trusted_proxies = &.{"10.0.0.2"},
@@ -511,7 +517,7 @@ test "H3: trust_proxy=false 且带内核 peer_ip 时按对端 IP 限流" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Forwarded-For: 192.168.0.1\r\nX-Real-IP: 10.0.0.1\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, v4);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = false });
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = false });
     defer rl.deinit();
     // 不信任代理头 → 不用 X-Real-IP/Forwarded-For，用内核 accept 的对端 IP（H3 修复）
     var buf: [64]u8 = undefined;
@@ -525,7 +531,7 @@ test "trust_proxy=false 且无对端地址：返回 null（跳过限流）" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Forwarded-For: 192.168.0.1\r\nX-Real-IP: 10.0.0.1\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = false });
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = true, .trust_proxy = false });
     defer rl.deinit();
     var buf: [64]u8 = undefined;
     try std.testing.expect(rl.getIdentifier(&ctx, &buf) == null);
@@ -536,7 +542,7 @@ test "per_ip=false: 返回 global 标识" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Forwarded-For: 192.168.0.1\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = false, .trust_proxy = false });
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .per_ip = false, .trust_proxy = false });
     defer rl.deinit();
     var buf: [64]u8 = undefined;
     const id = rl.getIdentifier(&ctx, &buf);
@@ -550,7 +556,7 @@ test "P2-22: identifier_header 在 trust_proxy=false 时被忽略（防伪造绕
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Client-Id: attacker-rotating-value\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
     // identifier_header 设了，但 trust_proxy=false → 不信客户端头，回退到 global
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .identifier_header = "X-Client-Id",
         .per_ip = false,
         .trust_proxy = false,
@@ -567,7 +573,7 @@ test "P2-22: identifier_header 在 trust_proxy=true 时生效" {
     defer arena.deinit();
     var req = makeRateReq("GET / HTTP/1.1\r\nX-Client-Id: tenant-42\r\n\r\n");
     var ctx = makeRateCtx(arena.allocator(), &req, null);
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .identifier_header = "X-Client-Id",
         .per_ip = false,
         .trust_proxy = true,
@@ -590,7 +596,7 @@ test "畸形 X-Forwarded-For 不产生空 identifier（回退对端 IP）" {
     }) |raw| {
         var req = makeRateReq(raw);
         var ctx = makeRateCtx(arena.allocator(), &req, v4);
-        var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+        var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
             .per_ip = true,
             .trust_proxy = true,
         });
@@ -645,7 +651,7 @@ test "F-13: exclude_paths 命中的路径完全跳过限流" {
     defer arena.deinit();
 
     // max_requests=1：第二个非豁免请求就该 429。
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 1,
         .per_ip = false,
@@ -674,7 +680,7 @@ test "F-13: exclude_paths 命中的路径完全跳过限流" {
 }
 
 test "F-13: 豁免前缀按段对齐（/health 不豁免 /healthz）" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 1,
         .per_ip = false,
@@ -691,7 +697,7 @@ test "F-13: 豁免前缀按段对齐（/health 不豁免 /healthz）" {
 }
 
 test "F-13: exclude_paths 为空时全部限流（默认行为不变）" {
-    var rl = RateLimiter.init(std.testing.allocator, std.testing.io, .{
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{
         .window_seconds = 60,
         .max_requests = 1,
         .per_ip = false,
@@ -707,4 +713,11 @@ test "空 entry 被跳过，取左侧真正客户端" {
         "198.51.100.7",
         RateLimiter.proxyChainClient("198.51.100.7, 203.0.113.10,   ", &.{"203.0.113.10"}),
     );
+}
+
+test "init 拒绝 window_seconds=0 / max_requests=0（回归：ReleaseFast 下 assert 被编译掉、限流静默失效）" {
+    try std.testing.expectError(error.InvalidConfig, RateLimiter.init(std.testing.allocator, std.testing.io, .{ .window_seconds = 0, .max_requests = 10 }));
+    try std.testing.expectError(error.InvalidConfig, RateLimiter.init(std.testing.allocator, std.testing.io, .{ .window_seconds = 60, .max_requests = 0 }));
+    var rl = try RateLimiter.init(std.testing.allocator, std.testing.io, .{ .window_seconds = 1, .max_requests = 1, .per_ip = false });
+    rl.deinit();
 }
