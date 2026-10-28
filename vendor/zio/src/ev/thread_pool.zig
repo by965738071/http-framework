@@ -65,7 +65,7 @@ pub const ThreadPool = struct {
         const max_threads = if (builtin.single_threaded)
             0
         else
-            options.max_threads orelse (try std.Thread.getCpuCount()) * 2;
+            options.max_threads orelse ((try std.Thread.getCpuCount()) * 2);
 
         const min_threads = @min(options.min_threads, max_threads);
 

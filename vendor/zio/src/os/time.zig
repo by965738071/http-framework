@@ -1,14 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = @import("posix.zig");
-const w = @import("windows.zig");
+
 const time = @import("../time.zig");
 const Duration = time.Duration;
 const Clock = time.Clock;
 const Timestamp = time.Timestamp;
-
 pub const TimeInt = time.TimeInt;
 pub const ns_per_s = time.ns_per_s;
+const posix = @import("posix.zig");
+const w = @import("windows.zig");
 
 const is_darwin = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos, .driverkit => true,
@@ -176,8 +176,8 @@ fn windowsCpuTimeNs(clock: Clock) ?u64 {
     };
     if (ok == .FALSE) return null;
     // FILETIME counts 100-nanosecond ticks.
-    const kernel_ticks = @as(u64, kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime;
-    const user_ticks = @as(u64, user.dwHighDateTime) << 32 | user.dwLowDateTime;
+    const kernel_ticks = (@as(u64, kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+    const user_ticks = (@as(u64, user.dwHighDateTime) << 32) | user.dwLowDateTime;
     return (kernel_ticks + user_ticks) * 100;
 }
 

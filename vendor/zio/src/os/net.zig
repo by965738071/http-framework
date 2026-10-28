@@ -52,7 +52,7 @@ var wsa_init_mutex: thread.Mutex = .init();
 fn wsaInit() void {
     if (builtin.os.tag == .windows) {
         var wsa_data: windows.WSADATA = undefined;
-        _ = windows.WSAStartup(2 << 8 | 2, &wsa_data);
+        _ = windows.WSAStartup((2 << 8) | 2, &wsa_data);
     }
 }
 

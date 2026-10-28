@@ -1610,7 +1610,7 @@ test "CompletionQueue: a close racing the claim delivers the completion, then er
     var round: u32 = 0;
     while (round < 50) : (round += 1) {
         var cq = CompletionQueue.init();
-        var timer = ev.Timer.init(.{ .duration = .fromMicroseconds(round % 7 * 100) });
+        var timer = ev.Timer.init(.{ .duration = .fromMicroseconds((round % 7) * 100) });
         try cq.submit(&timer.c);
 
         var handle = try rt.spawn(Driver.run, .{ &cq, &timer });
