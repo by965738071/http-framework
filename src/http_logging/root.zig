@@ -37,16 +37,16 @@
 //! ```
 
 const std = @import("std");
-const builtin = @import("builtin");
-const http_app = @import("http_app");
-const http_protocol = @import("http_protocol");
 const flate = std.compress.flate;
+const builtin = @import("builtin");
 
+const http_app = @import("http_app");
 pub const Context = http_app.Context;
-pub const Response = http_protocol.Response;
 pub const Middleware = http_app.Middleware;
 pub const Next = http_app.Next;
 pub const RequestId = http_app.RequestId;
+const http_protocol = @import("http_protocol");
+pub const Response = http_protocol.Response;
 
 /// 跨平台实现，不依赖 libc：
 /// - 写 stderr/stdout 走 std.Io.File（std.Io 自带各平台后端）。
@@ -248,27 +248,88 @@ pub const Logger = struct {
         if (std.fs.path.dirname(path)) |dir| {
             if (dir.len > 0) try cwd.createDirPath(self.io, dir);
         }
-        self.file = try cwd.createFile(self.io, path, .{ .truncate = false });
+        // 优先拿“原子追加”快路径：Windows 用 FILE_APPEND_DATA 原生句柄，
+        // POSIX 用 fcntl(O_APPEND)；失败退回普通句柄，写路径走 stat+pwrite。
+        // 快路径下内核保证每次 write 原子落EOF，热路径不再每行 statFile
+        // 重算偏移（#17），也天然跨进程/多线程安全（多个 writer 各自的
+        // write 不会互相覆盖）。
+        const opened = try openAppendFile(self.io, cwd, path);
+        self.file = opened.file;
+        self.append_mode = opened.append;
         // 用路径 stat 而非已打开的写句柄 stat：Windows 上以写模式打开的
-        // 句柄缺少 FILE_READ_ATTRIBUTES，NtQueryInformationFile 会返回
-        // AccessDenied，导致读不到真实文件大小。
+        // 句柄（含本模块的 FILE_APPEND_DATA 追加句柄）缺少 FILE_READ_ATTRIBUTES，
+        // NtQueryInformationFile 会返回 AccessDenied，导致读不到真实文件大小。
         const st = cwd.statFile(self.io, path, .{}) catch {
             self.file_offset = 0;
             return;
         };
         self.file_offset = st.size;
+    }
 
-        // POSIX：给 fd 设置 O_APPEND，之后每次 write 由内核原子追加到 EOF。
-        // 这样写入路径不再需要每请求 statFile 重算偏移（性能瓶颈），也天然
-        // 跨进程/多线程安全（多个 writer 各自的 write 不会互相覆盖）。
-        // 失败（或非 POSIX）时保持 append_mode=false，退回 stat+pwrite 路径。
-        self.append_mode = enableAppendMode(self.file.handle);
+    /// 以“追加”语义打开日志文件句柄，并返回是否拿到原子追加快路径。
+    /// Windows：尝试 NtCreateFile(FILE_APPEND_DATA) 原生句柄；
+    /// POSIX：普通打开后 fcntl(F_SETFL, O_APPEND)；
+    /// 均失败时退回 std createFile 的普通句柄（写路径走 stat+pwrite 兼容路径）。
+    fn openAppendFile(io: std.Io, dir: std.Io.Dir, path: []const u8) !struct { file: std.Io.File, append: bool } {
+        if (openWindowsAppendFile(dir, path)) |f| return .{ .file = f, .append = true };
+        const file = try dir.createFile(io, path, .{ .truncate = false });
+        return .{ .file = file, .append = enableAppendMode(file.handle) };
+    }
+
+    /// Windows 原生 O_APPEND 等价实现：以只含 FILE_APPEND_DATA（不含
+    /// FILE_WRITE_DATA）的访问掩码打开日志文件。该访问掩码下内核把每次写
+    /// 强制原子落到 EOF——std 的 writeStreamingAll 在 Windows 上走的正是
+    /// `NtWriteFile(ByteOffset=null)`，与之完美契合；即 Win32
+    /// `CreateFile(FILE_APPEND_DATA)` 惯用法（两者都给时写按调用方偏移，
+    /// 只有 APPEND_DATA 才强制 EOF）。
+    /// 参数照抄 std `dirCreateFileWindows`，仅交换访问掩码：
+    /// GENERIC_WRITE → SPECIFIC.FILE.APPEND_DATA。
+    /// 任意失败（含非 Windows 目标）返回 null，调用方退回兼容路径。
+    fn openWindowsAppendFile(dir: std.Io.Dir, path: []const u8) ?std.Io.File {
+        if (builtin.os.tag == .windows) {
+            const windows = std.os.windows;
+            const wpath = std.Io.Threaded.sliceToPrefixedFileW(dir.handle, path, .{}) catch return null;
+            const obj_name = wpath.string();
+            const attr: windows.OBJECT.ATTRIBUTES = .{
+                .RootDirectory = if (std.Io.Dir.path.isAbsoluteWindowsWtf16(wpath.span())) null else dir.handle,
+                .ObjectName = @constCast(&obj_name),
+            };
+            const access: windows.ACCESS_MASK = .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .SPECIFIC = .{ .FILE = .{ .APPEND_DATA = true } },
+            };
+            var iosb: windows.IO_STATUS_BLOCK = undefined;
+            var handle: windows.HANDLE = undefined;
+            const status = windows.ntdll.NtCreateFile(
+                &handle,
+                access,
+                &attr,
+                &iosb,
+                null,
+                .{ .NORMAL = true },
+                .VALID_FLAGS, // 共享模式同 std（轮转时的 rename/delete 不被本句柄阻挡）
+                .OPEN_IF, // 与 createFile(.truncate = false) 同语义：打开或创建
+                .{ .NON_DIRECTORY_FILE = true, .IO = .SYNCHRONOUS_NONALERT },
+                null,
+                0,
+            );
+            if (status != .SUCCESS) return null;
+            // 同步句柄（SYNCHRONOUS_NONALERT）→ nonblocking=false：必须与
+            // std 打开的 File.flags 一致，fileWriteStreamingWindows 同步
+            // 分支依此标志选择 NtWriteFile 路径（PENDING 在其同步分支是
+            // unreachable）。
+            return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        }
+        return null;
     }
 
     /// 给已打开的文件描述符设置 O_APPEND（POSIX）。成功返回 true。
     /// 非 POSIX 平台、未链接 libc（`std.c.fcntl` 不可用）或 fcntl 失败时
     /// 返回 false（调用方退回 pwrite 路径）。
-    fn enableAppendMode(handle: std.posix.fd_t) bool {
+    // 用 std.Io.File.Handle 而非 std.posix.fd_t 作参数类型：参数类型在 Windows 上
+    // 也会被语义分析，而 std.posix 本身在 Windows 直接 @compileError。
+    // Handle 定义为 comptime if（Windows 上是 HANDLE），跨平台安全。
+    fn enableAppendMode(handle: std.Io.File.Handle) bool {
         // std.c.fcntl 是 libc extern 符号；没链接 libc 时直接走兼容路径，
         // 保证框架在无 libc 目标上也能编译/运行。
         if (!builtin.link_libc) return false;
@@ -406,13 +467,21 @@ pub const Logger = struct {
             // 不能走 reopen()/openLogFile()：那里 truncate=false 且 file_offset=现有
             // 文件大小，轮转条件（file_offset >= max_size）会立刻再次成立，导致每条
             // 日志都触发轮转且文件永不截断、无限增长（bug.md §3）。
-            self.file = cwd.createFile(self.io, path, .{ .truncate = true }) catch {
+            // 追加句柄不含 FILE_WRITE_DATA、无法自行截断：先用普通句柄把
+            // 文件清空（truncate 仍由 std 完成）并关闭，再按追加语义重开拿快路径。
+            var trunc_file = cwd.createFile(self.io, path, .{ .truncate = true }) catch {
                 // fd 已 close：重开失败必须暂停文件写，避免向失效句柄写入。
                 self.pauseFileWrites();
                 return;
             };
+            trunc_file.close(self.io);
+            const reopened = openAppendFile(self.io, cwd, path) catch {
+                self.pauseFileWrites();
+                return;
+            };
+            self.file = reopened.file;
             self.file_offset = 0;
-            self.append_mode = enableAppendMode(self.file.handle);
+            self.append_mode = reopened.append;
             return;
         }
 
@@ -1050,6 +1119,60 @@ test "max_backups 0 rotates by truncating instead of growing forever" {
     const bak = try std.fmt.allocPrint(std.testing.allocator, "{s}.1", .{path});
     defer std.testing.allocator.free(bak);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, bak, .{}));
+}
+
+test "windows native append handle takes the fast path (incl. rotate reopens)" {
+    // 验证 Windows 的 FILE_APPEND_DATA 原生打开确实生效（而非静默降级到
+    // stat+pwrite 兼容路径）。覆盖三种打开时机：首次打开、rename 轮转后
+    // 重开、truncate 轮转（max_backups=0）后重开。
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 1) 首次打开即快路径。
+    const path1 = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/fast.log", .{tmp.sub_path});
+    defer std.testing.allocator.free(path1);
+    var logger1 = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .text,
+        .output = .file,
+        .file = .{ .path = path1, .max_size = 1 << 20 },
+    });
+    defer logger1.deinit();
+    try std.testing.expect(logger1.append_mode);
+
+    // 2) rename 轮转重开后仍是快路径。
+    const path2 = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/fastrot.log", .{tmp.sub_path});
+    defer std.testing.allocator.free(path2);
+    var logger2 = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .text,
+        .output = .file,
+        .file = .{ .path = path2, .max_size = 200, .max_backups = 1, .compress = false },
+    });
+    defer logger2.deinit();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        logger2.info(null, "line {d} with padding ..........", &.{});
+    }
+    try std.testing.expect(logger2.append_mode);
+
+    // 3) truncate 轮转（max_backups=0）先建空文件再换追加句柄，仍是快路径。
+    const path3 = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/fastzero.log", .{tmp.sub_path});
+    defer std.testing.allocator.free(path3);
+    var logger3 = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .text,
+        .output = .file,
+        .file = .{ .path = path3, .max_size = 200, .max_backups = 0 },
+    });
+    defer logger3.deinit();
+    i = 0;
+    while (i < 5) : (i += 1) {
+        logger3.info(null, "line {d} with padding ..........", &.{});
+    }
+    try std.testing.expect(logger3.append_mode);
 }
 
 test "rotated backup decompresses to original lines" {
