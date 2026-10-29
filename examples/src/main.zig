@@ -70,11 +70,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const framework = @import("http_framework");
+
 const admin = @import("admin");
-const devices = @import("devices");
-const register = @import("register");
 const app = @import("app");
+const devices = @import("devices");
+const framework = @import("http_framework");
+const register = @import("register");
 
 // ────────────────────────────────────────────────────────────────────────────
 // 全局状态
@@ -249,7 +250,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     //   /app    —— 业务前端 SPA（index.html + assets，一次加载 3~5 个请求）
     // 刻意**不**豁免 /admin：它的子树里有 /admin/login，与下面
     // /api/v1/auth/login 同理——登录入口必须留在限流闸内。
-    var rate_mw = framework.RateLimiter.init(allocator, io, .{
+    var rate_mw = try framework.RateLimiter.init(allocator, io, .{
         .window_seconds = 60,
         .max_requests = 120,
         .per_ip = false,
@@ -706,9 +707,6 @@ fn sessionMeHandler(ctx: *framework.Context, res: *framework.Response) !void {
     };
 
     const username = sessions.getValue(session_id, "username", ctx.arena) catch {
-        try ctx.failWith(framework.AppError.unauthorized("session expired or invalid"));
-        return;
-    } orelse {
         try ctx.failWith(framework.AppError.unauthorized("session expired or invalid"));
         return;
     };

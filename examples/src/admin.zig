@@ -9,6 +9,7 @@
 //!   └─ 前端管理界面（单页 SPA）
 
 const std = @import("std");
+
 const framework = @import("http_framework");
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -270,7 +271,7 @@ pub const RequireRoleMiddleware = struct {
             return;
         };
 
-        const username = sessions.getValue(session_id, "username", ctx.arena) catch null orelse {
+        const username = sessions.getValue(session_id, "username", ctx.arena) catch {
             try ctx.failWith(framework.AppError.unauthorized("session expired"));
             return;
         };
@@ -575,11 +576,11 @@ pub fn meHandler(ctx: *framework.Context, res: *framework.Response, services: *A
         return;
     };
 
-    const username = sessions.getValue(session_id, "username", ctx.arena) catch null orelse {
+    const username = (sessions.getValue(session_id, "username", ctx.arena) catch null) orelse {
         try ctx.failWith(framework.AppError.unauthorized("session expired"));
         return;
     };
-    const role_str = sessions.getValue(session_id, "role", ctx.arena) catch null orelse "viewer";
+    const role_str = (sessions.getValue(session_id, "role", ctx.arena) catch null) orelse "viewer";
 
     const store = services.users;
     const users = try store.all(ctx.arena);

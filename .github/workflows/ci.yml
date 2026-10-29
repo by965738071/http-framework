@@ -16,11 +16,19 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          # 与本地开发快照对齐：vendored zio（vendor/zio，含 [vendor-patch]）只适配
-          # 0.18.0-dev.253 时期的 std.Io（accept 改经 operate 下发）。换快照先本地
-          # 验证：vendor/zio/src/io.zig 与 std.Io.VTable/Operation 是隐式契约，
-          # 且 examples（runZio 配对）必须能编译。
-          version: 0.18.0-dev.253+16d31ceed
+          # 与本地开发快照对齐：zio v0.19.1 的 std.Io 适配补丁（patches/zio-dev738.patch）
+          # 是按 0.18.0-dev.738 的 VTable/Operation 布局做的，换快照先本地验证：
+          # zio 的 io.zig 与 std.Io.VTable/Operation 是隐式契约，且 examples
+          # （runZio 配对）必须能编译。
+          version: 0.18.0-dev.738+ae9a8acc7
+
+      - name: Fetch dependencies
+        run: zig build --fetch
+
+      - name: Apply zio dev738 patch
+        # zig-pkg/ 解包的是上游 v0.19.1 原样内容；补丁恢复本地验证过的适配
+        # （netAccept 等改走 operate、BatchSlot、ino_t 截断等），详见补丁头部说明。
+        run: git apply -p0 patches/zio-dev738.patch
 
       - name: Build for Ubuntu
         run: zig build
@@ -35,10 +43,25 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
-          # 同 build job：必须与 vendored zio 适配的 std.Io 快照一致，见 build job 注释。
-          version: 0.18.0-dev.253+16d31ceed
+          # 同 build job：必须与 zio 补丁适配的 std.Io 快照一致，见 build job 注释。
+          version: 0.18.0-dev.738+ae9a8acc7
+
+      - name: Fetch dependencies
+        run: zig build --fetch
+
+      - name: Apply zio dev738 patch
+        run: git apply -p0 patches/zio-dev738.patch
+
       - name: Run unit & integration tests
         run: zig build test
+
+      - name: Fetch example dependencies
+        working-directory: examples
+        run: zig build --fetch
+
+      - name: Apply zio dev738 patch (examples)
+        # examples 是独立构建根，zio 会在 examples/zig-pkg/ 另解包一份，需再打一次。
+        run: git apply -p0 --directory=examples patches/zio-dev738.patch
 
       - name: Build examples
         working-directory: examples
