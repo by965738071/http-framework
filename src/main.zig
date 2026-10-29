@@ -11,6 +11,7 @@
 //! 与真实并发相当；Windows 上 per-operation 读写超时暂不可用（退化为阻塞，setup 会告警）。
 
 const std = @import("std");
+
 const framework = @import("http_framework");
 
 pub fn main(init: std.process.Init) !void {
@@ -25,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const allocator = debug_allocator.allocator();
     //try framework.runZio(allocator, appMain);
-    try framework.runStd(allocator, appMain);
+    try framework.runZio(allocator, appMain);
 }
 
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
@@ -81,7 +82,7 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     const hooks = [_]framework.Hook{framework.Hook.init(&log_hook)};
 
     // 6. 组装并运行 Server（与入口配对：runStd ↔ StdServer，runZio ↔ ZioServer）
-    var server = try framework.StdServer.init(allocator, io, config, &router);
+    var server = try framework.ZioServer.init(allocator, io, config, &router);
     defer server.deinit();
     try server.setup();
     server.setLifecycle(.{ .hooks = &hooks });

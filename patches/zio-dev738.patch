@@ -1,0 +1,617 @@
+zio 0.19.1 patch for zig 0.18.0-dev.738 (Windows).
+Apply from project root with a pristine zig-pkg tree:
+  git apply -p0 patches/zio-dev738.patch
+
+Also requires build.zig.zon to keep the pinned zio v0.19.1 git dependency.
+
+diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig
+--- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig	2026-10-29 10:19:05.330456000 +0800
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig	2026-10-29 10:13:42.157428800 +0800
+@@ -59,20 +59,19 @@
+ 
+ const std = @import("std");
+ 
+-const ev = @import("ev/root.zig");
+-const os = @import("os/root.zig");
+ const common = @import("common.zig");
+-const Futex = @import("sync/Futex.zig");
+-const SimpleQueue = @import("utils/simple_queue.zig").SimpleQueue;
+-const Runtime = @import("runtime.zig").Runtime;
+-const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
+-
+ const Cancelable = common.Cancelable;
+ const Timeoutable = common.Timeoutable;
+ const Closeable = common.Closeable;
+ const Waiter = common.Waiter;
+-const Timeout = @import("time.zig").Timeout;
++const ev = @import("ev/root.zig");
+ const Completion = ev.Completion;
++const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
++const os = @import("os/root.zig");
++const Runtime = @import("runtime.zig").Runtime;
++const Futex = @import("sync/Futex.zig");
++const Timeout = @import("time.zig").Timeout;
++const SimpleQueue = @import("utils/simple_queue.zig").SimpleQueue;
+ 
+ pub const CompletionQueue = struct {
+     mutex: os.Mutex,
+diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig
+--- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig	2026-10-29 10:14:32.855993300 +0800
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig	2026-10-29 11:01:21.249201800 +0800
+@@ -8,48 +8,49 @@
+ //! and partial directory operations.
+ 
+ const std = @import("std");
+-const builtin = @import("builtin");
+ const Io = std.Io;
+ const Alignment = std.mem.Alignment;
++const builtin = @import("builtin");
+ 
++const Awaitable = @import("awaitable.zig").Awaitable;
++const common = @import("common.zig");
++const Waiter = common.Waiter;
++const waitForIo = common.waitForIo;
++const timedWaitForIoClock = common.timedWaitForIoClock;
++const waitForIoUncancelable = common.waitForIoUncancelable;
+ const coro = @import("coro/root.zig");
+-const runtime_mod = @import("runtime.zig");
++const zio_dns = @import("dns/root.zig");
++const ev = @import("ev/root.zig");
++const Group = @import("group.zig").Group;
++const groupSpawnBlockingTask = @import("group.zig").groupSpawnBlockingTask;
++const groupSpawnTask = @import("group.zig").groupSpawnTask;
++const os_fs = @import("os/fs.zig");
++const os_net = @import("os/net.zig");
++const os_posix = @import("os/posix.zig");
++const os_process = @import("os/process.zig");
++const process_impl = @import("process.zig");
+ const random_mod = @import("random.zig");
++const runtime_mod = @import("runtime.zig");
+ const Runtime = runtime_mod.Runtime;
+ const getCurrentTask = runtime_mod.getCurrentTask;
+ const getCurrentExecutor = runtime_mod.getCurrentExecutor;
+ const beginShield = runtime_mod.beginShield;
+ const endShield = runtime_mod.endShield;
+ const checkCancel = runtime_mod.checkCancel;
+-
+-const spawnTask = @import("task.zig").spawnTask;
+-const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+-const Awaitable = @import("awaitable.zig").Awaitable;
+-const Group = @import("group.zig").Group;
+-const groupSpawnTask = @import("group.zig").groupSpawnTask;
+-const groupSpawnBlockingTask = @import("group.zig").groupSpawnBlockingTask;
+ const select = @import("select.zig");
++const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
++const spawnTask = @import("task.zig").spawnTask;
++const stderr = @import("stderr.zig");
+ const Futex = @import("sync/Futex.zig");
+ const Mutex = @import("sync/Mutex.zig");
+-const stderr = @import("stderr.zig");
+ const time = @import("time.zig");
+-const common = @import("common.zig");
+-const Waiter = common.Waiter;
+-const waitForIo = common.waitForIo;
+-const timedWaitForIoClock = common.timedWaitForIoClock;
+-const waitForIoUncancelable = common.waitForIoUncancelable;
+-
+-const ev = @import("ev/root.zig");
+-const os_net = @import("os/net.zig");
+-const os_fs = @import("os/fs.zig");
++const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
++const fillBuf = @import("utils/writer.zig").fillBuf;
+ const zio_fs = @import("fs.zig");
+-const os_posix = @import("os/posix.zig");
+-const os_process = @import("os/process.zig");
+-const process_impl = @import("process.zig");
++/// The same fixture the `fs.zig` tests use, handing its directory out as an
++/// `Io.Dir` through `stdDir`.
++const TestDirFixture = zio_fs.TestDirFixture;
+ const zio_net = @import("net.zig");
+-const zio_dns = @import("dns/root.zig");
+-const fillBuf = @import("utils/writer.zig").fillBuf;
+-const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
+ const zio_options = @import("options.zig").options;
+ 
+ /// Must match `net.Stream.max_iovecs_len` in std.Io. Used as the cap on
+@@ -240,13 +241,15 @@
+     .processSetCurrentDir = processSetCurrentDirImpl,
+     .processSetCurrentPath = processSetCurrentPathImpl,
+     .processReplace = processReplaceImpl,
+-    .processReplacePath = processReplacePathImpl,
++    //.processReplacePath = processReplacePathImpl,
+     .processSpawn = processSpawnImpl,
+-    .processSpawnPath = processSpawnPathImpl,
++    //.processSpawnPath = processSpawnPathImpl,
+     .childWait = childWaitImpl,
+     .childKill = childKillImpl,
+ 
+     .progressParentFile = progressParentFileImpl,
++    .inheritParentDir = inheritParentDirImpl,
++    .inheritParentFile = inheritParentFileImpl,
+ 
+     .now = nowImpl,
+     .clockResolution = clockResolutionImpl,
+@@ -256,15 +259,15 @@
+     .randomSecure = randomSecureImpl,
+ 
+     .netListenIp = netListenIpImpl,
+-    .netAccept = netAcceptImpl,
++    //.netAccept = netAcceptImpl,
+     .netBindIp = netBindIpImpl,
+     .netConnectIp = netConnectIpImpl,
+     .netListenUnix = netListenUnixImpl,
+     .netConnectUnix = netConnectUnixImpl,
+     .netSocketCreatePair = netSocketCreatePairImpl,
+-    .netSend = netSendImpl,
+-    .netRead = netReadImpl,
+-    .netWrite = netWriteImpl,
++    //.netSend = netSendImpl,
++    //.netRead = netReadImpl,
++    //.netWrite = netWriteImpl,
+     .netWriteFile = netWriteFileImpl,
+     .netClose = netCloseImpl,
+     .netShutdown = netShutdownImpl,
+@@ -487,6 +490,30 @@
+                 break :result netReceiveMore(o);
+             },
+         },
++        // These operations moved from VTable slots into Io.Operation in newer
++        // std; reuse the old VTable implementations synchronously.
++        .net_send => |*o| return .{ .net_send = netSendImpl(null, o.socket_handle, o.messages, o.flags) },
++        .net_accept => |*o| return .{ .net_accept = result: {
++            const socket = netAcceptImpl(null, o.socket_handle, o.options) catch |err| switch (err) {
++                error.Canceled => return error.Canceled,
++                else => |e| break :result e,
++            };
++            break :result socket;
++        } },
++        .net_read => |*o| return .{ .net_read = result: {
++            const n = netReadImpl(null, o.socket_handle, o.data) catch |err| switch (err) {
++                error.Canceled => return error.Canceled,
++                else => |e| break :result e,
++            };
++            break :result Io.net.Stream.ReadResult{ .data_len = n };
++        } },
++        .net_write => |*o| return .{ .net_write = result: {
++            const n = netWriteImpl(null, o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
++                error.Canceled => return error.Canceled,
++                else => |e| break :result e,
++            };
++            break :result n;
++        } },
+     }
+ }
+ 
+@@ -572,6 +599,11 @@
+         message_buffer: *Io.net.IncomingMessage,
+         data_buffer: []u8,
+     },
++    // Not submitted through batches (std uses `Io.operate` for these).
++    net_send: void,
++    net_accept: void,
++    net_read: void,
++    net_write: void,
+ 
+     fn getCompletion(self: *BatchCompletionData) *ev.Completion {
+         return switch (self.*) {
+@@ -579,21 +611,25 @@
+             .file_write_streaming => |*d| &d.op.c,
+             .device_io_control => |*d| &d.op.c,
+             .net_receive => |*d| &d.op.c,
++            .net_send, .net_accept, .net_read, .net_write => unreachable,
+         };
+     }
+ };
+ 
+-/// Flags stored in the low bits of the `BatchCompletionData` pointer in `pending.userdata[0]`.
++/// A pooled batch operation: the completion data plus the result slot written by the
++/// completion callback and read by the await thread before the slot is freed.
++const BatchSlot = struct {
++    data: BatchCompletionData,
++    result: Io.Operation.Result,
++};
++
++/// Flags stored in the low bits of the `BatchSlot` pointer in `pending.userdata[0]`.
+ const batch_ready_flag: usize = 1;
+ const batch_canceled_flag: usize = 2;
+ const batch_flags_mask: usize = batch_ready_flag | batch_canceled_flag;
+ 
+ comptime {
+-    const Userdata = Io.Operation.Storage.Pending.Userdata;
+-    const Result = Io.Operation.Result;
+-    std.debug.assert(@sizeOf(Result) <= @sizeOf(Userdata) - @sizeOf(usize));
+-    std.debug.assert(@alignOf(Result) <= @alignOf(usize));
+-    std.debug.assert(@alignOf(BatchCompletionData) > batch_flags_mask);
++    std.debug.assert(@alignOf(BatchSlot) > batch_flags_mask);
+ }
+ 
+ /// State for concurrent batch operations, stored in batch.userdata.
+@@ -601,7 +637,7 @@
+ /// Callback signals completion via ready flag in pending.userdata, then bumps
+ /// `signaled` and wakes the waiter via futex.
+ const BatchState = struct {
+-    pool: MemoryPool(BatchCompletionData),
++    pool: MemoryPool(BatchSlot),
+     allocator: std.mem.Allocator,
+     batch: *Io.Batch,
+     /// Number of callbacks done with the state, wrapping.
+@@ -611,7 +647,7 @@
+ 
+     fn init(allocator: std.mem.Allocator, batch: *Io.Batch) BatchState {
+         return .{
+-            .pool = MemoryPool(BatchCompletionData).init(allocator),
++            .pool = MemoryPool(BatchSlot).init(allocator),
+             .allocator = allocator,
+             .batch = batch,
+             .signaled = std.atomic.Value(u32).init(0),
+@@ -704,10 +740,10 @@
+         }
+ 
+         // Allocate completion data from pool
+-        const data = state.pool.create() catch return error.ConcurrencyUnavailable;
++        const slot = state.pool.create() catch return error.ConcurrencyUnavailable;
+ 
+         // Initialize the ev operation based on operation type
+-        const completion = initBatchOperation(data, submission.operation);
++        const completion = initBatchOperation(&slot.data, submission.operation);
+ 
+         // Set up callback - store state pointer in completion userdata
+         completion.userdata = state;
+@@ -716,14 +752,15 @@
+ 
+         // Move from submitted to pending
+         // userdata layout:
+-        //   [0]: data pointer (BatchCompletionData*) with `batch_flags_mask` bits as flags
+-        //   [1..]: result (Io.Operation.Result), unset if canceled
++        //   [0]: BatchSlot* with `batch_flags_mask` bits as flags
++        // The result lives in the slot itself (written by the completion callback,
++        // read by the drain before the slot is freed), unset if canceled.
+         storage.* = .{ .pending = .{
+             .node = .{ .prev = batch.pending.tail, .next = .none },
+             .tag = submission.operation,
+             .userdata = undefined,
+         } };
+-        @as(*usize, @ptrCast(&storage.pending.userdata[0])).* = @intFromPtr(data); // no flags = not ready
++        @as(*usize, @ptrCast(&storage.pending.userdata[0])).* = @intFromPtr(slot); // no flags = not ready
+ 
+         if (batch.pending.tail != .none) {
+             batch.storage[batch.pending.tail.toIndex()].pending.node.next = index;
+@@ -863,6 +900,7 @@
+             );
+             return &data.net_receive.op.c;
+         },
++        .net_send, .net_accept, .net_read, .net_write => unreachable,
+     }
+ }
+ 
+@@ -880,21 +918,21 @@
+     const storage = &batch.storage[batch_index];
+     const userdata = &storage.pending.userdata;
+ 
+-    const data_ptr = @as(*const usize, @ptrCast(&userdata[0])).*;
++    const slot_ptr = @as(*const usize, @ptrCast(&userdata[0])).*;
+     const canceled = if (completion.err) |err| err == error.Canceled else false;
+ 
+     var flags = batch_ready_flag;
+     if (canceled) {
+         flags |= batch_canceled_flag;
+     } else {
+-        // Store result in userdata[1..] (after data pointer)
+-        const data: *BatchCompletionData = @ptrFromInt(data_ptr);
+-        const result = extractBatchResult(data, storage.pending.tag);
+-        @as(*Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).* = result;
++        // Store result in the slot (freed later by the drain)
++        const slot: *BatchSlot = @ptrFromInt(slot_ptr);
++        const result = extractBatchResult(&slot.data, storage.pending.tag);
++        slot.result = result;
+     }
+ 
+-    // Set flags in the data pointer (release to ensure result is visible)
+-    @atomicStore(usize, @as(*usize, @ptrCast(&userdata[0])), data_ptr | flags, .release);
++    // Set flags in the slot pointer (release to ensure result is visible)
++    @atomicStore(usize, @as(*usize, @ptrCast(&userdata[0])), slot_ptr | flags, .release);
+ 
+     // Signal waiter, `state` may be freed after the increment
+     _ = state.signaled.fetchAdd(1, .release);
+@@ -931,6 +969,7 @@
+                 break :blk .{ null, 1 };
+             },
+         },
++        .net_send, .net_accept, .net_read, .net_write => unreachable,
+     };
+ }
+ 
+@@ -951,9 +990,8 @@
+             continue;
+         }
+ 
+-        // Get data pointer (mask off flags) and free it
+-        const data: *BatchCompletionData = @ptrFromInt(data_ptr & ~batch_flags_mask);
+-        state.pool.destroy(data);
++        // Get the slot pointer (mask off flags)
++        const slot: *BatchSlot = @ptrFromInt(data_ptr & ~batch_flags_mask);
+         state.drained +%= 1;
+ 
+         // Remove from pending list
+@@ -970,6 +1008,8 @@
+         }
+ 
+         if (data_ptr & batch_canceled_flag != 0) {
++            state.pool.destroy(slot);
++
+             // Add to unused list
+             const tail_index = batch.unused.tail;
+             if (tail_index != .none) {
+@@ -984,8 +1024,9 @@
+             continue;
+         }
+ 
+-        // Get result from userdata[1..]
+-        const result = @as(*const Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).*;
++        // Read the result before freeing the slot
++        const result = slot.result;
++        state.pool.destroy(slot);
+ 
+         // Add to completed list
+         storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+@@ -1014,8 +1055,8 @@
+         // Only cancel if not already ready
+         const data_ptr = @atomicLoad(usize, @as(*usize, @ptrCast(&userdata[0])), .acquire);
+         if (data_ptr & batch_ready_flag == 0) {
+-            const data: *BatchCompletionData = @ptrFromInt(data_ptr);
+-            const completion = data.getCompletion();
++            const slot: *BatchSlot = @ptrFromInt(data_ptr);
++            const completion = slot.data.getCompletion();
+             executor.loopCancel(completion);
+         }
+         index = storage.pending.node.next;
+@@ -1441,14 +1482,26 @@
+     return try op.getResult();
+ }
+ 
++/// `Io.File.Uid`/`Gid` are `void` on Windows (no Unix-style ownership); the
++/// ev operations take `?u32`, so map the absent case to `null`.
++fn uidToZio(uid: ?Io.File.Uid) ?u32 {
++    if (Io.File.Uid == void) return null;
++    return uid;
++}
++
++fn gidToZio(gid: ?Io.File.Gid) ?u32 {
++    if (Io.File.Gid == void) return null;
++    return gid;
++}
++
+ fn dirSetOwnerImpl(_: ?*anyopaque, dir: Io.Dir, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.Dir.SetOwnerError!void {
+-    var op = ev.DirSetOwner.init(stdIoHandleToZio(dir.handle), owner, group);
++    var op = ev.DirSetOwner.init(stdIoHandleToZio(dir.handle), uidToZio(owner), gidToZio(group));
+     try waitForIo(&op.c);
+     try op.getResult();
+ }
+ 
+ fn dirSetFileOwnerImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, owner: ?Io.File.Uid, group: ?Io.File.Gid, options: Io.Dir.SetFileOwnerOptions) Io.Dir.SetFileOwnerError!void {
+-    var op = ev.DirSetFileOwner.init(stdIoHandleToZio(dir.handle), sub_path, owner, group, .{
++    var op = ev.DirSetFileOwner.init(stdIoHandleToZio(dir.handle), sub_path, uidToZio(owner), gidToZio(group), .{
+         .follow_symlinks = options.follow_symlinks,
+     });
+     try waitForIo(&op.c);
+@@ -1667,7 +1720,7 @@
+ }
+ 
+ fn fileSetOwnerImpl(_: ?*anyopaque, file: Io.File, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.File.SetOwnerError!void {
+-    var op = ev.FileSetOwner.init(stdIoHandleToZio(file.handle), owner, group);
++    var op = ev.FileSetOwner.init(stdIoHandleToZio(file.handle), uidToZio(owner), gidToZio(group));
+     try waitForIo(&op.c);
+     try op.getResult();
+ }
+@@ -1919,6 +1972,17 @@
+     process_impl.childKill(child);
+ }
+ 
++fn inheritParentDirImpl(_: ?*anyopaque, handle: Io.Dir.Handle) Io.InheritParentHandleError!Io.Dir {
++    // Pure handle wrapping with no event-loop integration; delegate to Threaded.
++    const io = globalIo();
++    return io.vtable.inheritParentDir(io.userdata, handle);
++}
++
++fn inheritParentFileImpl(_: ?*anyopaque, handle: Io.File.Handle, flags: Io.File.Flags) Io.InheritParentHandleError!Io.File {
++    const io = globalIo();
++    return io.vtable.inheritParentFile(io.userdata, handle, flags);
++}
++
+ fn progressParentFileImpl(userdata: ?*anyopaque) std.Progress.ParentFileError!Io.File {
+     // TODO: the inherited handle is an overlapped pipe that is not associated
+     // with our IOCP port, so writes through the thread pool fail with WouldBlock.
+@@ -1976,11 +2040,11 @@
+ 
+ fn zioIpToStdIo(addr: zio_net.IpAddress) Io.net.IpAddress {
+     return switch (addr.any.family) {
+-        std.posix.AF.INET => .{ .ip4 = .{
++        os_net.AF.INET => .{ .ip4 = .{
+             .bytes = @bitCast(addr.in.addr),
+             .port = std.mem.bigToNative(u16, addr.in.port),
+         } },
+-        std.posix.AF.INET6 => .{ .ip6 = .{
++        os_net.AF.INET6 => .{ .ip6 = .{
+             .bytes = addr.in6.addr,
+             .port = std.mem.bigToNative(u16, addr.in6.port),
+             .flow = addr.in6.flowinfo,
+@@ -2000,8 +2064,8 @@
+ 
+ fn sockAddrLen(addr: *const os_net.sockaddr) os_net.socklen_t {
+     return switch (addr.family) {
+-        std.posix.AF.INET => @sizeOf(os_net.sockaddr.in),
+-        std.posix.AF.INET6 => @sizeOf(os_net.sockaddr.in6),
++        os_net.AF.INET => @sizeOf(os_net.sockaddr.in),
++        os_net.AF.INET6 => @sizeOf(os_net.sockaddr.in6),
+         else => unreachable,
+     };
+ }
+@@ -2107,7 +2171,7 @@
+         try waitForIo(&op.c);
+         const handle = op.getResult() catch |err| switch (err) {
+             error.ConnectionAborted => continue,
+-            error.WouldBlock => return error.WouldBlock,
++            error.WouldBlock => return error.Unexpected, // not in the new AcceptError set
+             error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
+             error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
+             error.SystemResources => return error.SystemResources,
+@@ -2187,12 +2251,11 @@
+         waitForIoUncancelable(&close_op.c);
+     }
+ 
+-    // TODO(zig-0.17): `ip6_only` became `?bool`, where null means "leave it to the system
+-    // configuration" (ziglang/zig a0aba69c11). Set the option only when it is non-null,
+-    // with `@intFromBool` as the value, instead of only ever turning it on.
+-    if (options.ip6_only) {
++    // `ip6_only` is `?bool`: null means "leave it to the system configuration"
++    // (ziglang/zig a0aba69c11), so set IPV6_V6ONLY only when it is non-null.
++    if (options.ip6_only) |only| {
+         if (zio_addr.any.family != os_net.AF.INET6) return error.OptionUnsupported;
+-        const value: c_int = 1;
++        const value: c_int = @intFromBool(only);
+         // IPV6_V6ONLY optname: 26 on Linux, 27 on BSD/macOS/Windows.
+         const v6only: u32 = switch (builtin.os.tag) {
+             .linux => 26,
+@@ -2728,14 +2791,14 @@
+     return error.NetworkDown;
+ }
+ 
+-fn netCloseImpl(_: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
++fn netCloseImpl(_: ?*anyopaque, sockets: []const Io.net.Socket) void {
+     var i: usize = 0;
+-    while (i < handles.len) {
++    while (i < sockets.len) {
+         var ops: [8]ev.NetClose = undefined;
+         var group = ev.Group.init(.gather);
+-        const n = @min(ops.len, handles.len - i);
++        const n = @min(ops.len, sockets.len - i);
+         for (0..n) |j| {
+-            ops[j] = ev.NetClose.init(stdIoHandleToZio(handles[i + j]));
++            ops[j] = ev.NetClose.init(stdIoHandleToZio(sockets[i + j].handle));
+             group.add(&ops[j].c);
+         }
+         waitForIoUncancelable(&group.c);
+@@ -2845,10 +2908,6 @@
+     _ = process_impl;
+ }
+ 
+-/// The same fixture the `fs.zig` tests use, handing its directory out as an
+-/// `Io.Dir` through `stdDir`.
+-const TestDirFixture = zio_fs.TestDirFixture;
+-
+ test "Runtime.io / Runtime.fromIo round-trip" {
+     const rt = try Runtime.init(std.testing.allocator, .{});
+     defer rt.deinit();
+diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig
+--- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig	2026-10-29 10:14:32.882985500 +0800
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig	2026-10-29 10:59:31.776193900 +0800
+@@ -1,12 +1,16 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+-const posix = @import("posix.zig");
+-const darwin = @import("darwin.zig");
+-const w = @import("windows.zig");
+-const options = @import("../options.zig").options;
+ 
+-const unexpectedError = @import("base.zig").unexpectedError;
++const options = @import("../options.zig").options;
++const darwin = @import("darwin.zig");
++pub const iovec = @import("base.zig").iovec;
++pub const iovec_const = @import("base.zig").iovec_const;
++const posix = @import("posix.zig");
++pub const mode_t = posix.sys.mode_t;
++pub const ino_t = posix.sys.ino_t;
+ const syscall_cancel = @import("syscall_cancel.zig");
++const unexpectedError = @import("base.zig").unexpectedError;
++const w = @import("windows.zig");
+ 
+ // Cached probe result: once we see ENOSYS from openat2, skip future attempts.
+ var openat2_nosys: std.atomic.Value(bool) = .init(false);
+@@ -64,12 +68,6 @@
+     };
+ }
+ 
+-pub const iovec = @import("base.zig").iovec;
+-pub const iovec_const = @import("base.zig").iovec_const;
+-
+-pub const mode_t = posix.sys.mode_t;
+-pub const ino_t = posix.sys.ino_t;
+-
+ pub const FileKind = enum {
+     block_device,
+     character_device,
+@@ -531,7 +529,7 @@
+         return switch (builtin.os.tag) {
+             .linux, .macos, .ios, .tvos, .watchos, .visionos => entry.ino,
+             .freebsd, .netbsd, .openbsd, .dragonfly => entry.fileno,
+-            .windows => entry.FileIndex,
++            .windows => @truncate(entry.FileIndex),
+             else => @compileError("unsupported OS"),
+         };
+     }
+@@ -802,7 +800,7 @@
+             else => |err| {
+                 if (flags.resolve_beneath) {
+                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
++                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                 }
+                 return errnoToFileOpenError(err, flags);
+             },
+@@ -924,7 +922,7 @@
+             else => |err| {
+                 if (flags.resolve_beneath) {
+                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
++                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                 }
+                 return errnoToDirOpenError(err, flags);
+             },
+@@ -1070,7 +1068,7 @@
+             else => |err| {
+                 if (flags.resolve_beneath) {
+                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
+-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
++                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
+                 }
+                 return errnoToFileOpenError(err, flags);
+             },
+@@ -2222,7 +2220,7 @@
+         }
+ 
+         const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+-        const inode: ino_t = @bitCast((@as(u64, info.nFileIndexHigh) << 32) | info.nFileIndexLow);
++        const inode: ino_t = @truncate((@as(u64, info.nFileIndexHigh) << 32) | info.nFileIndexLow);
+ 
+         const kind: FileKind = if (info.dwFileAttributes & w.FILE_ATTRIBUTE_DIRECTORY != 0)
+             .directory
+@@ -3321,7 +3319,7 @@
+             if (std.c.realpath(path, buffer.ptr)) |_| {
+                 return std.mem.indexOfScalar(u8, buffer, 0) orelse buffer.len;
+             }
+-            const err: posix.system.E = @enumFromInt(std.c._errno().*);
++            const err: posix.system.E = @fromBackingInt(@intCast(std.c._errno().*));
+             if (err == .INTR) continue;
+             return errnoToDirRealPathFileError(err);
+         }
+@@ -3568,7 +3566,7 @@
+             else
+                 rc,
+             .INTR => continue,
+-            else => |err| return -@as(i32, @intFromEnum(err)),
++            else => |err| return -@as(i32, @backingInt(err)),
+         }
+     }
+ }
+diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig
+--- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig	2026-10-29 10:20:20.144836500 +0800
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig	2026-10-29 10:11:50.876655500 +0800
+@@ -52,7 +52,7 @@
+ fn wsaInit() void {
+     if (builtin.os.tag == .windows) {
+         var wsa_data: windows.WSADATA = undefined;
+-        _ = windows.WSAStartup((2 << 8 ) | 2, &wsa_data);
++        _ = windows.WSAStartup((2 << 8) | 2, &wsa_data);
+     }
+ }
+ 
