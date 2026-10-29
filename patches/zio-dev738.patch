@@ -1,12 +1,14 @@
-zio 0.19.1 patch for zig 0.18.0-dev.738 (Windows).
-Apply from project root with a pristine zig-pkg tree:
+zio 0.19.1 adaptation for zig 0.18.0-dev.738.
+Generated with diff -u against the pristine package tarball
+(zio-0.19.1-xHbV...tar.gz from the global zig cache).
+
+Apply from project root onto a freshly fetched tree (zig build --fetch):
   git apply -p0 patches/zio-dev738.patch
+For examples (separate build root, its own zig-pkg):
+  git apply -p0 --directory=examples patches/zio-dev738.patch
 
-Also requires build.zig.zon to keep the pinned zio v0.19.1 git dependency.
-
-diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig
---- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig	2026-10-29 10:19:05.330456000 +0800
-+++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig	2026-10-29 10:13:42.157428800 +0800
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/completion_queue.zig
 @@ -59,20 +59,19 @@
  
  const std = @import("std");
@@ -35,9 +37,28 @@ diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtS
  
  pub const CompletionQueue = struct {
      mutex: os.Mutex,
-diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig
---- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig	2026-10-29 10:14:32.855993300 +0800
-+++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig	2026-10-29 11:01:21.249201800 +0800
+@@ -1529,7 +1528,7 @@
+     var round: u32 = 0;
+     while (round < 50) : (round += 1) {
+         var cq = CompletionQueue.init();
+-        var timer = ev.Timer.init(.{ .duration = .fromMicroseconds(round % 7 * 100) });
++        var timer = ev.Timer.init(.{ .duration = .fromMicroseconds((round % 7) * 100) });
+         try cq.submit(&timer.c);
+ 
+         var handle = try rt.spawn(Driver.run, .{ &cq, &timer });
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/ev/thread_pool.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/ev/thread_pool.zig
+@@ -64,7 +64,7 @@
+         const max_threads = if (builtin.single_threaded)
+             0
+         else
+-            options.max_threads orelse (try std.Thread.getCpuCount()) * 2;
++            options.max_threads orelse ((try std.Thread.getCpuCount()) * 2);
+ 
+         const min_threads = @min(options.min_threads, max_threads);
+ 
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/io.zig
 @@ -8,48 +8,49 @@
  //! and partial directory operations.
  
@@ -502,9 +523,8 @@ diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtS
  test "Runtime.io / Runtime.fromIo round-trip" {
      const rt = try Runtime.init(std.testing.allocator, .{});
      defer rt.deinit();
-diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig
---- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig	2026-10-29 10:14:32.882985500 +0800
-+++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig	2026-10-29 10:59:31.776193900 +0800
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/fs.zig
 @@ -1,12 +1,16 @@
  const std = @import("std");
  const builtin = @import("builtin");
@@ -603,15 +623,27 @@ diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtS
          }
      }
  }
-diff -ruN examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig
---- examples/zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig	2026-10-29 10:20:20.144836500 +0800
-+++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig	2026-10-29 10:11:50.876655500 +0800
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/net.zig
 @@ -52,7 +52,7 @@
  fn wsaInit() void {
      if (builtin.os.tag == .windows) {
          var wsa_data: windows.WSADATA = undefined;
--        _ = windows.WSAStartup((2 << 8 ) | 2, &wsa_data);
+-        _ = windows.WSAStartup(2 << 8 | 2, &wsa_data);
 +        _ = windows.WSAStartup((2 << 8) | 2, &wsa_data);
      }
+ }
+ 
+--- zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/time.zig
++++ zig-pkg/zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn/src/os/time.zig
+@@ -176,8 +176,8 @@
+     };
+     if (ok == .FALSE) return null;
+     // FILETIME counts 100-nanosecond ticks.
+-    const kernel_ticks = @as(u64, kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime;
+-    const user_ticks = @as(u64, user.dwHighDateTime) << 32 | user.dwLowDateTime;
++    const kernel_ticks = (@as(u64, kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
++    const user_ticks = (@as(u64, user.dwHighDateTime) << 32) | user.dwLowDateTime;
+     return (kernel_ticks + user_ticks) * 100;
  }
  
