@@ -13,20 +13,40 @@
 const std = @import("std");
 
 const framework = @import("http_framework");
+const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
-    var debug_allocator = std.heap.SafeAllocator.init(init.gpa, .{});
-    defer {
-        // 泄漏时打印报告并以非零码退出，而不是直接 panic——调试期的任何小泄漏
-        // 不应表现为无法区分的「Ctrl-C 后崩溃」。
-        if (debug_allocator.deinit() > 0) {
-            std.debug.print("error:memory leak\n", .{});
-            std.process.exit(1);
+    // debug / ReleaseSafe：init.gpa 本身已经是 runtime 配置好的 SafeAllocator
+    // （线程安全，进程退出时会自动打印每个泄漏的分配点与调用栈）。注意 std
+    // 自己的退出检查不影响退出码（start.zig 里明确注释了这一点），所以需要
+    // 「发现泄漏 → 非零退出」时，再包一层 SafeAllocator 拿 deinit() 的泄漏计数。
+    const check_leaks = switch (builtin.mode) {
+        .debug, .safe => true,
+        .fast, .small => false,
+    };
+
+    std.log.info("Running in {s} mode", .{@tagName(builtin.mode)});
+
+    if (check_leaks) {
+        // 双层 SafeAllocator 是有意为之：内层负责泄漏计数与退出时的 panic；
+        // defer 的 bookkeeping 会释放进外层，不会产生虚假泄漏告警。
+        // Fast/Small 档 init.gpa 是 c_allocator/smp_allocator，包一层只会
+        // 白付出性能，泄漏检测交由 debug 构建（CI）负责。
+        var leak_check: std.heap.SafeAllocator = .init(init.gpa, .{});
+        defer {
+            if (leak_check.deinit() > 0) {
+                // 泄漏详情（分配点、栈回溯）已由 deinit() 自带打印。
+                std.debug.panic("heap memory leaked (see report above)", .{});
+            }
         }
+        try run(leak_check.allocator());
+    } else {
+        try run(init.gpa);
     }
-    const allocator = debug_allocator.allocator();
-    //try framework.runZio(allocator, appMain);
-    try framework.runZio(allocator, appMain);
+}
+
+pub fn run(gpa: std.mem.Allocator) !void {
+    try framework.runZio(gpa, appMain);
 }
 
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
