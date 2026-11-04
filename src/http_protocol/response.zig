@@ -15,7 +15,8 @@ const mem = std.mem;
 
 /// 响应输出接口 — 把 std.http 的 respond/respondStreaming 抽象出来。
 ///
-/// Response 通过这个 trait 写响应，不知道背后是 std.http 还是别的后端。
+/// Response 通过这个接口（`*anyopaque` + 函数指针表 vtable 的类型擦除）写响应，
+/// 不知道背后是 std.http 还是别的后端。
 /// 回应 bug.md §8："Response 绑死 std.http" 的问题。
 pub const Sink = struct {
     ptr: *anyopaque,
@@ -24,23 +25,10 @@ pub const Sink = struct {
     pub const VTable = struct {
         /// 发送完整响应（状态行 + 头 + body）。
         /// keep_alive=false 时底层应写 `Connection: close`（HTTP/1.1）。
-        respond: *const fn (
-            ptr: *anyopaque,
-            status: http.Status,
-            headers: []const http.Header,
-            body: []const u8,
-            keep_alive: bool,
-        ) anyerror!void,
+        respond: *const fn (ptr: *anyopaque, status: http.Status, headers: []const http.Header, body: []const u8, keep_alive: bool) anyerror!void,
 
         /// 开始流式响应，返回 body writer。
-        startStream: *const fn (
-            ptr: *anyopaque,
-            status: http.Status,
-            headers: []const http.Header,
-            content_length: ?u64,
-            buffer: []u8,
-            keep_alive: bool,
-        ) anyerror!http.BodyWriter,
+        startStream: *const fn (ptr: *anyopaque, status: http.Status, headers: []const http.Header, content_length: ?u64, buffer: []u8, keep_alive: bool) anyerror!http.BodyWriter,
     };
 
     pub fn fromHttp(request: *http.Server.Request) Sink {

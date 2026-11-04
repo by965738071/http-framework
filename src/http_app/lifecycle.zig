@@ -4,12 +4,14 @@
 //! RequestObserver（vtable + setObserver）、Worker（vtable + setWorker）。
 //! 加新钩子类型要改 core。
 //!
-//! 现在用统一的 `Hook` trait + `Event` enum。Logger/Observer/Worker
-//! 都变成 Hook 的具体实现，各自注册自己关心的 Event。扩展点开放。
+//! 现在用统一的 `Hook` 接口（`*anyopaque` + 函数指针表 vtable）+ `Event` enum。
+//! Logger/Observer/Worker 都变成 Hook 的具体实现，各自注册自己关心的 Event。扩展点开放。
 
 const std = @import("std");
-const Context = @import("context.zig").Context;
+
 const Response = @import("http_protocol").Response;
+
+const Context = @import("context.zig").Context;
 
 pub const Event = enum {
     connection_open,

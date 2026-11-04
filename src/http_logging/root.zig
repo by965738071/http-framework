@@ -220,6 +220,9 @@ pub const Logger = struct {
 
         if (config.output == .file) {
             const fc = config.file orelse return error.MissingFileOutputConfig;
+            // 必须 dupe：fc.path 只拷贝切片头，字符本体在调用方内存里；而
+            // owned_path 在 init 之后长期反复使用（openLogFile/rotate 重开文件）。
+            // 回归见 test "file output survives caller reuse of path buffer"。
             self.owned_path = try allocator.dupe(u8, fc.path);
             try self.openLogFile();
         }
@@ -361,7 +364,7 @@ pub const Logger = struct {
                 // 缓冲区写满（WriteFailed）时不能把整条日志丢掉：字段最多、
                 // 最长的日志恰恰是出错时那些。回退成一条截断标记行
                 // （保留 ts/level/rid + "truncated":true）。
-                writer = std.Io.Writer.fixed(&buf);
+                writer = std.Io.Writer.fixed(&buf); // 必须重置：否则救援行写不进写满的 writer
                 formatTruncated(&writer, ts, level, ctx, msg) catch return;
             },
             .text => formatText(&writer, ts, level, ctx, msg, fields) catch {
@@ -1031,6 +1034,50 @@ test "file output writes lines to the log file" {
     try std.testing.expect(std.mem.indexOf(u8, content, "n=42") != null);
 }
 
+test "overlong line rescues a truncated marker instead of vanishing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/tr.log",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(path);
+
+    var logger = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .json,
+        .output = .file,
+        .file = .{ .path = path, .max_size = 1 << 20 },
+    });
+    defer logger.deinit();
+
+    // 单字段 24KB，远超 MAX_LOG_LINE=8192：formatJson 中途必写满失败。
+    const big = try std.testing.allocator.alloc(u8, 3 * MAX_LOG_LINE);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+
+    logger.info(null, "big blob", &.{fstr("payload", big)});
+
+    const content = std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(1 << 20),
+    ) catch |err| {
+        std.debug.print("read log failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer std.testing.allocator.free(content);
+
+    // 救援成功：文件里有一条截断标记行（含原 msg）。若删掉 catch 里的
+    // writer 重置，formatTruncated 会在写满的 writer 上立刻再失败，
+    // 整行丢失 → 下面的断言失败。
+    try std.testing.expect(content.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, content, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "big blob") != null);
+}
+
 test "file output rotates and gzips backups" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1080,6 +1127,45 @@ test "file output rotates and gzips backups" {
     defer std.testing.allocator.free(gz2);
     _ = std.Io.Dir.cwd().statFile(std.testing.io, gz2, .{}) catch |err| {
         std.debug.print("missing backup .2.gz: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+test "file output survives caller reuse of path buffer (init must dupe)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 模拟一个完全合法的调用方：path 来自它自己的可复用缓冲（栈数组），
+    // init 之后调用方继续复用这块内存——它没有义务为 Logger 保留内容。
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/app.log", .{tmp.sub_path});
+    // 先留一份期望路径的独立副本，供断言用（buf 稍后会被覆盖）。
+    const want_active = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{path});
+    defer std.testing.allocator.free(want_active);
+
+    var logger = try Logger.init(std.testing.allocator, std.testing.io, .{
+        .min_level = .debug,
+        .format = .text,
+        .output = .file,
+        .file = .{ .path = path, .max_size = 200, .max_backups = 1, .compress = false },
+    });
+    defer logger.deinit();
+
+    // 调用方复用同一块缓冲（合法操作，与 Logger 无关）。
+    _ = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/other.log", .{tmp.sub_path});
+
+    // 触发轮转：Logger 必须按「自己拥有的路径」rename/reopen。
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        logger.info(null, "line {d} with some padding ..........", &.{fint("seq", @intCast(i))});
+    }
+
+    // 正确实现（init dupe）：轮转产生 app.log.1。若 init 只浅拷贝 fc.path，
+    // rotate 读到的是被覆盖后的 other.log，app.log.1 永远不会出现。
+    const bak = try std.fmt.allocPrint(std.testing.allocator, "{s}.1", .{want_active});
+    defer std.testing.allocator.free(bak);
+    _ = std.Io.Dir.cwd().statFile(std.testing.io, bak, .{}) catch |err| {
+        std.debug.print("missing backup {s}: {s}\n", .{ bak, @errorName(err) });
         return err;
     };
 }
