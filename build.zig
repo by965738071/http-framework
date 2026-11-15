@@ -127,10 +127,14 @@ pub fn build(b: *std.Build) void {
     });
 
     // Addon: http_logging — 结构化日志（依赖 http_app, http_protocol）
-    // libc 不再是强制依赖：仅 `-Dlibc=true` 时链接，用于在 POSIX 上启用
-    // http_logging 的 O_APPEND fcntl 快路径；不链接时由代码内 comptime 守卫
-    // 退回 stat+pwrite 兼容路径（Windows 本就走该路径）。
-    const link_libc = b.option(bool, "libc", "Link libc (enables http_logging O_APPEND fast path on POSIX)") orelse false;
+    // libc：0.19.1 → 0.20.1 起 zio 自己的 module 声明了
+    // `link_libc = os.tag != .freestanding`（所有宿主平台都要 libc），而新版
+    // zig build 会把整个 module graph 的 link_libc 统一——任何显式 false 都会
+    // 与 zio 冲突（报 "modules have conflicting values for link_libc"）。
+    // 因此 -Dlibc 开关废除，值改由 target 决定；http_logging 的 O_APPEND
+    // fcntl 快路径随之在宿主平台恒开（freestanding 仍走 comptime 守卫的
+    // stat+pwrite 兼容路径）。
+    const link_libc = target.result.os.tag != .freestanding;
     const http_logging = b.addModule("http_logging", .{
         .root_source_file = b.path("src/http_logging/root.zig"),
         .target = target,
