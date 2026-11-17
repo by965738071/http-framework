@@ -11,7 +11,7 @@ pub fn json(
     ctx: *framework.Context,
     res: *framework.Response,
 ) !T {
-    const body = ctx.readBody(ctx.arena, 1024 * 1024) catch |err| {
+    const body = ctx.readBody(1024 * 1024) catch |err| {
         if (err == error.BodyTooLarge) {
             res.keep_alive = false;
             try errors.fail(ctx, errors.ApiError.badRequest(errors.codes.invalid_json, "请求体过大"));

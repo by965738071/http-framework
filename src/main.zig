@@ -179,7 +179,7 @@ fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // http_codec.JsonBody 的既有惯例）——一律 catch 成 400 会把 BodyTooLarge
     // （413）和 OOM（500）的语义吞掉。chunked 超限的残留 body std 不会排空，
     // 413 之后必须关连接，否则残余字节会被当成下一个请求（请求走私面）。
-    const raw = ctx.readBody(ctx.arena, 1 << 20) catch |err| switch (err) {
+    const raw = ctx.readBody(1 << 20) catch |err| switch (err) {
         error.BodyTooLarge => {
             res.keep_alive = false;
             return ctx.failWith(.{ .status = .payload_too_large, .message = "request body too large" });
@@ -214,7 +214,7 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // 逐项映射 multipartFrom 的错误（见其文档）：一律 catch 成 400 会把
     // BodyTooLarge（413）/ OOM（500）的语义吞掉。
     var form = framework.multipartFrom(ctx, 10 * 1024 * 1024) catch |err| switch (err) {
-        error.NotMultipart, error.MissingBoundary, error.TooManyParts, error.MalformedPart, error.DuplicateField => {
+        error.NotMultipart, error.MissingBoundary, error.TooManyParts, error.MalformedPart, error.DuplicateField, error.MalformedBody => {
             return ctx.failWith(.{ .status = .bad_request, .message = "invalid multipart request" });
         },
         error.BodyTooLarge => {
@@ -271,6 +271,8 @@ const TimingMiddleware = struct {
             return err;
         };
         const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
-        _ = try res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?");
+        // L-43：与错误路径同口径——写头是「锦上添花」，不能让一次已成功的
+        // 响应因 header 写入失败（如 OOM）而变成错误传播。
+        _ = res.header("X-Response-Time-ns", std.fmt.allocPrint(ctx.arena, "{d}", .{elapsed}) catch "?") catch {};
     }
 };

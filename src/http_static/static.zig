@@ -101,6 +101,16 @@ pub const StaticFileServer = struct {
                     _ = res.statusCode(.forbidden);
                     try res.text("Access denied");
                 },
+                // L-27：`/existing-file/` 之类路径的 stat 结果是 NotDir，语义是
+                // 资源不存在；旧实现落入 else 回 500 并刷 err 日志（可被零成本刷屏）。
+                error.NotDir => {
+                    _ = res.statusCode(.not_found);
+                    try res.text("File not found");
+                },
+                error.SymLinkLoop => {
+                    _ = res.statusCode(.not_found);
+                    try res.text("File not found");
+                },
                 else => {
                     // 修复低优先级表：不把实现细节（错误名）泄露给客户端，进日志。
                     std.log.err("static: statFile failed for '{s}': {s}", .{ full_path, @errorName(err) });
@@ -119,7 +129,12 @@ pub const StaticFileServer = struct {
         if (stat.kind == .directory) {
             if (!std.mem.endsWith(u8, ctx.request.path, "/")) {
                 const loc = try std.fs.path.join(ctx.arena, &.{ ctx.request.path, "/" });
-                _ = try res.redirect(loc, false);
+                // L-28：目录重定向保留 query string（nginx 等实现的行为）。
+                const final_loc = if (ctx.request.query.len > 0)
+                    try std.fmt.allocPrint(ctx.arena, "{s}?{s}", .{ loc, ctx.request.query })
+                else
+                    loc;
+                _ = try res.redirect(final_loc, false);
                 return;
             }
             resolved_path = try std.fs.path.join(ctx.arena, &.{ full_path, "index.html" });
@@ -142,6 +157,30 @@ pub const StaticFileServer = struct {
             return;
         }
 
+        // M-12：上面的路径校验之后，攻击者仍可在 open 前把符号链接换成指向
+        // 根外的文件（TOCTOU）。这里只打开一次，并对**已打开的 fd** 再校验
+        // 落点；metadata 也取自该 fd，后续所有读取复用它，不再按路径重开。
+        const vf = self.openVerified(ctx, resolved_path) catch |err| {
+            switch (err) {
+                error.AccessDenied => {
+                    _ = res.statusCode(.forbidden);
+                    try res.text("Access denied");
+                },
+                error.FileNotFound => {
+                    _ = res.statusCode(.not_found);
+                    try res.text("File not found");
+                },
+                else => {
+                    std.log.err("static: open verified file failed for '{s}': {s}", .{ resolved_path, @errorName(err) });
+                    _ = res.statusCode(.internal_server_error);
+                    try res.text("internal error");
+                },
+            }
+            return;
+        };
+        defer vf.file.close(ctx.io);
+        stat = vf.stat;
+
         // ETag —— 叠入 size + mtime（弱验证器已够）
         var etag_buf: [80]u8 = undefined;
         const etag = std.fmt.bufPrint(&etag_buf, "\"{d}-{d}\"", .{
@@ -154,12 +193,15 @@ pub const StaticFileServer = struct {
         const last_modified: ?[]const u8 = formatHttpDate(&lm_buf, stat.mtime.nanoseconds);
 
         // 条件请求：If-None-Match 优先于 If-Modified-Since。
-        const inm_match = if (ctx.request.getHeader("If-None-Match")) |inm| ifNoneMatch(inm, etag) else false;
+        const inm_header = ctx.request.getHeader("If-None-Match");
+        const inm_match = if (inm_header) |inm| ifNoneMatch(inm, etag) else false;
         // P2-12：If-Modified-Since 按语义（时间点）比较，而非字符串精确相等。
         // 客户端可能发送与我们生成格式不同、但语义上 >= mtime 的日期（如带前导零
         // 差异、或复用其它来源的 Last-Modified），字符串比较会漏掉合法 304。
         // 解析失败时回退到原字符串比较，保证不会误判为已修改。
-        const ims_match = if (!inm_match)
+        // L-24（RFC 9110 §13.2.2）：只要 If-None-Match 存在就不评估 IMS，
+        // 即使 INM 不匹配——旧条件 `!inm_match` 会误把本应 200 的请求回 304。
+        const ims_match = if (inm_header == null)
             (if (ctx.request.getHeader("If-Modified-Since")) |ims|
                 ifModifiedSinceMatch(ims, stat.mtime.nanoseconds, last_modified)
             else
@@ -181,12 +223,14 @@ pub const StaticFileServer = struct {
         if (last_modified) |lm| _ = try res.header("Last-Modified", lm);
         _ = try res.header("Cache-Control", "public, max-age=3600");
         _ = try res.header("Accept-Ranges", "bytes");
+        // L-29：所有静态响应统一 nosniff（若根目录承载用户上传，只挡 SVG 不够；
+        // nosniff 对静态服务无副作用）。
+        _ = try res.header("X-Content-Type-Options", "nosniff");
 
         // P2-11：SVG 可含脚本，内联访问用户上传目录下的 SVG 就是存储型 XSS
         // （nosniff 挡不住 image/svg+xml）。强制 attachment 下载，避免浏览器内联渲染执行脚本。
         if (std.mem.startsWith(u8, content_type, "image/svg+xml")) {
             _ = try res.header("Content-Disposition", "attachment");
-            _ = try res.header("X-Content-Type-Options", "nosniff");
         }
 
         // 协商是否 gzip 压缩（仅大文件 >MAX_BUFFERED_SIZE）。HEAD 分支也共用此逻辑，
@@ -219,7 +263,7 @@ pub const StaticFileServer = struct {
                     if (ctx.request.method == .HEAD) {
                         return self.headRange(res, stat.size, content_type, rng);
                     }
-                    return self.serveRange(ctx, res, resolved_path, stat.size, content_type, rng);
+                    return self.serveRange(ctx, res, vf.file, stat.size, content_type, rng);
                 },
                 .unsatisfiable => {
                     // 不可满足的范围 → 416 + Content-Range: bytes */size。
@@ -267,13 +311,9 @@ pub const StaticFileServer = struct {
         if (stat.size > MAX_BUFFERED_SIZE) {
             // 大文件流式响应。use_gzip / can_compress / accept_encoding 已在上方
             // （HEAD 分支之前）协商并共享计算，这里直接复用。
-            const file = std.Io.Dir.cwd().openFile(ctx.io, resolved_path, .{}) catch |err| {
-                std.log.err("static: openFile failed for '{s}': {s}", .{ resolved_path, @errorName(err) });
-                _ = res.statusCode(.internal_server_error);
-                try res.text("internal error");
-                return;
-            };
-            defer file.close(ctx.io);
+            // M-12：复用上面已校验的 fd，不再按路径重开（否则校验与读取之间
+            // 仍有 TOCTOU 窗口）。
+            const file = vf.file;
 
             if (use_gzip) {
                 // gzip 流式压缩：Content-Length 未知（压缩后大小不确定）
@@ -344,13 +384,8 @@ pub const StaticFileServer = struct {
                 try stream.end();
             }
         } else {
-            // 小文件：整体读入内存
-            const file_content = std.Io.Dir.cwd().readFileAlloc(
-                ctx.io,
-                resolved_path,
-                ctx.arena,
-                .limited(MAX_BUFFERED_SIZE),
-            ) catch |err| {
+            // 小文件：从已校验的 fd 整体读入内存（M-12）。
+            const file_content = self.readVerifiedFile(ctx, vf) catch |err| {
                 switch (err) {
                     error.FileNotFound => {
                         _ = res.statusCode(.not_found);
@@ -384,7 +419,7 @@ pub const StaticFileServer = struct {
         self: *const StaticFileServer,
         ctx: *Context,
         res: *Response,
-        path: []const u8,
+        file: std.Io.File,
         total: u64,
         content_type: []const u8,
         rng: ByteRange,
@@ -396,14 +431,7 @@ pub const StaticFileServer = struct {
         const cr = std.fmt.bufPrint(&cr_buf, "bytes {d}-{d}/{d}", .{ rng.start, rng.end, total }) catch "";
         _ = try res.header("Content-Range", cr);
 
-        const file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
-            std.log.err("static: serveRange openFile failed for '{s}': {s}", .{ path, @errorName(err) });
-            _ = res.statusCode(.internal_server_error);
-            try res.text("internal error");
-            return;
-        };
-        defer file.close(ctx.io);
-
+        // M-12：file 由调用方从已校验的 fd 传入，不再按路径重开。
         _ = res.statusCode(.partial_content);
         var stream_buf: [8192]u8 = undefined;
         var stream = try res.stream(&stream_buf, .{
@@ -476,6 +504,57 @@ pub const StaticFileServer = struct {
         const root_n = std.Io.Dir.cwd().realPathFile(io, self.root_dir, &root_buf) catch return false;
         const file_n = std.Io.Dir.cwd().realPathFile(io, path, &file_buf) catch return false;
         return isPathWithinRoot(file_buf[0..file_n], root_buf[0..root_n]);
+    }
+
+    /// M-12：TOCTOU 修复——先打开 fd，再对**已打开的 fd** 校验真实路径仍落在
+    /// 根目录内；metadata 也来自同一个 fd（而不是再次按路径 stat/open）。
+    /// macOS 用 F_GETPATH，Linux 用 /proc/self/fd/<fd>，其它平台退回路径校验。
+    fn isOpenedFileWithinRoot(self: *const StaticFileServer, io: std.Io, file: std.Io.File) bool {
+        var fd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const fd_len: usize = switch (std.builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos => blk: {
+                @memset(&fd_buf, 0);
+                switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.GETPATH, &fd_buf))) {
+                    .SUCCESS => break :blk std.mem.indexOfScalar(u8, &fd_buf, 0) orelse fd_buf.len,
+                    else => return false,
+                }
+            },
+            .linux => blk: {
+                var link_buf: [64]u8 = undefined;
+                const link = std.fmt.bufPrint(&link_buf, "/proc/self/fd/{d}", .{file.handle}) catch return false;
+                break :blk std.Io.Dir.cwd().readLink(io, link, &fd_buf) catch return false;
+            },
+            else => return self.isResolvedPathWithinRoot(io, self.root_dir),
+        };
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root_n = std.Io.Dir.cwd().realPathFile(io, self.root_dir, &root_buf) catch return false;
+        // fd_buf 已经是内核解析后的绝对路径；比较它是否在 root 内。
+        return isPathWithinRoot(fd_buf[0..fd_len], root_buf[0..root_n]);
+    }
+
+    /// 打开一次并校验 fd 的落点；返回 fd 与其权威 metadata。
+    fn openVerified(self: *const StaticFileServer, ctx: *Context, path: []const u8) !VerifiedFile {
+        const file = try std.Io.Dir.cwd().openFile(ctx.io, path, .{});
+        errdefer file.close(ctx.io);
+        const stat = try file.stat(ctx.io);
+        if (!self.isOpenedFileWithinRoot(ctx.io, file)) return error.AccessDenied;
+        return .{ .file = file, .stat = stat };
+    }
+
+    const VerifiedFile = struct { file: std.Io.File, stat: std.Io.File.Stat };
+
+    /// 从已校验的 fd 读取整个小文件（不再按路径二次打开）。
+    fn readVerifiedFile(self: *const StaticFileServer, ctx: *Context, vf: VerifiedFile) ![]const u8 {
+        _ = self;
+        if (vf.stat.size > MAX_BUFFERED_SIZE) return error.StreamTooLong;
+        const buf = try ctx.arena.alloc(u8, @intCast(vf.stat.size));
+        var offset: u64 = 0;
+        while (offset < vf.stat.size) {
+            const n = try vf.file.readPositional(ctx.io, &.{buf[@intCast(offset)..]}, offset);
+            if (n == 0) return error.UnexpectedEof;
+            offset += n;
+        }
+        return buf;
     }
 };
 

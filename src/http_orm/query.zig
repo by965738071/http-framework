@@ -492,6 +492,9 @@ fn evaluateCondition(comptime T: type, instance: T, cond: WhereCondition, field_
     return switch (fv) {
         .integer => |v| switch (cv) {
             .integer => |c| compareInteger(cond.operator, v, c),
+            // L-5：与 compareValues（排序）保持一致——int 字段遇 float 条件
+            // 提升为 f64 比较，而不是静默恒 false。
+            .float => |c| compareFloat(cond.operator, @floatFromInt(v), c),
             else => false,
         },
         .string => |v| switch (cv) {

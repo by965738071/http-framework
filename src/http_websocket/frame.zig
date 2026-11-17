@@ -129,9 +129,14 @@ pub fn encode(
         try writer.writeAll(&masking_key);
         // mask 与 payload 一起写——payload 要被 XOR 过
         // RFC §5.3: transformed_payload = original XOR(i mod 4)
+        // M-24：分块应用掩码，避免逐字节 writeByte 的热路径开销。
+        var chunk: [4096]u8 = undefined;
         var i: usize = 0;
-        while (i < payload.len) : (i += 1) {
-            try writer.writeByte(payload[i] ^ masking_key[i & 3]);
+        while (i < payload.len) {
+            const n = @min(chunk.len, payload.len - i);
+            for (0..n) |j| chunk[j] = payload[i + j] ^ masking_key[(i + j) & 3];
+            try writer.writeAll(chunk[0..n]);
+            i += n;
         }
     } else {
         try writer.writeAll(payload);
@@ -139,7 +144,9 @@ pub fn encode(
 }
 
 /// 单帧 payload 的默认上限（字节）。防止客户端用超大长度字段触发 OOM（修复 E1）。
-pub const DEFAULT_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+// M-24：16MB 默认值对服务端过于宽大（组装期 f.payload + payload_list 双份
+// 驻留，单连接峰值 ≥32MB）。降到 4MB，需要更大消息请显式配置上限。
+pub const DEFAULT_MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 
 /// 从 reader 读一帧并解码。
 ///

@@ -57,22 +57,62 @@ pub const ACCEPT_KEY_LEN = 28;
 /// CSWSH（跨站 WebSocket 劫持）。生产中应显式设置白名单。
 var allowed_origins: ?[]const []const u8 = null;
 
+/// M-22：缺失 Origin 头的处置模式。浏览器发起 WS 必带 Origin，但其它客户端
+/// 可能不带；配置了白名单后若仍放行缺失 Origin，攻击页面可用受害者的 cookie
+/// 建立跨站 WebSocket（CSWSH）。默认 `.allow_missing` 兼容非浏览器客户端，
+/// 但 setAllowedOrigins 会切到 `.deny_missing`——生产用白名单时必须显式
+/// setOriginMode(.allow_missing) 才能放行无 Origin 的客户端。
+pub const OriginMode = enum { allow_missing, deny_missing };
+var origin_mode: OriginMode = .allow_missing;
+
 /// 设置 WebSocket 握手的 Origin 白名单（全局，启动期调用一次）。
 /// 传入的切片必须在进程存活期内有效（通常是编译期常量）。
 /// 传 null / 不调用 = 不校验（适用于非浏览器客户端 / 内网）。
+/// M-22：设置非 null 白名单时自动切到 deny_missing（防 CSWSH）。
 pub fn setAllowedOrigins(origins: ?[]const []const u8) void {
     allowed_origins = origins;
+    if (origins != null) origin_mode = .deny_missing;
+}
+
+/// 显式设置「无 Origin 头」的处置模式（在 setAllowedOrigins 之后调用）。
+pub fn setOriginMode(mode: OriginMode) void {
+    origin_mode = mode;
 }
 
 /// 校验请求 Origin 是否在白名单内。未配白名单时总是通过（向后兼容）。
-/// 配了白名单但请求无 Origin 头（非浏览器客户端）也通过。
+/// 配了白名单后，缺失 Origin 头按 origin_mode 决定（默认拒绝）。
 fn isOriginAllowed(ctx: *Context) bool {
     const allowed = allowed_origins orelse return true;
-    const origin = ctx.header("origin") orelse return true; // 非浏览器客户端无 Origin
+    const origin = ctx.header("origin") orelse return (origin_mode == .allow_missing);
     for (allowed) |o| {
         if (std.mem.eql(u8, o, origin)) return true;
     }
     return false;
+}
+
+/// L-47：可选的子协议白名单（全局，启动期设置）。命中客户端
+/// `Sec-WebSocket-Protocol` 列表中的第一项时，在 101 响应里回显该子协议。
+var allowed_subprotocols: ?[]const []const u8 = null;
+
+pub fn setAllowedSubprotocols(list: ?[]const []const u8) void {
+    allowed_subprotocols = list;
+}
+
+fn selectSubprotocol(ctx: *Context) ?[]const u8 {
+    const allowed = allowed_subprotocols orelse return null;
+    const offered = ctx.header("sec-websocket-protocol") orelse return null;
+    var it = std.mem.splitScalar(u8, offered, ',');
+    while (it.next()) |token| {
+        const t = std.mem.trim(u8, token, " \t");
+        for (allowed) |sp| {
+            if (std.mem.eql(u8, sp, t)) return sp;
+        }
+    }
+    return null;
+}
+
+fn setSubprotocolHeader(ctx: *Context, res: *Response) !void {
+    if (selectSubprotocol(ctx)) |sp| _ = try res.header("Sec-WebSocket-Protocol", sp);
 }
 
 /// 共享的升级请求校验（RFC 6455 §4.1/§4.2.1）：method / Upgrade / Connection /
@@ -80,38 +120,61 @@ fn isOriginAllowed(ctx: *Context) bool {
 /// `handshake()` 与 `upgrade()` 共用，消除两处逐段复制的校验逻辑漂移风险（#18）。
 /// 失败返回 null（按需写回 403/426）；成功返回 client 的 Sec-WebSocket-Key
 /// （借用，生命周期 = 请求头缓冲）。
+fn rejectUpgrade(res: *Response) void {
+    // L-50：所有握手失败分支都要写回错误响应。旧实现多数分支返回 false 且
+    // 响应为空，调用方按文档直接 return 后被兜底发成空 200。
+    _ = res.statusCode(.bad_request);
+    res.text("Bad Request") catch {};
+}
+
 fn validateUpgradeRequest(ctx: *Context, res: *Response) !?[]const u8 {
     // RFC §4.1: WebSocket 握手请求必须是 GET。
-    if (ctx.request.method != .GET) return null;
+    if (ctx.request.method != .GET) {
+        rejectUpgrade(res);
+        return null;
+    }
 
     // 校验 Upgrade 头（大小写不敏感）。RFC §4.2.1: 值必须是 "websocket"。
-    const upgrade_hdr = ctx.header("upgrade") orelse return null;
-    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) return null;
+    const upgrade_hdr = ctx.header("upgrade") orelse {
+        rejectUpgrade(res);
+        return null;
+    };
+    if (!std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
+        rejectUpgrade(res);
+        return null;
+    }
 
     // 校验 Connection 头包含 "upgrade" token。
-    // Connection 头可能是 "keep-alive, Upgrade" 形式，所以用 contains 而非 eql。
-    const connection_hdr = ctx.header("connection") orelse return null;
-    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) return null;
+    const connection_hdr = ctx.header("connection") orelse {
+        rejectUpgrade(res);
+        return null;
+    };
+    if (!containsTokenIgnoreCase(connection_hdr, "upgrade")) {
+        rejectUpgrade(res);
+        return null;
+    }
 
     // 必须有 Sec-WebSocket-Key（16 字节 base64 编码 = 24 字符）。
-    // P2-19：不能只校验存在——RFC 6455 §4.1 要求客户端发 16 字节随机值的 base64。
-    // 长度必为 24 且以 "==" 结尾，并能合法 base64 解码为 16 字节。
-    const key = ctx.header("sec-websocket-key") orelse return null;
-    // RFC §4.1: 重复的 Sec-WebSocket-Key 头必须拒绝（RFC 要求，不能静默取第一个）。
-    if (countHeader(ctx, "sec-websocket-key") != 1) return null;
-    if (!isValidWebSocketKey(key)) return null;
+    const key = ctx.header("sec-websocket-key") orelse {
+        rejectUpgrade(res);
+        return null;
+    };
+    if (countHeader(ctx, "sec-websocket-key") != 1 or !isValidWebSocketKey(key)) {
+        rejectUpgrade(res);
+        return null;
+    }
 
     // 校验 Origin（防 CSWSH）。未配白名单时不校验（向后兼容）。
     if (!isOriginAllowed(ctx)) {
         _ = res.statusCode(.forbidden);
+        res.text("Forbidden") catch {};
         return null;
     }
 
     // 校验 Sec-WebSocket-Version（RFC 6455 §4.2.1）：本实现仅支持版本 13。
-    // 缺失或不支持时按 RFC 回 426 Upgrade Required + Sec-WebSocket-Version: 13，
-    // 让客户端知道服务端期望的版本。
     const version = ctx.header("sec-websocket-version") orelse {
-        setUnsupportedVersion(res) catch {};
+        // L-51：写 426 失败必须上抛，不能静默降级为无响应。
+        try setUnsupportedVersion(res);
         return null;
     };
     if (!containsTokenIgnoreCase(version, "13")) {
@@ -146,6 +209,7 @@ pub fn handshake(ctx: *Context, res: *Response) !bool {
     _ = try res.header("Upgrade", "websocket");
     _ = try res.header("Connection", "Upgrade");
     _ = try res.header("Sec-WebSocket-Accept", accept_value);
+    try setSubprotocolHeader(ctx, res);
 
     return true;
 }
@@ -245,9 +309,10 @@ pub fn upgrade(
     // 需要把 client key 和用户回调 handlerFn 一起带到回调里——用一个请求 arena
     // 上的 UpgradeCtx 打包（arena 在 hijack.run 执行前不会被 reset，因为 run 在
     // 本请求的 keep-alive 循环迭代内、endRequest 之前就被调用）。
-    const UpgradeCtx = struct { key: []const u8, user: UserCtx };
+    const UpgradeCtx = struct { key: []const u8, subprotocol: ?[]const u8, user: UserCtx };
     const uc = try ctx.arena.create(UpgradeCtx);
-    uc.* = .{ .key = key_owned, .user = hijack_ctx };
+    const selected_sp = if (selectSubprotocol(ctx)) |sp| try ctx.arena.dupe(u8, sp) else null;
+    uc.* = .{ .key = key_owned, .subprotocol = selected_sp, .user = hijack_ctx };
 
     const runFn = struct {
         fn run(
@@ -264,9 +329,11 @@ pub fn upgrade(
                 "HTTP/1.1 101 Switching Protocols\r\n" ++
                     "Upgrade: websocket\r\n" ++
                     "Connection: Upgrade\r\n" ++
-                    "Sec-WebSocket-Accept: {s}\r\n\r\n",
+                    "Sec-WebSocket-Accept: {s}\r\n",
                 .{accept_value},
             );
+            if (u.subprotocol) |sp| try writer.print("Sec-WebSocket-Protocol: {s}\r\n", .{sp});
+            try writer.writeAll("\r\n");
             try writer.flush();
 
             // 2. 构造 WebSocket 连接对象，交给用户回调。io 必须传给 initServer：

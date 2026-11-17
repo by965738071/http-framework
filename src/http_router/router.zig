@@ -7,6 +7,19 @@
 //! 4. dispatch：trie 匹配 → 组装管道（全局 + 组级）→ 执行
 //!
 //! 不负责 TCP / 信号 / 连接生命周期（那些在 http_server 层）。
+//!
+//! ## 线程契约（M-7）
+//!
+//! 所有注册 API——`route` / `use` / `group` / `notFoundHandler` 以及
+//! `RouteGroup` 上的 `use` / `route` / `group`——**必须在 serve 开始前、
+//! 单线程环境下完成**。它们不是线程安全的：注册会 realloc 路由表，与
+//! 其它线程正在进行的 `match` 构成数据竞争（UB）。serve 开始后路由表
+//! 即为只读，多线程并发 `dispatch`（zio_server 每个 worker 线程共享同一
+//! 个 Router）是安全的。
+//!
+//! 服务端启动时应调用 `seal()` 把契约变成可检测的：此后任何注册调用在
+//! debug 构建下断言失败。该接线由 http_server 层负责（启动监听前置位），
+//! 本文件不改启动代码；release 构建下断言消失，契约仍由调用方保证。
 
 const std = @import("std");
 const http = std.http;
@@ -62,16 +75,23 @@ pub const RouteGroup = struct {
 
     /// 给本组追加一个中间件。对本组（含子组）所有路由生效，**与注册顺序无关**。
     pub fn use(self: *RouteGroup, mw: Middleware) !void {
-        try self.router.groups.items[self.id].middleware.append(self.router.allocator, mw);
-        // 同时登记进 Router 的组级中间件列表，让 Router 成为它的释放者。
-        // RouteGroup 是借用视图（没有 deinit），中间件实例却是调用方的，
-        // 不登记就永远没人调 T.deinit()。这里只登记所有权，**不影响 dispatch
-        // 顺序**（顺序由上面的 group 链表决定，组级 mw 不会因此变成全局的）。
+        self.router.assertNotSealed();
+        // 旧实现是「先挂组链、再登记所有权」，第二步 OOM 时中间件已进入
+        // dispatch 链却不在所有权表里 → deinit 永不调它的 deinit（L-9）。
+        // 现在反过来：先登记所有权（deinitAll 的释放依据），成功后再挂组链；
+        // 挂链失败就把刚登记的所有权 pop 回滚——刚 append 的必在表尾，且
+        // 注册期单线程（见文件头线程契约），pop 撤销是精确的。任何失败路径
+        // 上既不漏释放、也不会双重释放。
         try self.router.group_middleware.append(self.router.allocator, mw);
+        self.router.groups.items[self.id].middleware.append(self.router.allocator, mw) catch |err| {
+            _ = self.router.group_middleware.pop();
+            return err;
+        };
     }
 
     /// 在本组前缀下注册路由。最终 pattern = 组前缀 + sub_pattern。
     pub fn route(self: *RouteGroup, method: http.Method, sub_pattern: []const u8, handler: Handler) !void {
+        self.router.assertNotSealed();
         const full = try joinPath(self.router.arena.allocator(), self.prefix, sub_pattern);
         try self.router.trie.insert(method, full, .{ .handler = handler, .group = self.id });
     }
@@ -81,6 +101,7 @@ pub const RouteGroup = struct {
     /// 子组不再拷贝父组中间件，而是在 `Router.groups` 里记住 parent——
     /// 拷贝会把「创建子组的时刻」固化成顺序语义（父组之后再 use 就进不来）。
     pub fn group(self: *RouteGroup, sub_prefix: []const u8) !RouteGroup {
+        self.router.assertNotSealed();
         const full = try joinPath(self.router.arena.allocator(), self.prefix, sub_prefix);
         return self.router.newGroup(self.id, full);
     }
@@ -95,22 +116,6 @@ const Group = struct {
     prefix: []const u8,
     middleware: std.ArrayList(Middleware) = .empty,
 };
-
-/// 路径段数硬上限。trie 按段递归，段数过多会击穿协程栈。
-/// 正常 REST 路径极少超过几十段，64 留足余量。
-const MAX_PATH_SEGMENTS = 64;
-
-/// 判断路径段数是否超限（连续 `/` 也计入，与 trie 递归行为一致）。
-fn tooManyPathSegments(path: []const u8) bool {
-    var count: usize = 0;
-    for (path) |c| {
-        if (c == '/') {
-            count += 1;
-            if (count > MAX_PATH_SEGMENTS) return true;
-        }
-    }
-    return false;
-}
 
 /// 拼接前缀与子路径，规范化斜杠（避免 `//` 与缺失 `/`）。
 fn joinPath(alloc: std.mem.Allocator, prefix: []const u8, sub: []const u8) ![]const u8 {
@@ -133,6 +138,12 @@ fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
     return path[p.len] == '/';
 }
 
+/// L-12：段对齐前缀的有效长度（trim 尾部 `/` 后）。空/仅 "/" 视为根组，
+/// 长度为 0，平局时永远输给任何有实质前缀的组（但赢给同根组）。
+fn groupPrefixLen(prefix: []const u8) usize {
+    return std.mem.trimEnd(u8, prefix, "/").len;
+}
+
 pub const Router = struct {
     trie: Trie,
     global_middleware: std.ArrayList(Middleware) = .empty,
@@ -145,6 +156,10 @@ pub const Router = struct {
     not_found: ?Handler = null,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
+    /// 调试保护标志（M-7）：serve 开始（`seal()`）后置位，之后的注册调用
+    /// 在 debug 构建下断言失败。原子只为并发 dispatch 线程上的可见性——
+    /// 注册端本身按线程契约是单线程的，不需要互斥。
+    sealed: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator) !Router {
         return .{
@@ -152,6 +167,22 @@ pub const Router = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
         };
+    }
+
+    /// 封锁路由表（M-7）。服务端开始 serve（监听并接受请求）**之前**调用：
+    /// 此后任何注册 API 在 debug 构建下断言失败，把「serve 后还在注册」
+    /// 这个与多线程 dispatch 数据竞争的编程错误暴露在开发期。接线由
+    /// http_server 层负责（启动监听前调用）。幂等：重复调用无害。
+    /// release 构建下这里只是一次原子写，不设运行时门槛——线程契约
+    ///（注册期单线程 / serve 后只读）见文件头。
+    pub fn seal(self: *Router) void {
+        self.sealed.store(true, .release);
+    }
+
+    /// 注册 API 的公共守卫。std.debug.assert 在 Debug / ReleaseSafe 下生效；
+    /// 断言本身按线程契约是单线程读，acquire 只为与 seal 的 release 配对。
+    inline fn assertNotSealed(self: *const Router) void {
+        std.debug.assert(!self.sealed.load(.acquire));
     }
 
     pub fn deinit(self: *Router) void {
@@ -184,11 +215,13 @@ pub const Router = struct {
 
     /// 注册路由（无组级中间件）。
     pub fn route(self: *Router, method: http.Method, pattern: []const u8, handler: Handler) !void {
+        self.assertNotSealed();
         try self.trie.insert(method, pattern, .{ .handler = handler });
     }
 
     /// 注册全局中间件（作用于所有路由）。
     pub fn use(self: *Router, mw: Middleware) !void {
+        self.assertNotSealed();
         try self.global_middleware.append(self.allocator, mw);
     }
 
@@ -200,7 +233,15 @@ pub const Router = struct {
     /// 指针，且要等到几行之后的 route()/group() 才解引用，症状极难定位。
     /// 与 RouteGroup.group 一致，复制可能失败，所以返回 error union。
     pub fn group(self: *Router, prefix: []const u8) !RouteGroup {
-        const owned = try self.arena.allocator().dupe(u8, prefix);
+        self.assertNotSealed();
+        // L-12：归一化前缀，去掉尾部 `/`（空/仅 "/" 视为根组，记为 "")。
+        // 匹配语义由 pathHasPrefix 决定（它自身也会 trim 尾斜杠，见 :133），
+        // 但 groupForPath 的平局判定用原始长度比较——若不归一化，
+        // 后注册的 "/api/"（len 5）会赢过先注册的 "/api"（len 4），
+        // 与「平局取最先注册者」的文档相悖。
+        const trimmed = std.mem.trimEnd(u8, prefix, "/");
+        const normalized: []const u8 = if (trimmed.len == 0) "" else trimmed;
+        const owned = try self.arena.allocator().dupe(u8, normalized);
         return self.newGroup(null, owned);
     }
 
@@ -216,6 +257,7 @@ pub const Router = struct {
     /// 重复调用会**先释放旧 handler**——Handler 是值类型，直接覆盖等于丢掉
     /// FactoryCtx 的唯一引用，永久泄漏。两种例外见实现注释。
     pub fn notFoundHandler(self: *Router, handler: Handler) void {
+        self.assertNotSealed();
         if (self.not_found) |old| {
             // 例外一：旧 handler 同时在 trie.registered 里（也被 route() 注册
             // 过）→ trie 才是它的持有者，deinit 时会释放一次，这里再 deinit
@@ -239,9 +281,13 @@ pub const Router = struct {
         const method = @as(http.Method, ctx.request.method);
 
         // 路径段数上限：matchNode 按段递归（非尾递归），超长路径（如 /a/a/.../a
-        // 或 //////...）会击穿协程栈 → 远程 DoS。命中上限时按 404 处理（回应审查 C1）。
-        const result: Trie.MatchResult = if (tooManyPathSegments(ctx.request.path)) .{} else blk: {
-            var r = self.trie.match(method, ctx.request.path, ctx.state);
+        // 或 //////...）会击穿协程栈 → 远程 DoS（回应审查 C1）。
+        // L-13：检查已下沉到 Trie.match 本身（它是公开 API，防护不能依赖
+        // Router 调用方自觉）；这里把超限错误归一成空结果，按 404 呈现。
+        const result: Trie.MatchResult = blk: {
+            var r = self.trie.match(method, ctx.request.path, ctx.state) catch |err| switch (err) {
+                error.TooManyPathSegments => break :blk .{},
+            };
 
             // HEAD 自动回退到 GET（RFC 9110 §9.3.2：HEAD 应在任何提供 GET 的地方可用）。
             // std.http 在 HEAD 请求下会自动抑制 body，所以直接跑 GET handler 即可。
@@ -249,7 +295,9 @@ pub const Router = struct {
                 // P2-6：第一次 HEAD 匹配可能在 param 节点写过 path_params（即使未命中
                 // handler）。回退前清空，否则 GET 重试可能叠加上一轮的残留参数。
                 ctx.state.path_params.clear();
-                const get_result = self.trie.match(.GET, ctx.request.path, ctx.state);
+                // 同一条 path 刚在上方通过段数检查，这次调用不会再超限。
+                const get_result = self.trie.match(.GET, ctx.request.path, ctx.state) catch
+                    break :blk .{};
                 if (get_result.route != null) r = get_result;
             }
             break :blk r;
@@ -376,11 +424,14 @@ pub const Router = struct {
         var best: trie_mod.GroupId = trie_mod.NO_GROUP;
         var best_len: usize = 0;
         for (self.groups.items, 0..) |g, i| {
+            // L-12：平局判定用归一化长度（trim 尾部 `/`），与段对齐语义一致。
+            // 注册期已归一化 prefix（group() 去尾斜杠），这里再防御一次。
+            const len = groupPrefixLen(g.prefix);
             // 严格长于当前最优 → 平局时保留先注册者（下标更小）。
-            if (g.prefix.len <= best_len) continue;
+            if (len <= best_len) continue;
             if (!pathHasPrefix(path, g.prefix)) continue;
             best = @intCast(i);
-            best_len = g.prefix.len;
+            best_len = len;
         }
         return best;
     }
@@ -859,6 +910,38 @@ test "F-12: 404 的组前缀按段对齐（/health 不匹配 /healthz）" {
     const r = try dispatchPath(&router, allocator, "/healthz", &buf);
     // 段不对齐的话 /healthz 会继承 /health 的中间件，把无关 URL 拉进组语义
     try std.testing.expect(std.mem.indexOf(u8, r, "X-Group") == null);
+}
+
+test "L-12: 尾斜杠变体平局取最先注册者" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *Context, res: *Response) !void {
+            try res.text("ok");
+        }
+    }.f);
+
+    // 先注册 "/api"（len 4），再注册 "/api/"（len 5 但归一化后 len 4）。
+    // 旧实现用原始长度比较，后注册的 "/api/" 会赢过 "/api"，
+    // 导致 404 跑到 "/api/" 组的中间件上（与文档相悖）。
+    var mw1 = MarkerMiddleware{ .value = "first" };
+    var g1 = try router.group("/api");
+    try g1.use(Middleware.init(MarkerMiddleware, &mw1));
+    try g1.route(.GET, "/a", h);
+
+    var mw2 = MarkerMiddleware{ .value = "second" };
+    var g2 = try router.group("/api/");
+    try g2.use(Middleware.init(MarkerMiddleware, &mw2));
+    try g2.route(.GET, "/b", h);
+
+    // /api/c 在两个组下都 404，平局应取先注册者（g1）。
+    var buf: [512]u8 = undefined;
+    const miss = try dispatchPath(&router, allocator, "/api/c", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "X-Group: first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "X-Group: second") == null);
 }
 
 test "F-12: 405 走最长前缀匹配组的中间件" {

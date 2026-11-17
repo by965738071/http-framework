@@ -35,6 +35,25 @@ pub const Route = struct {
 /// 直接拒绝」要防的情形，所以直接绑定到 CAP 这个单一事实来源。
 const MAX_PATTERN_PARAMS = PathParams.CAP;
 
+/// 路径段数硬上限。trie 按段递归（matchNode 非尾递归），段数过多会击穿
+/// 协程栈（zio 协程栈池化、容量有限）。正常 REST 路径极少超过几十段，
+/// 64 留足余量。常量与检查放在 Trie 本身（L-13）：Trie 经 root.zig 公开
+/// 导出，绕过 Router 直接调 `Trie.match` 时防护必须依然成立，不能依赖
+/// 调用方先做检查。
+pub const MAX_PATH_SEGMENTS = 64;
+
+/// 判断路径段数是否超限（连续 `/` 也计入，与 trie 递归行为一致）。
+pub fn tooManyPathSegments(path: []const u8) bool {
+    var count: usize = 0;
+    for (path) |c| {
+        if (c == '/') {
+            count += 1;
+            if (count > MAX_PATH_SEGMENTS) return true;
+        }
+    }
+    return false;
+}
+
 const Node = struct {
     segment: []const u8 = "",
     param_name: ?[]const u8 = null,
@@ -61,6 +80,8 @@ pub const Trie = struct {
     /// 所有已注册 route handler，按注册顺序记录。
     /// deinit 时逐个 `h.deinit()`：factory handler 的 FactoryCtx 由 GPA 分配，
     /// 不随 trie arena 释放，漏掉会永久泄漏（bug.md §5 router.zig:104-110）。
+    /// 登记规则见 insert：factory 按值去重（只释放一次），func/singleton
+    /// 一律追加（deinit 是 no-op，重复登记无害）。
     registered: std.ArrayList(Handler) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !Trie {
@@ -88,6 +109,34 @@ pub const Trie = struct {
         try validatePattern(pattern);
 
         const alloc = self.arena.allocator();
+
+        // L-10：动树之前先做一轮**只查找不创建**的预扫，把这次注册会碰到的
+        // 所有冲突（参数歧义、同 method 重复注册）提前检测出来。注册期单线程
+        //（见 Router 的线程契约），预扫与实建之间没有并发写入，所以
+        // 「预扫无冲突 ⇒ 实建无冲突」：RouteConflict 从半途新建的节点链里
+        // 抛出成为不可能，失败路径上可达结构与插入前完全等价。
+        {
+            var node = self.root;
+            var it = std.mem.splitScalar(u8, pattern, '/');
+            var first = true;
+            var fully_existing = true; // 整条 pattern 都落在既有节点上
+            while (it.next()) |seg| {
+                if (first) {
+                    first = false;
+                    if (seg.len == 0) continue; // leading /
+                }
+                if (seg.len == 0) continue;
+
+                node = (try Trie.findChild(node, seg)) orelse {
+                    // 该段需要新建：后续段全是新节点的子节点，不可能再冲突，
+                    // 预扫到此为止。
+                    fully_existing = false;
+                    break;
+                };
+            }
+            if (fully_existing and node.handlers.get(method) != null) return error.RouteConflict;
+        }
+
         var node = self.root;
         var it = std.mem.splitScalar(u8, pattern, '/');
         var first = true;
@@ -100,17 +149,25 @@ pub const Trie = struct {
 
             node = try Trie.findOrCreateChild(node, seg, alloc);
         }
+        // 预扫已排除 method 冲突（fully_existing 时查过；否则节点是本次新建），
+        // 这里是兜底，正常不可达。
         if (node.handlers.get(method) != null) return error.RouteConflict;
         // 先登记到 deinit 列表，再写入 node：登记失败时 insert 返回错误，
         // 而 node.has_any_handler 仍为 false，路由表现为「未注册」，不会出现
         // 「可派发但从不释放」的半注册态。
-        // 同一 Handler 值多次注册（如同一 factory handler 挂多个 method/路径）只
-        // 登记一次，deinit 时只释放一次，避免 double-free。
+        //
+        // L-11：只对 `.factory` handler 按值去重。deinit 有实际动作的只有
+        // factory（释放 FactoryCtx；handler.zig 对 func/singleton 的 deinit
+        // 是 no-op），同一个 factory 值被多条路由引用时必须只登记一次，否则
+        // deinit 释放两次 = double-free。func/singleton 重复登记无害，跳过
+        // 去重让上万路由的注册期从 O(n²) 降回 O(n)。
         var already_registered = false;
-        for (self.registered.items) |r| {
-            if (std.meta.eql(r, route.handler)) {
-                already_registered = true;
-                break;
+        if (route.handler == .factory) {
+            for (self.registered.items) |r| {
+                if (std.meta.eql(r, route.handler)) {
+                    already_registered = true;
+                    break;
+                }
             }
         }
         if (!already_registered) {
@@ -170,7 +227,11 @@ pub const Trie = struct {
         }
     }
 
-    fn findOrCreateChild(parent: *Node, seg: []const u8, alloc: std.mem.Allocator) !*Node {
+    /// 只查找不创建：在 parent 的 children 里找 seg 对应的**既有**子节点。
+    /// 冲突判定与创建路径共用同一份逻辑（findOrCreateChild 也走这里）：
+    /// 同层不同名 :param / *catch_all 是注册期歧义，返回 RouteConflict。
+    /// 返回 null 表示「没有可复用的子节点，需要新建」。
+    fn findChild(parent: *Node, seg: []const u8) !?*Node {
         // 检查是否已有匹配的子节点
         for (parent.children.items) |child| {
             if (seg.len > 0 and seg[0] == ':') {
@@ -204,6 +265,12 @@ pub const Trie = struct {
             }
         }
 
+        return null;
+    }
+
+    fn findOrCreateChild(parent: *Node, seg: []const u8, alloc: std.mem.Allocator) !*Node {
+        if (try findChild(parent, seg)) |child| return child;
+
         // 创建新子节点
         const child = try Node.init(alloc);
         if (seg.len > 0 and seg[0] == ':') {
@@ -231,7 +298,13 @@ pub const Trie = struct {
 
     /// 匹配路径。参数绑定写进 `state.path_params`（内联数组，不分配），
     /// 所以不需要分配器。
-    pub fn match(self: *const Trie, method: http.Method, path: []const u8, state: *RequestState) MatchResult {
+    ///
+    /// 路径段数超过 `MAX_PATH_SEGMENTS` 时返回 `error.TooManyPathSegments`
+    /// 而不是继续递归（L-13）：matchNode 按段非尾递归，超长路径（/a/a/.../a、
+    /// //////...）会打穿协程栈。Trie 是公开 API，防护在本层成立——
+    /// 调用方决定呈现语义（Router.dispatch 把它归一成 404）。
+    pub fn match(self: *const Trie, method: http.Method, path: []const u8, state: *RequestState) error{TooManyPathSegments}!MatchResult {
+        if (tooManyPathSegments(path)) return error.TooManyPathSegments;
         var result = MatchResult{};
         self.matchNode(self.root, path, method, state, &result);
         return result;
@@ -377,7 +450,7 @@ test "Trie matches static route" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/hello", &state);
+    const result = try trie.match(.GET, "/hello", &state);
     try std.testing.expect(result.route != null);
 }
 
@@ -393,7 +466,7 @@ test "Trie extracts path params" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/users/42", &state);
+    const result = try trie.match(.GET, "/users/42", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
 }
@@ -410,7 +483,7 @@ test "Trie returns 405 when pattern matches but method doesn't" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.POST, "/items", &state);
+    const result = try trie.match(.POST, "/items", &state);
     try std.testing.expect(result.pattern_matched);
     try std.testing.expect(result.route == null);
     try std.testing.expect(result.allowed_count > 0);
@@ -429,7 +502,7 @@ test "Trie catch_all matches remaining path" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/static/css/app.css", &state);
+    const result = try trie.match(.GET, "/static/css/app.css", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("filepath").?);
 }
@@ -491,7 +564,7 @@ test "Trie: 精确命中但 method 不匹配时不回落到更低优先级的 :p
     // /users/me 是精确命中，但该节点只有 POST → 应 405。
     // 旧实现会继续回落进 /users/:id，把 GET /users/me 交给 :id 的 handler，
     // 顺带把 route_pattern / Allow 也串成 /users/:id。
-    const result = trie.match(.GET, "/users/me", &state);
+    const result = try trie.match(.GET, "/users/me", &state);
     try std.testing.expect(result.route == null);
     try std.testing.expect(result.pattern_matched);
     try std.testing.expectEqualStrings("/users/me", result.pattern);
@@ -513,7 +586,7 @@ test "Trie: catch_all 匹配带尾斜杠的空剩余路径" {
     defer state.deinit();
     // 静态路由允许 /hello/ 命中 /hello，catch_all 也必须允许空剩余路径，
     // 否则 /static/ 404 而 /static/x 命中，两套 trailing slash 语义打架。
-    const result = trie.match(.GET, "/static/", &state);
+    const result = try trie.match(.GET, "/static/", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("", state.path_params.get("filepath").?);
 }
@@ -531,7 +604,7 @@ test "Trie: 裸 * 的 catch_all 参数名取 '*'" {
 
     var state = RequestState{ .arena = allocator };
     defer state.deinit();
-    const result = trie.match(.GET, "/static/css/app.css", &state);
+    const result = try trie.match(.GET, "/static/css/app.css", &state);
     try std.testing.expect(result.route != null);
     try std.testing.expectEqualStrings("css/app.css", state.path_params.get("*").?);
 }
@@ -579,6 +652,90 @@ test "Trie: 参数个数超过 PathParams.CAP 注册时直接拒绝（旧行为�
         break :blk p;
     };
     try trie.insert(.GET, at_cap, .{ .handler = h });
+}
+
+// ── L-10：RouteConflict 不留幽灵节点 ──────────────────────────────────
+
+test "Trie: RouteConflict 失败后 Trie 与插入前等价（无幽灵节点）" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    try trie.insert(.GET, "/api/users/:id", .{ .handler = h });
+
+    // 冲突一：同层不同名参数（:uid 撞 :id）
+    try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/api/users/:uid/posts", .{ .handler = h }));
+    // 冲突二：同 method 重复注册同一 pattern
+    try std.testing.expectError(error.RouteConflict, trie.insert(.GET, "/api/users/:id", .{ .handler = h }));
+
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
+    // 冲突插入后原路由仍能匹配、参数正确
+    const r1 = try trie.match(.GET, "/api/users/42", &state);
+    try std.testing.expect(r1.route != null);
+    try std.testing.expectEqualStrings("42", state.path_params.get("id").?);
+
+    var state2 = RequestState{ .arena = allocator };
+    defer state2.deinit();
+    // 错误路由不存在：冲突注册的深处段没有留下可命中的节点
+    const r2 = try trie.match(.GET, "/api/users/42/posts", &state2);
+    try std.testing.expect(r2.route == null);
+    try std.testing.expect(!r2.pattern_matched);
+
+    // 幽灵检测：若 :uid 以幽灵节点残留在 /api/users 下，这条合法注册
+    //（复用 :id 往深处建链）会误报 RouteConflict。
+    try trie.insert(.GET, "/api/users/:id/posts", .{ .handler = h });
+    var state3 = RequestState{ .arena = allocator };
+    defer state3.deinit();
+    const r3 = try trie.match(.GET, "/api/users/7/posts", &state3);
+    try std.testing.expect(r3.route != null);
+    try std.testing.expectEqualStrings("7", state3.path_params.get("id").?);
+}
+
+// ── L-13：段数防护在 Trie.match 本身 ──────────────────────────────────
+
+/// 测试辅助：构造 "/c/c/c/..."（segments 段），避免依赖已移除的字符串 `**` 运算符。
+fn makeSegmentedPath(allocator: std.mem.Allocator, c: u8, segments: usize) ![]u8 {
+    const buf = try allocator.alloc(u8, 1 + segments * 2);
+    buf[0] = '/';
+    for (0..segments) |i| {
+        buf[1 + i * 2] = c;
+        buf[2 + i * 2] = '/';
+    }
+    return buf;
+}
+
+test "Trie: 超过 MAX_PATH_SEGMENTS 的路径 match 报错不递归（L-13）" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator);
+    defer trie.deinit();
+
+    const h = Handler.fromFn(struct {
+        fn f(_: *@import("http_app").Context, _: *@import("http_protocol").Response) !void {}
+    }.f);
+    try trie.insert(.GET, "/hello", .{ .handler = h });
+
+    var state = RequestState{ .arena = allocator };
+    defer state.deinit();
+
+    // 65 个段（66 个 '/'）：防护在 Trie.match 内部，绕过 Router 直用时同样生效
+    // 本机 Zig 版本已无字符串 `**` 重复运算符，显式填充缓冲区构造长路径。
+    const long_path = try makeSegmentedPath(allocator, 'a', MAX_PATH_SEGMENTS + 1);
+    defer allocator.free(long_path);
+    try std.testing.expectError(error.TooManyPathSegments, trie.match(.GET, long_path, &state));
+
+    // 恰好 64 段不超限：走完匹配（该路径无路由 → 空结果而非错误）
+    const at_limit = try makeSegmentedPath(allocator, 'x', MAX_PATH_SEGMENTS - 1);
+    defer allocator.free(at_limit);
+    const r = try trie.match(.GET, at_limit, &state);
+    try std.testing.expect(r.route == null);
+
+    // 普通路径不受影响
+    const ok = try trie.match(.GET, "/hello", &state);
+    try std.testing.expect(ok.route != null);
 }
 
 test {

@@ -11,6 +11,39 @@
 const std = @import("std");
 
 const framework = @import("http_framework");
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const PW_ROUNDS: u32 = 10_000;
+
+/// H-7：与 core.password 相同的 PHC 格式（pbkdf2-sha256$rounds$salt$hash），
+/// 在本模块内直接实现以避免 examples build.zig 中 admin/app 模块重复导入
+/// 同一源文件（Zig 0.18 禁止一个文件同时属于多个模块）。
+pub fn hashPassword(allocator: std.mem.Allocator, io: std.Io, password: []const u8) ![]const u8 {
+    var salt: [16]u8 = undefined;
+    io.random(&salt);
+    var dk: [32]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&dk, password, &salt, PW_ROUNDS, HmacSha256);
+    const salt_hex = std.fmt.bytesToHex(salt, .lower);
+    const hash_hex = std.fmt.bytesToHex(dk, .lower);
+    return std.fmt.allocPrint(allocator, "pbkdf2-sha256${d}${s}${s}", .{ PW_ROUNDS, &salt_hex, &hash_hex });
+}
+
+fn verifyPassword(password: []const u8, encoded: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, encoded, '$');
+    const scheme = parts.next() orelse return false;
+    if (!std.mem.eql(u8, scheme, "pbkdf2-sha256")) return false;
+    const rounds_str = parts.next() orelse return false;
+    const salt_hex = parts.next() orelse return false;
+    const hash_hex = parts.next() orelse return false;
+    if (parts.next() != null or salt_hex.len != 32 or hash_hex.len != 64) return false;
+    var salt: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&salt, salt_hex) catch return false;
+    var expected: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, hash_hex) catch return false;
+    const rounds = std.fmt.parseInt(u32, rounds_str, 10) catch return false;
+    var actual: [32]u8 = undefined;
+    std.crypto.pwhash.pbkdf2(&actual, password, &salt, rounds, HmacSha256) catch return false;
+    return std.crypto.timing_safe.eql([32]u8, expected, actual);
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // 模型定义
@@ -281,8 +314,10 @@ pub const RequireRoleMiddleware = struct {
         const all_users = try store.all(self.services.allocator);
         defer store.freeRows(self.services.allocator, all_users);
 
+        var user_found = false;
         for (all_users) |u| {
             if (std.mem.eql(u8, u.username, username)) {
+                user_found = true;
                 const user_role: Role = if (std.mem.eql(u8, u.role, "admin")) .admin else if (std.mem.eql(u8, u.role, "editor")) .editor else .viewer;
                 const required = self.role;
                 // admin 可以访问所有，editor 可以访问 admin+editor，viewer 只能访问 viewer
@@ -298,7 +333,12 @@ pub const RequireRoleMiddleware = struct {
                 break;
             }
         }
-
+        // M-15：用户名匹配失败（用户被删 / store 为空）必须 fail-closed，
+        // 与 RequireAuthMiddleware 的 found 检查保持一致。
+        if (!user_found) {
+            try ctx.failWith(framework.AppError.unauthorized("user not found"));
+            return;
+        }
         try next.call(ctx, res);
     }
 };
@@ -340,7 +380,9 @@ pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, servic
     var user_found = false;
     var role: Role = .viewer;
     for (users) |u| {
-        if (std.mem.eql(u8, u.username, username) and std.mem.eql(u8, u.password_hash, password)) {
+        // H-7：storage 是 PBKDF2 哈希串；明文/旧格式一律拒绝（示例数据已迁移）。
+        const pw_ok = verifyPassword(password, u.password_hash);
+        if (std.mem.eql(u8, u.username, username) and pw_ok) {
             user_found = true;
             const role_str = u.role;
             if (std.mem.eql(u8, role_str, "admin")) {
@@ -387,7 +429,9 @@ pub fn loginApiHandler(ctx: *framework.Context, res: *framework.Response, servic
 }
 
 /// POST /admin/logout — 登出
-pub fn logoutHandler(_: *framework.Context, res: *framework.Response, _: *AdminServices) !void {
+pub fn logoutHandler(ctx: *framework.Context, res: *framework.Response, _: *AdminServices) !void {
+    // M-16：只清浏览器 cookie 不足以登出——被窃取的旧 sid 仍可在服务端续用。
+    if (ctx.service(framework.SessionManager)) |sessions| sessions.destroyFromRequest(ctx);
     _ = try res.setCookieFull(.{
         .name = "sid",
         .value = "deleted",
@@ -435,6 +479,13 @@ pub fn userListHandler(_: *framework.Context, res: *framework.Response, services
     try res.json(.{ .total = users.len, .users = users });
 }
 
+/// H-8：用户角色白名单——不接受客户端传来的任意 role。
+fn isValidRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, "admin") or
+        std.mem.eql(u8, role, "editor") or
+        std.mem.eql(u8, role, "viewer");
+}
+
 /// POST /admin/users — 创建用户
 pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, services: *AdminServices) !void {
     const username = (ctx.formDecoded("username", 1 << 16) catch {
@@ -453,12 +504,16 @@ pub fn userCreateHandler(ctx: *framework.Context, res: *framework.Response, serv
         return;
     };
     const role_str = (try ctx.formDecoded("role", 1 << 16)) orelse "viewer";
+    if (!isValidRole(role_str)) {
+        try ctx.failWith(framework.AppError.badRequest("invalid role"));
+        return;
+    }
 
     const id = services.users.insert(.{
         .id = 0,
         .username = username,
         .email = email,
-        .password_hash = password,
+        .password_hash = try hashPassword(ctx.arena, services.io, password),
         .role = role_str,
         .created_at = @as(u64, @intCast(@divTrunc(std.Io.Timestamp.now(services.io, .real).nanoseconds, 1_000_000))),
     }) catch |err| {
@@ -493,6 +548,10 @@ pub fn userUpdateHandler(ctx: *framework.Context, res: *framework.Response, serv
     }) orelse "";
     const email = (try ctx.formDecoded("email", 1 << 16)) orelse "";
     const role = (try ctx.formDecoded("role", 1 << 16)) orelse "";
+    if (role.len > 0 and !isValidRole(role)) {
+        try ctx.failWith(framework.AppError.badRequest("invalid role"));
+        return;
+    }
 
     const existing = try services.users.findById(ctx.arena, id) orelse {
         try ctx.failWith(framework.AppError.notFound("user not found"));
@@ -539,8 +598,9 @@ pub fn logListHandler(ctx: *framework.Context, res: *framework.Response, service
     const logs = try services.logs.all(services.allocator);
     defer services.logs.freeRows(services.allocator, logs);
 
-    const start = if (offset < logs.len) offset else logs.len;
-    const end = if (offset + limit < logs.len) offset + limit else logs.len;
+    // L-36：饱和计算——`offset + limit` 对攻击者可控的 u64 会溢出 panic。
+    const start: usize = @intCast(@min(offset, @as(u64, logs.len)));
+    const end: usize = start + @as(usize, @intCast(@min(limit, @as(u64, logs.len - start))));
     const slice = logs[start..end];
 
     try res.json(.{ .total = logs.len, .offset = offset, .limit = limit, .logs = slice });

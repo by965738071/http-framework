@@ -76,7 +76,7 @@ fn readJsonBody(
     limit: u64,
     empty_msg: ?[]const u8,
 ) !?*T {
-    const raw = ctx.readBody(ctx.arena, limit) catch |err| switch (err) {
+    const raw = ctx.readBody(limit) catch |err| switch (err) {
         error.BodyTooLarge => {
             // 413 后连接不应继续复用：避免 keep-alive 连接去 drain 超限 body。
             // keep_alive=false 在 ErrorRenderer flush 时同样生效；即使管道没挂

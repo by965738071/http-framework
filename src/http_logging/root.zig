@@ -224,6 +224,11 @@ pub const Logger = struct {
             // owned_path 在 init 之后长期反复使用（openLogFile/rotate 重开文件）。
             // 回归见 test "file output survives caller reuse of path buffer"。
             self.owned_path = try allocator.dupe(u8, fc.path);
+            // L-16：openLogFile 失败（目录创建失败/无权限）时释放已 dupe 的路径。
+            errdefer {
+                allocator.free(self.owned_path.?);
+                self.owned_path = null;
+            }
             try self.openLogFile();
         }
         return self;
@@ -236,7 +241,11 @@ pub const Logger = struct {
             // 关到（可能已被复用的）无关句柄，必须跳过。
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (!self.file_paused) self.file.close(self.io);
+            // L-17：先置 paused 再 close——否则解锁后并发 log() 看到 false
+            // 会向已关闭（并可能被复用）的 fd 写入。
+            const was_paused = self.file_paused;
+            self.file_paused = true;
+            if (!was_paused) self.file.close(self.io);
         }
         if (self.owned_path) |p| {
             self.allocator.free(p);
@@ -408,13 +417,17 @@ pub const Logger = struct {
                     if (self.append_mode) {
                         // O_APPEND 快路径：内核保证每次 write 原子追加到 EOF，
                         // 不会留下 NUL 空洞。
-                        self.file.writeStreamingAll(self.io, written) catch {
+                        self.file.writeStreamingAll(self.io, written) catch |e| {
+                            // M-11：写失败不再无声消失（磁盘满/fd 失效等）。
+                            std.debug.print("http_logging: write failed: {s}\n", .{@errorName(e)});
                             self.mutex.unlock(self.io);
                             return;
                         };
                     } else {
                         // 兼容路径（Windows / fcntl 失败）：stat 校准后 pwrite。
-                        self.file.writePositionalAll(self.io, written, self.file_offset) catch {
+                        self.file.writePositionalAll(self.io, written, self.file_offset) catch |e| {
+                            // M-11：同上，兼容路径的写失败必须可见。
+                            std.debug.print("http_logging: write failed: {s}\n", .{@errorName(e)});
                             self.mutex.unlock(self.io);
                             return;
                         };
@@ -424,21 +437,19 @@ pub const Logger = struct {
                 }
             },
         }
-        // 在锁内取走待压缩归档路径：若在锁外读，两个线程可能同时取到同一路径，
-        // 导致重复压缩与双重 free。
+        // M-10：归档压缩必须在**锁内**完成。旧实现锁外按路径名压缩+删源，
+        // 与下一次轮转的 shift rename 交错时，`deleteFile("path.1")` 可能删掉
+        // 另一线程刚 rename 进来的新归档 B → B 的日志内容永久丢失。
+        // 代价是压缩期间其它日志写短暂阻塞；正确性优先于这项低优先优化。
         const pending = self.pending_gzip;
         self.pending_gzip = null;
-        self.mutex.unlock(self.io);
-
-        // 压缩在锁外执行：轮转时 rename 出归档文件后即释放锁，gzip 整文件
-        // 不阻塞其它日志写（修复低优先：轮转压缩不持日志锁）。失败只打
-        // stderr 提示（直接写，不再经 log()，避免压缩失败触发新的日志写）。
         if (pending) |rotated| {
             defer self.allocator.free(rotated);
             self.compressToGzip(rotated) catch |e| {
                 std.debug.print("http_logging: compress {s} failed: {s}\n", .{ rotated, @errorName(e) });
             };
         }
+        self.mutex.unlock(self.io);
     }
 
     /// 当前文件超过 max_size 时触发轮转。
@@ -560,7 +571,9 @@ pub const Logger = struct {
         const allocator = self.allocator;
         const cwd = std.Io.Dir.cwd();
 
-        const cap = fc.max_size + MAX_LOG_LINE;
+        // L-20：std 的 limited 在「达到或超过」上限时即返回 StreamTooLong，
+        // 归档恰好 cap 字节会永远压缩失败——读上限放宽 1 字节。
+        const cap = fc.max_size + MAX_LOG_LINE + 1;
         const bytes = blk: {
             const data = cwd.readFileAlloc(self.io, src, allocator, .limited(cap)) catch |e| {
                 // 文件超过压缩上限（异常大）：先截断源文件到 cap 再压缩，避免
@@ -578,7 +591,12 @@ pub const Logger = struct {
         const gz_path = try std.fmt.allocPrint(allocator, "{s}.gz", .{src});
         defer allocator.free(gz_path);
 
-        const gz_file = try cwd.createFile(self.io, gz_path, .{ .truncate = true });
+        // L-21：先写 *.gz.tmp，成功后再 rename 到终名——中途失败不会留下
+        // 部分写入的归档被 rotate 的 shift 当作有效备份上移。
+        const gz_tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{gz_path});
+        defer allocator.free(gz_tmp);
+        errdefer cwd.deleteFile(self.io, gz_tmp) catch {};
+        const gz_file = try cwd.createFile(self.io, gz_tmp, .{ .truncate = true });
         defer gz_file.close(self.io);
 
         var write_buf: [4096]u8 = undefined;
@@ -595,6 +613,9 @@ pub const Logger = struct {
         try encoder.writer.writeAll(bytes);
         try encoder.finish();
         try file_writer.flush();
+        // 保持 fd 打开直到 defer close；POSIX 上 rename 打开中的文件是安全的，
+        // 且避免 double-close（defer 里还有一次 close）。
+        try cwd.rename(gz_tmp, cwd, gz_path, self.io);
 
         // gz 已生成，删源文件；失败也应上报（否则超限归档仍会残留）。
         try cwd.deleteFile(self.io, src);
@@ -631,8 +652,10 @@ pub const Logger = struct {
 /// （纯 std.time.epoch 实现，不依赖 libc，跨平台）。strftime 那套只有
 /// libc 有，这里手动算年月日。`T` 为日期/时间分隔符，`Z` 表示 UTC 时区
 /// （零偏移）。返回 length 恒为 20 的切片。
-fn formatUtcTimestamp(ts: i64, buf: *[20]u8) []const u8 {
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+fn formatUtcTimestamp(ts_raw: i64, buf: *[20]u8) []const u8 {
+    // L-18：异常系统时钟（1970 前 / 年份 > 9999）不应把服务器打崩。
+    const ts: u64 = @intCast(@max(ts_raw, 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = ts };
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
@@ -643,7 +666,11 @@ fn formatUtcTimestamp(ts: i64, buf: *[20]u8) []const u8 {
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
         ds.getSecondsIntoMinute(),
-    }) catch unreachable;
+    }) catch {
+        // 年份超出 4 位等极端情况：固定占位串，保持返回值长度恒为 20。
+        @memcpy(buf, "9999-12-31T23:59:59Z");
+        return buf;
+    };
     return buf;
 }
 
@@ -813,9 +840,10 @@ pub const LoggingMiddleware = struct {
     pub fn process(self: *Self, ctx: *Context, res: *Response, next: Next) !void {
         self.logger.info(ctx, "request_start", &.{});
 
-        const start = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
+        // L-19：耗时用单调钟 .awake（墙钟会被 NTP 步进/改时钟打乱，得到负值或虚高）。
+        const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
         next.call(ctx, res) catch |e| {
-            const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+            const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
             self.logger.err(ctx, "request_error", &.{
                 fstr("error", @errorName(e)),
                 fint("duration_ns", @intCast(elapsed)),
@@ -823,7 +851,7 @@ pub const LoggingMiddleware = struct {
             });
             return e;
         };
-        const elapsed = std.Io.Timestamp.now(ctx.io, .real).nanoseconds - start;
+        const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
 
         self.logger.info(ctx, "request_end", &.{
             fint("status", @backingInt(res.status)),

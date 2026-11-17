@@ -208,20 +208,19 @@ pub const Response = struct {
         // keep-alive 客户端/反代会把第二个当成下一个请求的响应（响应队列投毒）。
         if (self.flushed) return;
         if (!self.buffered) return;
+        // 缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
+        // == null），只要响应已被标记发送（sent）也应发一个空 body 响应。
+        // M-9：addCookiesToHeaders 会**清空** cookies，必须在确认真的要发送之后
+        // 才调用——旧代码在早退判定之前先清空，导致「只设 cookie + 中间件提前
+        // flush」时 cookie 被静默丢弃，兜底响应没有 Set-Cookie。
+        const body: []const u8 = self.pending_body orelse blk: {
+            if (!self.sent) return; // 从未产生任何响应，不发（此时保留 cookies）
+            break :blk "";
+        };
         // P2-7：缓冲模式下，中间件在 next() 之后调用 setCookie 设的 cookie 也要
         // 进入最终响应。sendResponse/redirect/stream 各自只在提交那一刻 addCookies
         // 一次，晚于它们的 setCookie（典型是外层中间件在 next() 返回后）会被静默丢弃。
-        // flush 是缓冲响应真正上 wire 的唯一出口，在此补一次即可（addCookiesToHeaders
-        // 会 clear cookies，幂等安全）。
         try self.addCookiesToHeaders();
-        // 缓冲模式下，即使 handler 只设了 status/头而没写 body（pending_body
-        // == null），只要响应已被标记发送（sent）也应发一个空 body 响应。
-        const body = self.pending_body orelse {
-            if (!self.sent) return; // 从未产生任何响应，不发
-            self.flushed = true;
-            try self.sink.respond(self.status, self.headers.items, "", self.keep_alive);
-            return;
-        };
         self.pending_body = null;
         self.flushed = true;
         try self.sink.respond(self.status, self.headers.items, body, self.keep_alive);

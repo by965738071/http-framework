@@ -328,6 +328,27 @@ pub const Server = struct {
             reader.setTimeout(zio.Timeout.fromNanoseconds(self.server.config.network.read_timeout_ns));
             writer.setTimeout(zio.Timeout.fromNanoseconds(self.server.config.network.write_timeout_ns));
 
+            // M-8：请求头阶段用绝对 deadline（而非 per-op duration）——慢速客户端
+            // 每次读之间滴 1 字节也无法把头阶段无限拖长。头读完由 on_head_end
+            // 恢复 per-op 超时，避免误伤正常的长 body/长响应。
+            const HeadCtx = struct {
+                r: *@TypeOf(reader),
+                cfg: *const @TypeOf(self.server.config),
+
+                fn begin(ctx: ?*anyopaque) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx.?));
+                    const deadline = zio.Timestamp.now(.monotonic).addDuration(
+                        zio.Duration.fromNanoseconds(c.cfg.network.max_head_duration_ns),
+                    );
+                    c.r.setTimeout(.{ .deadline = deadline });
+                }
+                fn end(ctx: ?*anyopaque) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx.?));
+                    c.r.setTimeout(zio.Timeout.fromNanoseconds(c.cfg.network.read_timeout_ns));
+                }
+            };
+            var head_ctx = HeadCtx{ .r = &reader, .cfg = &self.server.config };
+
             // 汇合点：把 std.Io 读写接口交给后端无关的 HTTP 引擎。
             var runner = ConnectionRunner{
                 .reader = &reader.interface,
@@ -340,6 +361,9 @@ pub const Server = struct {
                 .allocator = self.server.allocator,
                 .services = self.server.services,
                 .peer_ip = self.peer_ip,
+                .head_timeout_ctx = &head_ctx,
+                .on_head_begin = HeadCtx.begin,
+                .on_head_end = HeadCtx.end,
             };
             runner.run();
         }

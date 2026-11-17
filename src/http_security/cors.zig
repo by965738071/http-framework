@@ -11,6 +11,8 @@ const root = @import("root.zig");
 const Context = root.Context;
 const Response = root.Response;
 const Next = root.Next;
+const Request = root.Request;
+const RequestState = root.http_app.RequestState;
 
 const http = std.http;
 
@@ -53,6 +55,9 @@ pub const CorsMiddleware = struct {
 
         if (!self.isOriginAllowed(origin)) {
             if (self.config.block_unauthorized) {
+                // M-18：403 也随 Origin 变化（允许 origin 正常、拒绝 origin 403），
+                // 与非 block 分支一样必须声明 Vary: Origin。
+                if (self.config.allowed_origins != null and !self.isWildcardAllow()) try addVaryOrigin(res);
                 _ = res.statusCode(.forbidden);
                 try res.text("CORS: origin not allowed");
                 return; // short-circuit
@@ -270,4 +275,58 @@ test "addVaryOrigin 无既有 Vary 时只写 Origin" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "L-40/L-18: process() 阻断非法 Origin 的 403 也带 Vary: Origin" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "GET / HTTP/1.1\r\nOrigin: https://evil.example\r\n\r\n";
+    var req = Request{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = head,
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .none,
+    };
+    var state = RequestState{ .arena = a };
+    defer state.deinit();
+    var buf: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var res = Response.init(a, @import("http_protocol").Sink.testSink(&writer));
+    defer res.deinit();
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &.{},
+        .arena = a,
+        .io = std.testing.io,
+    };
+    const allowed = [_][]const u8{"https://good.example"};
+    var mw = CorsMiddleware{ .config = .{
+        .allowed_origins = &allowed,
+        .block_unauthorized = true,
+    } };
+    const handler = @import("http_app").Handler.fromFn(struct {
+        fn f(_: *Context, r: *Response) !void {
+            try r.text("should not run");
+        }
+    }.f);
+    try mw.process(&ctx, &res, Next.root(&.{}, handler));
+    const wire = buf[0..writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, wire, "403") != null);
+    // testSink 不输出头，直接检查 Response 的头集合。
+    var found_vary = false;
+    for (res.headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Vary") and
+            std.mem.indexOf(u8, h.value, "Origin") != null) found_vary = true;
+    }
+    try std.testing.expect(found_vary);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "should not run") == null);
 }

@@ -7,6 +7,11 @@
 //! 所有公开方法通过 `std.Io.Mutex` 互斥保护 `rows`/`next_id` 与文件写入，
 //! 可被并发请求安全共享。
 //!
+//! # 并发模型（L-7）
+//! 上述互斥只覆盖**单进程**内线程；多进程同时打开同一张表没有文件锁，
+//! 后写者会直接覆盖前写者的 read-modify-write 结果。部署上必须保证一张表
+//! 同一时刻只被一个进程打开（不要在多 worker 进程间共享 data 目录）。
+//!
 //! # 存储格式
 //! 文件内容为 JSON 数组：
 //! ```json
@@ -24,8 +29,28 @@ const TableSchema = schema_mod.TableSchema;
 const FieldValue = schema_mod.FieldValue;
 const QueryBuilder = query_mod.QueryBuilder;
 
+/// L-4：load 与 flush 共享的单个表文件大小上限。flush 超限直接报错，
+/// 避免写出一个下次 open() 永远打不开的表。
+const MAX_TABLE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// JSON 文件存储引擎
 pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
+    // L-8：手写 schema 与模型字段名不一致时编译期报错，而不是等到 insert/load
+    // 运行到 getFieldValue 才 @panic（远程/启动期崩溃）。
+    comptime {
+        for (schema.fields) |f| {
+            if (!@hasField(T, f.name)) {
+                @compileError("schema field '" ++ f.name ++ "' not found in model " ++ @typeName(T));
+            }
+        }
+        for (schema.indexes) |idx| {
+            for (idx.fields) |name| {
+                if (!@hasField(T, name)) {
+                    @compileError("index field '" ++ name ++ "' not found in model " ++ @typeName(T));
+                }
+            }
+        }
+    }
     return struct {
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -34,6 +59,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         next_id: u64,
         rows: std.ArrayList(T),
         dirty: bool,
+        /// M-5：close 会解锁后销毁 self；并发等待者在锁上醒来后不能继续操作
+        /// 已释放的内存。closing 只在持锁期间读写，lock() 成功后立即复核。
+        closing: bool = false,
         /// 主键 id -> rows 下标，提供 O(1) 的 findById
         id_index: std.AutoHashMap(u64, usize) = undefined,
         /// 唯一单字段增量索引：key（store 自持有，allocator 分配）→ 行 id。
@@ -88,7 +116,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         };
 
         fn lock(self: *Self) !void {
-            return self.mutex.lock(self.io);
+            try self.mutex.lock(self.io);
+            if (self.closing) {
+                self.mutex.unlock(self.io);
+                return error.StoreClosed;
+            }
         }
 
         fn unlock(self: *Self) void {
@@ -121,6 +153,26 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // Ensure data directory exists
             try cwd.createDirPath(self.io, data_dir);
 
+            // L-3：清理上次进程在 tmp 写入途中崩溃留下的 `.{table}.json.*.tmp`
+            // 垃圾——否则残留文件永不回收（open 只认正式文件名）。
+            {
+                const file_path = try self.tableFilePath();
+                defer allocator.free(file_path);
+                const base = std.fs.path.basename(file_path);
+                if (cwd.openDir(self.io, data_dir, .{})) |d| {
+                    defer d.close(self.io);
+                    var it = std.Io.Dir.iterate(d);
+                    while (it.next(self.io) catch null) |entry| {
+                        if (std.mem.startsWith(u8, entry.name, base) and
+                            std.mem.endsWith(u8, entry.name, ".tmp") and
+                            entry.name.len > base.len)
+                        {
+                            d.deleteFile(self.io, entry.name) catch {};
+                        }
+                    }
+                } else |_| {}
+            }
+
             // Try to create the empty file if it doesn't exist
             const file_path = try self.tableFilePath();
             defer allocator.free(file_path);
@@ -141,7 +193,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             if (unique_field_count > 0 or unique_index_count > 0) {
                 errdefer self.destroyUniqueMaps();
                 try self.initUniqueMaps();
-                self.buildUniqueIndexes();
+                try self.buildUniqueIndexes();
             }
             return self;
         }
@@ -150,8 +202,13 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
         /// 无条件释放资源，最后再报 flush 错误：close 是消费性 API，
         /// 旧实现在 flush 失败时直接 return，rows / 每行字符串 / id_index / data_dir /
         /// self 全部泄漏，而调用方连句柄都没了，无法重试。
+        ///
+        /// M-5：close 之后该句柄彻底失效；框架内通过 closing 标志让并发等待者
+        /// 在 lock() 时收到 error.StoreClosed。调用方仍需在外部与所有持有
+        /// 本句柄的使用方同步「谁最后 close」，不要重复 close。
         pub fn close(self: *Self) !void {
             try self.lock();
+            self.closing = true;
             const flush_err = self.flushUnlocked();
             if (unique_field_count > 0 or unique_index_count > 0) {
                 self.destroyUniqueMaps();
@@ -202,7 +259,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 return;
             }
 
-            const content = try cwd.readFileAlloc(self.io, file_path, self.allocator, .limited(100 * 1024 * 1024));
+            const content = try cwd.readFileAlloc(self.io, file_path, self.allocator, .limited(MAX_TABLE_BYTES));
             defer self.allocator.free(content);
 
             if (content.len <= 2) {
@@ -232,6 +289,8 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             for (parsed.value) |jrow| {
                 if (jrow != .object) continue;
                 var row = try jsonObjectToType(T, self.allocator, jrow.object);
+                // H-2/M-6：损坏数据文件里的 NaN/Inf、非法 UTF-8 在 open 阶段就报错。
+                try validateRowFields(T, row);
                 // 当前行尚未进入 self.rows：若本迭代后续失败（append OOM / 损坏
                 // 数据返回），errdefer 释放该行已 dup 的字符串，避免与外层 errdefer
                 // （只清理已入列行）冲突或泄漏。
@@ -261,15 +320,24 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 // 的行做一次逐字段 dup；否则 close / 后续 freeStringFields 会去
                 // free schema 里的编译期常量（rodata），在测试 allocator 上不是
                 // panic 而是卡死在分配器内部。
+                // H-3：applyDefaults 是字段级零值改写；早先整行调用会把 JSON 里
+                // 存在但为零值的字段（如 role:""）也改成 schema 默认值，而 dup
+                // 循环只收编「键缺失」的字段——被覆写的字符串留在 rodata 上，
+                // 后续 delete/truncate/close 会 free(rodata) → 挂死/UB。
+                // 现在只对「键确实缺失」的字段应用默认值，并立即 dup 其字符串。
                 if (needs_defaults) {
-                    applyDefaults(&row);
                     inline for (schema.fields) |f| {
-                        if (f.constraints.default_value != null and jrow.object.get(f.name) == null) {
-                            const FT = @TypeOf(@field(row, f.name));
-                            if (comptime isConstU8Slice(FT)) {
-                                const ds = @field(row, f.name);
-                                if (ds.len > 0) {
-                                    @field(row, f.name) = try self.allocator.dupe(u8, ds);
+                        if (f.constraints.default_value) |dv| {
+                            if (jrow.object.get(f.name) == null) {
+                                query_mod.setFieldFromValue(T, &row, f.name, dv);
+                                const FT = @TypeOf(@field(row, f.name));
+                                if (comptime isConstU8Slice(FT)) {
+                                    const ds = @field(row, f.name);
+                                    if (ds.len > 0) @field(row, f.name) = try self.allocator.dupe(u8, ds);
+                                } else if (comptime isOptionalConstU8Slice(FT)) {
+                                    if (@field(row, f.name)) |ds| {
+                                        if (ds.len > 0) @field(row, f.name) = try self.allocator.dupe(u8, ds);
+                                    }
                                 }
                             }
                         }
@@ -282,8 +350,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 
                 // M3：统一以行内实际值 getFieldId 建索引/推进 max_id，不再依赖原始
                 // JSON 的 tag；缺失/≤0/重复 id 一律报损坏数据，杜绝索引与行脱同步。
-                const row_id: u64 = getFieldId(T, row);
-                if (row_id == 0) return error.CorruptData;
+                const row_id: u64 = try getFieldId(T, row);
+                // M-2：maxInt(u64) 会让下面的 next_id = max_id + 1 溢出 panic。
+                if (row_id == 0 or row_id == std.math.maxInt(u64)) return error.CorruptData;
                 if (self.id_index.contains(row_id)) return error.CorruptData;
 
                 // 先预留容量，之后 append/putAssumeCapacity 均不可失败（避免把已
@@ -328,6 +397,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             if (self.rows.items.len > 0) try buf.append(self.allocator, '\n');
             try buf.append(self.allocator, ']');
+            // L-4：写出前按 load 同一上限校验，超限时保留 dirty=true 报错，
+            // 不产生一个永久无法 reopen 的表。
+            if (buf.items.len > MAX_TABLE_BYTES) return error.TableTooLarge;
 
             try self.writeFile(buf.items);
             self.dirty = false;
@@ -358,6 +430,15 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 try file.sync(self.io);
             }
             try std.Io.Dir.rename(cwd, tmp_path, cwd, file_path, self.io);
+            // L-3：fsync 父目录，保证 rename 这个目录项本身在掉电后也持久
+            // （否则文件内容已 fsync，但可能回退到旧文件，绕过整套 tmp/fsync/rename）。
+            // 目录 fsync 在部分平台/文件系统上不支持，best-effort 不阻断写入。
+            const parent = cwd.openDir(self.io, self.data_dir, .{}) catch null;
+            if (parent) |d| {
+                defer d.close(self.io);
+                const dir_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+                dir_file.sync(self.io) catch {};
+            }
         }
 
         // ── CRUD ────────────────────────────────────────
@@ -378,6 +459,8 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             const id = self.next_id;
 
             var new_row = row;
+            // H-2/M-6：写入边界校验（NaN/Inf 与非法 UTF-8 会让整表永久打不开）。
+            try validateRowFields(T, new_row);
             applyDefaults(&new_row);
             setFieldByIdentifier(T, &new_row, "id", id);
             // 唯一约束校验：O(1) 增量索引查询（F-NEW-8，旧为全表扫描）
@@ -487,6 +570,8 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             if (query.data == null) {
                 return 0;
             }
+            // H-2/M-6：更新值同样在写入前校验，挡住 NaN/Inf 与非法 UTF-8。
+            try validateRowFields(T, query.data.?);
 
             // First pass: collect indices of rows that match the query.
             // 锁由 wrapper 持有：内部的提前返回不需要自己 unlock。
@@ -594,14 +679,15 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             defer new_rows.deinit(self.allocator);
             for (matched_indices.items) |idx| {
                 const row = self.rows.items[idx];
-                const orig_id = getFieldId(T, row);
+                const orig_id = try getFieldId(T, row);
                 var updated = row;
                 if (query.update_fields) |fields| {
                     for (fields) |field_name| {
                         // field_name 可能来自用户 JSON key：不存在的字段直接跳过，
                         // 不能 @panic（P0-8：一个 PATCH handler 把未知 key 传进来就能打死进程）。
-                        const val = query_mod.getFieldValueOpt(T, query.data.?, field_name) orelse continue;
-                        setFieldByIdentifier(T, &updated, field_name, val);
+                        // M-1：optional 字段直接从 query.data 拷贝（含 null），
+                        // 绕过 FieldValue 的零值中转。
+                        setFieldFromRowData(T, &updated, query.data.?, field_name);
                     }
                     setFieldByIdentifier(T, &updated, "id", orig_id);
                 } else {
@@ -680,7 +766,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 applyStringChanges(T, self.allocator, row, &updated, prepared_list[j].items);
                 self.rows.items[idx] = updated;
                 if (unique_field_count > 0 or unique_index_count > 0) {
-                    self.registerRowUniques(updated, getFieldId(T, updated));
+                    self.registerRowUniques(updated, try getFieldId(T, updated));
                 }
                 updated_count += 1;
             }
@@ -753,7 +839,7 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             // 造成索引半重建 + dirty 仍落盘。
             self.id_index.clearRetainingCapacity();
             for (self.rows.items, 0..) |row, idx| {
-                self.id_index.putAssumeCapacity(getFieldId(T, row), idx);
+                self.id_index.putAssumeCapacity(try getFieldId(T, row), idx);
             }
 
             self.dirty = true;
@@ -814,10 +900,27 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
             self.rows.clearRetainingCapacity();
             self.id_index.clearRetainingCapacity();
-            // 唯一键索引清空（key 全部 store 自持有，一并释放）
+            // M-4：先完整分配好新 maps 再整体换入。旧代码先 destroy 再 try
+            // initUniqueMaps，后者 OOM 时行已清空、maps 为-empty 切片但
+            // unique_field_count>0 仍成立 → 后续 insert/checkUnique 越界 panic。
             if (unique_field_count > 0 or unique_index_count > 0) {
+                var new_field_maps: []std.StringHashMap(u64) = &.{};
+                var new_index_maps: []std.StringHashMap(u64) = &.{};
+                errdefer {
+                    if (new_field_maps.len > 0) self.allocator.free(new_field_maps);
+                    if (new_index_maps.len > 0) self.allocator.free(new_index_maps);
+                }
+                if (unique_field_count > 0) {
+                    new_field_maps = try self.allocator.alloc(std.StringHashMap(u64), unique_field_count);
+                    for (new_field_maps) |*m| m.* = .init(self.allocator);
+                }
+                if (unique_index_count > 0) {
+                    new_index_maps = try self.allocator.alloc(std.StringHashMap(u64), unique_index_count);
+                    for (new_index_maps) |*m| m.* = .init(self.allocator);
+                }
                 self.destroyUniqueMaps();
-                try self.initUniqueMaps();
+                self.field_key_maps = new_field_maps;
+                self.index_key_maps = new_index_maps;
             }
             self.next_id = 1;
             self.dirty = true;
@@ -1056,7 +1159,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 if (comptime mi >= 0 and f.constraints.unique) {
                     const m = &self.field_key_maps[@intCast(mi)];
                     if (!query_mod.isFieldNull(T, row, f.name)) {
-                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch {
+                            // L-1：旧代码静默吞 OOM → 约束悄然失效。这里至少可见。
+                            std.log.err("orm: {s} 唯一索引 key 分配失败（约束可能失效）", .{self.table_name});
+                            return;
+                        };
                         const gop = m.getOrPut(key) catch {
                             self.allocator.free(key);
                             return;
@@ -1075,7 +1182,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 if (comptime mi >= 0 and idx.unique) {
                     const m = &self.index_key_maps[@intCast(mi)];
                     if (!groupHasNull(row, idx.fields)) {
-                        const key = groupKey(self.allocator, row, idx.fields) catch return;
+                        const key = groupKey(self.allocator, row, idx.fields) catch {
+                            // L-1：旧代码静默吞 OOM → 联合约束悄然失效。
+                            std.log.err("orm: {s} 联合唯一索引 key 分配失败（约束可能失效）", .{self.table_name});
+                            return;
+                        };
                         const gop = m.getOrPut(key) catch {
                             self.allocator.free(key);
                             return;
@@ -1097,7 +1208,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 if (comptime mi >= 0 and f.constraints.unique) {
                     const m = &self.field_key_maps[@intCast(mi)];
                     if (!query_mod.isFieldNull(T, row, f.name)) {
-                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                        const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch {
+                            // L-1：旧代码静默吞 OOM → 约束悄然失效。这里至少可见。
+                            std.log.err("orm: {s} 唯一索引 key 分配失败（约束可能失效）", .{self.table_name});
+                            return;
+                        };
                         defer self.allocator.free(key);
                         if (m.fetchRemove(key)) |kv| self.allocator.free(kv.key);
                     }
@@ -1108,7 +1223,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                 if (comptime mi >= 0 and idx.unique) {
                     const m = &self.index_key_maps[@intCast(mi)];
                     if (!groupHasNull(row, idx.fields)) {
-                        const key = groupKey(self.allocator, row, idx.fields) catch return;
+                        const key = groupKey(self.allocator, row, idx.fields) catch {
+                            // L-1：旧代码静默吞 OOM → 联合约束悄然失效。
+                            std.log.err("orm: {s} 联合唯一索引 key 分配失败（约束可能失效）", .{self.table_name});
+                            return;
+                        };
                         defer self.allocator.free(key);
                         if (m.fetchRemove(key)) |kv| self.allocator.free(kv.key);
                     }
@@ -1166,21 +1285,23 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
 
         /// 开启时重建唯一键索引（load 之后调用）。发现存量重复时告警
         /// 并保留首行映射（warning-only，不拒启动——见 F-NEW-5.1 讨论）。
-        fn buildUniqueIndexes(self: *Self) void {
+        fn buildUniqueIndexes(self: *Self) !void {
             if (unique_field_count == 0 and unique_index_count == 0) return;
-            // 逐 map 预留容量，让 putAssumeCapacity 阶段不可失败。
-            self.ensureUniqueCapacityRows(self.rows.items.len) catch return;
+            // L-1：OOM 必须上抛（open 的 errdefer 会释放已建索引），不能静默留下
+            // 一个「约束悄然失效」的 store。
+            try self.ensureUniqueCapacityRows(self.rows.items.len);
             for (self.rows.items) |row| {
-                const id = getFieldId(T, row);
+                // load() 已逐行校验 id（非正/超界报 CorruptData），这里必然成功。
+                const id = getFieldId(T, row) catch unreachable;
                 inline for (schema.fields, 0..) |f, fi| {
                     const mi = field_map_idx[fi];
                     if (comptime mi >= 0 and f.constraints.unique) {
                         if (!query_mod.isFieldNull(T, row, f.name)) {
-                            const key = fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name)) catch return;
+                            const key = try fieldValuesKey(self.allocator, query_mod.getFieldValue(T, row, f.name));
                             const m = &self.field_key_maps[@intCast(mi)];
                             const gop = m.getOrPut(key) catch {
                                 self.allocator.free(key);
-                                return;
+                                return error.OutOfMemory;
                             };
                             if (gop.found_existing) {
                                 std.log.warn("orm: {s} 打开时发现存量数据违反唯一约束（字段 {s} 有重复值）——加载已放行；后续 update/insert 该值会报 UniqueViolation", .{ self.table_name, f.name });
@@ -1195,11 +1316,11 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
                     const mi = index_map_idx[ii];
                     if (comptime mi >= 0 and idx.unique) {
                         if (!groupHasNull(row, idx.fields)) {
-                            const key = groupKey(self.allocator, row, idx.fields) catch return;
+                            const key = try groupKey(self.allocator, row, idx.fields);
                             const m = &self.index_key_maps[@intCast(mi)];
                             const gop = m.getOrPut(key) catch {
                                 self.allocator.free(key);
-                                return;
+                                return error.OutOfMemory;
                             };
                             if (gop.found_existing) {
                                 std.log.warn("orm: {s} 打开时发现存量数据违反联合唯一约束（索引 {s} 有重复组合）——加载已放行；后续写入会报 UniqueViolation", .{ self.table_name, idx.name });
@@ -1302,6 +1423,9 @@ pub fn JsonStore(comptime T: type, comptime schema: TableSchema) type {
             }
         }
 
+        /// L-6：默认值迁移的固有局限——零值（0 / "" / false）与「未设置」不可
+        /// 区分：insert 时显式写入的零值若 schema 默认值非零会被静默改写。
+        /// 需要表达「未设置」请用 optional 字段（null 才是真正的未设置）。
         fn isZeroValue(v: FieldValue) bool {
             return switch (v) {
                 .integer => |x| x == 0,
@@ -1391,6 +1515,8 @@ fn jsonObjectToType(comptime T: type, allocator: std.mem.Allocator, obj: std.jso
 
 fn typeToJsonString(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     const T = @TypeOf(value);
+    // 最后一道关口（连同 insert/update/load 边界校验）：绝不把非法 JSON 写盘。
+    try validateRowFields(T, value);
     var buf = std.ArrayList(u8).empty;
 
     try buf.append(allocator, '{');
@@ -1420,14 +1546,14 @@ fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.j
                 if (!(f >= @as(f64, @floatFromInt(std.math.minInt(i64))) and f <= @as(f64, @floatFromInt(std.math.maxInt(i64))))) return error.CorruptData;
                 return std.math.cast(T, @as(i64, @intFromFloat(f))) orelse error.CorruptData;
             }
-            if (value == .number_string) return std.fmt.parseInt(T, value.number_string, 10) catch 0;
-            return 0;
+            if (value == .number_string) return std.fmt.parseInt(T, value.number_string, 10) catch return error.CorruptData;
+            return error.CorruptData;
         },
         .float, .comptime_float => {
             if (value == .float) return @floatCast(value.float);
             if (value == .integer) return @floatFromInt(value.integer);
-            if (value == .number_string) return std.fmt.parseFloat(T, value.number_string) catch 0.0;
-            return 0.0;
+            if (value == .number_string) return std.fmt.parseFloat(T, value.number_string) catch return error.CorruptData;
+            return error.CorruptData;
         },
         .bool => {
             if (value == .bool) return value.bool;
@@ -1450,14 +1576,17 @@ fn jsonValueToField(comptime T: type, allocator: std.mem.Allocator, value: std.j
             return try jsonValueToField(Child, allocator, value);
         },
         .@"enum" => {
+            // M-3：@fromBackingInt 对非法 tag 是运行期 panic（ReleaseFast 下类型
+            // 混淆 UB），且「未知字符串回退 tag 0」对不从 0 起的枚举是编译错误。
+            // 统一用 fromInt（返回 optional）→ CorruptData。
             if (value == .string) {
-                if (std.meta.stringToEnum(T, value.string)) |e| return e;
+                return std.meta.stringToEnum(T, value.string) orelse error.CorruptData;
             }
             if (value == .integer) {
                 const tag: std.meta.Tag(T) = std.math.cast(std.meta.Tag(T), value.integer) orelse return error.CorruptData;
-                return @fromBackingInt(tag);
+                return std.enums.fromInt(T, tag) orelse error.CorruptData;
             }
-            return @fromBackingInt(@intCast(@as(std.meta.Tag(T), 0)));
+            return error.CorruptData;
         },
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     }
@@ -1472,6 +1601,9 @@ fn appendJsonField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value:
             try buf.appendSlice(allocator, s);
         },
         .float, .comptime_float => {
+            // H-2：NaN/Inf 经 `{d}` 会写成 `nan`/`inf`（非法 JSON），下次 open()
+            // 解析失败 → 整表永久打不开。这里是最后的写入关口，非有限值一律拒绝。
+            if (!std.math.isFinite(@as(f64, @floatCast(value)))) return error.InvalidFloat;
             var num_buf: [64]u8 = undefined;
             const s = try std.fmt.bufPrint(&num_buf, "{d}", .{value});
             try buf.appendSlice(allocator, s);
@@ -1579,6 +1711,30 @@ fn setFieldByIdentifier(comptime T: type, instance: *T, field_name: []const u8, 
     }
 }
 
+/// M-1：update_fields 路径必须从 query.data 原样拷贝 optional 值。
+/// query.zig 的 toFieldValue(null) 产出零值（.string="" / .integer=0），经
+/// FieldValue 中转会把 `?[]const u8` 变成 SOME("")、`?int` 变成 SOME(0)
+/// ——部分更新永远无法把字段置回 NULL。
+fn setFieldFromRowData(comptime T: type, instance: *T, data: T, field_name: []const u8) void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (std.mem.eql(u8, fname, field_name)) {
+            if (comptime @typeInfo(ftype) == .optional) {
+                if (@field(data, fname) == null) {
+                    @field(instance, fname) = null;
+                    return;
+                }
+            }
+            const val = query_mod.getFieldValueOpt(T, data, fname) orelse return;
+            setTypedField(ftype, &@field(instance, fname), val);
+            return;
+        }
+    }
+}
+
 /// 按目标字段类型写入值。optional 字段递归解包到 child 类型（与 query.zig 的
 /// setTyped 一致），保证 `?T` 字段的更新真正生效而不被静默丢弃（M2）。
 fn setTypedField(comptime FieldT: type, field_ptr: anytype, value: anytype) void {
@@ -1620,9 +1776,11 @@ fn setTypedField(comptime FieldT: type, field_ptr: anytype, value: anytype) void
     }
 }
 
-fn getFieldId(comptime T: type, value: T) u64 {
+/// M-2：@intCast 对负数 id（模型 id: i64 时数据文件 `{"id": -5}`）是运行期
+/// panic（在 open 路径上）；改用可失败的 std.math.cast，由调用方归入 CorruptData。
+fn getFieldId(comptime T: type, value: T) !u64 {
     if (@hasField(T, "id")) {
-        return @intCast(@field(value, "id"));
+        return std.math.cast(u64, @field(value, "id")) orelse error.CorruptData;
     }
     @compileError("Type has no 'id' field: " ++ @typeName(T));
 }
@@ -1662,6 +1820,49 @@ fn dupStringFields(comptime T: type, allocator: std.mem.Allocator, row: *T) !voi
                 @field(row.*, fname) = try allocator.dupe(u8, s);
             }
             done += 1;
+        }
+    }
+}
+
+/// H-2/M-6：写入边界的行值校验——float 必须有限（NaN/Inf 会写成非法 JSON
+/// `nan`/`inf` → 整表永久打不开），字符串必须是合法 UTF-8（std.json 解析时
+/// 会校验 → 同样永久打不开）。insert/update/load/flush 四处调用，错误在
+/// 破坏落盘之前返回。
+fn isFloatField(comptime FT: type) bool {
+    return switch (@typeInfo(FT)) {
+        .float, .comptime_float => true,
+        else => false,
+    };
+}
+
+fn isOptionalFloatField(comptime FT: type) bool {
+    return switch (@typeInfo(FT)) {
+        .optional => |opt| switch (@typeInfo(opt.child)) {
+            .float, .comptime_float => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn validateRowFields(comptime T: type, row: T) !void {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("expected struct"),
+    };
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime isConstU8Slice(ftype)) {
+            if (!std.unicode.utf8ValidateSlice(@field(row, fname))) return error.InvalidUtf8;
+        } else if (comptime isOptionalConstU8Slice(ftype)) {
+            if (@field(row, fname)) |s| {
+                if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+            }
+        } else if (comptime isFloatField(ftype)) {
+            if (!std.math.isFinite(@as(f64, @floatCast(@field(row, fname))))) return error.InvalidFloat;
+        } else if (comptime isOptionalFloatField(ftype)) {
+            if (@field(row, fname)) |f| {
+                if (!std.math.isFinite(@as(f64, @floatCast(f)))) return error.InvalidFloat;
+            }
         }
     }
 }
@@ -1726,16 +1927,20 @@ fn prepareStringChanges(comptime T: type, allocator: std.mem.Allocator, original
                 try dupAppendChange(allocator, changes, fname, false, new_slice);
             }
         } else if (comptime isOptionalConstU8Slice(ftype)) {
+            // H-1：本机编译器不允许对 optional 直接 switch（`error: switch on
+            // optional type '?[]const u8'`），只要模型含 optional 字符串且调用
+            // update 就会编译失败。改为显式 null 检查 + unwrap。
             const orig_opt = @field(original, fname);
             const new_opt = @field(updated.*, fname);
-            switch (orig_opt) {
-                null => if (new_opt) |new_slice| try dupAppendChange(allocator, changes, fname, true, new_slice),
-                else => |orig_slice| switch (new_opt) {
-                    null => try changes.append(allocator, .{ .name = fname, .is_optional = true, .new = null }),
-                    else => |new_slice| if (orig_slice.ptr != new_slice.ptr) {
-                        try dupAppendChange(allocator, changes, fname, true, new_slice);
-                    },
-                },
+            if (orig_opt == null) {
+                if (new_opt) |new_slice| try dupAppendChange(allocator, changes, fname, true, new_slice);
+            } else {
+                const orig_slice = orig_opt.?;
+                if (new_opt == null) {
+                    try changes.append(allocator, .{ .name = fname, .is_optional = true, .new = null });
+                } else if (orig_slice.ptr != new_opt.?.ptr) {
+                    try dupAppendChange(allocator, changes, fname, true, new_opt.?);
+                }
             }
         }
     }
@@ -3223,4 +3428,111 @@ test "load 时按当前 schema 对齐旧数据：缺列补默认值、多余键�
     const rr = (try reopened.findById(allocator, 1)).?;
     defer reopened.freeRow(allocator, rr);
     try std.testing.expectEqualStrings("member", rr.role);
+}
+
+// ── 高危回归测试 ────────────────────────────────────
+
+test "H-1/M-1: optional 字符串字段 update 编译并支持置回 null" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct {
+        id: u64 = 0,
+        name: []const u8 = "",
+        nickname: ?[]const u8 = null,
+    };
+    const sch = TableSchema{
+        .table_name = "h1_optional_update",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true } },
+            .{ .name = "name", .field_type = .string, .constraints = .{} },
+            .{ .name = "nickname", .field_type = .string, .constraints = .{} },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    const id = try store.insert(.{ .name = "Alice", .nickname = "Al" });
+
+    // 部分更新：置回 null（M-1）——旧版经 FieldValue 中转会变成 SOME("")。
+    var qb = QueryBuilder(U).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+    _ = qb.update(.{ .name = "Alice", .nickname = null }, &.{"nickname"});
+    try std.testing.expectEqual(@as(usize, 1), try store.update(&qb));
+
+    const row = (try store.findById(allocator, id)).?;
+    defer store.freeRow(allocator, row);
+    try std.testing.expect(row.nickname == null);
+    try std.testing.expectEqualStrings("Alice", row.name);
+}
+
+test "H-2: NaN/Inf 在 update/insert 边界被拒绝，表仍可打开" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, score: f64 = 0 };
+    const sch = TableSchema{
+        .table_name = "h2_float_guard",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true } },
+            .{ .name = "score", .field_type = .float, .constraints = .{} },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    var store = try Store.open(allocator, io, ".test_data");
+    defer {
+        store.truncate() catch {};
+        store.close() catch {};
+    }
+    const id = try store.insert(.{ .score = 1.5 });
+    try store.flush();
+
+    var qb = QueryBuilder(U).init(allocator);
+    defer qb.deinit();
+    _ = qb.where(.Eq, "id", .{ .integer = @intCast(id) });
+    _ = qb.update(.{ .score = std.math.nan(f64) }, &.{"score"});
+    try std.testing.expectError(error.InvalidFloat, store.update(&qb));
+    try std.testing.expectError(error.InvalidFloat, store.insert(.{ .score = std.math.inf(f64) }));
+
+    var reopened = try Store.open(allocator, io, ".test_data");
+    defer reopened.close() catch {};
+    const row = (try reopened.findById(allocator, id)).?;
+    defer reopened.freeRow(allocator, row);
+    try std.testing.expectEqual(@as(f64, 1.5), row.score);
+}
+
+test "H-3: JSON 中存在但为零值的字段不被默认值迁移改写" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const U = struct { id: u64 = 0, role: []const u8 = "" };
+    const sch = TableSchema{
+        .table_name = "h3_defaults",
+        .fields = &.{
+            .{ .name = "id", .field_type = .integer, .constraints = .{ .primary_key = true } },
+            .{ .name = "role", .field_type = .string, .constraints = .{ .default_value = FieldValue{ .string = "member" } } },
+        },
+    };
+    const Store = JsonStore(U, sch);
+    const path = ".test_data/h3_defaults.json";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer f.close(io);
+        var wb: [256]u8 = undefined;
+        var w = f.writer(io, wb[0..]);
+        try w.interface.writeAll("[{\"id\":1,\"role\":\"\"}]");
+        try w.flush();
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var store = try Store.open(allocator, io, ".test_data");
+    defer store.close() catch {};
+    const row = (try store.findById(allocator, 1)).?;
+    try std.testing.expectEqualStrings("", row.role);
+    // 若 role 仍指向 rodata，下面的 delete 会在 close/freeStringFields 时非法 free。
+    try std.testing.expect(try store.deleteById(1));
+    const rows = try store.all(allocator);
+    defer store.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
 }

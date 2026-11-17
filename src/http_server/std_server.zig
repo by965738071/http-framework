@@ -309,6 +309,24 @@ pub const Server = struct {
                 self.write_buf,
             );
 
+            // M-8：头阶段用绝对 deadline（toDeadline），头读完恢复 per-op 超时。
+            // operateTimeout 对 .deadline 变体直接按绝对时间判定，滴灌无效。
+            const HeadCtx = struct {
+                r: *TimedReader,
+                io: std.Io,
+                cfg: *const @TypeOf(s.config),
+
+                fn begin(ctx: ?*anyopaque) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx.?));
+                    c.r.timeout = timeoutFromNs(c.cfg.network.max_head_duration_ns).toDeadline(c.io);
+                }
+                fn end(ctx: ?*anyopaque) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx.?));
+                    c.r.timeout = timeoutFromNs(c.cfg.network.read_timeout_ns);
+                }
+            };
+            var head_ctx = HeadCtx{ .r = &reader, .io = s.io, .cfg = &s.config };
+
             // 汇合点：把 std.Io 读写接口交给后端无关的 HTTP 引擎。
             var runner = ConnectionRunner{
                 .reader = &reader.interface,
@@ -321,6 +339,9 @@ pub const Server = struct {
                 .allocator = s.allocator,
                 .services = s.services,
                 .peer_ip = self.peer_ip,
+                .head_timeout_ctx = &head_ctx,
+                .on_head_begin = HeadCtx.begin,
+                .on_head_end = HeadCtx.end,
             };
             runner.run();
 

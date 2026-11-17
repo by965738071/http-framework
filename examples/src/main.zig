@@ -109,8 +109,11 @@ const UserStore = UserModel.Store;
 // 入口
 // ────────────────────────────────────────────────────────────────────────────
 
+/// M-17：Bearer token 从环境变量读取；未设置时不挂载 /admin/secret。
+var demo_bearer_token: ?[]const u8 = null;
+
 pub fn main(init: std.process.Init) !void {
-    _ = init;
+    demo_bearer_token = init.environ_map.get("DEMO_BEARER_TOKEN");
     // 使用框架的 runZio 启动 zio 运行时
     var allocator = std.heap.DebugAllocator(.{}){};
     defer {
@@ -125,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
 fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
     // 2. 配置（分层：network / http / body / pool）
     const config = framework.Config{
-        .network = .{ .port = 9000 },
+        .network = .{ .address = "127.0.0.1", .port = 9000 },
         .http = .{ .server_name = "examples" },
         .body = .{ .size_limit = 10 * 1024 * 1024 },
         .pool = .{ .request_arena_retain_bytes = 4 * 1024 },
@@ -335,6 +338,9 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // 5f. Device & Register handler instances
     var register_handler = register.RegisterHandler{ .io = io, .users = admin_users };
+    // L-39：演示 CSRF 中间件的挂载（本地明文 HTTP 示例需 secure=false；
+    // 生产部署请用 HTTPS 并保持默认 true）。
+    var csrf_mw = framework.CsrfMiddleware{ .io = io, .config = .{ .secure = false } };
     var device_list_handler = devices.DeviceListHandler{ .store = device_store };
     var device_create_handler = devices.DeviceCreateHandler{ .store = device_store, .io = io };
     var device_get_handler = devices.DeviceGetHandler{ .store = device_store };
@@ -355,14 +361,18 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
 
         // Bearer Token 演示：/admin/secret 用 AuthMiddleware（Authorization: Bearer ...）保护，
         // 与后台 UI 的 session 鉴权互不相关，仅作为 Bearer 认证示例。
-        {
+        // M-17：不再硬编码 bearer token——从 DEMO_BEARER_TOKEN 读取；
+        // 未设置时不挂载该演示端点（避免默认弱凭据暴露）。
+        if (demo_bearer_token) |token| {
             var admin_bearer_routes = try admin_routes.group("");
             var admin_auth = framework.AuthMiddleware{ .config = .{
-                .bearer_token = "demo-secret-token",
+                .bearer_token = token,
                 .realm = "Protected",
             } };
             try admin_bearer_routes.use(framework.Middleware.init(framework.AuthMiddleware, &admin_auth));
             try admin_bearer_routes.route(.GET, "/secret", framework.Handler.fromFn(adminSecretHandler));
+        } else {
+            std.log.warn("DEMO_BEARER_TOKEN 未设置：/admin/secret 演示端点未挂载", .{});
         }
 
         // 后台 UI 的受保护路由：用 session 鉴权（admin.requireAuth）。
@@ -371,6 +381,10 @@ fn appMain(io: std.Io, allocator: std.mem.Allocator) !void {
         {
             var admin_session_routes = try admin_routes.group("");
             try admin_session_routes.use(admin.requireAuth(&admin_services));
+            // H-8：管理端点要求 admin 角色；与开放注册形不成越权链。
+            try admin_session_routes.use(admin.requireRole(.admin, &admin_services));
+            // L-39：状态变更端点挂 CSRF（演示用法）。
+            try admin_session_routes.use(framework.Middleware.init(framework.CsrfMiddleware, &csrf_mw));
 
             try admin_session_routes.route(.GET, "/me", framework.Handler.initSingleton(&me_handler));
             try admin_session_routes.route(.GET, "/dashboard", framework.Handler.initSingleton(&dashboard_handler));
@@ -523,7 +537,7 @@ const LoginRequest = struct {
 
 fn loginHandler(ctx: *framework.Context, res: *framework.Response) !void {
     // parseJson(T, arena, body)：解析并返回 *T（arena 分配，请求结束自动回收）
-    const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
@@ -544,7 +558,7 @@ const CreateItemRequest = struct {
 };
 
 fn createItemHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const body = framework.parseJson(CreateItemRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = framework.parseJson(CreateItemRequest, ctx.arena, ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
@@ -593,8 +607,23 @@ fn uploadHandler(ctx: *framework.Context, res: *framework.Response) !void {
     const username = form.getText("username") orelse "anonymous";
 
     if (form.getFile("avatar")) |file| {
-        const file_name = file.safeBaseName() orelse "upload.bin";
-        var target_file = try std.Io.Dir.createFile(.cwd(), ctx.io, file_name, .{});
+        // L-37：不再用客户端文件名直接写 CWD（会覆盖 build.zig/data 等）——
+        // 写入专用 uploads/ 子目录 + 随机文件名 + 扩展名白名单。
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(ctx.io, "uploads");
+        const base = file.safeBaseName() orelse "upload.bin";
+        const ext = std.fs.path.extension(base);
+        const allowed_ext = std.mem.eql(u8, ext, ".png") or std.mem.eql(u8, ext, ".jpg") or
+            std.mem.eql(u8, ext, ".jpeg") or std.mem.eql(u8, ext, ".gif") or std.mem.eql(u8, ext, ".txt");
+        if (!allowed_ext) {
+            try ctx.failWith(framework.AppError.badRequest("unsupported file extension"));
+            return;
+        }
+        var rand: [8]u8 = undefined;
+        ctx.io.random(&rand);
+        const rand_hex = std.fmt.bytesToHex(rand, .lower);
+        const file_name = try std.fmt.allocPrint(ctx.arena, "uploads/{s}{s}", .{ &rand_hex, ext });
+        var target_file = try cwd.createFile(ctx.io, file_name, .{});
         defer target_file.close(ctx.io);
         var writer = target_file.writer(ctx.io, &.{});
         const w = &writer.interface;
@@ -666,7 +695,7 @@ fn errorDemoHandler(ctx: *framework.Context, res: *framework.Response) !void {
 
 /// POST /session/login  {"username":"alice","password":"secret"}
 fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void {
-    const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = framework.parseJson(LoginRequest, ctx.arena, ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
@@ -692,7 +721,7 @@ fn sessionLoginHandler(ctx: *framework.Context, res: *framework.Response) !void 
         logger.info(ctx, "user logged in", &.{framework.fstr("user", body.username)});
     }
 
-    try res.json(.{ .ok = true, .session = session_id });
+    try res.json(.{ .ok = true });
 }
 
 /// GET /session/me （带 cookie）→ 返回当前登录用户
@@ -714,7 +743,9 @@ fn sessionMeHandler(ctx: *framework.Context, res: *framework.Response) !void {
 }
 
 /// POST /session/logout → 让 cookie 过期
-fn sessionLogoutHandler(_: *framework.Context, res: *framework.Response) !void {
+fn sessionLogoutHandler(ctx: *framework.Context, res: *framework.Response) !void {
+    // M-16：先销毁服务端会话，旧 sid 才不能继续使用（只清 cookie 无效）。
+    if (ctx.service(framework.SessionManager)) |sessions| sessions.destroyFromRequest(ctx);
     _ = try res.setCookieFull(.{
         .name = "sid",
         .value = "deleted",
@@ -777,7 +808,7 @@ fn ormCreateHandler(ctx: *framework.Context, res: *framework.Response) !void {
         return;
     };
 
-    const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {
@@ -829,7 +860,7 @@ fn ormUpdateHandler(ctx: *framework.Context, res: *framework.Response) !void {
     };
     const id = (try parseId(ctx)) orelse return;
 
-    const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = framework.parseJson(NewUserBody, ctx.arena, ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return;
     }) catch {

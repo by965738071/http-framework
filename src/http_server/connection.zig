@@ -36,6 +36,13 @@ pub const ConnectionRunner = struct {
     /// 对端 IP 地址（由后端从 accept 结果注入），透传到每个请求的 Context。
     /// null 表示后端未提供（如内存测试后端或 Unix socket）。
     peer_ip: ?std.Io.net.IpAddress = null,
+    /// M-8：头阶段绝对 deadline 的后端钩子。后端在每次 receiveHead 前把 reader
+    /// 设成 deadline（now + config.network.max_head_duration_ns），读完恢复
+    /// per-op 超时；这样「滴灌字节」无法无限延续头阶段。connection.zig 只负责
+    /// 在正确的时机调用钩子，不依赖任何具体后端或超时类型。
+    head_timeout_ctx: ?*anyopaque = null,
+    on_head_begin: ?*const fn (?*anyopaque) void = null,
+    on_head_end: ?*const fn (?*anyopaque) void = null,
 
     /// 跑完一条连接的完整 keep-alive 生命周期。不 close 连接（调用方负责）。
     pub fn run(self: *ConnectionRunner) void {
@@ -56,6 +63,8 @@ pub const ConnectionRunner = struct {
         while (true) {
             if (self.stats.shutting_down.load(.monotonic)) break;
 
+            // M-8：每个请求头阶段都从绝对 deadline 开始（后端钩子）。
+            if (self.on_head_begin) |f| f(self.head_timeout_ctx);
             const result = conn_loop.next() catch |err| {
                 // 只有真正的客户端协议错误才写响应。
                 // 旧代码在判断错误类型「之前」就无条件写了 400，于是每一个正常关闭
@@ -76,6 +85,8 @@ pub const ConnectionRunner = struct {
                 break;
             };
             const next_result = result orelse break; // connection closed
+            // M-8：头已读完（无论后面 handler 做什么），恢复 per-op 超时。
+            if (self.on_head_end) |f| f(self.head_timeout_ctx);
             var request = next_result.parsed;
             const http_request = next_result.raw;
             // Issue 5: 无 body 方法携带 CL 时的待排空字节数。提前快照成栈上标量：
@@ -97,6 +108,15 @@ pub const ConnectionRunner = struct {
             // 在 processRequest 之前降级，响应里才能带上 Connection: close。
             if (ignored_body_len) |n| {
                 if (n > IGNORED_BODY_DRAIN_CAP) response_keep_alive = false;
+            }
+            // H-4：HEAD + Content-Length>0 时框架有意放行（body 为 .none），
+            // 但 std 的 readerExpectNone 对 HEAD 直接返回 .ending，reader 状态
+            // 停在 .received_head；keep-alive 的 respond → discardBody 排空 0 字节
+            // 后 assert(state == .ready) 失败 → Debug/ReleaseSafe 下单个请求打死
+            // 整个进程，ReleaseFast 下退化为请求走私。这里强制关连接：std 走
+            // .closing 路径，不触发断言。
+            if (request.method == .HEAD and ignored_body_len != null) {
+                response_keep_alive = false;
             }
             const hijack = self.processRequest(&request, http_request, &arenas, response_keep_alive) catch |err| blk: {
                 std.log.err("processRequest: {s}", .{@errorName(err)});
@@ -131,14 +151,26 @@ pub const ConnectionRunner = struct {
             // response_keep_alive 与旧的 keep_alive 是两个逐字相同的表达式（同一
             // shutting_down 快照），合并消除「看起来像两个决策」的误导。
             arenas.endRequest(self.config.pool.request_arena_retain_bytes);
+            // H-5：handler 用流式 reader 只读了部分 body 就返回时，std 的
+            // discardBody 对 .body_remaining_* 状态直接 return 不排空（对照
+            // std/http/Server.zig 的 discardBody），残留字节会被下一个 receiveHead
+            // 当成新请求行解析——攻击者可构造合法请求行+头形成 CL 走私原语。
+            // 复用决策感知不到这件事，只能在这里查 reader 状态，强制断连。
+            const reader_state = http_request.server.reader.state;
+            if (reader_state == .body_remaining_content_length or
+                reader_state == .body_remaining_chunk_len)
+            {
+                response_keep_alive = false;
+            }
             // 请求处理报错后不再复用连接：body 是否读净、协议状态是否一致
             // 都不确定，继续 keep-alive 可能错帧（回应审查发现 #7）。
             if (request_failed or !response_keep_alive) break;
-            // Issue 5: 无 body 方法携带 CL 的残留字节。std 0.18 起，keep-alive
-            // 响应时 respond → discardBody 会自动消费掉这些字节（旧 0.17 的恒空
-            // .ending reader 从不消费，框架才需要手动 discardAll64）。超限降级 /
-            // 客户端 close 时框架响应 keep_alive=false，std 不排空并置 .closing，
-            // 下面直接 break，未排空字节随连接一起丢弃。
+            // Issue 5: 无 body 方法携带 CL 的残留字节。旧注释声称「std 0.18 起
+            // discardBody 会自动消费」——这对 HEAD（H-4）与部分读取的流式 body
+            // （H-5）均不成立，已由上面两处强制断连处理；其余 .received_head
+            // 情形（如未读 body 的 POST）才由 std 排空。
+            // 超限降级 / 客户端 close 时框架响应 keep_alive=false，std 不排空并置
+            // .closing，下面直接 break，未排空字节随连接一起丢弃。
             // 真正的空闲等待发生在下一次 conn_loop.next() 的阻塞读里，
             // 由 reader 的 read_timeout_ns 约束。旧代码在 next() 前采样 idle_start、
             // 在处理完后算差，实际测的是“读+处理”总耗时，既无法在真正空闲时
@@ -166,8 +198,10 @@ pub const ConnectionRunner = struct {
         var state = http_app.RequestState{ .arena = arena_alloc };
         defer state.deinit();
 
+        // M-19：RequestConfig.trust_proxy 已删除（从未有过读取方的死字段，
+        // 限流器用自己的 RateLimitConfig.trust_proxy）；body_size_limit 由
+        // Context.readBody(0) 消费（未显式传 limit 时的全局上限）。
         const req_config = http_app.RequestConfig{
-            .trust_proxy = self.config.body.trust_proxy_headers,
             .body_size_limit = self.config.body.size_limit,
         };
 

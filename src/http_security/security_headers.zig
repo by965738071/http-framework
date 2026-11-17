@@ -11,8 +11,16 @@ const Next = root.Next;
 pub const SecurityHeadersConfig = struct {
     x_content_type_options: ?[]const u8 = "nosniff",
     x_frame_options: ?[]const u8 = "DENY",
-    content_security_policy: ?[]const u8 = "default-src 'self'",
+    // L-33：默认 CSP 补齐 object-src/base-uri/frame-ancestors 加固子句。
+    content_security_policy: ?[]const u8 = "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+    /// L-33：HSTS 默认不发（null）——明文 HTTP 上无效，且需由 TLS 终止层确认。
+    /// 生产 HTTPS 部署推荐 `max-age=31536000; includeSubDomains`（确认所有子域
+    /// 均支持 HTTPS 后再加 preload）。
     strict_transport_security: ?[]const u8 = null,
+    /// L-33：Cross-Origin 隔离头（默认不发，按需开启）。
+    cross_origin_opener_policy: ?[]const u8 = null,
+    cross_origin_resource_policy: ?[]const u8 = null,
+    cross_origin_embedder_policy: ?[]const u8 = null,
     /// X-XSS-Protection 已被主流浏览器弃用，`1; mode=block` 有已知 XS-leak 风险，
     /// 现代指导是置 0 或省略。默认 null（不发），依靠 CSP 防 XSS。
     x_xss_protection: ?[]const u8 = null,
@@ -58,6 +66,15 @@ pub const SecurityHeaders = struct {
         if (self.config.permissions_policy) |val| {
             _ = try res.setHeader("Permissions-Policy", val);
         }
+        if (self.config.cross_origin_opener_policy) |val| {
+            _ = try res.setHeader("Cross-Origin-Opener-Policy", val);
+        }
+        if (self.config.cross_origin_resource_policy) |val| {
+            _ = try res.setHeader("Cross-Origin-Resource-Policy", val);
+        }
+        if (self.config.cross_origin_embedder_policy) |val| {
+            _ = try res.setHeader("Cross-Origin-Embedder-Policy", val);
+        }
         if (self.config.server) |val| {
             _ = try res.setHeader("Server", val);
         }
@@ -72,7 +89,7 @@ test "SecurityHeadersConfig defaults" {
     const cfg = SecurityHeadersConfig{};
     try std.testing.expectEqualStrings("nosniff", cfg.x_content_type_options.?);
     try std.testing.expectEqualStrings("DENY", cfg.x_frame_options.?);
-    try std.testing.expectEqualStrings("default-src 'self'", cfg.content_security_policy.?);
+    try std.testing.expectEqualStrings("default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'", cfg.content_security_policy.?);
     try std.testing.expectEqual(null, cfg.strict_transport_security);
 }
 

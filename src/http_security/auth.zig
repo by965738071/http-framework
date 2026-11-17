@@ -72,6 +72,8 @@ pub const AuthConfig = struct {
     /// 浏览器历史、Referer 头里，等同明文泄露。建议仅用于受控的脚本/内网测试；
     /// 生产优先用 header 方案。启用时框架会打一条一次性 WARN 提醒。
     api_key_query: bool = false,
+    /// L-35：`api_key_query=true` 时使用的 query 参数名（与 api_key_header 一样可配置）。
+    api_key_query_name: []const u8 = "api_key",
     /// 无状态自定义校验钩子：裸函数指针（无 self 捕获），只能返回 bool，
     /// 适合「启动时已知的常量判断类」共享密钥场景。
     /// 需要 session/DB 等**有状态**依赖、或需要携带用户身份时，用 `resolver`。
@@ -222,7 +224,7 @@ pub const AuthMiddleware = struct {
             // Referer。一次性 WARN 提醒（避免每个请求都打日志）。
             if (!api_key_query_warned.swap(true, .acq_rel))
                 std.log.warn("auth: api_key_query=true 启用——API key 走 URL query，会泄露到访问日志、浏览器历史与 Referer 头（见 auth.zig api_key_query 字段注释）", .{});
-            if (ctx.request.getQuery("api_key")) |key| {
+            if (ctx.request.getQuery(self.config.api_key_query_name)) |key| {
                 return constantTimeEql(key, expected);
             }
         }
@@ -274,7 +276,7 @@ pub const AuthMiddleware = struct {
                 if (ctx.request.getHeader(self.config.api_key_header)) |key| {
                     info_ptr.api_key = try ctx.arena.dupe(u8, key);
                 } else if (self.config.api_key_query) {
-                    if (ctx.request.getQuery("api_key")) |key| {
+                    if (ctx.request.getQuery(self.config.api_key_query_name)) |key| {
                         info_ptr.api_key = try ctx.arena.dupe(u8, key);
                     }
                 }
@@ -547,4 +549,27 @@ test "checkBasic logic with base64 decode" {
 }
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "L-40: checkApiKey 经 header 与可配置 query 名放行" {
+    const gpa = std.testing.allocator;
+    {
+        var env = try AuthTestEnv.init(gpa, "GET / HTTP/1.1\r\nX-API-Key: s3cret\r\n\r\n");
+        defer env.deinit();
+        var mw = AuthMiddleware{ .config = .{ .api_key = "s3cret" } };
+        try env.run(&mw);
+        try std.testing.expect(std.mem.indexOf(u8, env.body(), "handler ran") != null);
+    }
+    {
+        var env = try AuthTestEnv.init(gpa, "GET /?my_key=s3cret HTTP/1.1\r\n\r\n");
+        defer env.deinit();
+        env.req.query = "my_key=s3cret";
+        var mw = AuthMiddleware{ .config = .{
+            .api_key = "s3cret",
+            .api_key_query = true,
+            .api_key_query_name = "my_key",
+        } };
+        try env.run(&mw);
+        try std.testing.expect(std.mem.indexOf(u8, env.body(), "handler ran") != null);
+    }
 }

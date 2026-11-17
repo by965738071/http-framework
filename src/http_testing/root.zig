@@ -77,7 +77,9 @@ pub const AppError = http_app.AppError;
 /// `noneDrain`）直接透传进同一容器。用 `.none` 而非复刻 std 的 content-length /
 /// chunked 分帧：harness 断言的是「流式响应写出了什么」，裸 body 字节比帧结构
 /// 更可断言（分帧是 std 的职责，集成测试走真实 respondStreaming 路径覆盖）。
-fn capturingSink(writer: *std.Io.Writer) Sink {
+const CaptureCtx = struct { writer: *std.Io.Writer, method: http.Method };
+
+fn capturingSink(capture: *CaptureCtx) Sink {
     const Ctx = struct {
         fn respond(
             ptr: *anyopaque,
@@ -87,11 +89,14 @@ fn capturingSink(writer: *std.Io.Writer) Sink {
             keep_alive: bool,
         ) anyerror!void {
             _ = keep_alive;
-            const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
+            const cap: *CaptureCtx = @ptrCast(@alignCast(ptr));
+            const w: *std.Io.Writer = cap.writer;
             try w.print("HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), status.phrase() orelse "Error" });
             for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
             try w.writeAll("\r\n");
-            try w.writeAll(body);
+            // L-31：生产路径 std 会对 HEAD 省略 body；harness 必须对齐，
+            // 否则用 harness 写的 HEAD 断言在生产不成立。
+            if (cap.method != .HEAD) try w.writeAll(body);
         }
 
         fn startStream(
@@ -102,7 +107,8 @@ fn capturingSink(writer: *std.Io.Writer) Sink {
             buffer: []u8,
             keep_alive: bool,
         ) anyerror!http.BodyWriter {
-            const w: *std.Io.Writer = @ptrCast(@alignCast(ptr));
+            const cap: *CaptureCtx = @ptrCast(@alignCast(ptr));
+            const w: *std.Io.Writer = cap.writer;
             try w.print("HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), status.phrase() orelse "Error" });
             if (content_length) |len| try w.print("content-length: {d}\r\n", .{len});
             for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
@@ -125,7 +131,7 @@ fn capturingSink(writer: *std.Io.Writer) Sink {
         }
     };
     return .{
-        .ptr = @ptrCast(writer),
+        .ptr = @ptrCast(capture),
         .vtable = &.{ .respond = Ctx.respond, .startStream = Ctx.startStream },
     };
 }
@@ -159,6 +165,7 @@ pub const Harness = struct {
     built: Request = undefined,
     state: RequestState,
     res: ?Response = null,
+    capture: CaptureCtx = undefined,
     ctx: ?Context = null,
     wire: std.Io.Writer.Allocating,
     /// `Next.call` 返回的错误。run() 会把它原样返回给调用方，方便
@@ -211,6 +218,9 @@ pub const Harness = struct {
     ///
     /// target 可以是带 query 的完整形式（`/x?q=1`），path/query 自动切分。
     pub fn req(self: *Harness, method: http.Method, target: []const u8) !void {
+        // L-26：新请求必须清掉上一轮 reqBody 的残留，否则第二个请求会静默
+        // 携带旧 body 却没有对应 Content-Length 头。
+        self.req_body = null;
         self.method = method;
         self.target = try self.arena.allocator().dupe(u8, target);
         self.head.clearRetainingCapacity();
@@ -281,7 +291,8 @@ pub const Harness = struct {
             .body = if (self.req_body) |b| .{ .buffered = b } else .none,
         };
 
-        self.res = Response.init(arena_alloc, capturingSink(&self.wire.writer));
+        self.capture = .{ .writer = &self.wire.writer, .method = self.method };
+        self.res = Response.init(arena_alloc, capturingSink(&self.capture));
         const res = &self.res.?;
         self.ctx = .{
             .request = &self.built,
@@ -297,7 +308,9 @@ pub const Harness = struct {
             self.dispatch_err = err;
         };
         // flush 失败（buffer 太小等）不顶替 dispatch 错误：真实病因在后者。
-        res.flush() catch {};
+        // L-32：dispatch 成功时 flush 失败（如 OOM）不能被吞掉，否则测试
+        // 会带着残缺 wire 通过。
+        if (self.dispatch_err == null) try res.flush();
         if (self.dispatch_err) |e| return e;
     }
 
@@ -433,7 +446,7 @@ test "harness：请求头 / query / body 能被 handler 读到" {
 
     const handler = Handler.fromFn(struct {
         fn handle(ctx: *Context, res: *Response) !void {
-            const body = try ctx.readBody(ctx.arena, 1024);
+            const body = try ctx.readBody(1024);
             try res.json(.{
                 .token = ctx.header("x-token"),
                 .next = ctx.query("next"),

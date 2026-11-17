@@ -749,3 +749,115 @@ test "Issue 5: 超限 CL → 不排空，响应带 Connection: close 后断开" 
     try std.testing.expect(std.mem.indexOf(u8, written, "connection: close") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Hello, World!") == null);
 }
+
+// ── H-4 / H-5：请求体边界导致的 std 断言与请求走私回归 ──────────────
+
+/// 每次底层 stream 最多返回 chunk 字节——模拟真实 socket 上 body 分批到达，
+/// 避免 fixed reader 一次性把 100 字节全填进 std reader 缓冲掩盖 H-5。
+const ChunkedReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    chunk: usize,
+    interface: std.Io.Reader,
+
+    fn init(data: []const u8, chunk: usize, buf: []u8) ChunkedReader {
+        var r = ChunkedReader{ .data = data, .chunk = chunk, .interface = undefined };
+        r.interface = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = buf,
+            .seek = 0,
+            .end = 0,
+        };
+        return r;
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ChunkedReader = @fieldParentPtr("interface", r);
+        const want = @min(limit.toInt() orelse self.chunk, self.chunk);
+        const n = @min(want, self.data.len - self.pos);
+        if (n == 0) return error.EndOfStream;
+        try w.writeAll(self.data[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+fn runChunkedConnection(
+    allocator: std.mem.Allocator,
+    router: *const http_router.Router,
+    raw_request: []const u8,
+    out: []u8,
+) []const u8 {
+    var rbuf: [512]u8 = undefined;
+    var reader = ChunkedReader.init(raw_request, 8, &rbuf);
+    var writer = std.Io.Writer.fixed(out);
+    var config = http_app.Config{};
+    var stats = http_app.RuntimeState{};
+    var runner = ConnectionRunner{
+        .reader = &reader.interface,
+        .writer = &writer,
+        .io = std.testing.io,
+        .router = router,
+        .config = &config,
+        .lifecycle = .{},
+        .stats = &stats,
+        .allocator = allocator,
+    };
+    runner.run();
+    return out[0..writer.end];
+}
+
+fn partialBodyHandler(ctx: *Context, res: *Response) !void {
+    // 只读前 10 字节就返回：CL=100 的剩余 90 字节故意不排空。
+    var transfer: [4096]u8 = undefined;
+    if (try ctx.request.bodyReader(&transfer)) |br_value| {
+        var br = br_value;
+        var small: [10]u8 = undefined;
+        _ = br.read(&small) catch {};
+    }
+    try res.statusCode(.ok).text("ok");
+}
+
+test "H-4: HEAD + Content-Length 不触发 std 断言，响应后关连接" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.GET, "/", Handler.fromFn(helloHandler));
+
+    var out: [8192]u8 = undefined;
+    const written = runConnection(
+        allocator,
+        &router,
+        "HEAD / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello" ++
+            "GET / HTTP/1.1\r\nHost: t\r\n\r\n",
+        &out,
+    );
+    // 旧行为：std respond 的 discardBody 在 .received_head 上排空 0 字节后
+    // assert(state == .ready) 失败 → 进程 panic。现在只回一个响应并断连。
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "HTTP/1.1 200"));
+    try std.testing.expectEqual(@as(u16, 200), extractStatus(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hello, World!") == null);
+}
+
+test "H-5: 流式 body 部分读取后正常响应 → 强制关连接，残留字节不成新请求" {
+    const allocator = std.testing.allocator;
+    var router = try http_router.Router.init(allocator);
+    defer router.deinit();
+    try router.route(.POST, "/partial", Handler.fromFn(partialBodyHandler));
+    try router.route(.GET, "/", Handler.fromFn(helloHandler));
+
+    var body: [100]u8 = undefined;
+    @memset(&body, 'x');
+    var raw: [1024]u8 = undefined;
+    const req = std.fmt.bufPrint(&raw, "POST /partial HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n{s}" ++
+        "GET / HTTP/1.1\r\nHost: t\r\n\r\n", .{body[0..]}) catch unreachable;
+
+    var out: [8192]u8 = undefined;
+    const written = runChunkedConnection(allocator, &router, req, &out);
+    // 旧行为：残留 90 字节被 receiveHead 当成 "GET / HTTP/..." 之外的垃圾解析
+    // → 400；攻击者可把它构造成完整请求行形成走私。现在响应后直接断连。
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, written, " 400 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hello, World!") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ok") != null);
+}

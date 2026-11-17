@@ -63,8 +63,8 @@ pub const CompressConfig = struct {
     /// 最小压缩 body 大小（字节）。小于此值不压缩。
     min_size: usize = 1024,
     /// 最大压缩 body 大小（字节）。超过此值不压缩、原样透传，避免缓冲模式
-    /// 压缩任意大 body 时峰值内存约 3× body。0 表示不设上限。
-    max_size: usize = 0,
+    /// 压缩任意大 body 时峰值内存约 3× body。L-23：默认 8 MiB；0 表示显式不设上限。
+    max_size: usize = 8 * 1024 * 1024,
     /// 压缩等级（1=最快, 6=默认, 9=最佳）
     level: flate.Compress.Options = .default,
     /// 支持的编码（按优先级）
@@ -146,11 +146,16 @@ pub const CompressMiddleware = struct {
             return;
         };
 
-        // 只有压缩后更小才替换
+        // L-22：先挂响应头、后换 body。旧顺序把 header 写入失败（arena OOM）
+        // 用 catch {} 吞掉后仍替换 body → 客户端收到没有 Content-Encoding 的
+        // gzip 字节（响应损坏而非降级）。头失败就原样发送未压缩 body。
         if (compressed.len < body.len) {
-            _ = res.replacePendingBody(compressed);
-            _ = res.header("Vary", "Accept-Encoding") catch {};
-            _ = res.header("Content-Encoding", encoding.headerValue()) catch {};
+            const vary_ok = res.header("Vary", "Accept-Encoding") catch null;
+            const enc_ok = if (vary_ok != null)
+                (res.header("Content-Encoding", encoding.headerValue()) catch null)
+            else
+                null;
+            if (enc_ok != null) _ = res.replacePendingBody(compressed);
         }
 
         try res.flush();

@@ -39,6 +39,9 @@ pub const SessionConfig = struct {
     /// session 数量上限，防止匿名高频请求堆积 session 耗尽内存（DoS）。
     /// 达上限时先触发一次过期清理，仍满则驱逐采样中最旧的一条。
     max_sessions: usize = 100_000,
+    /// L-53：单条 session value 的大小上限（默认 64 KiB）。防止应用把任意大的
+    /// 用户输入写进 session 时，max_sessions 只限条数不限字节的放大面。
+    max_value_size: usize = 64 * 1024,
 };
 
 /// 满员驱逐时的采样条数（M7）。用「采样 K 条中最旧」近似 LRU 代替全表 O(n)
@@ -96,6 +99,9 @@ pub const SessionManager = struct {
                 if (now < record.expires) {
                     // 滑动窗口：更新过期时间
                     record.expires = now + @as(i96, self.config.session_timeout_sec) * 1_000_000_000;
+                    // L-52：驱逐按 created 取最旧；滑动续期必须同步刷新它，
+                    // 否则活跃老会话永远是最旧候选（近似 FIFO，误逐活跃用户）。
+                    record.created = now;
                     // Cookie 里的 session_id 生命周期随请求（head arena），本身安全，
                     // 但为统一语义也拷到 ctx.arena 返回。
                     return try ctx.arena.dupe(u8, session_id);
@@ -203,6 +209,10 @@ pub const SessionManager = struct {
         defer self.mutex.unlock(self.io);
 
         const record = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        // L-53：value 大小上限（0 表示不设限）。
+        if (self.config.max_value_size != 0 and value.len > self.config.max_value_size) {
+            return error.ValueTooLarge;
+        }
 
         // 先 dup（可能 OOM），成功后才动 map。
         const key_dup = try self.allocator.dupe(u8, key);
@@ -272,6 +282,9 @@ pub const SessionManager = struct {
         data.deinit();
     }
 
+    /// L-54：过期清理是全表 O(n) 扫描且在全局锁内执行（每 cleanup_interval_sec
+    /// 一次）；10 万条目时是毫秒级周期性延迟毛刺。后续可分片 records，每次
+    /// 只扫一片；当前依赖节流 + max_sessions 上限把影响限制在可接受范围。
     fn maybeCleanupLocked(self: *Self) void {
         const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         const interval_ns = @as(i96, self.config.cleanup_interval_sec) * 1_000_000_000;

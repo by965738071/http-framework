@@ -117,7 +117,13 @@ pub const ErrorRenderer = struct {
             if (err == error.OutOfMemory) return err;
 
             // 如果响应已经发送（handler 自己处理了错误），不重复发
-            if (res.sent) return;
+            if (res.sent) {
+                // L-42：此前静默 return，handler 已写过响应后再抛错不留任何
+                // 痕迹——同函数其它路径都有日志，唯独这里无声丢弃，排查
+                // 「错误去哪了」时无从下手。补一条 warn（含请求路径定位）。
+                std.log.warn("ErrorRenderer: response already sent, error dropped: {s} (path={s})", .{ @errorName(err), ctx.request.path });
+                return;
+            }
 
             // 启用缓冲模式，确保 toResponse 写入 pending 而非直接发送
             res.setBuffered();

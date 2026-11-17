@@ -25,6 +25,11 @@ pub const RateLimitConfig = struct {
     /// 仅在 trust_proxy=true 时生效——否则客户端可任意伪造该头绕过限流（P2-22）。
     identifier_header: ?[]const u8 = null,
     limit_message: []const u8 = "Rate limit exceeded",
+    /// M-23：records 条目数上限（0 = 不设限）。XFF 的任意唯一值 / IPv6 大地址段
+    /// 可让每个唯一 identifier 建一条记录；无上限时单窗口内 map 可无限增长。
+    max_records: usize = 100_000,
+    /// M-23：identifier 最大字节数，超过则截断（同一攻击者仍归同一桶）。
+    max_identifier_len: usize = 64,
     /// 是否信任 X-Forwarded-For / X-Real-IP 头。
     /// false 时不读代理头——但 per_ip 仍会退化为内核 accept 得到的对端 IP
     /// （H3：默认配置不再静默失效）。
@@ -126,10 +131,12 @@ pub const RateLimiter = struct {
         // ip_buf 供 peerIpString 格式化对端 IP；identifier 的生命周期只到本次
         // updateRecordLocked（内部会 dup 成键），栈缓冲足够。
         var ip_buf: [64]u8 = undefined;
-        const identifier = self.getIdentifier(ctx, &ip_buf) orelse {
+        const identifier_raw = self.getIdentifier(ctx, &ip_buf) orelse {
             try next.call(ctx, res);
             return;
         };
+        // M-23：截断过长的客户端可控 identifier（防海量唯一长 key 放大内存）。
+        const identifier = identifier_raw[0..@min(identifier_raw.len, self.config.max_identifier_len)];
 
         // 单调时钟：墙钟（.real）被 NTP 校正/手工改时间会重置或冻结限流窗口。
         const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
@@ -192,6 +199,8 @@ pub const RateLimiter = struct {
     /// 周期性驱逐窗口已过期的记录，防止 records map 无限增长（修复 B1）。
     /// 攻击者轮换 X-Forwarded-For 可制造无限 key —— 无驱逐会导致内存耗尽。
     /// 清理间隔取窗口长度（至少 1 秒），在锁内调用。
+    /// L-54：当前是带节流的全表 O(n) 扫描（持锁），条目到 max_records 时扫描
+    /// 成本毫秒级；后续若需进一步摊薄，可把 records 分片、每 tick 只扫一片。
     fn maybeCleanupLocked(self: *Self, now: i96) void {
         const window_ns = @as(i96, self.config.window_seconds) * 1_000_000_000;
         const interval_ns = @max(window_ns, 1_000_000_000);
@@ -325,6 +334,26 @@ pub const RateLimiter = struct {
                 record.count += 1;
             }
         } else {
+            // M-23：满员时采样驱逐一条旧记录（优先已过期者，否则取遍历到的
+            // 前若干条中最旧的），避免 records 随唯一 identifier 无限增长。
+            if (self.config.max_records != 0 and self.records.count() >= self.config.max_records) {
+                var best_key: ?[]const u8 = null;
+                var best_start: i96 = std.math.maxInt(i96);
+                var scanned: usize = 0;
+                var it = self.records.iterator();
+                while (it.next()) |entry| {
+                    const start = entry.value_ptr.window_start;
+                    if (start < best_start) {
+                        best_start = start;
+                        best_key = entry.key_ptr.*;
+                    }
+                    scanned += 1;
+                    if (scanned >= 32) break;
+                }
+                if (best_key) |k| {
+                    if (self.records.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+                }
+            }
             const key_dup = try self.allocator.dupe(u8, identifier);
             errdefer self.allocator.free(key_dup);
             try self.records.put(self.allocator, key_dup, .{

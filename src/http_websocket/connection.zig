@@ -161,6 +161,9 @@ pub const WebSocket = struct {
         if (self.io) |io| self.send_mutex.lockUncancelable(io);
         defer if (self.io) |io| self.send_mutex.unlock(io);
 
+        // L-48：关闭握手发起后禁止再发数据帧（控制帧 close 本身例外）。
+        if (self.closed and opcode != .close) return error.ConnectionClosed;
+
         if (self.is_client) {
             // RFC 6455 §5.3: 客户端每帧必须用不可预测的随机 mask key，
             // 防经过代理时的缓存投毒攻击。
@@ -181,6 +184,13 @@ pub const WebSocket = struct {
             try frame_mod.encode(self.writer, opcode, payload, false, .{ 0, 0, 0, 0 });
         }
         try self.writer.flush();
+    }
+
+    /// L-49：协议错误统一以 1002 close 帧完成关闭握手后再返回错误，
+    /// 避免裸断 TCP（RFC 6455 §7.1.7）。
+    fn protocolError(self: *Self) anyerror {
+        self.closeWithCode(1002) catch {};
+        return error.ProtocolError;
     }
 
     /// 用指定数字状态码发送 close 帧（内部用,不做 CloseCode enum 约束）。
@@ -263,17 +273,17 @@ pub const WebSocket = struct {
             defer self.allocator.free(f.payload);
 
             // 修复 E6：未协商扩展时 RSV 位必须为 0。
-            if (f.rsv1 or f.rsv2 or f.rsv3) return error.ProtocolError;
+            if (f.rsv1 or f.rsv2 or f.rsv3) return self.protocolError();
 
             // 修复 E4：控制帧不可分片（RFC §5.4，FIN 必须为 1）。
-            if (f.opcode.isControl() and !f.fin) return error.ProtocolError;
+            if (f.opcode.isControl() and !f.fin) return self.protocolError();
 
             // 修复 E3：服务端必须拒绝未 mask 的客户端帧（RFC §5.1）。
-            if (!self.is_client and !f.mask) return error.ProtocolError;
+            if (!self.is_client and !f.mask) return self.protocolError();
 
             // 修复：客户端模式必须拒绝 mask 的服务端帧（RFC §5.1）——
             // 服务端→客户端帧不得 mask，否则必须失败连接。
-            if (self.is_client and f.mask) return error.ProtocolError;
+            if (self.is_client and f.mask) return self.protocolError();
 
             switch (f.opcode) {
                 .ping => {
@@ -288,10 +298,10 @@ pub const WebSocket = struct {
                 .close => {
                     // RFC §5.5.1：close payload 长度必须为 0 或 ≥ 2（P2-17）。
                     // 长度为 1 无法容纳 2 字节 close code → 协议错误。
-                    if (f.payload.len == 1) return error.ProtocolError;
+                    if (f.payload.len == 1) return self.protocolError();
                     // close reason（code 之后的字节）必须是合法 UTF-8（RFC §5.5.1 / §8.1）。
                     if (f.payload.len > 2 and !std.unicode.utf8ValidateSlice(f.payload[2..])) {
-                        return error.ProtocolError;
+                        return self.protocolError();
                     }
                     // RFC §7.1.2: 收到 close 后应回一个 close（如果还没发过）。
                     if (!self.closed) {
@@ -322,7 +332,7 @@ pub const WebSocket = struct {
                     // 修复 E5：用 saw_first_frame 判定（而非 payload_list.len），
                     // 否则首帧空 payload+FIN=0 时会漏判。
                     if (saw_first_frame) {
-                        return error.ProtocolError;
+                        return self.protocolError();
                     }
                     first_opcode = f.opcode;
                     saw_first_frame = true;
@@ -333,14 +343,14 @@ pub const WebSocket = struct {
                 .continuation => {
                     // 必须在已有首帧的上下文里——否则协议错误。
                     if (!saw_first_frame) {
-                        return error.ProtocolError;
+                        return self.protocolError();
                     }
                     try self.appendBounded(&payload_list, f.payload);
                     if (f.fin) return self.finishMessage(&payload_list, first_opcode);
                 },
                 else => {
                     // 保留 opcode（0x3-0x7, 0xB-0xF）——未知帧，协议错误。
-                    return error.ProtocolError;
+                    return self.protocolError();
                 },
             }
         }

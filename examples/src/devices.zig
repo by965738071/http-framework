@@ -98,7 +98,7 @@ const DeviceUpdateRequest = struct {
 };
 
 fn readJsonBody(comptime T: type, ctx: *framework.Context) !T {
-    const body = ctx.readBody(ctx.arena, 1 << 20) catch {
+    const body = ctx.readBody(1 << 20) catch {
         try ctx.failWith(framework.AppError.badRequest("failed to read body"));
         return error.BadRequest;
     };

@@ -19,9 +19,9 @@
 //!
 //! ```zig
 //! fn process(self, ctx, res, next) !void {
-//!     const start = std.Io.Timestamp.now(ctx.io, .monotonic).nanoseconds;
+//!     const start = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds;
 //!     try next.call(ctx, res);     // 先执行 handler
-//!     const elapsed = std.Io.Timestamp.now(ctx.io, .monotonic).nanoseconds - start;
+//!     const elapsed = std.Io.Timestamp.now(ctx.io, .awake).nanoseconds - start;
 //!     _ = res.header("X-Duration-ns", ...) catch {};
 //! }
 //! ```
@@ -228,14 +228,30 @@ pub fn Pipeline(comptime N: usize) type {
         /// 越界返回 `error.PipelineFull`（旧版无检查：直接写穿数组 → UB）。
         /// `idx > len` 跳位时，中间的空洞自动填直通占位（不做事、只调 next），
         /// 避免 `items[0..len]` 里混入未初始化的 Middleware 被 dispatch 读到。
-        /// 覆盖已有位置时旧值被丢弃，其实例不再由框架释放——需要换中间件
-        /// 请重建管道。
+        /// 覆盖已有位置（idx < len）时，旧值先按去重规则释放（L-46：修复前
+        /// 旧实例被直接丢弃、destroy 钩子永不执行，带 deinit 的中间件被覆盖
+        /// 即泄漏）：与 `deinit` 用的 `deinitAll` 同一套契约——旧值在其余位置
+        /// 还有同值记录时不在这里释放，交给 `deinitAll` 按那条记录释放一次，
+        /// 避免同一实例被 deinit 两次（double-free）。
         pub fn set(self: *Self, idx: usize, mw: Middleware) !void {
             if (idx >= N) return error.PipelineFull;
             if (idx > self.len) {
                 for (self.len..idx) |i| {
                     self.items[i] = skip_mw;
                 }
+            } else if (idx < self.len) {
+                // L-46：覆盖前释放旧值。去重规则必须与 deinitAll 完全一致，
+                // 故复用同一个 deinitAll：单元素 items = {旧值}，prior 里是
+                // 「除 idx 外的现有值」——旧值在它们之中出现即为重复，跳过
+                // （deinitAll 收尾时会经那条记录释放一次）。
+                var prior: [N]Middleware = undefined;
+                var prior_len: usize = 0;
+                for (self.items[0..self.len], 0..) |existing, i| {
+                    if (i == idx) continue;
+                    prior[prior_len] = existing;
+                    prior_len += 1;
+                }
+                Middleware.deinitAll(self.items[idx .. idx + 1], prior[0..prior_len]);
             }
             self.items[idx] = mw;
             self.len = idx + 1;
@@ -720,6 +736,43 @@ test "Middleware.deinitAll: 同类型的不同实例各释放一次（去重不�
 
     // 同 T 同 process 函数指针，但 ptr 不同 → 是两个值，各 deinit 一次。
     try std.testing.expectEqual(@as(usize, 2), counter.frees);
+}
+
+test "Pipeline(N).set: 覆盖已有位置时旧中间件被释放（L-46 回归）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counter = FreeCounter{ .inner = arena.allocator() };
+    var old = try ProbeMiddleware.init(counter.allocator());
+    var fresh = try ProbeMiddleware.init(counter.allocator());
+
+    var pipeline = Pipeline(1).init(noopHandler);
+    try pipeline.set(0, Middleware.init(ProbeMiddleware, &old));
+    // 覆盖位置 0：修复前旧实例被静默丢弃（destroy 钩子永不执行 → 泄漏），
+    // 现在覆盖前先 deinit 旧值。
+    try pipeline.set(0, Middleware.init(ProbeMiddleware, &fresh));
+    try std.testing.expectEqual(@as(usize, 1), counter.frees);
+
+    // 收尾 deinit 只释放现役的 fresh（旧值已在 set 时释放过，不 double-free）
+    pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 2), counter.frees);
+}
+
+test "Pipeline(N).set: 覆盖同值引用不 double-free（与 deinitAll 同一套去重）" {
+    // 被覆盖的旧值在其余位置仍有同值记录时，set 不立即释放——交给收尾的
+    // deinitAll 按那条记录释放一次。与「同一中间件 add 两次只释放一次」同构。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counter = FreeCounter{ .inner = arena.allocator() };
+    var probe = try ProbeMiddleware.init(counter.allocator());
+
+    var pipeline = Pipeline(2).init(noopHandler);
+    try pipeline.set(0, Middleware.init(ProbeMiddleware, &probe));
+    try pipeline.set(1, Middleware.init(ProbeMiddleware, &probe));
+    // 覆盖位置 0 为同一实例：prior（位置 1）里还有同值 → set 时跳过释放
+    try pipeline.set(0, Middleware.init(ProbeMiddleware, &probe));
+    pipeline.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), counter.frees);
 }
 
 test {

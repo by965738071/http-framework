@@ -30,6 +30,28 @@ fn parseEnvBool(raw: []const u8) !bool {
     return error.BadEnvValue;
 }
 
+/// network.address 字面量预检（M-21）。
+/// 与唯一消费方（zio_server listen 处的 `zio.net.IpAddress.parseIp`）同语义：
+/// IPv4 点分十进制或裸 IPv6 字面量（parseIp 只做字面量解析、不做 DNS），
+/// 另宽松接受 `[...]` 包裹的 IPv6（剥括号后 parse，兼容 RFC 3986 IP-literal
+/// 写法）。主机名一律拒绝——listen 不做 DNS，配了也必然在 listen 时失败，
+/// 不如启动期就报 InvalidConfig。
+fn isParsableAddressLiteral(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var addr = text;
+    if (addr[0] == '[' and addr[addr.len - 1] == ']') addr = addr[1 .. addr.len - 1];
+    // std 解析前的保守底线（M-21 要求）：非空、不含空白、至少含一个冒号或点。
+    if (addr.len == 0) return false;
+    for (addr) |c| {
+        if (std.ascii.isWhitespace(c)) return false;
+    }
+    if (std.mem.indexOfAny(u8, addr, ":.") == null) return false;
+    // std 的纯解析（IPv4 失败再试 IPv6，无 scope id 支持——消费方 zio 同样
+    // 不支持，语义一致，不会产生「validate 放行、listen 拒绝」的假阴性）。
+    _ = std.Io.net.IpAddress.parse(addr, 0) catch return false;
+    return true;
+}
+
 /// 按字段类型把 env 字符串解析并赋值。类型从 `ptr` 自身推导（同 `Handler.initSingleton`
 /// 的 anytype 套路，调用点不重复写类型）。支持：整数、bool、[]const u8、?[]const u8。
 fn assignFromEnv(ptr: anytype, allocator: std.mem.Allocator, raw: []const u8) EnvError!void {
@@ -65,6 +87,10 @@ fn assignFromEnv(ptr: anytype, allocator: std.mem.Allocator, raw: []const u8) En
 ///   其余类型 comptime 报错。
 /// - 字符串值用 `allocator` dupe，返回的 struct 持有该内存——推荐直接传进程级
 ///   arena；否则调用方负责在配置生命周期结束后释放。
+/// - **对同一 target 只应调用一次（L-45）**：字符串字段每次覆盖都 dupe 新内存、
+///   旧值指针被直接丢弃（无处追踪引用），重复调用会泄漏前一轮字符串——gpa
+///   下是真泄漏，进程级 arena 下也要白占内存到 arena 统一回收。「先 profile
+///   默认再 env 覆盖」请新建字面量后调用一次，而不是对同一实例调两次。
 ///
 /// 这同时是**应用级配置的扩展点**：框架不猜应用需要哪些字段，应用把自己的配置
 /// 声明成普通 struct、与 `Config` 组合，再对组合 struct 调本函数即可共享同一套
@@ -164,6 +190,10 @@ pub const Config = struct {
             std.log.warn("config: network.write_timeout_ns 不能为 0（拒绝启动）", .{});
             ok = false;
         }
+        if (n.max_head_duration_ns == 0) {
+            std.log.warn("config: network.max_head_duration_ns 不能为 0（会失去 Slowloris 防护，拒绝启动）", .{});
+            ok = false;
+        }
         if (n.drain_timeout_ns == 0) {
             std.log.warn("config: network.drain_timeout_ns 不能为 0（拒绝启动）", .{});
             ok = false;
@@ -178,6 +208,50 @@ pub const Config = struct {
         }
         if (self.body.size_limit == 0) {
             std.log.warn("config: body.size_limit 不能为 0（会拒绝所有请求体，几乎必然是配错，拒绝启动）", .{});
+            ok = false;
+        }
+
+        // ── M-21：可解析性 / 上界类校验（此前只查「== 0」）────────────────
+        // 上界取值原则：默认值的 2-4 个数量级以内已覆盖一切合理部署；
+        // 再大几乎必然是配错单位（把总量当每连接值），在启动期暴露比运行期
+        // OOM 便宜得多。
+
+        // address 可解析性：非法字符串（主机名、笔误）此前拖到 listen 才报
+        // parseIp 错误，失败点离配置点太远。与消费方同语义预检（见
+        // isParsableAddressLiteral 注释）。
+        if (!isParsableAddressLiteral(n.address)) {
+            std.log.warn("config: network.address='{s}' 不是可解析的 IP 字面量（listen 不做 DNS 解析；主机名请先在部署层解析为 IP，IPv6 支持裸字面量与 [...] 形式）", .{n.address});
+            ok = false;
+        }
+
+        // read/write buffer 是**每连接**分配（read + write 各一份 × 连接数）。
+        // 默认 16 KiB / 8 KiB，1 MiB 已是默认的 64/128 倍——再大几乎必然是
+        // 把「总容量」误配成「每连接值」（1024 连接 × 4 GiB 撑不到运行期
+        // OOM 就该先在这里被拒）。
+        const max_buffer_size: usize = 1024 * 1024;
+        if (h.read_buffer_size > max_buffer_size) {
+            std.log.warn("config: http.read_buffer_size={d} 超过每连接上界 {d}（每连接分配 × 连接数，防止单项配置耗尽内存）", .{ h.read_buffer_size, max_buffer_size });
+            ok = false;
+        }
+        if (h.write_buffer_size > max_buffer_size) {
+            std.log.warn("config: http.write_buffer_size={d} 超过每连接上界 {d}（每连接分配 × 连接数，防止单项配置耗尽内存）", .{ h.write_buffer_size, max_buffer_size });
+            ok = false;
+        }
+
+        // arena 保留容量同样是**每连接**一份（keep-alive 下不归还 OS）。
+        // 默认 16 KiB，256 MiB 已高出默认 4 个数量级，超过它只能是配错。
+        const max_arena_retain: usize = 256 * 1024 * 1024;
+        if (self.pool.request_arena_retain_bytes > max_arena_retain) {
+            std.log.warn("config: pool.request_arena_retain_bytes={d} 超过上界 {d}（每连接保留，过大时高并发下内存失控）", .{ self.pool.request_arena_retain_bytes, max_arena_retain });
+            ok = false;
+        }
+
+        // zio 下每连接一个轻量协程，1M 是数量级上界：每连接至少还占 fd、
+        // socket 缓冲与协程栈，超过它先撞进程 fd 上限（ulimit），配再大
+        // 只是自欺。
+        const max_connections_cap: u32 = 1_000_000;
+        if (n.max_connections > max_connections_cap) {
+            std.log.warn("config: network.max_connections={d} 超过上界 {d}（每连接至少占 fd + 协程栈，超配先撞 ulimit）", .{ n.max_connections, max_connections_cap });
             ok = false;
         }
 
@@ -207,6 +281,10 @@ pub const NetworkConfig = struct {
     read_timeout_ns: u64 = 30_000_000_000,
     /// 单次写超时（纳秒）。zio 原生 per-operation timeout。
     write_timeout_ns: u64 = 30_000_000_000,
+    /// M-8：请求头阶段的**绝对总时限**（纳秒）。per-op read_timeout_ns 只约束
+    /// 单次 read，客户端每隔小于它的间隔滴 1 字节即可无限占用连接（Slowloris）。
+    /// 两个后端在 receiveHead 前把它设成 reader 的 deadline，头读完恢复 per-op。
+    max_head_duration_ns: u64 = 30_000_000_000,
     /// 优雅关机等待在途连接结束的上限（纳秒）。超时后强制 cancel 剩余连接。
     /// 部署时与容器 `terminationGracePeriodSeconds` 对齐（后者先 SIGKILL）。
     drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
@@ -367,6 +445,61 @@ test "Config.validate: 越界取值拒绝启动" {
     var cfg2 = Config{};
     cfg2.http.read_buffer_size = 0;
     try std.testing.expectError(error.InvalidConfig, cfg2.validate());
+}
+
+test "Config.validate: address 可解析性预检（M-21）" {
+    // 合法字面量：IPv4、裸 IPv6、[...] 包裹的 IPv6 都通过
+    var v4 = Config{};
+    v4.network.address = "127.0.0.1";
+    try v4.validate();
+    var v6 = Config{};
+    v6.network.address = "::1";
+    try v6.validate();
+    var v6b = Config{};
+    v6b.network.address = "[fe80::1]";
+    try v6b.validate();
+
+    // 主机名 / 空串 / 带空白：listen 处的 parseIp 不做 DNS，启动即拒
+    var host = Config{};
+    host.network.address = "localhost";
+    try std.testing.expectError(error.InvalidConfig, host.validate());
+    var empty = Config{};
+    empty.network.address = "";
+    try std.testing.expectError(error.InvalidConfig, empty.validate());
+    var spaced = Config{};
+    spaced.network.address = "127.0.0.1 ";
+    try std.testing.expectError(error.InvalidConfig, spaced.validate());
+    // 结构非法（有冒号但不是 IP）
+    var junk = Config{};
+    junk.network.address = "not:an:ip";
+    try std.testing.expectError(error.InvalidConfig, junk.validate());
+}
+
+test "Config.validate: buffer / retain / max_connections 上界（M-21）" {
+    // 恰好在上界内：通过
+    var ok_cfg = Config{};
+    ok_cfg.http.read_buffer_size = 1024 * 1024;
+    ok_cfg.http.write_buffer_size = 1024 * 1024;
+    ok_cfg.network.max_connections = 1_000_000;
+    ok_cfg.pool.request_arena_retain_bytes = 256 * 1024 * 1024;
+    try ok_cfg.validate();
+
+    // 各自超界 1：拒绝启动
+    var big_read = Config{};
+    big_read.http.read_buffer_size = 1024 * 1024 + 1;
+    try std.testing.expectError(error.InvalidConfig, big_read.validate());
+
+    var big_write = Config{};
+    big_write.http.write_buffer_size = 1024 * 1024 + 1;
+    try std.testing.expectError(error.InvalidConfig, big_write.validate());
+
+    var big_conn = Config{};
+    big_conn.network.max_connections = 1_000_001;
+    try std.testing.expectError(error.InvalidConfig, big_conn.validate());
+
+    var big_retain = Config{};
+    big_retain.pool.request_arena_retain_bytes = 256 * 1024 * 1024 + 1;
+    try std.testing.expectError(error.InvalidConfig, big_retain.validate());
 }
 
 test "Config.validate: kill switch only warns unless strict" {

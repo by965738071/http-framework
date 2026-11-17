@@ -21,6 +21,11 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        // M-14：url/hash 消费者构建必需——build.zig 的 zio 依赖指向 vendor/zio，
+        // gen-api 工具在 tools/；缺目录时依赖方编译直接失败（本地路径依赖
+        // 不走 .paths 过滤，所以日常开发发现不了）。
+        "tools",
+        "vendor",
         "README.md",
     },
 }

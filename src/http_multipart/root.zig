@@ -137,9 +137,14 @@ pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
 /// 从 Context 解析 multipart 表单。
 /// `limit` 是 body 最大字节数。
 ///
+/// I-1（设计取舍）：body 整体缓冲进请求 arena，内存占用约
+/// `limit × 并发连接数`（10 MB × 1000 连接 ≈ 10 GB），无磁盘落盘选项。
+/// 需要大文件上传的业务应在反向代理层限制并发上传预算，或改用流式协议。
+///
 /// 错误 → 建议状态码（调用方应逐项映射到 failWith/ErrorRenderer，
 /// **不要一律 catch 成 400**——那会把 413/500 的语义吞掉）：
-/// - `error.NotMultipart` / `error.MissingBoundary` → 400（Content-Type 不对）
+/// - `error.NotMultipart` / `error.MissingBoundary` / `error.MalformedBody` → 400
+///   （Content-Type 不对 / 找不到有效首分隔符；L-25）
 /// - `error.TooManyParts` / `error.MalformedPart` / `error.DuplicateField` → 400
 ///   （构造畸形或不符合本解析器模型的表单）
 /// - `error.BodyTooLarge` → 413（body 超过 `limit`）。若 body 是 chunked，
@@ -150,14 +155,20 @@ pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
 pub fn from(ctx: *Context, limit: u64) !FormData {
     const ct = ctx.request.content_type orelse return error.NotMultipart;
     // 媒体类型大小写不敏感（RFC 9110 §8.3.1）。
-    if (!std.ascii.startsWithIgnoreCase(ct, "multipart/form-data")) {
+    // L-30：前缀匹配必须校验子类型边界，否则 `multipart/form-database` 会被放行。
+    const media = "multipart/form-data";
+    if (ct.len < media.len or !std.ascii.startsWithIgnoreCase(ct, media)) {
         return error.NotMultipart;
+    }
+    if (ct.len > media.len) {
+        const next = ct[media.len];
+        if (next != ';' and next != ' ' and next != '\t') return error.NotMultipart;
     }
     const boundary_raw = extractBoundary(ct) orelse return error.MissingBoundary;
     // 实际分隔符是 "--" + boundary
     const delimiter = try std.fmt.allocPrint(ctx.arena, "--{s}", .{boundary_raw});
 
-    const body = try ctx.readBody(ctx.arena, limit);
+    const body = try ctx.readBody(limit);
     return parseBody(ctx.arena, body, delimiter);
 }
 
@@ -195,8 +206,9 @@ pub fn parseBody(allocator: std.mem.Allocator, body: []const u8, delimiter: []co
             search_from = found + 1;
         }
     }
-    // 无有效首分隔符：视为空表单（保持旧语义，不报错）。
-    const fd = first_delim orelse return form;
+    // L-25：无有效首分隔符（垃圾 body / boundary 不匹配 / 纯 LF 行尾）是
+    // 解析失败，不是「成功空表单」——调用方需要能区分两者。
+    const fd = first_delim orelse return error.MalformedBody;
     var pos: usize = fd + delimiter.len;
 
     // 修复 M3：next_delim_search 在循环外分配一次复用（而非每轮 allocPrint），

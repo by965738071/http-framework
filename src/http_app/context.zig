@@ -124,10 +124,17 @@ pub const RequestState = struct {
     /// 405 时的 Allow 头值（逗号分隔的方法名）。由 router 在方法不匹配时填充，
     /// methodNotAllowedHandler 读取并写入响应头（修复 F4：405 缺 Allow）。
     allow_header: ?[]const u8 = null,
-    poisoned: bool = false,
     /// 已缓冲的请求体（fix.md §四.7：Request 不可变，body 缓存移到 State）。
     /// readBody 首次调用后缓存于此，后续调用直接返回。
     body_buffer: ?[]const u8 = null,
+    /// H-6：readBody 是否已尝试过（成功或失败都算）。成功时 body_buffer 非
+    /// null、失败时 body_read_error 缓存首个错误——readBody 入口据此短路
+    /// 二次调用，不再进入 readBodyInto（std 的 streaming reader 只能构造
+    /// 一次，重入 = std 断言 panic / 内存级 UB，远程一条请求即可触发）。
+    body_read_attempted: bool = false,
+    /// H-6：readBody 首次失败的错误缓存。与 body_read_attempted 同时置位；
+    /// 二次调用直接返回它（同型错误，调用方已有的 catch 分支语义不变）。
+    body_read_error: ?anyerror = null,
     /// readBody 遇到 BodyTooLarge 时置位。ConnectionRunner 在 flush 前检查
     /// 此 flag，自动置 res.keep_alive=false——避免使用者忘记关连接导致
     /// chunked 残留字节污染下一个请求（请求走私）。
@@ -212,7 +219,11 @@ pub const UserData = struct {
 /// 配置视图（全局共享，不可变）。
 /// 回应 bug.md §4：配置不再平铺到每个请求。
 pub const RequestConfig = struct {
-    trust_proxy: bool = false,
+    /// 全局 body 上限（字节）。`Context.readBody(0)`（未显式传 limit）时取
+    /// 此值——M-19 修复前它是没有任何读取方的死配置，现在由 readBody 消费。
+    /// 生产路径由 ConnectionRunner 从 `Config.body.size_limit` 注入
+    /// （`Config.validate` 保证后者非 0）；缺省 0 = 裸测试 Context 下回退到
+    /// readBodyInto 的 HARD_BODY_CAP。
     body_size_limit: u64 = 0,
 };
 
@@ -260,9 +271,41 @@ pub const Context = struct {
     /// 读取请求体。首次调用从 streaming body 读取并存入 state.body_buffer；
     /// 后续调用直接返回缓存的 buffer。handler/中间件应通过此方法读 body，
     /// 而非 ctx.request.readBody()（Request 已不可变，不再提供 readBody）。
-    pub fn readBody(self: *Context, allocator: std.mem.Allocator, limit: u64) ![]const u8 {
+    ///
+    /// **签名变更（M-20）**：不再接受 allocator 参数，内部固定用请求 arena
+    /// （`self.arena`）。迁移：`ctx.readBody(ctx.arena, N)` → `ctx.readBody(N)`。
+    /// 缓冲随请求 arena 生命周期回收（请求结束 arena reset 统一归还，不单独
+    /// free）——旧签名允许传 gpa，而 buffer 与 4 KiB transfer buffer 都挂在该
+    /// allocator 上永不释放，每请求必泄漏；现在从签名上杜绝这条路。
+    ///
+    /// **`limit` 语义（M-19）**：`0` = 未指定 → 默认取全局
+    /// `self.config.body_size_limit`（生产路径由 ConnectionRunner 从
+    /// `Config.body.size_limit` 注入，`Config.validate` 保证非 0）。显式传值
+    /// 可按路由收紧（如登录接口 64 KiB）；框架**不做**「不得越过全局限制」的
+    /// 强制钳制——传更大值即绕过全局上限，这是调用方自律契约，需要硬保证时
+    /// 在中间件里对照 `config.body_size_limit` 自查。
+    ///
+    /// **失败后不得重试（H-6）**：首次调用失败时缓存错误并置位
+    /// `state.body_read_attempted`，二次调用直接返回缓存的首个错误，不再进入
+    /// `readBodyInto`——std 的 streaming reader 只能构造一次，重入会在
+    /// `readerExpectContinue` 的 std 断言上 panic（Debug/ReleaseSafe，一条远程
+    /// 请求打死整个进程）或退化为内存级 UB（ReleaseFast）。典型触发：中间件
+    /// 先 readBody 失败后放行、handler 再读，或 handler catch 413 后换更大
+    /// limit 重试。
+    pub fn readBody(self: *Context, limit: u64) ![]const u8 {
         if (self.state.body_buffer) |buf| return buf;
-        const buf = self.request.readBodyInto(allocator, limit) catch |err| {
+        // H-6：首读已失败（attempted 置位、无缓存 buffer）→ 返回缓存的首个
+        // 错误并短路。orelse 兜底理论上不可达（两个状态位同时置位），仅防
+        // 外部手工构造 State 时字段不一致。
+        if (self.state.body_read_attempted) {
+            return self.state.body_read_error orelse error.BodyAlreadyRead;
+        }
+        self.state.body_read_attempted = true;
+        // M-19：limit=0 表示「未显式指定」，回退到全局配置上限。
+        const effective_limit: u64 = if (limit == 0) self.config.body_size_limit else limit;
+        const buf = self.request.readBodyInto(self.arena, effective_limit) catch |err| {
+            // 首个失败存档：后续 readBody 一律短路到这里返回的同一错误（H-6）。
+            self.state.body_read_error = err;
             // BodyTooLarge 时标记，让 ConnectionRunner 自动关连接——
             // chunked 超限的残留 body std 不排空，复用连接会走私。
             // 使用者无需在每个 handler 里记得 res.keep_alive=false。
@@ -313,14 +356,16 @@ pub const Context = struct {
 
     /// 便捷方法：读 body 后获取表单字段（原始，未解码）。
     /// 读取的 body 缓冲在 state.body_buffer（streaming body 经 readBody 缓冲）。
+    /// `limit` 语义同 `readBody`：0 = 用全局 `config.body_size_limit`。
     pub fn form(self: *Context, key: []const u8, limit: u64) !?[]const u8 {
-        const body = try self.readBody(self.arena, limit);
+        const body = try self.readBody(limit);
         return Request.getFormFrom(body, key);
     }
 
     /// 便捷方法：读 body 后获取表单字段并解码（urlencoded）。
+    /// `limit` 语义同 `readBody`：0 = 用全局 `config.body_size_limit`。
     pub fn formDecoded(self: *Context, key: []const u8, limit: u64) !?[]const u8 {
-        const body = try self.readBody(self.arena, limit);
+        const body = try self.readBody(limit);
         return Request.getFormDecodedFrom(self.arena, body, key);
     }
 
@@ -708,9 +753,101 @@ test "Context.readBody 超限置 body_too_large（413 自动关连接）" {
     };
 
     // 超限时 readBody 返回 BodyTooLarge
-    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(arena.allocator(), 100));
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(100));
     // state.body_too_large 被置位——ConnectionRunner 据此自动关连接
     try std.testing.expect(state.body_too_large);
+}
+
+test "Context.readBody 失败后二次调用返回缓存错误，不重入 readBodyInto（H-6 回归）" {
+    // 场景：handler catch 413 后换更大 limit 重试（或中间件先读失败后放行、
+    // handler 再读）。首读 limit=100 < CL=1000，在建 reader 前判出（streaming
+    // 指针未解引用，undefined 安全）；二读 limit=1000 若无 H-6 守卫会重入
+    // readBodyInto → readerExpectContinue 解引用未构造的 streaming reader →
+    // std 断言 panic（Debug/ReleaseSafe）或 UB（ReleaseFast）。守卫生效时
+    // 二读直接短路到缓存的首个错误，同型返回、绝不 panic。
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+
+    var req = Request{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "POST / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = 1000,
+        .transfer_encoding = .none,
+        .body = .{ .streaming = undefined },
+    };
+    const cfg = RequestConfig{ .body_size_limit = 1 << 20 };
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    // 首读：CL 前置检查失败（未建 reader）
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(100));
+    try std.testing.expect(state.body_read_attempted);
+    try std.testing.expectEqual(@as(?anyerror, error.BodyTooLarge), state.body_read_error);
+    // 二读（更大 limit）与三读（limit=0 = 全局限制）都必须短路到同一错误，
+    // 不得重入 readBodyInto（那里会解引用 undefined streaming 指针）
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(1000));
+    try std.testing.expectError(error.BodyTooLarge, ctx.readBody(0));
+    // body_too_large 保持置位：ConnectionRunner 关连接的依据不受短路影响
+    try std.testing.expect(state.body_too_large);
+}
+
+test "Context.readBody 用请求 arena 缓冲、随 arena 回收，limit=0 走全局上限（M-20/M-19 回归）" {
+    // arena 挂在 std.testing.allocator 上，deinit 时自动做泄漏检查——
+    // readBody 若还接受任意 allocator 并在其上分配（M-20 修复前的泄漏
+    // 路径），签名上已不可能；这里验证新签名下的缓冲生命周期与缓存行为。
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var state = RequestState{ .arena = arena.allocator() };
+    defer state.deinit();
+
+    var req = Request{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version = .@"HTTP/1.1",
+        .head_bytes = "POST / HTTP/1.1\r\n\r\n",
+        .content_type = null,
+        .content_length = null,
+        .transfer_encoding = .none,
+        .body = .{ .buffered = "name=zig&lang=zig" },
+    };
+    const cfg = RequestConfig{ .body_size_limit = 1 << 20 };
+    var ctx = Context{
+        .request = &req,
+        .state = &state,
+        .config = &cfg,
+        .arena = arena.allocator(),
+        .io = undefined,
+    };
+
+    // limit=0 = 未指定 → 取全局 config.body_size_limit（M-19 接线）
+    const body = try ctx.readBody(0);
+    try std.testing.expectEqualStrings("name=zig&lang=zig", body);
+    // 二次调用返回同一缓存缓冲（不重复读、不重复分配）
+    const again = try ctx.readBody(1 << 20);
+    try std.testing.expect(again.ptr == body.ptr);
+    try std.testing.expect(state.body_buffer != null);
+
+    // form/formDecoded 内部走同一 readBody 缓存路径（limit=0 同样合法）
+    try std.testing.expectEqualStrings("zig", (try ctx.form("lang", 0)).?);
+    try std.testing.expectEqualStrings("zig", (try ctx.formDecoded("name", 0)).?);
 }
 
 test {

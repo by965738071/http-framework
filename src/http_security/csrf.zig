@@ -31,6 +31,14 @@ pub const CsrfConfig = struct {
     /// 防明文嗅探——明文 HTTP 下被嗅探即可伪造表单；纯本机开发请显式关掉。
     secure: bool = true,
     ignored_methods: []const http.Method = &.{ .GET, .HEAD, .OPTIONS },
+    /// M-13：会话绑定模式。设置 session_cookie_name 与 binding_secret 后，
+    /// token 形如 `<random_hex>.<mac_hex>`，MAC = HMAC-SHA256(secret,
+    /// random_hex ++ session_id)——攻击者即便通过 cookie tossing 同时固定
+    /// cookie 与 header，没有会话值/密钥也无法伪造 token。会话 cookie 缺失时
+    /// 不下发 token（无会话 GET 不再无条件发 token）。
+    /// 两者都未设置时维持向后兼容的纯 double-submit 语义。
+    session_cookie_name: ?[]const u8 = null,
+    binding_secret: ?[]const u8 = null,
 };
 
 pub const CsrfMiddleware = struct {
@@ -47,7 +55,15 @@ pub const CsrfMiddleware = struct {
             // bug.md §6 csrf.zig:46-49：token 生成失败（OOM/随机源故障）不能静默
             // 放行——那样后续任何 POST 都会神秘 403。显式 500 让管理员能看见。
             if (ctx.request.getCookie(self.config.cookie_name) == null) {
-                const token = self.generateToken(ctx.arena) catch {
+                // M-13：绑定模式下没有会话就不发 token。
+                if (self.isBindingMode() and self.sessionId(ctx) == null) {
+                    try next.call(ctx, res);
+                    return;
+                }
+                const token = (if (self.isBindingMode())
+                    self.generateBoundToken(ctx.arena, self.sessionId(ctx).?)
+                else
+                    self.generateToken(ctx.arena)) catch {
                     _ = res.statusCode(.internal_server_error);
                     try res.text("Failed to generate CSRF token");
                     return;
@@ -102,6 +118,16 @@ pub const CsrfMiddleware = struct {
             return;
         }
 
+        // M-13：会话绑定校验——token 必须是 <random>.<mac> 且 MAC 与当前
+        // 会话值匹配；缺失会话 cookie 一律拒绝。
+        if (self.isBindingMode()) {
+            if (!self.verifyBound(ctx.arena, cookie_token.?, submitted.?, self.sessionId(ctx).?)) {
+                _ = res.statusCode(.forbidden);
+                try res.text("CSRF token invalid for session");
+                return;
+            }
+        }
+
         // 常量时间比较——修复 P0 时序侧信道
         if (!constantTimeEql(cookie_token.?, submitted.?)) {
             _ = res.statusCode(.forbidden);
@@ -112,10 +138,59 @@ pub const CsrfMiddleware = struct {
         try next.call(ctx, res);
     }
 
+    fn isBindingMode(self: *const Self) bool {
+        return self.config.session_cookie_name != null and self.config.binding_secret != null;
+    }
+
+    fn sessionId(self: *const Self, ctx: *Context) ?[]const u8 {
+        const name = self.config.session_cookie_name orelse return null;
+        return ctx.request.getCookie(name);
+    }
+
+    fn hexEncode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+        const out = try allocator.alloc(u8, bytes.len * 2);
+        const chars = "0123456789abcdef";
+        for (bytes, 0..) |b, i| {
+            out[i * 2] = chars[b >> 4];
+            out[i * 2 + 1] = chars[b & 0x0f];
+        }
+        return out;
+    }
+
+    fn boundMac(self: *const Self, arena: std.mem.Allocator, random_hex: []const u8, session_id: []const u8) ![32]u8 {
+        const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ random_hex, session_id });
+        var mac: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, msg, self.config.binding_secret.?);
+        return mac;
+    }
+
+    /// 会话绑定 token：<random_hex>.<HMAC(secret, random_hex || session_id) hex>。
+    pub fn generateBoundToken(self: *const Self, allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+        const random = try self.generateToken(allocator);
+        defer allocator.free(random);
+        const mac = try self.boundMac(allocator, random, session_id);
+        const mac_hex = try hexEncode(allocator, &mac);
+        defer allocator.free(mac_hex);
+        return std.fmt.allocPrint(allocator, "{s}.{s}", .{ random, mac_hex });
+    }
+
+    fn verifyBound(self: *const Self, allocator: std.mem.Allocator, cookie_token: []const u8, submitted: []const u8, session_id: []const u8) bool {
+        _ = cookie_token;
+        const dot = std.mem.indexOfScalar(u8, submitted, '.') orelse return false;
+        const random_hex = submitted[0..dot];
+        const mac_hex = submitted[dot + 1 ..];
+        if (random_hex.len == 0 or mac_hex.len != 64) return false;
+        const expected = self.boundMac(allocator, random_hex, session_id) catch return false;
+        const expected_hex = hexEncode(allocator, &expected) catch return false;
+        defer allocator.free(expected_hex);
+        return constantTimeEql(expected_hex, mac_hex);
+    }
+
     /// 生成安全的随机 CSRF token（hex 编码字符串）。
     /// 返回的内存由调用者负责释放。
     pub fn generateToken(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        const byte_len = self.config.token_length;
+        // M-13/L-34：token_length 无下限会退化到 8 bit 熵；clamp 到 16 字节。
+        const byte_len = @max(self.config.token_length, 16);
         const random_bytes = try allocator.alloc(u8, byte_len);
         defer allocator.free(random_bytes);
 

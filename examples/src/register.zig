@@ -77,7 +77,8 @@ pub fn registerHandler(ctx: *framework.Context, res: *framework.Response, io: st
         .id = 0,
         .username = username,
         .email = email,
-        .password_hash = password, // 简单演示：明文存储
+        // H-7：口令永久存储用 PBKDF2 + 随机盐（与 admin 登录 verify 配套）。
+        .password_hash = try admin.hashPassword(ctx.arena, io, password),
         .role = "viewer",
         .created_at = now,
         .last_login = 0,
