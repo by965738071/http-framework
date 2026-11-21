@@ -1,16 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const windows = @import("windows.zig");
-const compat = @import("../compat.zig");
+
 const log = @import("../common.zig").log;
+const compat = @import("../compat.zig");
+const windows = @import("windows.zig");
 
 pub const iovec = switch (builtin.os.tag) {
     .windows => windows.WSABUF,
+    // dev.1240：Linux 的 posix 层是 std.os.linux（纯 Zig），其 readv/writev/
+    // preadv/pwritev/recvmsg/msghdr/io_uring SQE 一律要 os.linux.iovec 类型
+    // （与 std.c.iovec 布局/字段名相同，但类型身份不同，指针不能互转）。
+    .linux => std.os.linux.iovec,
     else => std.c.iovec,
 };
 
 pub const iovec_const = switch (builtin.os.tag) {
     .windows => windows.WSABUF,
+    .linux => std.os.linux.iovec_const,
     else => std.c.iovec_const,
 };
 

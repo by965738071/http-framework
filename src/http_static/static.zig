@@ -6,11 +6,12 @@
 //! - 大文件流式响应：用 res.stream() 而非整体读入内存
 
 const std = @import("std");
-const http_app = @import("http_app");
-const http_protocol = @import("http_protocol");
-const http_compress = @import("http_compress");
+const builtin = @import("builtin");
 
+const http_app = @import("http_app");
 const Context = http_app.Context;
+const http_compress = @import("http_compress");
+const http_protocol = @import("http_protocol");
 const Response = http_protocol.Response;
 
 /// 最大允许整体读入内存的文件大小（超过此大小则流式响应）
@@ -387,10 +388,6 @@ pub const StaticFileServer = struct {
             // 小文件：从已校验的 fd 整体读入内存（M-12）。
             const file_content = self.readVerifiedFile(ctx, vf) catch |err| {
                 switch (err) {
-                    error.FileNotFound => {
-                        _ = res.statusCode(.not_found);
-                        try res.text("File not found");
-                    },
                     error.StreamTooLong => {
                         // 修复低优先级表：stat 后文件增大导致读取超限，语义是服务器侧问题，
                         // 不是请求体过大——改回 500 而非 413。
@@ -511,7 +508,7 @@ pub const StaticFileServer = struct {
     /// macOS 用 F_GETPATH，Linux 用 /proc/self/fd/<fd>，其它平台退回路径校验。
     fn isOpenedFileWithinRoot(self: *const StaticFileServer, io: std.Io, file: std.Io.File) bool {
         var fd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const fd_len: usize = switch (std.builtin.os.tag) {
+        const fd_len: usize = switch (builtin.os.tag) {
             .macos, .ios, .tvos, .watchos => blk: {
                 @memset(&fd_buf, 0);
                 switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.GETPATH, &fd_buf))) {

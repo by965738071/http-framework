@@ -8,50 +8,51 @@
 //! and partial directory operations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const Alignment = std.mem.Alignment;
+const builtin = @import("builtin");
 
+const Awaitable = @import("awaitable.zig").Awaitable;
+const CanceledStatus = @import("task.zig").CanceledStatus;
+const common = @import("common.zig");
+const Waiter = common.Waiter;
+const waitForIo = common.waitForIo;
+const timedWaitForIoClock = common.timedWaitForIoClock;
+const waitForIoUncancelable = common.waitForIoUncancelable;
 const coro = @import("coro/root.zig");
-const runtime_mod = @import("runtime.zig");
+const zio_dns = @import("dns/root.zig");
+const probePollable = @import("ev/backends/common.zig").probePollable;
+const ev = @import("ev/root.zig");
+const Group = @import("group.zig").Group;
+const groupSpawnBlockingTask = @import("group.zig").groupSpawnBlockingTask;
+const groupSpawnTask = @import("group.zig").groupSpawnTask;
+const os_fs = @import("os/fs.zig");
+const os_net = @import("os/net.zig");
+const os_posix = @import("os/posix.zig");
+const os_process = @import("os/process.zig");
+const process_impl = @import("process.zig");
 const random_mod = @import("random.zig");
+const runtime_mod = @import("runtime.zig");
 const Runtime = runtime_mod.Runtime;
 const getCurrentTask = runtime_mod.getCurrentTask;
 const getCurrentExecutor = runtime_mod.getCurrentExecutor;
 const beginShield = runtime_mod.beginShield;
 const endShield = runtime_mod.endShield;
 const checkCancel = runtime_mod.checkCancel;
-
-const spawnTask = @import("task.zig").spawnTask;
-const CanceledStatus = @import("task.zig").CanceledStatus;
-const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
-const Awaitable = @import("awaitable.zig").Awaitable;
-const Group = @import("group.zig").Group;
-const groupSpawnTask = @import("group.zig").groupSpawnTask;
-const groupSpawnBlockingTask = @import("group.zig").groupSpawnBlockingTask;
 const select = @import("select.zig");
+const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+const spawnTask = @import("task.zig").spawnTask;
+const stderr = @import("stderr.zig");
 const Futex = @import("sync/Futex.zig");
 const Mutex = @import("sync/Mutex.zig");
-const stderr = @import("stderr.zig");
 const time = @import("time.zig");
-const common = @import("common.zig");
-const Waiter = common.Waiter;
-const waitForIo = common.waitForIo;
-const timedWaitForIoClock = common.timedWaitForIoClock;
-const waitForIoUncancelable = common.waitForIoUncancelable;
-
-const ev = @import("ev/root.zig");
-const os_net = @import("os/net.zig");
-const os_fs = @import("os/fs.zig");
-const zio_fs = @import("fs.zig");
-const os_posix = @import("os/posix.zig");
-const os_process = @import("os/process.zig");
-const process_impl = @import("process.zig");
-const zio_net = @import("net.zig");
-const zio_dns = @import("dns/root.zig");
-const fillBuf = @import("utils/writer.zig").fillBuf;
-const probePollable = @import("ev/backends/common.zig").probePollable;
 const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
+const fillBuf = @import("utils/writer.zig").fillBuf;
+const zio_fs = @import("fs.zig");
+/// The same fixture the `fs.zig` tests use, handing its directory out as an
+/// `Io.Dir` through `stdDir`.
+const TestDirFixture = zio_fs.TestDirFixture;
+const zio_net = @import("net.zig");
 const zio_options = @import("options.zig").options;
 
 /// Must match `net.Stream.max_iovecs_len` in std.Io. Used as the cap on
@@ -691,17 +692,26 @@ const BatchCompletionData = union(Io.Operation.Tag) {
     }
 };
 
-/// Flags stored in the low bits of the `BatchCompletionData` pointer in `pending.userdata[0]`.
+/// Pooled item for one concurrent batch operation: the ev completion data
+/// plus the extracted result.
+/// dev.1240: `Io.Operation.Result` grew to 56 bytes, which no longer fits in
+/// `Operation.Storage.Pending.Userdata` ([7]usize = 56 bytes, minus the item
+/// pointer slot leaves 48), so the result lives in the pool item instead of
+/// `pending.userdata[1..]`.
+const BatchItem = struct {
+    data: BatchCompletionData,
+    result: Io.Operation.Result,
+};
+
+/// Flags stored in the low bits of the `BatchItem` pointer in `pending.userdata[0]`.
 const batch_ready_flag: usize = 1;
 const batch_canceled_flag: usize = 2;
 const batch_flags_mask: usize = batch_ready_flag | batch_canceled_flag;
 
 comptime {
     const Userdata = Io.Operation.Storage.Pending.Userdata;
-    const Result = Io.Operation.Result;
-    std.debug.assert(@sizeOf(Result) <= @sizeOf(Userdata) - @sizeOf(usize));
-    std.debug.assert(@alignOf(Result) <= @alignOf(usize));
-    std.debug.assert(@alignOf(BatchCompletionData) > batch_flags_mask);
+    std.debug.assert(@sizeOf(Userdata) >= @sizeOf(usize));
+    std.debug.assert(@alignOf(BatchItem) > batch_flags_mask);
 }
 
 /// State for concurrent batch operations, stored in batch.userdata.
@@ -709,7 +719,7 @@ comptime {
 /// Callback signals completion via ready flag in pending.userdata, then bumps
 /// `signaled` and wakes the waiter via futex.
 const BatchState = struct {
-    pool: MemoryPool(BatchCompletionData),
+    pool: MemoryPool(BatchItem),
     allocator: std.mem.Allocator,
     batch: *Io.Batch,
     /// Number of callbacks done with the state, wrapping.
@@ -719,7 +729,7 @@ const BatchState = struct {
 
     fn init(allocator: std.mem.Allocator, batch: *Io.Batch) BatchState {
         return .{
-            .pool = MemoryPool(BatchCompletionData).init(allocator),
+            .pool = MemoryPool(BatchItem).init(allocator),
             .allocator = allocator,
             .batch = batch,
             .signaled = std.atomic.Value(u32).init(0),
@@ -811,11 +821,11 @@ fn batchAwaitConcurrentImpl(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io
             continue;
         }
 
-        // Allocate completion data from pool
-        const data = state.pool.create() catch return error.ConcurrencyUnavailable;
+        // Allocate batch item from pool
+        const item = state.pool.create() catch return error.ConcurrencyUnavailable;
 
         // Initialize the ev operation based on operation type
-        const completion = initBatchOperation(data, submission.operation);
+        const completion = initBatchOperation(&item.data, submission.operation);
 
         // Set up callback - store state pointer in completion userdata
         completion.userdata = state;
@@ -824,14 +834,13 @@ fn batchAwaitConcurrentImpl(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io
 
         // Move from submitted to pending
         // userdata layout:
-        //   [0]: data pointer (BatchCompletionData*) with `batch_flags_mask` bits as flags
-        //   [1..]: result (Io.Operation.Result), unset if canceled
+        //   [0]: item pointer (BatchItem*) with `batch_flags_mask` bits as flags
         storage.* = .{ .pending = .{
             .node = .{ .prev = batch.pending.tail, .next = .none },
             .tag = submission.operation,
             .userdata = undefined,
         } };
-        @as(*usize, @ptrCast(&storage.pending.userdata[0])).* = @intFromPtr(data); // no flags = not ready
+        @as(*usize, @ptrCast(&storage.pending.userdata[0])).* = @intFromPtr(item); // no flags = not ready
 
         if (batch.pending.tail != .none) {
             batch.storage[batch.pending.tail.toIndex()].pending.node.next = index;
@@ -1042,8 +1051,8 @@ fn initBatchOperation(data: *BatchCompletionData, operation: Io.Operation) *ev.C
 }
 
 /// Callback when a batch operation completes.
-/// Stores result in userdata, sets ready flag (and canceled flag if the operation was
-/// canceled) in the data pointer, signals waiter via futex.
+/// Stores result in the pool item, sets ready flag (and canceled flag if the
+/// operation was canceled) in the item pointer, signals waiter via futex.
 /// Once the waiter sees the ready flag, the batch storage may be reused, and once
 /// `signaled` catches up with `drained`, `batchCancelImpl` may free the state.
 fn batchCompletionCallback(_: *ev.Loop, completion: *ev.Completion) void {
@@ -1062,13 +1071,12 @@ fn batchCompletionCallback(_: *ev.Loop, completion: *ev.Completion) void {
     if (canceled) {
         flags |= batch_canceled_flag;
     } else {
-        // Store result in userdata[1..] (after data pointer)
-        const data: *BatchCompletionData = @ptrFromInt(data_ptr);
-        const result = extractBatchResult(data, storage.pending.tag);
-        @as(*Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).* = result;
+        // Store result in the pool item
+        const item: *BatchItem = @ptrFromInt(data_ptr);
+        item.result = extractBatchResult(&item.data, storage.pending.tag);
     }
 
-    // Set flags in the data pointer (release to ensure result is visible)
+    // Set flags in the item pointer (release to ensure result is visible)
     @atomicStore(usize, @as(*usize, @ptrCast(&userdata[0])), data_ptr | flags, .release);
 
     // Signal waiter, `state` may be freed after the increment
@@ -1155,9 +1163,9 @@ fn batchDrainReady(batch: *Io.Batch, state: *BatchState) void {
             continue;
         }
 
-        // Get data pointer (mask off flags) and free it
-        const data: *BatchCompletionData = @ptrFromInt(data_ptr & ~batch_flags_mask);
-        state.pool.destroy(data);
+        // Get item pointer (mask off flags) and free it
+        const item: *BatchItem = @ptrFromInt(data_ptr & ~batch_flags_mask);
+        state.pool.destroy(item);
         state.drained +%= 1;
 
         // Remove from pending list
@@ -1188,8 +1196,9 @@ fn batchDrainReady(batch: *Io.Batch, state: *BatchState) void {
             continue;
         }
 
-        // Get result from userdata[1..]
-        const result = @as(*const Io.Operation.Result, @ptrCast(@alignCast(&userdata[1]))).*;
+        // Get result from the pool item (the await thread owns the pool, so
+        // no reuse can happen until this drain pass returns)
+        const result = item.result;
 
         // Add to completed list
         storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
@@ -1218,8 +1227,8 @@ fn batchCancelPending(batch: *Io.Batch, state: *BatchState) void {
         // Only cancel if not already ready
         const data_ptr = @atomicLoad(usize, @as(*usize, @ptrCast(&userdata[0])), .acquire);
         if (data_ptr & batch_ready_flag == 0) {
-            const data: *BatchCompletionData = @ptrFromInt(data_ptr);
-            const completion = data.getCompletion();
+            const item: *BatchItem = @ptrFromInt(data_ptr & ~batch_flags_mask);
+            const completion = item.data.getCompletion();
             executor.loopCancel(completion);
         }
         index = storage.pending.node.next;
@@ -1646,13 +1655,13 @@ fn dirReadLinkImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, buffer: []
 }
 
 fn dirSetOwnerImpl(_: ?*anyopaque, dir: Io.Dir, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.Dir.SetOwnerError!void {
-    var op = ev.DirSetOwner.init(stdIoHandleToZio(dir.handle), owner, group);
+    var op = ev.DirSetOwner.init(stdIoHandleToZio(dir.handle), uidToZio(owner), gidToZio(group));
     try waitForIo(&op.c);
     try op.getResult();
 }
 
 fn dirSetFileOwnerImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, owner: ?Io.File.Uid, group: ?Io.File.Gid, options: Io.Dir.SetFileOwnerOptions) Io.Dir.SetFileOwnerError!void {
-    var op = ev.DirSetFileOwner.init(stdIoHandleToZio(dir.handle), sub_path, owner, group, .{
+    var op = ev.DirSetFileOwner.init(stdIoHandleToZio(dir.handle), sub_path, uidToZio(owner), gidToZio(group), .{
         .follow_symlinks = options.follow_symlinks,
     });
     try waitForIo(&op.c);
@@ -1871,7 +1880,7 @@ fn fileSetLengthImpl(_: ?*anyopaque, file: Io.File, new_length: u64) Io.File.Set
 }
 
 fn fileSetOwnerImpl(_: ?*anyopaque, file: Io.File, owner: ?Io.File.Uid, group: ?Io.File.Gid) Io.File.SetOwnerError!void {
-    var op = ev.FileSetOwner.init(stdIoHandleToZio(file.handle), owner, group);
+    var op = ev.FileSetOwner.init(stdIoHandleToZio(file.handle), uidToZio(owner), gidToZio(group));
     try waitForIo(&op.c);
     try op.getResult();
 }
@@ -2172,6 +2181,22 @@ fn randomSecureImpl(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
     return random_mod.randomSecure(buffer);
 }
 
+/// dev.1240: `Io.File.Uid`/`Gid` are `void` on Windows (ownership is not
+/// expressible), while the ev layer always takes `?fs.uid_t`/`?fs.gid_t`.
+fn uidToZio(uid: ?Io.File.Uid) ?os_fs.uid_t {
+    return switch (builtin.os.tag) {
+        .windows => null,
+        else => uid,
+    };
+}
+
+fn gidToZio(gid: ?Io.File.Gid) ?os_fs.gid_t {
+    return switch (builtin.os.tag) {
+        .windows => null,
+        else => gid,
+    };
+}
+
 fn stdIoIpToZio(addr: Io.net.IpAddress) zio_net.IpAddress {
     return switch (addr) {
         .ip4 => |ip4| zio_net.IpAddress.initIp4(ip4.bytes, ip4.port),
@@ -2181,11 +2206,11 @@ fn stdIoIpToZio(addr: Io.net.IpAddress) zio_net.IpAddress {
 
 fn zioIpToStdIo(addr: zio_net.IpAddress) Io.net.IpAddress {
     return switch (addr.any.family) {
-        std.posix.AF.INET => .{ .ip4 = .{
+        os_net.AF.INET => .{ .ip4 = .{
             .bytes = @bitCast(addr.in.addr),
             .port = std.mem.bigToNative(u16, addr.in.port),
         } },
-        std.posix.AF.INET6 => .{ .ip6 = .{
+        os_net.AF.INET6 => .{ .ip6 = .{
             .bytes = addr.in6.addr,
             .port = std.mem.bigToNative(u16, addr.in6.port),
             .flow = addr.in6.flowinfo,
@@ -2205,8 +2230,8 @@ fn senderAddrToStdIo(addr: *const os_net.sockaddr, len: os_net.socklen_t) Io.net
 
 fn sockAddrLen(addr: *const os_net.sockaddr) os_net.socklen_t {
     return switch (addr.family) {
-        std.posix.AF.INET => @sizeOf(os_net.sockaddr.in),
-        std.posix.AF.INET6 => @sizeOf(os_net.sockaddr.in6),
+        os_net.AF.INET => @sizeOf(os_net.sockaddr.in),
+        os_net.AF.INET6 => @sizeOf(os_net.sockaddr.in6),
         else => unreachable,
     };
 }
@@ -3140,10 +3165,6 @@ fn dnsLookupErrToStdErr(err: zio_dns.LookupError) Io.net.HostName.LookupError {
 test {
     _ = process_impl;
 }
-
-/// The same fixture the `fs.zig` tests use, handing its directory out as an
-/// `Io.Dir` through `stdDir`.
-const TestDirFixture = zio_fs.TestDirFixture;
 
 test "Runtime.io / Runtime.fromIo round-trip" {
     const rt = try Runtime.init(std.testing.allocator, .{});

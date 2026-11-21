@@ -7,9 +7,10 @@
     .fingerprint = 0xfe7cb1c07e898ad5,
     .dependencies = .{
         // zio 上游 main（0.20.1/b0efa2b，2026-11-15）落后于本机 std 一步：
-        // zig 0.18.0-dev.1124 把 `packed struct/union` 更名为 `bitpack`，且
-        // `<< |`、`% *` 组合改为要求显式括号（行为同 0.17 的求值顺序）。上游
-        // 未跟进，因此 vendor 一份并打最小补丁（清单见 vendor/zio/README.md）。
+        // dev.1124 把 `packed struct/union` 更名为 `bitpack`、`<< |`/`% *` 组合
+        // 要求显式括号；dev.1240 又改了 std.Io 内部布局（Operation.Result 变大、
+        // Io.File.Uid 在 Windows 上变 void、std.builtin.os 移除等）。上游未跟进，
+        // 因此 vendor 一份并打最小补丁（清单见 vendor/zio/README.md）。
         // 上游跟进后可换回 url/hash 依赖。
 
         .zio = .{

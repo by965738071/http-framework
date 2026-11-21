@@ -9,9 +9,10 @@
 //!   └─ 前端管理界面（单页 SPA）
 
 const std = @import("std");
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 const framework = @import("http_framework");
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
 const PW_ROUNDS: u32 = 10_000;
 
 /// H-7：与 core.password 相同的 PHC 格式（pbkdf2-sha256$rounds$salt$hash），
@@ -304,10 +305,11 @@ pub const RequireRoleMiddleware = struct {
             return;
         };
 
-        const username = sessions.getValue(session_id, "username", ctx.arena) catch {
+        const username = sessions.getValue(session_id, "username", ctx.arena) catch null;
+        if (username == null) {
             try ctx.failWith(framework.AppError.unauthorized("session expired"));
             return;
-        };
+        }
 
         // 验证角色
         const store = self.services.users;
@@ -316,7 +318,7 @@ pub const RequireRoleMiddleware = struct {
 
         var user_found = false;
         for (all_users) |u| {
-            if (std.mem.eql(u8, u.username, username)) {
+            if (std.mem.eql(u8, u.username, username.?)) {
                 user_found = true;
                 const user_role: Role = if (std.mem.eql(u8, u.role, "admin")) .admin else if (std.mem.eql(u8, u.role, "editor")) .editor else .viewer;
                 const required = self.role;

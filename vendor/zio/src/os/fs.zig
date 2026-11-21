@@ -1,12 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = @import("posix.zig");
-const darwin = @import("darwin.zig");
-const w = @import("windows.zig");
-const options = @import("../options.zig").options;
 
-const unexpectedError = @import("base.zig").unexpectedError;
+const options = @import("../options.zig").options;
+const darwin = @import("darwin.zig");
+pub const iovec = @import("base.zig").iovec;
+pub const iovec_const = @import("base.zig").iovec_const;
+const posix = @import("posix.zig");
+pub const mode_t = posix.sys.mode_t;
 const syscall_cancel = @import("syscall_cancel.zig");
+const unexpectedError = @import("base.zig").unexpectedError;
+const w = @import("windows.zig");
+
+// Windows 下 std 的目标类型是 Io.File.INode = LARGE_INTEGER(i64)，而 c.ino_t
+// 是 16 位 c_ushort，装不下 64 位 NTFS FileIndex，故 Windows 用 i64 与 std 对齐
+// （本地补丁，见 README 补丁清单）。
+pub const ino_t = if (builtin.os.tag == .windows) std.os.windows.LARGE_INTEGER else posix.sys.ino_t;
 
 // Cached probe result: once we see ENOSYS from openat2, skip future attempts.
 var openat2_nosys: std.atomic.Value(bool) = .init(false);
@@ -121,12 +129,6 @@ pub fn pipe() PipeError![2]fd_t {
         else => posix.pipe(.{ .nonblocking = true, .cloexec = true }),
     };
 }
-
-pub const iovec = @import("base.zig").iovec;
-pub const iovec_const = @import("base.zig").iovec_const;
-
-pub const mode_t = posix.sys.mode_t;
-pub const ino_t = posix.sys.ino_t;
 
 pub const FileKind = enum {
     block_device,

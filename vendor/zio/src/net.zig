@@ -3,27 +3,26 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zio_options = @import("options.zig").options;
+
+const common = @import("common.zig");
+const waitForIo = common.waitForIo;
+const waitForIoUncancelable = common.waitForIoUncancelable;
+const timedWaitForIo = common.timedWaitForIo;
+const compat = @import("compat.zig");
+const dns = @import("dns/root.zig");
+const Duration = @import("time.zig").Duration;
 const ev = @import("ev/root.zig");
+const Handle = ev.Backend.NetHandle;
+const Group = @import("group.zig").Group;
 const os = @import("os/root.zig");
+pub const ShutdownHow = os.net.ShutdownHow;
 const runtime_mod = @import("runtime.zig");
 const Runtime = runtime_mod.Runtime;
 const getCurrentTask = runtime_mod.getCurrentTask;
 const Channel = @import("sync/channel.zig").Channel;
-const Group = @import("group.zig").Group;
-
-const dns = @import("dns/root.zig");
-
-const common = @import("common.zig");
-const compat = @import("compat.zig");
-const waitForIo = common.waitForIo;
-const waitForIoUncancelable = common.waitForIoUncancelable;
-const timedWaitForIo = common.timedWaitForIo;
 const Timeout = @import("time.zig").Timeout;
-const Duration = @import("time.zig").Duration;
 const fillBuf = @import("utils/writer.zig").fillBuf;
-
-const Handle = ev.Backend.NetHandle;
+const zio_options = @import("options.zig").options;
 
 pub const max_vecs = 16;
 
@@ -207,8 +206,6 @@ pub const HostName = struct {
         return error.UnknownHostName;
     }
 };
-
-pub const ShutdownHow = os.net.ShutdownHow;
 
 /// Get the socket address length for a given sockaddr.
 /// Determines the appropriate length based on the address family.
@@ -1363,8 +1360,12 @@ pub const Stream = struct {
             var storage: [1 + max_vecs]os.iovec = undefined;
             const dest_n, const data_size = if (builtin.os.tag == .windows)
                 try io_r.writableVectorWsa(&storage, data)
-            else
-                try io_r.writableVectorPosix(&storage, data);
+            else blk: {
+                // dev.1240：writableVectorPosix 签名固定用 std.posix.iovec（c.iovec）；
+                // Linux 上 storage 是 std.os.linux.iovec（布局相同、类型身份不同），按位重解释。
+                const std_iovecs: [*]std.posix.iovec = @ptrCast(&storage[0]);
+                break :blk try io_r.writableVectorPosix(std_iovecs[0..storage.len], data);
+            };
             if (dest_n == 0) return 0;
 
             const n = readBuf(r.handle, .{ .iovecs = storage[0..dest_n] }, r.timeout) catch |err| {

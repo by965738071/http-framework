@@ -5,25 +5,23 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const ev = @import("ev/root.zig");
-const os = @import("os/root.zig");
-const Runtime = @import("runtime.zig").Runtime;
-const getCurrentTask = @import("runtime.zig").getCurrentTask;
 const beginShield = @import("runtime.zig").beginShield;
-const endShield = @import("runtime.zig").endShield;
-const log = @import("common.zig").log;
 const Cancelable = @import("common.zig").Cancelable;
+const endShield = @import("runtime.zig").endShield;
+const probeStreamingRoute = @import("ev/backends/common.zig").probeStreamingRoute;
+const ev = @import("ev/root.zig");
+const getCurrentTask = @import("runtime.zig").getCurrentTask;
+const log = @import("common.zig").log;
+const os = @import("os/root.zig");
+pub const Handle = os.fs.fd_t;
+const random = @import("random.zig").random;
+const Runtime = @import("runtime.zig").Runtime;
+const timedWaitForIo = @import("common.zig").timedWaitForIo;
+const Timeout = @import("time.zig").Timeout;
 const Timeoutable = @import("common.zig").Timeoutable;
+const fillBuf = @import("utils/writer.zig").fillBuf;
 const waitForIo = @import("common.zig").waitForIo;
 const waitForIoUncancelable = @import("common.zig").waitForIoUncancelable;
-const timedWaitForIo = @import("common.zig").timedWaitForIo;
-const fillBuf = @import("utils/writer.zig").fillBuf;
-const random = @import("random.zig").random;
-const probeStreamingRoute = @import("ev/backends/common.zig").probeStreamingRoute;
-const Timeout = @import("time.zig").Timeout;
-
-pub const Handle = os.fs.fd_t;
-
 /// zio's std.Io integration. Imported for `debug_io` and `zioFileToStd`; the
 /// mutual fs<->io import is fine (no comptime cycle).
 const zio_io = @import("io.zig");
@@ -1615,8 +1613,12 @@ pub const FileReader = struct {
         var iovec_storage: [1 + max_vecs]os.iovec = undefined;
         const dest_n, const data_size = if (builtin.os.tag == .windows)
             try io_reader.writableVectorWsa(&iovec_storage, data)
-        else
-            try io_reader.writableVectorPosix(&iovec_storage, data);
+        else blk: {
+            // dev.1240：writableVectorPosix 签名固定用 std.posix.iovec（c.iovec）；
+            // Linux 上 storage 是 std.os.linux.iovec（布局相同、类型身份不同），按位重解释。
+            const std_iovecs: [*]std.posix.iovec = @ptrCast(&iovec_storage[0]);
+            break :blk try io_reader.writableVectorPosix(std_iovecs[0..iovec_storage.len], data);
+        };
         if (dest_n == 0) return 0;
 
         switch (r.mode) {
